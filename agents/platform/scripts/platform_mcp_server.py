@@ -32,6 +32,7 @@ from cluster_agent_profile import (
 )
 from gke_endpoint import dns_endpoint_args
 from profile_scaffold import profiles_base
+import fleet_scope_targets
 
 DEFAULT_SESSION_KV_DB_PATH = "/var/lib/kube-agents/session/session_kv.db"
 
@@ -426,6 +427,49 @@ def _cluster_agent_roster() -> list[dict]:
             log(f"Warning: could not read the cluster identity of {home.name}: {e}")
         roster.append(entry)
     return roster
+
+
+@mcp.tool()
+def fleet_scope() -> str:
+    """
+    The install's declared scope, resolved: which GCP projects a fleet audit
+    sweeps, and the arguments to hand its collector.
+
+    Reads the reconcile's snapshot (fleet_scope.json at the data volume's
+    root). Returns JSON:
+      {"declared": true, "resolved_at": "...", "projects": [...],
+       "unread": [{"project": ..., "outcome": ...}], "collector_args": "...",
+       "source": "<the snapshot's path>"}
+    `projects` is the sweep: every project the scope resolved to that this
+    install could read (its Kubernetes Engine API off included; the collectors
+    count such a project empty). `unread` names each declared project the
+    install could not read (denied, unreachable, over-cap); the collectors
+    record them as a coverage gap. `collector_args` is the string to append to
+    a collector command verbatim (`--scope-projects ... --scope-unread ...`),
+    empty when nothing is readable, which is a run with no project.
+    `{"declared": false, "note": "..."}` means the install declares no scope
+    (or no snapshot exists yet): the collectors then enumerate every project
+    the identity can list, as before scopes existed. A spec.scope block that
+    is present with empty lists is a declared scope of the management project
+    alone, not the absence of one. The collectors cannot read the snapshot
+    themselves: they run in the shell sandbox, whose data volume is not this
+    pod's.
+    """
+    try:
+        targets = fleet_scope_targets.declared_scope_targets()
+    except Exception as e:  # noqa: BLE001 - a tool answers, it does not raise
+        return f"ERROR: Could not read the scope snapshot: {e}"
+    if targets is None:
+        return json.dumps({"declared": False, "projects": [], "unread": [], "collector_args": "",
+                           "note": "no declared scope (or no snapshot yet): the collectors enumerate every project the identity can list"}, indent=2)
+    return json.dumps({
+        "declared": True,
+        "resolved_at": targets.resolved_at,
+        "projects": list(targets.projects),
+        "unread": [{"project": project, "outcome": outcome} for project, outcome in targets.unread],
+        "collector_args": targets.collector_args(),
+        "source": targets.path,
+    }, indent=2)
 
 
 @mcp.tool()

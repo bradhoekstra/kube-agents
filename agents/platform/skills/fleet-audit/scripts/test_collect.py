@@ -19,6 +19,8 @@ import subprocess
 import sys
 import textwrap
 import unittest
+import os
+from unittest import mock
 from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -12395,6 +12397,62 @@ class TestDefaultRun(unittest.TestCase):
         self.assertIsInstance(result.stdout, str)
         self.assertIsInstance(result.stderr, str)
 
+
+
+def run_of(rc: int, stdout: str = "", stderr: str = "") -> collect.Run:
+    return collect.Run(argv=[], rc=rc, stdout=stdout, stderr=stderr, duration_s=0.0)
+
+
+class DeclaredScopeFromTheToolTest(unittest.TestCase):
+    """The declared scope the agent carries from the platform_control fleet_scope
+    tool (`--scope-projects`, `--scope-unread`) is the sweep: nothing is listed,
+    an unread declared project is the one note, and without the flags the
+    listing runs as before."""
+
+    def tearDown(self):
+        collect.declared_scope.set(None, None)
+
+    def test_the_declared_scope_is_swept_and_nothing_is_listed(self):
+        def run(argv, **kwargs):
+            raise AssertionError(f"the declared scope is the sweep; nothing should be listed: {argv}")
+
+        collect.declared_scope.set("ops-mgmt,payments-prod", "payments-staging=denied")
+        discovery = collect.discover_fleet(None, run=run)
+        self.assertEqual(discovery.projects, ["ops-mgmt", "payments-prod"])
+        self.assertIsNone(discovery.error)
+        self.assertIn("payments-staging (denied)", discovery.partial)
+        self.assertIn("fleet_scope tool", discovery.partial)
+
+    def test_every_declared_project_read_leaves_no_note(self):
+        collect.declared_scope.set("ops-mgmt payments-prod", "")
+        discovery = collect.discover_fleet(None, run=lambda *a, **k: run_of(1))
+        self.assertEqual((discovery.projects, discovery.partial), (["ops-mgmt", "payments-prod"], None))
+
+    def test_without_the_flags_the_listing_runs_as_before(self):
+        def run(argv, **kwargs):
+            if argv[:2] == ["gcloud", "config"]:
+                return run_of(0, "acme\n")
+            return run_of(0, "acme\nother\n")
+
+        collect.declared_scope.set("", None)
+        self.assertEqual(collect.discover_fleet(None, run=run).projects, ["acme", "other"])
+
+    def test_a_project_override_still_wins(self):
+        collect.declared_scope.set("ops-mgmt", None)
+        self.assertEqual(collect.discover_fleet("acme-only", run=lambda *a, **k: run_of(1)).projects, ["acme-only"])
+
+    def test_main_hands_the_flags_to_the_resolver(self):
+        # The wiring the SOP relies on: the two flags main parses reach the
+        # holder the resolver reads, before anything else runs.
+        with mock.patch.object(collect.declared_scope, "set", side_effect=SystemExit(0)) as handed, self.assertRaises(SystemExit):
+            collect.main(["compliance-audit", "--scope-projects", "ops-mgmt,payments-prod", "--scope-unread", "payments-staging=denied"])
+        handed.assert_called_once_with("ops-mgmt,payments-prod", "payments-staging=denied")
+
+    def test_the_flags_are_parsed_from_the_command_line(self):
+        proc = subprocess.run([sys.executable, collect.__file__, "--help"], capture_output=True, text=True, timeout=120)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("--scope-projects", proc.stdout)
+        self.assertIn("--scope-unread", proc.stdout)
 
 if __name__ == "__main__":
     unittest.main()

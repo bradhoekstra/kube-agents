@@ -1469,5 +1469,47 @@ class TestClusterAgentRoster(unittest.TestCase):
         self.assertEqual([], json.loads(platform_mcp_server.list_cluster_profiles()))
 
 
+
+class FleetScopeToolTest(unittest.TestCase):
+    """fleet_scope: the declared scope's resolved projects and the collector
+    arguments, read from the snapshot at the data volume's root; `declared:
+    false` with no scope or no snapshot."""
+
+    SNAPSHOT = {
+        "resolvedAt": "2026-10-09T12:00:00Z",
+        "declared": {"projects": ["payments-prod", "payments-staging"], "folders": [], "organizations": [], "sharedVpcHosts": [], "metricsScopes": [], "exclude": {}},
+        "projects": [
+            {"id": "ops-mgmt", "via": ["management"], "outcome": "ok", "state": "in-scope"},
+            {"id": "payments-prod", "via": ["explicit"], "outcome": "ok", "state": "in-scope"},
+            {"id": "payments-staging", "via": ["explicit"], "outcome": "denied", "state": "in-scope"},
+        ],
+    }
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def _call(self, snapshot):
+        if snapshot is not None:
+            (Path(self.tmp.name) / "fleet_scope.json").write_text(json.dumps(snapshot), encoding="utf-8")
+        # The worker's HERMES_HOME is the profile home; the snapshot is at the root.
+        with patch.dict(os.environ, {"PLATFORM_AGENT_HOME": self.tmp.name, "HERMES_HOME": str(Path(self.tmp.name) / "profiles" / "platform")}):
+            return json.loads(platform_mcp_server.fleet_scope())
+
+    def test_a_declared_scope_is_reported_with_the_collector_arguments(self):
+        out = self._call(self.SNAPSHOT)
+        self.assertTrue(out["declared"])
+        self.assertEqual(out["projects"], ["ops-mgmt", "payments-prod"])
+        self.assertEqual(out["unread"], [{"project": "payments-staging", "outcome": "denied"}])
+        self.assertEqual(out["collector_args"], "--scope-projects ops-mgmt,payments-prod --scope-unread payments-staging=denied")
+        self.assertEqual(out["resolved_at"], "2026-10-09T12:00:00Z")
+
+    def test_no_declared_scope_and_no_snapshot_both_report_undeclared(self):
+        undeclared = dict(self.SNAPSHOT, declared={k: [] for k in ("projects", "folders", "organizations", "sharedVpcHosts", "metricsScopes")})
+        self.assertFalse(self._call(undeclared)["declared"])
+        self.assertEqual(self._call(undeclared)["collector_args"], "")
+        self.assertFalse(self._call(None)["declared"])
+
+
 if __name__ == '__main__':
     unittest.main()

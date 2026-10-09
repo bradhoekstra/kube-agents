@@ -1962,6 +1962,11 @@ def reconcile(dry_run: bool = False) -> dict:
         _write_snapshot({
             "resolvedAt": datetime.now(timezone.utc).strftime(SNAPSHOT_TIME_FORMAT),
             "declared": declared,
+            # Whether the CR carried a spec.scope block at all: a present block with
+            # empty lists is the host-only boundary (the operator's own definition of
+            # an empty present block), which a reader of the snapshot cannot tell from
+            # an absent one by `declared` alone. The audits' fleet_scope tool keys on it.
+            SCOPE_PRESENT_KEY: scope_present,
             SCOPE_MAX_PROJECTS_KEY: cap,
             "resolver": RESOLVER_ASSET_INVENTORY if _container_ids(scope) else RESOLVER_EXPLICIT,
             "containers": sorted(containers, key=lambda c: c["id"]),

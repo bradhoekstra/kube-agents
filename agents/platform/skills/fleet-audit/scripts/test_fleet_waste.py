@@ -7958,5 +7958,55 @@ class ContentModeWorkspaceTest(unittest.TestCase):
                 fw.main(["--workspace", str(scratch)])
         self.assertIsNone(seen["w"], "a failed mirror indexes nothing, not the scratch")
 
+
+class DeclaredScopeFromTheToolTest(unittest.TestCase):
+    """The declared scope the agent carries from the platform_control fleet_scope
+    tool (`--scope-projects`, `--scope-unread`) is the sweep: nothing is listed,
+    an unread declared project is the one note, and without the flags the
+    listing runs as before."""
+
+    def tearDown(self):
+        fw.declared_scope.set(None, None)
+
+    def test_the_declared_scope_is_swept_and_nothing_is_listed(self):
+        def run(argv, **kwargs):
+            raise AssertionError(f"the declared scope is the sweep; nothing should be listed: {argv}")
+
+        fw.declared_scope.set("ops-mgmt,payments-prod", "payments-staging=denied")
+        projects, partial = fw.get_target_projects(None, run=run)
+        self.assertEqual(projects, ["ops-mgmt", "payments-prod"])
+        self.assertIn("payments-staging (denied)", partial)
+        self.assertIn("fleet_scope tool", partial)
+
+    def test_every_declared_project_read_leaves_no_note(self):
+        fw.declared_scope.set("ops-mgmt payments-prod", "")
+        self.assertEqual(fw.get_target_projects(None, run=lambda *a, **k: run_of(1)), (["ops-mgmt", "payments-prod"], None))
+
+    def test_without_the_flags_the_listing_runs_as_before(self):
+        def run(argv, **kwargs):
+            if argv[:2] == ["gcloud", "config"]:
+                return run_of(0, "acme\n")
+            return run_of(0, "acme\nother\n")
+
+        fw.declared_scope.set("", None)
+        self.assertEqual(fw.get_target_projects(None, run=run), (["acme", "other"], None))
+
+    def test_a_project_override_still_wins(self):
+        fw.declared_scope.set("ops-mgmt", None)
+        self.assertEqual(fw.get_target_projects("acme-only", run=lambda *a, **k: run_of(1))[0], ["acme-only"])
+
+    def test_main_hands_the_flags_to_the_resolver(self):
+        # The wiring the SOP relies on: the two flags main parses reach the
+        # holder the resolver reads, before anything else runs.
+        with patch.object(fw.declared_scope, "set", side_effect=SystemExit(0)) as handed, self.assertRaises(SystemExit):
+            fw.main(["--scope-projects", "ops-mgmt,payments-prod", "--scope-unread", "payments-staging=denied"])
+        handed.assert_called_once_with("ops-mgmt,payments-prod", "payments-staging=denied")
+
+    def test_the_flags_are_parsed_from_the_command_line(self):
+        proc = subprocess.run([sys.executable, fw.__file__, "--help"], capture_output=True, text=True, timeout=120)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("--scope-projects", proc.stdout)
+        self.assertIn("--scope-unread", proc.stdout)
+
 if __name__ == "__main__":
     unittest.main()

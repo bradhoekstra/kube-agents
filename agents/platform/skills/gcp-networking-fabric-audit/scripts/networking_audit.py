@@ -17,6 +17,7 @@ import re
 import shlex
 import subprocess
 import sys
+from pathlib import Path
 
 MONITORED_PROJECTS_ENV = "MONITORED_PROJECT_IDS"
 PROJECT_ENV_VARS = ("GCP_PROJECT_ID", "GKE_PROJECT_ID", "PROJECT_ID")
@@ -41,6 +42,32 @@ UNENUMERATED_PROJECTS = "UNENUMERATED_PROJECTS"
 # saying so the document reads as the whole fleet, and `finish` resolves every
 # ledger finding on a project the run never looked at. fleet_drift.py records
 # the same `project/UNENUMERATED_PROJECTS` row for its `--project` runs.
+# Where the image and the shell sandbox ship the scripts the collectors share
+# (deploy/docker/Dockerfile and deploy/sandbox/Dockerfile copy them to
+# /opt/defaults/scripts), then the checkout's own copy for a run from the
+# repository.
+SHARED_SCRIPT_DIRS = (
+    "/opt/defaults/scripts",
+    "/opt/data/scripts",
+    str(Path(__file__).resolve().parents[3] / "scripts"),
+)
+
+# The install's declared scope, handed in by the agent from the platform_control
+# `fleet_scope` tool (the collectors run in the shell sandbox and cannot read
+# the reconcile's snapshot themselves): the flags, their parsing and the note
+# live in fleet_scope_args, shared with every collector. `--scope-projects` is
+# the sweep, complete coverage; `--scope-unread` names each declared project
+# the install could not read, recorded as a coverage gap. Without them the
+# collector enumerates every project the identity can list, the behaviour of
+# an install that declares no scope.
+for _shared_dir in SHARED_SCRIPT_DIRS:
+    if _shared_dir not in sys.path:
+        sys.path.append(_shared_dir)
+import fleet_scope_args  # noqa: E402
+
+# The scope this collector was handed, set by main from the two flags.
+declared_scope = fleet_scope_args.DeclaredScope()
+
 SCOPED_RUN_NOTE = (
     "scope narrowed to {projects} by {source}: discovery was skipped, so no other project "
     "in this fleet was named or read"
@@ -232,14 +259,18 @@ def get_target_projects(cli_project: str | None = None, listing_errors: list[str
     into a `project/UNENUMERATED_PROJECTS` skipped target so the run reads as
     partial rather than as the whole fleet:
 
-    - `--project-id` or a non-empty `MONITORED_PROJECT_IDS` narrows the scope
-      on purpose and skips discovery;
+    - `--project-id` narrows the scope on purpose and skips discovery;
+    - `--scope-projects`, passed by the SOP from the fleet_scope tool, is the
+      install's declared scope: swept as given, nothing listed, and a declared
+      project the install could not read (`--scope-unread`) is the one note;
+    - without either, a non-empty `MONITORED_PROJECT_IDS` narrows the scope on
+      purpose and skips discovery;
     - a failed `gcloud projects list` leaves only the env/config project;
     - a listing that succeeds without naming the configured project is
       filtered rather than complete, as fleet_drift.py treats it.
 
-    The host project from `gcloud config get-value project` is always part of
-    the discovered scope, alongside any `GCP_PROJECT_ID`-style variable.
+    When discovery runs, the host project from `gcloud config get-value project`
+    is always part of the scope, alongside any `GCP_PROJECT_ID`-style variable.
     """
     if cli_project and cli_project.strip():
         raw = cli_project.strip()
@@ -247,6 +278,12 @@ def get_target_projects(cli_project: str | None = None, listing_errors: list[str
         if listing_errors is not None:
             listing_errors.append(SCOPED_RUN_NOTE.format(projects=project, source="`--project-id`"))
         return [project]
+    if declared_scope.projects:
+        # The declared scope the agent carried from the fleet_scope tool: the
+        # sweep as given, nothing listed, the unread rows as the one note.
+        if listing_errors is not None and declared_scope.note():
+            listing_errors.append(declared_scope.note())
+        return sorted(declared_scope.projects)
 
     env_projects = {os.environ.get(var, "").strip() for var in PROJECT_ENV_VARS} - {""}
     # Parsed before it is tested, so a blank or separator-only value reads as
@@ -871,10 +908,12 @@ def node_blocks_that_fit(cidr: str, utilization: float, prefix: int | None) -> i
 def main():
     parser = argparse.ArgumentParser(description="Audit GCP VPC Networking Fabric")
     parser.add_argument("--project-id", help="Optional GCP Project ID")
+    fleet_scope_args.add_scope_arguments(parser)
     parser.add_argument("--output", help="Optional path to write findings JSON")
     parser.add_argument("--check", choices=CHECK_CHOICES, default=CHECK_ALL,
                         help="Run one sweep, or both (default)")
     args = parser.parse_args()
+    declared_scope.set(args.scope_projects, args.scope_unread)
     # A run killed before it writes must not leave the last run's document to
     # be merged as this one's.
     if args.output:

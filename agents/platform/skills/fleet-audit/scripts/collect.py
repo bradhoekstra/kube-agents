@@ -31,7 +31,8 @@ the first one happened to need.
 
 What this file does for the checks it covers:
 
-  1. Discovers every project the caller can see (`gcloud projects list`,
+  1. Discovers the install's scope: the projects the agent passes from the platform_control
+     `fleet_scope` tool (`--scope-projects`), or, without them, every project the caller can see (`gcloud projects list`,
      or the one `--project` names) and enumerates each one's clusters
      (`gcloud container clusters list`), naming every cluster
      `<project>/<location>/<name>` because a bare name is unique only inside
@@ -166,6 +167,32 @@ UNENUMERATED_PROJECTS_TARGET = PROJECT_TARGET_PREFIX + "UNENUMERATED_PROJECTS"
 # names no other; without a row saying so, `finish` resolves every ledger
 # finding on a cluster in any other project. `fleet_drift.SCOPED_RUN_NOTE`
 # states the same rule.
+# Where the image and the shell sandbox ship the scripts the collectors share
+# (deploy/docker/Dockerfile and deploy/sandbox/Dockerfile copy them to
+# /opt/defaults/scripts), then the checkout's own copy for a run from the
+# repository.
+SHARED_SCRIPT_DIRS = (
+    "/opt/defaults/scripts",
+    "/opt/data/scripts",
+    str(Path(__file__).resolve().parents[3] / "scripts"),
+)
+
+# The install's declared scope, handed in by the agent from the platform_control
+# `fleet_scope` tool (the collectors run in the shell sandbox and cannot read
+# the reconcile's snapshot themselves): the flags, their parsing and the note
+# live in fleet_scope_args, shared with every collector. `--scope-projects` is
+# the sweep, complete coverage; `--scope-unread` names each declared project
+# the install could not read, recorded as a coverage gap. Without them the
+# collector enumerates every project the identity can list, the behaviour of
+# an install that declares no scope.
+for _shared_dir in SHARED_SCRIPT_DIRS:
+    if _shared_dir not in sys.path:
+        sys.path.append(_shared_dir)
+import fleet_scope_args  # noqa: E402
+
+# The scope this collector was handed, set by main from the two flags.
+declared_scope = fleet_scope_args.DeclaredScope()
+
 SCOPED_RUN_NOTE = (
     "scope narrowed to project {project!r} by `--project`: discovery was skipped, so no other "
     "project in this fleet was named or read, and this run cannot speak for their clusters."
@@ -545,13 +572,22 @@ class Discovery(NamedTuple):
 
 
 def discover_fleet(base_project: str | None, *, run: RunFn = default_run) -> Discovery:
-    """The project scope. `--project` scopes the run to one project; without
-    one it is the active project plus every project `gcloud projects list`
-    returns -- the scope `fleet_drift.discover_fleet` and
-    `patch_readiness.discover_fleet` use, so every collector audits the same
-    fleet. Discovery names projects and lists none of them."""
+    """The project scope. `--project` scopes the run to one project; else the
+    declared scope the SOP passed from the fleet_scope tool (`--scope-projects`)
+    is the sweep as given, with a declared project the install could not read
+    (`--scope-unread`) as the one note; without either it is the active project
+    plus every project `gcloud projects list` returns -- the scope
+    `fleet_drift.discover_fleet` and `patch_readiness.discover_fleet` use, so
+    every collector audits the same fleet. Discovery names projects and lists
+    none of them."""
     if base_project:
         return Discovery([base_project], None, SCOPED_RUN_NOTE.format(project=base_project))
+
+    if declared_scope.projects:
+        # The declared scope the agent carried from the fleet_scope tool: the
+        # sweep as given, nothing listed, the unread rows as the one note.
+        log(f"scope: the install's declared scope, {len(declared_scope.projects)} project(s) from the fleet_scope tool")
+        return Discovery(list(declared_scope.projects), None, declared_scope.note())
 
     result = run(["gcloud", "config", "get-value", "project"])
     base = result.stdout.strip() if result.rc == 0 else ""
@@ -9960,10 +9996,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--project",
         help=(
-            "single project to audit; omit to audit the active project and every "
+            "single project to audit; omit to sweep --scope-projects when given, else the active project and every "
             "project `gcloud projects list` returns"
         ),
     )
+    fleet_scope_args.add_scope_arguments(parser)
     parser.add_argument(
         "--workspace",
         help=(
@@ -9981,6 +10018,7 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     args = parser.parse_args(argv)
+    declared_scope.set(args.scope_projects, args.scope_unread)
     workspace = Path(args.workspace) if args.workspace else None
     if workspace is not None and not workspace.is_dir():
         # Loud, and not fatal. A typo here would otherwise annotate nothing and

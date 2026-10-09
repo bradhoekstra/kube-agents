@@ -19,7 +19,7 @@ Follow the authoritative SOP at `governance/gcp_networking_fabric_sop.md` to exe
 - `mtu-packet-fragmentation`
 - `cloud-armor-false-positive`
 
-Helper runner (`networking_audit.py`): resolves the SOP §1 project scope itself and runs two sweeps, chosen with `--check {all,psc-routing-deadlock,subnet-ip-exhaustion}` (default `all`):
+Helper runner (`networking_audit.py`): sweeps the SOP §1 project scope, the `--scope-projects` the SOP passes from the `fleet_scope` tool, else the scope it resolves itself, and runs two sweeps, chosen with `--check {all,psc-routing-deadlock,subnet-ip-exhaustion}` (default `all`):
 
 - `subnet-ip-exhaustion`: required for SOP check 2.1. Measures Pod ranges from GKE's utilization fields and primary ranges as a lower bound from VM NICs, internal addresses and forwarding rules; skips proxy-only, PSC and NAT subnets. Writes `<project>/<region>/<subnet>` scope entries, findings, and `<project>/UNENUMERATED_SUBNETS` skipped entries; merge them as SOP 2.1 says.
 - `psc-routing-deadlock`: optional. Flags PSC forwarding rules in `REJECTED` or `CLOSED` state on `project/<id>` entries.

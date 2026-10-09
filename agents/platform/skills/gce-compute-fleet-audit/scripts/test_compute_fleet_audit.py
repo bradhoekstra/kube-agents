@@ -11,6 +11,7 @@ import os
 import subprocess
 import sys
 import unittest
+from unittest import mock
 from unittest.mock import patch
 from pathlib import Path
 
@@ -2261,6 +2262,62 @@ class SweepPoolTest(unittest.TestCase):
                     mod.MAX_WORKERS,
                 )
 
+
+class DeclaredScopeFromTheToolTest(unittest.TestCase):
+    """The declared scope the agent carries from the platform_control fleet_scope
+    tool (`--scope-projects`, `--scope-unread`) is the sweep: nothing is listed,
+    an unread declared project is the one note, and without the flags the
+    listing runs as before."""
+
+    ENV = {cf.MONITORED_PROJECTS_ENV: "", "GCP_PROJECT_ID": "ops-mgmt", "GKE_PROJECT_ID": "", "PROJECT_ID": ""}
+
+    def tearDown(self):
+        cf.declared_scope.set(None, None)
+
+    def test_the_declared_scope_is_swept_and_nothing_is_listed(self):
+        notes: list[str] = []
+        cf.declared_scope.set("payments-prod,ops-mgmt", "payments-staging=denied")
+        def fail(*a, **k):
+            raise AssertionError("nothing should be listed")
+
+        with mock.patch.dict(os.environ, self.ENV):
+            self.assertEqual(cf.get_target_projects(None, notes, run=fail), ["ops-mgmt", "payments-prod"])
+        self.assertEqual(len(notes), 1)
+        self.assertIn("payments-staging (denied)", notes[0])
+
+    def test_every_declared_project_read_leaves_no_note(self):
+        notes: list[str] = []
+        cf.declared_scope.set("ops-mgmt", "")
+        with mock.patch.dict(os.environ, self.ENV):
+            self.assertEqual(cf.get_target_projects(None, notes, run=lambda *a, **k: run_of(1)), ["ops-mgmt"])
+        self.assertEqual(notes, [])
+
+    def test_without_the_flags_the_listing_runs_as_before(self):
+        def fake(cmd, **kwargs):
+            if "projects" in cmd and "list" in cmd:
+                return run_of(0, "ops-mgmt\nother\n")
+            return run_of(0, "ops-mgmt\n")
+        cf.declared_scope.set(None, None)
+        with mock.patch.dict(os.environ, self.ENV):
+            self.assertEqual(cf.get_target_projects(None, [], run=fake), ["ops-mgmt", "other"])
+
+    def test_the_passed_scope_outranks_a_monitored_projects_variable(self):
+        cf.declared_scope.set("ops-mgmt", None)
+        with mock.patch.dict(os.environ, {**self.ENV, cf.MONITORED_PROJECTS_ENV: "acme-only"}):
+            self.assertEqual(cf.get_target_projects(None, [], run=lambda *a, **k: run_of(1)), ["ops-mgmt"])
+
+    def test_main_hands_the_flags_to_the_resolver(self):
+        # The wiring the SOP relies on: the two flags main parses reach the
+        # holder the resolver reads, before anything else runs.
+        with mock.patch.object(cf.declared_scope, "set", side_effect=SystemExit(0)) as handed, self.assertRaises(SystemExit):
+            cf.main(["--scope-projects", "ops-mgmt,payments-prod", "--scope-unread", "payments-staging=denied"])
+        handed.assert_called_once_with("ops-mgmt,payments-prod", "payments-staging=denied")
+
+    def test_the_flags_are_parsed_from_the_command_line(self):
+        proc = subprocess.run([sys.executable, cf.__file__, "--help"], capture_output=True, text=True, timeout=120)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("--scope-projects", proc.stdout)
+        self.assertIn("--scope-unread", proc.stdout)
 
 if __name__ == "__main__":
     unittest.main()

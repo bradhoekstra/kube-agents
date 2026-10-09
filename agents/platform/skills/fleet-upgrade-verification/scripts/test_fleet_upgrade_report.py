@@ -8,6 +8,8 @@ import shutil
 import sys
 import tempfile
 import unittest
+import subprocess
+from unittest import mock
 from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
@@ -873,6 +875,62 @@ class RolloutTrackingTest(unittest.TestCase):
         self.assertFalse(data["rollout"]["active"])
         self.assertEqual(data["rollout"]["summary"]["new"], 4)
 
+
+
+class DeclaredScopeFromTheToolTest(unittest.TestCase):
+    """The declared scope the agent carries from the platform_control fleet_scope
+    tool (`--scope-projects`, `--scope-unread`) is the sweep: nothing is listed,
+    an unread declared project is the one note, and without the flags the
+    listing runs as before."""
+
+    ENV = {report.MONITORED_PROJECTS_ENV: "", "GCP_PROJECT_ID": "ops-mgmt", "GKE_PROJECT_ID": "", "PROJECT_ID": ""}
+
+    def tearDown(self):
+        report.declared_scope.set(None, None)
+
+    def test_the_declared_scope_is_swept_and_nothing_is_listed(self):
+        notes: list[str] = []
+        report.declared_scope.set("payments-prod,ops-mgmt", "payments-staging=denied")
+        with mock.patch.dict(os.environ, self.ENV), mock.patch.object(report, "run_cmd", side_effect=lambda *a, **k: (_ for _ in ()).throw(AssertionError("nothing should be listed"))):
+            self.assertEqual(report.get_target_projects(None, notes), ["ops-mgmt", "payments-prod"])
+        self.assertEqual(len(notes), 1)
+        self.assertIn("payments-staging (denied)", notes[0])
+
+    def test_every_declared_project_read_leaves_no_note(self):
+        notes: list[str] = []
+        report.declared_scope.set("ops-mgmt", "")
+        with mock.patch.dict(os.environ, self.ENV), mock.patch.object(report, "run_cmd", side_effect=lambda *a, **k: (1, "", "")):
+            self.assertEqual(report.get_target_projects(None, notes), ["ops-mgmt"])
+        self.assertEqual(notes, [])
+
+    def test_without_the_flags_the_listing_runs_as_before(self):
+        def fake(cmd, **kwargs):
+            if "projects" in cmd and "list" in cmd:
+                return (0, "ops-mgmt\nother\n", "")
+            return (0, "ops-mgmt\n", "")
+        report.declared_scope.set(None, None)
+        with mock.patch.dict(os.environ, self.ENV), mock.patch.object(report, "run_cmd", side_effect=fake):
+            self.assertEqual(report.get_target_projects(None, []), ["ops-mgmt", "other"])
+
+    def test_the_passed_scope_outranks_a_monitored_projects_variable(self):
+        # An operator's MONITORED_PROJECT_IDS narrows a listing; a scope the SOP
+        # passed from the fleet_scope tool is the whole scope, env or no env.
+        report.declared_scope.set("ops-mgmt", None)
+        with mock.patch.dict(os.environ, {**self.ENV, report.MONITORED_PROJECTS_ENV: "acme-only"}), mock.patch.object(report, "run_cmd", side_effect=lambda *a, **k: (1, "", "")):
+            self.assertEqual(report.get_target_projects(None, []), ["ops-mgmt"])
+
+    def test_main_hands_the_flags_to_the_resolver(self):
+        # The wiring the SOP relies on: the two flags main parses reach the
+        # holder the resolver reads, before anything else runs.
+        with mock.patch.object(report.declared_scope, "set", side_effect=SystemExit(0)) as handed, self.assertRaises(SystemExit):
+            report.main(["--scope-projects", "ops-mgmt,payments-prod", "--scope-unread", "payments-staging=denied"])
+        handed.assert_called_once_with("ops-mgmt,payments-prod", "payments-staging=denied")
+
+    def test_the_flags_are_parsed_from_the_command_line(self):
+        proc = subprocess.run([sys.executable, report.__file__, "--help"], capture_output=True, text=True, timeout=120)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("--scope-projects", proc.stdout)
+        self.assertIn("--scope-unread", proc.stdout)
 
 if __name__ == "__main__":
     unittest.main()
