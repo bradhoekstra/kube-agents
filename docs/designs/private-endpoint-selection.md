@@ -21,8 +21,8 @@ timeout and had to work out the rest.
 1. **DNS endpoint**, `--dns-endpoint`, when `dnsEndpointConfig.endpoint` is set and
    `allowExternalTraffic` is `true`. Unchanged. It is first because the DNS endpoint ignores
    Master Authorized Networks and routes from anywhere.
-2. **DNS endpoint without a flag** when `ipEndpointsConfig` is present and `enabled` is not
-   `true`. gcloud's own test is `not enabled`, so it writes the DNS host by itself in that shape
+2. **DNS endpoint without a flag** when `ipEndpointsConfig` is present, even empty, and
+   `enabled` is not `true`. gcloud's own test is `not enabled`, so it writes the DNS host by itself in that shape
    and refuses `--internal-ip` (`IPEndpointsIsDisabledError`); authorized networks do not gate
    that host.
 3. **Private endpoint**, `--internal-ip`, when the cluster publishes
@@ -68,7 +68,9 @@ a stdio server only the keys named there (a contract test holds the block to
 `OWN_CLUSTER_ENV`).
 `gke_endpoint.own_cluster()` describes that cluster once with
 `--format=value(networkConfig.network,networkConfig.subnetwork,clusterIpv4Cidr)`, derives its
-region from `GKE_LOCATION`, and keeps the answer for the life of the process. The install's VPC
+region from `GKE_LOCATION` (everything before the last segment of a zone, as gcloud does), and
+keeps the answer for the life of the process. A value that is still the literal `${...}`
+placeholder Hermes hands an MCP server for an unset variable counts as unset. The install's VPC
 cannot change under a running pod, so this memo has no TTL, unlike the per-target decision,
 which keeps its 60-second one. A describe that fails, or answers anything other than exactly
 three fields with a non-empty network, is not cached, for the reason the module already gives
@@ -76,7 +78,11 @@ for the target describe: the credential proxy is a daemon.
 
 With any of the three variables unset the answer is "unknown", and rule 3 never fires. That is
 the position of every workstation and test caller, and it is what keeps the predicate copies
-in agreement without changing them.
+in agreement without changing them. A decision that needed the own cluster and did not get it
+(the describe failed) is returned but not put in the per-target cache, so the next call
+re-reads rather than serving a fallback for a minute; in the credential proxy a cold fetch
+inside that minute would otherwise write a public-IP kubeconfig that nothing invalidates until
+the pod restarts.
 
 A Shared VPC matches naturally: a service-project cluster reports the host project's network
 resource (`projects/<host>/global/networks/<name>`) in `networkConfig.network`.
@@ -111,9 +117,11 @@ preflight card read the same words:
   the Pod range spliced in;
 - `ip` with the list enabled, on the agent's network but in another region without global
   access: `REMEDY_OTHER_REGION`, which names control-plane global access;
-- `ip` with the list enabled, on another network with a private endpoint: `REMEDY_OTHER_NETWORK`;
+- `ip` on another network with a private endpoint, when the list is enabled or there is no
+  public endpoint: `REMEDY_OTHER_NETWORK`, which leads with the DNS endpoint because an
+  address on the list cannot open a private endpoint the agent cannot route to;
 - `ip` with the list enabled otherwise: `REMEDY_IP`;
-- `dns`, `internal-ip`, or any cluster whose list is not enabled: no remedy. An `internal-ip`
+- `dns`, `internal-ip`, or any other cluster whose list is not enabled: no remedy. An `internal-ip`
   decision never carries one, because it is only made where the list already admits the agent.
 
 ## The diagnostic
@@ -140,7 +148,8 @@ could be decided. After the mirror, the scaffold probes the cluster with
 kind, the address, the list, and kubectl's last line (just kubectl's last line when nothing was
 decided), adding the remedy only when kubectl's
 output is a connection failure (a timeout, no route, a refused dial) rather than an answer the
-server gave (401, 403, NotFound) or the shim reporting the credential proxy itself unreachable. When the probe itself does not finish inside its outer bound,
+server gave (401, 403, NotFound) or a message the credential-proxy shim itself produced
+(its `credential proxy:` and `credential proxy unavailable` prefixes). When the probe itself does not finish inside its outer bound,
 or cannot run, the log says that and nothing about the endpoint. The scaffold still returns
 normally: a cluster that is unreachable now may be reachable after the operator acts, and a
 scaffold that failed would only be retried on the next reconcile tick with the same result.
@@ -158,10 +167,11 @@ runs this rule, and any caller's `get-credentials`, whose output the proxy files
 context it selects. A caller that names no endpoint flag (the Platform Agent running the
 command by hand, the fleet-upgrade-verification skill) would otherwise move a cluster back to
 its public IP for everyone, so the proxy splices the rule's flags into such a fetch when it can
-read the target from the argv (the cluster positional, `--project`, and `--location`,
-`--region`, `--zone` or `-z`, in either flag form and on either side of the verb, skipping the
-values of gcloud's value-taking global flags); a caller that names `--dns-endpoint` or
-`--internal-ip` is run as given. Every writer therefore applies the same rule to the same
+read the target from the argv (the cluster positional and `--location`, `--region`, `--zone`
+or `-z`, in either flag form and on either side of the verb, skipping the values of gcloud's
+value-taking global flags; `--project` likewise, falling back to the proxy's own
+`GKE_PROJECT_ID`, which its bootstrap made gcloud's default project); a caller that names
+`--dns-endpoint` or `--internal-ip` is run as given. Every writer therefore applies the same rule to the same
 describe. `USER.md` records the scaffold's own decision, so it can still understate the live
 choice when the scaffold's describe of the agent's own cluster failed transiently (the proxy
 decides again and may splice `--internal-ip` where the scaffold wrote none); the probe then

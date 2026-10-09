@@ -111,6 +111,7 @@ GET_CREDENTIALS_ENDPOINT_FLAGS = ("--dns-endpoint", "--internal-ip")
 # without `=`.
 GET_CREDENTIALS_LOCATION_FLAGS = ("--location", "--region", "--zone", "-z")
 GET_CREDENTIALS_PROJECT_FLAG = "--project"
+GET_CREDENTIALS_DEFAULT_PROJECT_ENV = "GKE_PROJECT_ID"
 
 # Bounds on what a command's output costs this process while the command runs.
 # Output is read as it streams and only the first `--max-output-bytes` of each
@@ -3016,9 +3017,10 @@ def _get_credentials_target(argv: list[str]) -> ClusterTarget | None:
     they sit, before or after the verb, in `--flag=value` or `--flag value`
     form, with `-z` for `--zone`. Flags that take a detached value are the
     ones `command_policy` already knows, so `--verbosity debug` ahead of the
-    verb does not read `debug` as the cluster. Any of the three missing is
-    None: gcloud would fall back to its configured defaults, which this side
-    does not know.
+    verb does not read `debug` as the cluster. A missing project falls back
+    to the broker's own, which its bootstrap made gcloud's default; a missing
+    cluster or location is None, since gcloud's defaults for those are not
+    known here.
     """
     try:
         verb_index = argv.index("get-credentials")
@@ -3044,6 +3046,9 @@ def _get_credentials_target(argv: list[str]) -> ClusterTarget | None:
         elif (position > verb_index and not argument.startswith("-")
               and not cluster):
             cluster = argument
+    # The hand-typed form omits --project. The bootstrap set gcloud's default
+    # project to GKE_PROJECT_ID, so that is the project gcloud will use.
+    project = project or os.environ.get(GET_CREDENTIALS_DEFAULT_PROJECT_ENV, "")
     if not (project and cluster and location):
         return None
     return ClusterTarget(project=project, cluster=cluster, location=location)

@@ -94,9 +94,15 @@ CONNECTIVITY_FAILURE_RE = re.compile(
     r"TLS handshake timeout|dial tcp",
     re.IGNORECASE,
 )
-# The credential-proxy shim failing to reach the broker says "Connection
-# refused" too, and that is the broker being down, not the cluster's list.
-NOT_A_CONNECTION_FAILURE_RE = re.compile(r"credential proxy", re.IGNORECASE)
+# The credential-proxy shim's own messages ("credential proxy unavailable:
+# ... Connection refused", "credential proxy: kubeconfig is unreadable") are
+# the shim or the broker, not the cluster's list. Matched on the shim's
+# prefixes, not the words: preflight's cap text mentions "the credential
+# proxy's admission wait" and is a real timeout.
+NOT_A_CONNECTION_FAILURE_RE = re.compile(
+    r"credential proxy( token)? unavailable|credential proxy error|credential proxy:",
+    re.IGNORECASE,
+)
 
 
 def log(msg: str) -> None:

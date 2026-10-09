@@ -515,6 +515,18 @@ class CreateProfileTest(unittest.TestCase):
         self.assertIn("ip endpoint (203.0.113.10)", self.stderr)
         self.assertNotIn(ADMIT_REMEDY, self.stderr)
 
+    def test_the_shim_exclusion_matches_the_shims_prefixes_and_not_a_mention(self):
+        # The shim's own messages start "credential proxy:" or "credential proxy
+        # unavailable"; preflight's cap text merely mentions "the credential
+        # proxy's admission wait" and is a real timeout.
+        for shim in ("credential proxy unavailable: [Errno 111] Connection refused",
+                     "credential proxy: kubeconfig is unreadable: /x: [Errno 13] Permission denied",
+                     "credential proxy token unavailable: no token file",
+                     "credential proxy error (HTTP 502): non-JSON response"):
+            self.assertTrue(cap.NOT_A_CONNECTION_FAILURE_RE.search(shim), shim)
+        self.assertFalse(cap.NOT_A_CONNECTION_FAILURE_RE.search(
+            "timed out after 95s, the preflight's cap on one brokered call (the credential proxy's 60s admission wait plus 30s)"))
+
     def test_a_passing_probe_logs_nothing_about_the_endpoint(self):
         self.decision = a_decision()
         self.create()

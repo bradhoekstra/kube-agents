@@ -3396,6 +3396,19 @@ class CommandExecutorTest(unittest.TestCase):
                 self.assertIsNotNone(target, argv)
                 self.assertEqual(expected, (target.project, target.cluster, target.location))
 
+    def test_a_callers_fetch_without_a_project_uses_the_brokers_own(self):
+        # The hand-typed form omits --project; the bootstrap set gcloud's
+        # default project to GKE_PROJECT_ID, so that is what gcloud will use.
+        with mock.patch.dict(os.environ, {"GKE_PROJECT_ID": "demo-project"}):
+            target = credential_proxy._get_credentials_target(
+                ["gcloud", "container", "clusters", "get-credentials", "cluster-b", "--location=us-central1"])
+        self.assertIsNotNone(target)
+        self.assertEqual(("demo-project", "cluster-b", "us-central1"),
+                         (target.project, target.cluster, target.location))
+        with mock.patch.dict(os.environ, {"GKE_PROJECT_ID": ""}):
+            self.assertIsNone(credential_proxy._get_credentials_target(
+                ["gcloud", "container", "clusters", "get-credentials", "cluster-b", "--location=us-central1"]))
+
     def test_a_callers_fetch_that_names_an_endpoint_is_run_as_given(self):
         executor = self.fake_gcloud(self.executor())
         seen = []

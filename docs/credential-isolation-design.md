@@ -759,8 +759,9 @@ Consequences:
   `clusters describe` to decide which control-plane endpoint to reach (DNS,
   private, or gcloud's default), plus, once per process, a describe of the
   agent's own cluster when the private endpoint is a candidate. A caller's
-  own `get-credentials` that names no endpoint flag, and names its project,
-  cluster and location, gets the same decision spliced in, since its output
+  own `get-credentials` that names no endpoint flag, and names its cluster
+  and location (the project may come from the broker's own), gets the same
+  decision spliced in, since its output
   becomes the managed kubeconfig for that cluster;
   `docs/designs/private-endpoint-selection.md` has the rule. The common paths
   warm the cache themselves, since profile scaffolding and context switching

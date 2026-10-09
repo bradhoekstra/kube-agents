@@ -724,6 +724,28 @@ class PrivateEndpointTest(unittest.TestCase):
         d = decision(FakeRunner(PRIVATE_SAME_VPC), location="us-central1-a")
         self.assertEqual(d.flags, ("--internal-ip",))
 
+    def test_a_zone_with_a_long_suffix_is_still_its_region(self):
+        # gcloud's LocationToRegion drops the last segment whatever it is.
+        d = decision(FakeRunner(PRIVATE_SAME_VPC), location="us-central1-ai1a")
+        self.assertEqual(d.flags, ("--internal-ip",))
+
+    def test_an_empty_ip_endpoints_block_reads_as_disabled(self):
+        # gcloud tests the block for `is not None`, then `not enabled`.
+        shape = _variant(PRIVATE_SAME_VPC, controlPlaneEndpointsConfig={
+            **PRIVATE_SAME_VPC["controlPlaneEndpointsConfig"], "ipEndpointsConfig": {}})
+        d = decision(FakeRunner(shape))
+        self.assertEqual(d.flags, ())
+        self.assertEqual(d.kind, gke_endpoint.KIND_DNS)
+
+    def test_a_private_only_cluster_on_another_network_gets_a_remedy_that_can_work(self):
+        # No public endpoint, so an address on the list helps nobody; the DNS
+        # endpoint is the way in, and the remedy must lead with it.
+        shape = _variant(PRIVATE_ONLY_LIST_OFF, networkConfig={"network": OTHER_NETWORK})
+        d = decision(FakeRunner(shape))
+        self.assertEqual(d.flags, ())
+        self.assertIn("--enable-dns-access", d.remedy)
+        self.assertNotIn("egress address", d.remedy)
+
     def test_a_list_that_admits_only_the_nat_address_keeps_the_public_ip(self):
         # The estate that followed the old remedy must not regress on upgrade.
         d = decision(FakeRunner(PRIVATE_SAME_VPC_NAT_LISTED))
@@ -864,6 +886,30 @@ class OwnNetworkTest(unittest.TestCase):
         self.assertIsNone(first.same_network)
         self.assertEqual(second.flags, ("--internal-ip",))
         self.assertEqual(len(runner.own_network_calls), 2)
+
+    def test_a_decision_made_without_the_own_cluster_is_not_cached_for_that_cluster(self):
+        # The fallback "no flag" after a failed own-cluster describe must not
+        # sit in the per-target cache for a minute: in the credential proxy a
+        # cold fetch inside that window writes a public-IP kubeconfig that
+        # nothing invalidates until the pod restarts.
+        runner = FakeRunner(PRIVATE_SAME_VPC, own_network=None)
+        with unittest.mock.patch.dict(os.environ, OWN_CLUSTER_ENV), redirect_stderr(io.StringIO()):
+            first = gke_endpoint.endpoint_decision("p", "a", "us-central1", run=runner)
+            runner.own_network = OWN_ROW
+            second = gke_endpoint.endpoint_decision("p", "a", "us-central1", run=runner)
+        self.assertEqual(first.flags, ())
+        self.assertEqual(second.flags, ("--internal-ip",))
+        self.assertEqual(len(runner.describe_calls), 2, "the target was re-read, not served from cache")
+
+    def test_a_literal_placeholder_is_no_identity(self):
+        # Hermes hands an MCP server the literal "${GKE_PROJECT_ID}" when the
+        # variable is unset; that is not a cluster to describe.
+        placeholders = {name: "${%s}" % name for name in OWN_CLUSTER_ENV}
+        runner = FakeRunner(PRIVATE_SAME_VPC)
+        with unittest.mock.patch.dict(os.environ, placeholders), redirect_stderr(io.StringIO()):
+            d = gke_endpoint.endpoint_decision("p", "c", "us-central1", run=runner)
+        self.assertEqual(d.flags, ())
+        self.assertEqual(runner.own_network_calls, [])
 
     def test_an_empty_own_network_answer_is_not_cached(self):
         runner = FakeRunner(PRIVATE_SAME_VPC, own_network="")

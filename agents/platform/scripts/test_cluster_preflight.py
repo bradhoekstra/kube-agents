@@ -392,6 +392,14 @@ class ClusterPreflightTest(unittest.TestCase):
         self.assertEqual("5", result["check"])
         self.assertTrue(result["remediation"].startswith("The cluster may be deleted"), result["remediation"])
 
+    def test_check_5_hitting_its_own_cap_still_offers_the_remedy(self):
+        # The cap text mentions the credential proxy's admission wait; that is
+        # a timeout contacting the cluster, not the shim failing.
+        self.with_endpoint_bullets()
+        result = self.run_preflight(FAKE_CLUSTER_INFO_TIMES_OUT="1")
+        self.assertEqual("5", result["check"])
+        self.assertTrue(result["remediation"].startswith("Add 10.92.0.0/14"), result["remediation"])
+
     def test_check_5_without_endpoint_bullets_is_unchanged(self):
         result = self.run_preflight(FAKE_UNREACHABLE="1")
         self.assertEqual("Cannot reach the target cluster's API server.", result["reason"])

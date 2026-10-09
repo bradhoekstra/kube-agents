@@ -102,9 +102,10 @@ readonly RC_TIMED_OUT=124
 # scaffold's endpoint remedy only for these (cluster_agent_profile.py keeps the
 # same list as CONNECTIVITY_FAILURE_RE).
 readonly CONNECTIVITY_FAILURE_RE='i/o timeout|timed out|context deadline exceeded|Client\.Timeout|no route to host|connection refused|network is unreachable|Unable to connect to the server|TLS handshake timeout|dial tcp'
-# ...except the shim failing to reach the broker, which says "Connection
-# refused" about the proxy, not the cluster.
-readonly NOT_A_CONNECTION_FAILURE_RE='credential proxy'
+# ...except the shim's own messages, which are the shim or the broker and not
+# the cluster; matched on the shim's prefixes, since the cap text above
+# mentions "the credential proxy's admission wait" and is a real timeout.
+readonly NOT_A_CONNECTION_FAILURE_RE='credential proxy( token)? unavailable|credential proxy error|credential proxy:'
 # What a shell returns for a command it cannot find or cannot execute.
 readonly RC_COMMAND_NOT_FOUND=127
 readonly RC_COMMAND_NOT_EXECUTABLE=126
