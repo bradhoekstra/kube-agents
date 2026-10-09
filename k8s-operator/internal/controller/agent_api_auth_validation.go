@@ -30,11 +30,6 @@ const (
 	agentAPIAuthClaimsRefusal          = "the gateway pod declares no resourceClaims, so a claim named here cannot take effect"                                                                                                                                                                                             // #nosec G101 -- Error message, not a credential
 	agentAPIAuthUnrepresentableFmt     = "is not a representable byte count: it exceeds the %d bytes an int64 holds, which is what the Downward API hands the event watcher as its memory limit"                                                                                                                            // #nosec G101 -- Error message, not a credential
 	agentAPIAuthLimitWithoutRequestFmt = "%s is set without %s; GKE Autopilot without bursting sets a container's limits equal to its requests, so there the agent-api-auth container runs at the %s request and this limit has no effect — set %s to the same value, or enable bursting"                                   // #nosec G101 -- Warning text, not a credential
-	// Unlike the credential proxy's band warning, this one names no quota
-	// preflight: the chart's preflight does not count this override (the sidecar
-	// is one container of the agent pod, summed at its defaults), so there is no
-	// "short by the difference" to point at. The gap is documented on the field.
-	agentAPIAuthRequestsBandWarningFmt = "%s: %s of memory per %s of CPU is %.2f GiB per vCPU, outside the %d to %.1f GiB per vCPU that GKE Autopilot admits unchanged; Autopilot raises the smaller side into that band, so the pod it admits is larger than this CR declares" // #nosec G101 -- Warning text, not a credential
 )
 
 // agentAPIAuthMessages is the agent-api-auth sidecar's wording for
@@ -51,7 +46,7 @@ var agentAPIAuthMessages = containerResourceMessages{
 	crossedBesideFmt:       credentialProxyCrossedBesideFmt,
 	crossedDefLimitFmt:     credentialProxyCrossedDefLimitFmt,
 	crossedDefRequestFmt:   credentialProxyCrossedDefRequestFmt,
-	requestsBandFmt:        agentAPIAuthRequestsBandWarningFmt,
+	requestsBandFmt:        credentialProxyRequestsBandWarningFmt,
 	limitWithoutRequestFmt: agentAPIAuthLimitWithoutRequestFmt,
 }
 

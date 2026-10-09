@@ -1582,6 +1582,47 @@ The defaults carry no ephemeral-storage request because the operator renders non
   {{- $podReqEph := $base.ephemeralStorageBytesRequest | default 0 | int64 -}}
   {{- $podLimEph := $base.ephemeralStorageBytesLimit | default 0 | int64 -}}
 
+  {{- /* The agent-api-auth sidecar is one container of this pod, so its default
+         requests and limits are already in agentPod.base above. A
+         spec.deployment.agentAPIAuth.resources override (resolveAgentAPIAuthResources
+         in the operator) changes them per key, so add the override-minus-default
+         delta here before the pod is multiplied by replicas, the same accounting
+         kube-agents.credentialProxyFootprint does for the proxy's own pod. Without
+         it the preflight passes a quota the raised sidecar will not fit, and the
+         gateway's Recreate rollout then deletes the running Pod before the quota
+         refuses the larger one. The defaults are the agentAPIAuth* constants in
+         k8s-operator/internal/controller/platformagent_manifests.go: 150m and 384Mi
+         requests, 1 CPU, 2Gi memory and 2Gi ephemeral-storage limits; the sidecar
+         declares no ephemeral request, which the API server defaults to the limit,
+         so the base counts 2Gi on both ephemeral sides. */ -}}
+  {{- $aaResources := (((.Values.platformAgent.deployment | default dict).agentAPIAuth | default dict).resources) | default dict -}}
+  {{- $aaReq := (index $aaResources "requests") | default dict -}}
+  {{- $aaLim := (index $aaResources "limits") | default dict -}}
+  {{- with include "kube-agents.declaredQuantity" (dict "value" (index $aaReq "cpu") "fallback" "") -}}
+  {{- $podReqCpu = add $podReqCpu (sub (include "kube-agents.parseCpuMillis" . | int64) 150) -}}
+  {{- end -}}
+  {{- with include "kube-agents.declaredQuantity" (dict "value" (index $aaLim "cpu") "fallback" "") -}}
+  {{- $podLimCpu = add $podLimCpu (sub (include "kube-agents.parseCpuMillis" . | int64) 1000) -}}
+  {{- end -}}
+  {{- with include "kube-agents.declaredQuantity" (dict "value" (index $aaReq "memory") "fallback" "") -}}
+  {{- $podReqMem = add $podReqMem (sub (include "kube-agents.parseBytes" . | int64) 402653184) -}}
+  {{- end -}}
+  {{- with include "kube-agents.declaredQuantity" (dict "value" (index $aaLim "memory") "fallback" "") -}}
+  {{- $podLimMem = add $podLimMem (sub (include "kube-agents.parseBytes" . | int64) 2147483648) -}}
+  {{- end -}}
+  {{- $aaEphDefault := 2147483648 -}}
+  {{- $aaEphLim := $aaEphDefault -}}
+  {{- $aaEphReq := $aaEphDefault -}}
+  {{- with include "kube-agents.declaredQuantity" (dict "value" (index $aaLim "ephemeral-storage") "fallback" "") -}}
+  {{- $aaEphLim = include "kube-agents.parseBytes" . | int64 -}}
+  {{- $aaEphReq = $aaEphLim -}}
+  {{- end -}}
+  {{- with include "kube-agents.declaredQuantity" (dict "value" (index $aaReq "ephemeral-storage") "fallback" "") -}}
+  {{- $aaEphReq = include "kube-agents.parseBytes" . | int64 -}}
+  {{- end -}}
+  {{- $podLimEph = add $podLimEph (sub $aaEphLim $aaEphDefault) -}}
+  {{- $podReqEph = add $podReqEph (sub $aaEphReq $aaEphDefault) -}}
+
   {{- /* The dashboard is another container in the agent pod rather than a pod of its own,
          so it scales with the same replica count and adds no pod. Its flag is
          harness.hermes.dashboardEnabled; reading it one level up at harness.dashboardEnabled

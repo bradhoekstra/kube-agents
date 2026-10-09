@@ -137,6 +137,19 @@ _PROXY_EPHEMERAL_LIMIT_BYTES = 2 * 1024**3
 _PROXY_OVERRIDE_EPHEMERAL_LIMIT_BYTES = 10 * 1024**3
 _PROXY_VALUE = "platformAgent.deployment.credentialProxy.resources"
 
+# The agent-api-auth sidecar's defaults (agentAPIAuth* in platformagent_manifests.go);
+# it is one container of the agent pod, so these are already in agentPod.base and an
+# override moves the pod total by the delta. Its ephemeral request is defaulted to its
+# 2Gi limit, as the proxy's is.
+_AA_MEMORY_REQUEST_BYTES = 384 * 1024**2
+_AA_MEMORY_LIMIT_BYTES = 2 * 1024**3
+_AA_CPU_LIMIT_MILLIS = 1000
+_AA_EPHEMERAL_LIMIT_BYTES = 2 * 1024**3
+_AA_OVERRIDE_MEMORY_LIMIT_BYTES = 4 * 1024**3
+_AA_OVERRIDE_CPU_LIMIT_MILLIS = 2000
+_AA_OVERRIDE_EPHEMERAL_LIMIT_BYTES = 10 * 1024**3
+_AA_VALUE = "platformAgent.deployment.agentAPIAuth.resources"
+
 
 def _parse_gib_or_mib(quantity: str) -> int:
     """Bytes from the Gi/Mi spellings the patch generator emits."""
@@ -304,6 +317,54 @@ class PreflightDecisionTest(unittest.TestCase):
         # `memory: null` is how a values file drops a key; it means "not set", as on the CR.
         base = self._requirements()
         nulled = self._requirements([f"{_PROXY_VALUE}.limits.memory=null"])
+        self.assertEqual(nulled, base)
+
+    def test_agent_api_auth_memory_limit_override_moves_only_that_total(self) -> None:
+        """The field's use case (#2648): raising the sidecar's memory limit is counted,
+        so a namespace ResourceQuota sized to the preflight is not passed and then
+        overrun by the Recreate rollout."""
+        base = self._requirements()
+        raised = self._requirements([f"{_AA_VALUE}.limits.memory={_AA_OVERRIDE_MEMORY_LIMIT_BYTES}"])
+        self.assertEqual(
+            raised["limitsMemory"] - base["limitsMemory"],
+            _AA_OVERRIDE_MEMORY_LIMIT_BYTES - _AA_MEMORY_LIMIT_BYTES,
+        )
+        for key in ("pods", "requestsCpu", "limitsCpu", "requestsMemory",
+                    "requestsEphemeral", "limitsEphemeral", "persistentVolumeClaims"):
+            self.assertEqual(raised[key], base[key], key)
+
+    def test_agent_api_auth_request_and_cpu_overrides_are_each_counted(self) -> None:
+        base = self._requirements()
+        raised = self._requirements([
+            f"{_AA_VALUE}.requests.memory={_AA_MEMORY_LIMIT_BYTES}",
+            f"{_AA_VALUE}.limits.cpu={_AA_OVERRIDE_CPU_LIMIT_MILLIS}m",
+        ])
+        self.assertEqual(
+            raised["requestsMemory"] - base["requestsMemory"],
+            _AA_MEMORY_LIMIT_BYTES - _AA_MEMORY_REQUEST_BYTES,
+        )
+        self.assertEqual(
+            raised["limitsCpu"] - base["limitsCpu"],
+            _AA_OVERRIDE_CPU_LIMIT_MILLIS - _AA_CPU_LIMIT_MILLIS,
+        )
+        self.assertEqual(raised["requestsCpu"], base["requestsCpu"])
+
+    def test_agent_api_auth_ephemeral_override_moves_both_sides_with_defaulting(self) -> None:
+        base = self._requirements()
+        raised = self._requirements([f"{_AA_VALUE}.limits.ephemeral-storage={_AA_OVERRIDE_EPHEMERAL_LIMIT_BYTES}"])
+        moved = _AA_OVERRIDE_EPHEMERAL_LIMIT_BYTES - _AA_EPHEMERAL_LIMIT_BYTES
+        self.assertEqual(raised["limitsEphemeral"] - base["limitsEphemeral"], moved)
+        self.assertEqual(raised["requestsEphemeral"] - base["requestsEphemeral"], moved)
+        explicit = self._requirements([
+            f"{_AA_VALUE}.limits.ephemeral-storage={_AA_OVERRIDE_EPHEMERAL_LIMIT_BYTES}",
+            f"{_AA_VALUE}.requests.ephemeral-storage=4Gi",
+        ])
+        self.assertEqual(explicit["requestsEphemeral"] - base["requestsEphemeral"],
+                         4 * 1024**3 - _AA_EPHEMERAL_LIMIT_BYTES)
+
+    def test_agent_api_auth_null_override_key_keeps_the_default(self) -> None:
+        base = self._requirements()
+        nulled = self._requirements([f"{_AA_VALUE}.limits.memory=null"])
         self.assertEqual(nulled, base)
 
     def test_credential_proxy_override_the_preflight_cannot_parse_fails_naming_the_key(self) -> None:
