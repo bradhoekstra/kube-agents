@@ -60,14 +60,125 @@ DNS_INTERNAL_ONLY = {
 # A cluster old enough to predate DNS endpoints entirely.
 NO_DNS_BLOCK = {"controlPlaneEndpointsConfig": {"ipEndpointsConfig": {"enabled": True}}}
 
+OWN_NETWORK = "projects/host-proj/global/networks/shared-vpc"
+OTHER_NETWORK = "projects/other-proj/global/networks/default"
+OWN_CLUSTER_ENV = {
+    "GKE_PROJECT_ID": "mgmt-proj",
+    "GKE_LOCATION": "us-central1",
+    "GKE_CLUSTER_NAME": "platform-agent-host",
+}
+OWN_NETWORK_FORMAT = "--format=value(networkConfig.network)"
+
+# The enterprise shape this change exists for: private nodes, public endpoint on
+# but Master Authorized Networks restricted to corporate ranges, DNS endpoint
+# closed. The private endpoint is one hop away on the VPC the agent sits in.
+PRIVATE_SAME_VPC = {
+    "controlPlaneEndpointsConfig": {
+        "dnsEndpointConfig": {
+            "allowExternalTraffic": False,
+            "endpoint": "gke-0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b-123456789012.us-central1.gke.goog",
+        },
+        "ipEndpointsConfig": {
+            "authorizedNetworksConfig": {
+                "cidrBlocks": [{"cidrBlock": "10.0.0.0/8", "displayName": "corp"},
+                               {"cidrBlock": "172.16.0.0/12", "displayName": "vpn"}],
+                "enabled": True,
+            },
+            "enablePublicEndpoint": True,
+            "enabled": True,
+            "privateEndpoint": "10.10.0.2",
+            "publicEndpoint": "203.0.113.10",
+        },
+    },
+    "endpoint": "203.0.113.10",
+    "masterAuthorizedNetworksConfig": {
+        "cidrBlocks": [{"cidrBlock": "10.0.0.0/8", "displayName": "corp"},
+                       {"cidrBlock": "172.16.0.0/12", "displayName": "vpn"}],
+        "enabled": True,
+    },
+    "networkConfig": {"network": OWN_NETWORK},
+    "privateClusterConfig": {
+        "enablePrivateNodes": True,
+        "privateEndpoint": "10.10.0.2",
+        "publicEndpoint": "203.0.113.10",
+    },
+}
+
+
+def _variant(base, **changes):
+    """A deep copy of `base` with top-level keys replaced."""
+    document = json.loads(json.dumps(base))
+    document.update(changes)
+    return document
+
+
+PRIVATE_OTHER_VPC = _variant(PRIVATE_SAME_VPC, networkConfig={"network": OTHER_NETWORK})
+
+PRIVATE_SAME_VPC_DNS_OPEN = _variant(
+    PRIVATE_SAME_VPC,
+    controlPlaneEndpointsConfig={
+        **PRIVATE_SAME_VPC["controlPlaneEndpointsConfig"],
+        "dnsEndpointConfig": {
+            "allowExternalTraffic": True,
+            "endpoint": "gke-0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b-123456789012.us-central1.gke.goog",
+        },
+    },
+)
+
+# IP endpoints switched off: gcloud refuses --internal-ip outright
+# (IPEndpointsIsDisabledError) and selects the DNS endpoint on its own.
+PRIVATE_SAME_VPC_IP_DISABLED = _variant(
+    PRIVATE_SAME_VPC,
+    controlPlaneEndpointsConfig={
+        **PRIVATE_SAME_VPC["controlPlaneEndpointsConfig"],
+        "ipEndpointsConfig": {**PRIVATE_SAME_VPC["controlPlaneEndpointsConfig"]["ipEndpointsConfig"],
+                              "enabled": False},
+    },
+)
+
+# Same network, but the cluster reports no private endpoint at all.
+SAME_VPC_NO_PRIVATE_ENDPOINT = _variant(
+    PRIVATE_SAME_VPC,
+    privateClusterConfig={},
+    controlPlaneEndpointsConfig={
+        **PRIVATE_SAME_VPC["controlPlaneEndpointsConfig"],
+        "ipEndpointsConfig": {"enabled": True, "enablePublicEndpoint": True,
+                              "publicEndpoint": "203.0.113.10"},
+    },
+)
+
+# Authorized networks switched on with no ranges listed: still restricted.
+PRIVATE_SAME_VPC_EMPTY_LIST = _variant(
+    PRIVATE_SAME_VPC, masterAuthorizedNetworksConfig={"enabled": True},
+)
+
+# Authorized networks off entirely, the shape of an ordinary dev cluster. GKE
+# reports the block in both places, so both are cleared.
+PRIVATE_SAME_VPC_UNRESTRICTED = _variant(
+    PRIVATE_SAME_VPC,
+    masterAuthorizedNetworksConfig={},
+    controlPlaneEndpointsConfig={
+        **PRIVATE_SAME_VPC["controlPlaneEndpointsConfig"],
+        "ipEndpointsConfig": {
+            **{k: v for k, v in PRIVATE_SAME_VPC["controlPlaneEndpointsConfig"]["ipEndpointsConfig"].items()
+               if k != "authorizedNetworksConfig"},
+            "authorizedNetworksConfig": {},
+        },
+    },
+)
+
 
 class FakeRunner:
     """Answers the help probe and the describe, and records what it was asked."""
 
-    def __init__(self, describe=None, help_text=HELP_WITH_FLAG, describe_exit=0):
+    def __init__(self, describe=None, help_text=HELP_WITH_FLAG, describe_exit=0,
+                 own_network=OWN_NETWORK):
         self.describe = describe
         self.help_text = help_text
         self.describe_exit = describe_exit
+        # What the agent's own cluster reports; None makes that describe fail,
+        # "" makes it answer an empty line.
+        self.own_network = own_network
         self.help_exit = 0
         self.calls: list[list[str]] = []
 
@@ -75,6 +186,10 @@ class FakeRunner:
         self.calls.append(argv)
         if "--help" in argv:
             return self.help_exit, ("" if self.help_exit else self.help_text)
+        if OWN_NETWORK_FORMAT in argv:
+            if self.own_network is None:
+                return 1, ""
+            return 0, self.own_network + "\n"
         if "describe" in argv:
             if self.describe_exit != 0:
                 return self.describe_exit, ""
@@ -84,7 +199,11 @@ class FakeRunner:
 
     @property
     def describe_calls(self):
-        return [c for c in self.calls if "describe" in c]
+        return [c for c in self.calls if "describe" in c and OWN_NETWORK_FORMAT not in c]
+
+    @property
+    def own_network_calls(self):
+        return [c for c in self.calls if OWN_NETWORK_FORMAT in c]
 
 
 @contextmanager
@@ -104,10 +223,23 @@ def expired_cache():
 
 
 def decide(runner, project="p", cluster="c", location="us-central1"):
-    """Run the decision with a clean cache and stderr swallowed."""
+    """Run the flag-only decision with a clean cache, no own-cluster identity in
+    the environment, and stderr swallowed."""
     gke_endpoint.reset_cache()
-    with redirect_stderr(io.StringIO()):
+    scrubbed = {k: v for k, v in os.environ.items() if k not in OWN_CLUSTER_ENV}
+    with unittest.mock.patch.dict(os.environ, scrubbed, clear=True), \
+            redirect_stderr(io.StringIO()):
         return gke_endpoint.dns_endpoint_args(project, cluster, location, run=runner)
+
+
+def decision(runner, project="p", cluster="c", location="us-central1", env=None):
+    """Run the structured decision with a clean cache, stderr swallowed, and the
+    agent's own identity in the environment unless `env` says otherwise."""
+    gke_endpoint.reset_cache()
+    environment = {**os.environ, **OWN_CLUSTER_ENV} if env is None else env
+    with unittest.mock.patch.dict(os.environ, environment, clear=True), \
+            redirect_stderr(io.StringIO()):
+        return gke_endpoint.endpoint_decision(project, cluster, location, run=runner)
 
 
 class PredicateTest(unittest.TestCase):
@@ -426,6 +558,159 @@ class RunnerEnvironmentTest(unittest.TestCase):
             else:
                 os.environ["KUBECONFIG"] = original
         self.assertNotIn("KUBECONFIG", seen)
+
+
+class PrivateEndpointTest(unittest.TestCase):
+    """Rule 2 of docs/designs/private-endpoint-selection.md: --internal-ip when the
+    target is on the agent's own network and publishes a private endpoint."""
+
+    def test_same_network_private_cluster_gets_internal_ip(self):
+        d = decision(FakeRunner(PRIVATE_SAME_VPC))
+        self.assertEqual(d.flags, (gke_endpoint.INTERNAL_IP_FLAG,))
+        self.assertEqual(d.kind, gke_endpoint.KIND_INTERNAL_IP)
+        self.assertEqual(d.address, "10.10.0.2")
+        self.assertIs(d.same_network, True)
+        self.assertEqual(d.authorized_networks, ("10.0.0.0/8", "172.16.0.0/12"))
+        self.assertIn("authorized networks", d.remedy)
+        self.assertIn("--enable-dns-access", d.remedy)
+
+    def test_the_flag_only_wrapper_returns_internal_ip_too(self):
+        gke_endpoint.reset_cache()
+        with unittest.mock.patch.dict(os.environ, OWN_CLUSTER_ENV), redirect_stderr(io.StringIO()):
+            args = gke_endpoint.dns_endpoint_args("p", "c", "us-central1", run=FakeRunner(PRIVATE_SAME_VPC))
+        self.assertEqual(args, ["--internal-ip"])
+
+    def test_an_open_dns_endpoint_still_wins_on_the_same_network(self):
+        d = decision(FakeRunner(PRIVATE_SAME_VPC_DNS_OPEN))
+        self.assertEqual(d.flags, ("--dns-endpoint",))
+        self.assertEqual(d.kind, gke_endpoint.KIND_DNS)
+        self.assertEqual(d.remedy, "")
+
+    def test_another_network_gets_no_flag(self):
+        d = decision(FakeRunner(PRIVATE_OTHER_VPC))
+        self.assertEqual(d.flags, ())
+        self.assertEqual(d.kind, gke_endpoint.KIND_IP)
+        self.assertEqual(d.address, "203.0.113.10")
+        self.assertIs(d.same_network, False)
+        self.assertIn("not on this cluster's VPC", d.remedy)
+
+    def test_same_network_without_a_private_endpoint_gets_no_flag(self):
+        d = decision(FakeRunner(SAME_VPC_NO_PRIVATE_ENDPOINT))
+        self.assertEqual(d.flags, ())
+        self.assertEqual(d.kind, gke_endpoint.KIND_IP)
+
+    def test_ip_endpoints_disabled_gets_no_flag(self):
+        # gcloud picks the DNS endpoint by itself here and would refuse --internal-ip.
+        d = decision(FakeRunner(PRIVATE_SAME_VPC_IP_DISABLED))
+        self.assertEqual(d.flags, ())
+
+    def test_without_an_own_cluster_identity_the_rule_is_inert(self):
+        runner = FakeRunner(PRIVATE_SAME_VPC)
+        d = decision(runner, env={k: v for k, v in os.environ.items() if k not in OWN_CLUSTER_ENV})
+        self.assertEqual(d.flags, ())
+        self.assertIsNone(d.same_network)
+        self.assertEqual(runner.own_network_calls, [], "no identity, so nothing to describe")
+
+    def test_a_partial_own_cluster_identity_is_no_identity(self):
+        partial = {k: v for k, v in os.environ.items() if k not in OWN_CLUSTER_ENV}
+        partial["GKE_PROJECT_ID"] = "mgmt-proj"
+        runner = FakeRunner(PRIVATE_SAME_VPC)
+        self.assertEqual(decision(runner, env=partial).flags, ())
+        self.assertEqual(runner.own_network_calls, [])
+
+    def test_a_public_cluster_never_describes_the_own_cluster(self):
+        # The own-cluster describe is paid only when rule 2 could fire.
+        runner = FakeRunner(DNS_EXTERNAL)
+        decision(runner)
+        self.assertEqual(runner.own_network_calls, [])
+
+    def test_enabled_authorized_networks_with_no_blocks_reads_as_restricted(self):
+        d = decision(FakeRunner(PRIVATE_SAME_VPC_EMPTY_LIST))
+        self.assertEqual(d.authorized_networks, ())
+        self.assertNotEqual(d.remedy, "")
+
+    def test_unrestricted_authorized_networks_carry_no_remedy(self):
+        d = decision(FakeRunner(PRIVATE_SAME_VPC_UNRESTRICTED))
+        self.assertEqual(d.flags, ("--internal-ip",))
+        self.assertIsNone(d.authorized_networks)
+        self.assertEqual(d.remedy, "")
+
+    def test_a_failed_describe_yields_none(self):
+        self.assertIsNone(decision(FakeRunner(describe_exit=1)))
+
+
+class OwnNetworkTest(unittest.TestCase):
+    def setUp(self):
+        gke_endpoint.reset_cache()
+        self.addCleanup(gke_endpoint.reset_cache)
+
+    def test_the_own_cluster_is_described_once_per_process(self):
+        runner = FakeRunner(PRIVATE_SAME_VPC)
+        with unittest.mock.patch.dict(os.environ, OWN_CLUSTER_ENV), redirect_stderr(io.StringIO()):
+            gke_endpoint.endpoint_decision("p", "a", "us-central1", run=runner)
+            gke_endpoint.endpoint_decision("p", "b", "us-central1", run=runner)
+        self.assertEqual(len(runner.own_network_calls), 1)
+        self.assertEqual(len(runner.describe_calls), 2)
+
+    def test_the_own_cluster_describe_names_the_identity_from_the_environment(self):
+        runner = FakeRunner(PRIVATE_SAME_VPC)
+        with unittest.mock.patch.dict(os.environ, OWN_CLUSTER_ENV), redirect_stderr(io.StringIO()):
+            gke_endpoint.endpoint_decision("p", "c", "us-central1", run=runner)
+        argv = runner.own_network_calls[0]
+        self.assertEqual(argv[:5], ["gcloud", "container", "clusters", "describe", "platform-agent-host"])
+        self.assertIn("--location=us-central1", argv)
+        self.assertIn("--project=mgmt-proj", argv)
+        self.assertIn(OWN_NETWORK_FORMAT, argv)
+
+    def test_a_failed_own_cluster_describe_is_not_cached(self):
+        runner = FakeRunner(PRIVATE_SAME_VPC, own_network=None)
+        with unittest.mock.patch.dict(os.environ, OWN_CLUSTER_ENV), redirect_stderr(io.StringIO()):
+            first = gke_endpoint.endpoint_decision("p", "a", "us-central1", run=runner)
+            runner.own_network = OWN_NETWORK
+            second = gke_endpoint.endpoint_decision("p", "b", "us-central1", run=runner)
+        self.assertEqual(first.flags, ())
+        self.assertIsNone(first.same_network)
+        self.assertEqual(second.flags, ("--internal-ip",))
+        self.assertEqual(len(runner.own_network_calls), 2)
+
+    def test_an_empty_own_network_answer_is_not_cached(self):
+        runner = FakeRunner(PRIVATE_SAME_VPC, own_network="")
+        with unittest.mock.patch.dict(os.environ, OWN_CLUSTER_ENV), redirect_stderr(io.StringIO()):
+            first = gke_endpoint.endpoint_decision("p", "a", "us-central1", run=runner)
+            runner.own_network = OWN_NETWORK
+            second = gke_endpoint.endpoint_decision("p", "b", "us-central1", run=runner)
+        self.assertEqual(first.flags, ())
+        self.assertEqual(second.flags, ("--internal-ip",))
+
+    def test_a_runner_that_raises_on_the_own_describe_is_not_fatal(self):
+        class Raising(FakeRunner):
+            def __call__(self, argv):
+                if OWN_NETWORK_FORMAT in argv:
+                    raise OSError("no gcloud")
+                return super().__call__(argv)
+
+        with unittest.mock.patch.dict(os.environ, OWN_CLUSTER_ENV), redirect_stderr(io.StringIO()):
+            d = gke_endpoint.endpoint_decision("p", "c", "us-central1", run=Raising(PRIVATE_SAME_VPC))
+        self.assertEqual(d.flags, ())
+        self.assertIsNone(d.same_network)
+
+    def test_reset_cache_forgets_the_own_network(self):
+        runner = FakeRunner(PRIVATE_SAME_VPC)
+        with unittest.mock.patch.dict(os.environ, OWN_CLUSTER_ENV), redirect_stderr(io.StringIO()):
+            gke_endpoint.endpoint_decision("p", "a", "us-central1", run=runner)
+            gke_endpoint.reset_cache()
+            gke_endpoint.endpoint_decision("p", "a", "us-central1", run=runner)
+        self.assertEqual(len(runner.own_network_calls), 2)
+
+
+class DescribeFormatTest(unittest.TestCase):
+    def test_the_target_describe_asks_for_every_field_the_rule_reads(self):
+        runner = FakeRunner(PRIVATE_SAME_VPC)
+        decision(runner)
+        fmt = [a for a in runner.describe_calls[0] if a.startswith("--format=")][0]
+        for field in ("controlPlaneEndpointsConfig", "privateClusterConfig",
+                      "networkConfig.network", "masterAuthorizedNetworksConfig", "endpoint"):
+            self.assertIn(field, fmt)
 
 
 if __name__ == "__main__":
