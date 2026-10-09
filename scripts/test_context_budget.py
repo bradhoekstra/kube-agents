@@ -36,7 +36,7 @@ def run_main() -> tuple[int, str]:
 
 
 class IsImportTest(unittest.TestCase):
-    """`is_import` -- what gets excluded from the char count."""
+    """`is_import` -- what gets excluded from the byte count."""
 
     def test_bare_import_directive(self):
         self.assertTrue(check_context_budget.is_import("@AGENTS.md\n"))
@@ -152,6 +152,15 @@ class MeasureTest(unittest.TestCase):
 class RealFilesTest(unittest.TestCase):
     """The repository's own files are inside the budget."""
 
+    def test_budget_does_not_exceed_rule_file_byte_cap(self):
+        self.assertLessEqual(
+            check_context_budget.BUDGET,
+            check_context_budget.RULE_FILE_BYTE_CAP,
+            f"BUDGET ({check_context_budget.BUDGET}) must not exceed "
+            f"RULE_FILE_BYTE_CAP ({check_context_budget.RULE_FILE_BYTE_CAP}): "
+            "Antigravity silently truncates any rule file above that limit",
+        )
+
     def test_within_budget(self):
         total = sum(check_context_budget.measure().values())
         self.assertLessEqual(
@@ -182,8 +191,10 @@ class FailurePathTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("FAIL", output)
         # The remedy is in the message, not just the number: a gate that says
-        # only "too big" gets answered by deleting a rule.
+        # only "too big" gets answered by deleting a rule or raising BUDGET past
+        # Antigravity's per-file truncation cap.
         self.assertIn("docs/pull-request-workflow.md", output)
+        self.assertIn(f"{check_context_budget.RULE_FILE_BYTE_CAP:,} bytes", output)
 
     def test_small_overage_is_not_reported_as_zero(self):
         real = sum(check_context_budget.measure().values())

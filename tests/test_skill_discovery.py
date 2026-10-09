@@ -326,29 +326,48 @@ class LifecycleSkillDiscoverabilityTest(unittest.TestCase):
 
 
 class RuleFrontmatterTest(unittest.TestCase):
+    def _validate_rule_block(self, rule_name, block, why, description, desc_why):
+        self.assertIsNotNone(block, why)
+        if "paths" in block:
+            paths = block.get("paths")
+            self.assertTrue(
+                isinstance(paths, list) and paths and all(isinstance(p, str) and p.strip() for p in paths),
+                f"{rule_name} declares `paths`, which must be a non-empty list of non-empty glob strings for Claude Code",
+            )
+        self.assertEqual(
+            block.get("trigger"),
+            RULE_TRIGGER,
+            f"{rule_name} must set `trigger: {RULE_TRIGGER}` so Antigravity loads it on demand",
+        )
+        self.assertTrue(
+            description.strip(),
+            desc_why
+            or f"{rule_name} must declare a non-empty `description` for `trigger: {RULE_TRIGGER}`",
+        )
+
     def test_every_rule_has_frontmatter_for_both_harnesses(self):
         rules = _rule_files()
         self.assertTrue(rules, "found no .agents/rules/*.md files to check")
         for rule in rules:
             with self.subTest(rule=rule.name):
                 block, why = _frontmatter(rule)
-                self.assertIsNotNone(block, why)
-                paths = block.get("paths")
-                self.assertTrue(
-                    isinstance(paths, list) and paths and all(isinstance(p, str) and p.strip() for p in paths),
-                    f"{rule.name} must declare a non-empty `paths` list so Claude Code scopes it by file glob",
-                )
-                self.assertEqual(
-                    block.get("trigger"),
-                    RULE_TRIGGER,
-                    f"{rule.name} must set `trigger: {RULE_TRIGGER}` so Antigravity loads it on demand",
-                )
                 description, desc_why = _description(rule)
-                self.assertTrue(
-                    description.strip(),
-                    desc_why
-                    or f"{rule.name} must declare a non-empty `description` for `trigger: {RULE_TRIGGER}`",
-                )
+                self._validate_rule_block(rule.name, block, why, description, desc_why)
+
+    def test_rule_without_paths_is_accepted_as_always_on_in_claude_code(self):
+        block = {"trigger": RULE_TRIGGER, "description": "Applies across the tree."}
+        self._validate_rule_block("eval_driven_development.md", block, "", block["description"], "")
+
+    def test_rule_with_invalid_paths_is_rejected(self):
+        for bad_paths in (None, [], [""], "**/*.py"):
+            with self.subTest(paths=bad_paths):
+                block = {
+                    "paths": bad_paths,
+                    "trigger": RULE_TRIGGER,
+                    "description": "Scoped rule.",
+                }
+                with self.assertRaises(AssertionError):
+                    self._validate_rule_block("scoped.md", block, "", block["description"], "")
 
 
 if __name__ == "__main__":

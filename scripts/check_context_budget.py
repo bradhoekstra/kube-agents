@@ -21,9 +21,8 @@ The remedy when this fails is almost never to delete a rule -- it is to move
 the *mechanics* out to a document the agent opens when it is carrying the rule
 out, the way ``docs/pull-request-workflow.md`` holds the commands whose rules
 live in ``AGENTS.md`` and ``.agents/rules/`` holds the mechanics that are prose
-rather than commands. Raising ``BUDGET`` is the other option, and it is a real
-one, but it should be a decision someone argues for in a pull request rather
-than the path of least resistance.
+rather than commands. ``BUDGET`` cannot be raised past ``RULE_FILE_BYTE_CAP``
+(24,000 bytes) without re-introducing silent truncation in Antigravity.
 
 Standard library only, so it runs in CI and in a bare clone.
 
@@ -40,10 +39,14 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 
-# UTF-8 bytes. Antigravity truncates any rule file past 24,000 bytes (and Claude
-# Code warns at 40k chars); this sits 500 bytes below the 24,000-byte hard cap
-# so the check fires while there is still room to land the fix, rather than
-# after the tail of AGENTS.md is already being dropped from the prompt.
+# Hard per-file rule cap in Antigravity (UTF-8 bytes), beyond which a rule file
+# is truncated on line boundaries. BUDGET may never exceed this cap.
+RULE_FILE_BYTE_CAP = 24_000
+
+# UTF-8 bytes. Antigravity truncates any rule file past RULE_FILE_BYTE_CAP (and
+# Claude Code warns at 40k chars); this sits 500 bytes below the hard cap so the
+# check fires while there is still room to land the fix, rather than after the
+# tail of AGENTS.md is already being dropped from the prompt.
 BUDGET = 23_500
 
 # The two roots. CLAUDE.md pulls AGENTS.md in with an `@AGENTS.md` line, which
@@ -147,7 +150,8 @@ def main() -> int:
         over = total - BUDGET
         print(
             f"FAIL: the always-loaded instruction files total {total:,} bytes "
-            f"({breakdown}), {over:,} over the {BUDGET:,}-byte budget.\n"
+            f"({breakdown}), {over:,} over the {BUDGET:,}-byte budget "
+            f"(hard per-file cap: {RULE_FILE_BYTE_CAP:,} bytes).\n"
             "\n"
             "These files are loaded into every session in every checkout, so this is a\n"
             "cost paid by every task in the repository. Prefer moving mechanics out over\n"
@@ -155,8 +159,9 @@ def main() -> int:
             "carrying the rule out -- docs/pull-request-workflow.md for the ones that are\n"
             "commands, .agents/rules/ for the ones that are prose -- while the rule, its\n"
             "trigger, and its reason stay in AGENTS.md.\n"
-            "Raising BUDGET in scripts/check_context_budget.py is a legitimate answer too,\n"
-            "but argue for it in the pull request."
+            f"Do not raise BUDGET in scripts/check_context_budget.py past "
+            f"{RULE_FILE_BYTE_CAP:,} bytes: Antigravity truncates any rule file "
+            "above that limit."
         )
         return 1
 

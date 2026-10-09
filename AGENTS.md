@@ -278,13 +278,13 @@ finding or missing review.
 marked ready), tell the user the bot review is on its way and **offer to wait for it**. When
 findings arrive, summarise each and let the user decide whether to fix, push back, or defer before
 changing code. Answer every disagreed finding in its thread. After pushing fixes, ask the user
-whether to comment `/review` or `/review all`, fold the fixes and any re-run live tests into
-**Self-Review** and **Live validation**, and then resolve threads once the last `/review` settles.
-Resolve a thread only when **fully confident the issue is addressed** — the fix is on the PR head
-with its commit named, or the finding is factually wrong against the current merge target (plus,
-with a user in the loop, declined `kube-agents-bot` findings other than the description thread once
-replied to and recorded in **Self-Review**). Reply first, always: a resolved thread collapses, so
-the reply is the only record a reviewer may ever see.
+whether to comment `/review` or `/review all`; once the last `/review` settles, fold the fixes and
+any re-run live tests into **Self-Review** and **Live validation** and resolve the addressed
+threads. Resolve a thread only when **fully confident the issue is addressed** — the fix is on the
+PR head with its commit named, or the finding is factually wrong against the current merge target
+(plus, with a user in the loop, declined `kube-agents-bot` findings other than the description
+thread once replied to and recorded in **Self-Review**). Reply first, always: a resolved thread
+collapses, so the reply is the only record a reviewer may ever see.
 
 ## Before Reviewing Someone Else's Pull Request
 
