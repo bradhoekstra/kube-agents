@@ -3841,28 +3841,6 @@ func asNativeSidecar(c corev1.Container) corev1.Container {
 	return c
 }
 
-// buildAgentAPIAuthSidecar returns what is left in the gateway pod after the
-// credential runtime moved out: the authenticated front door for the Hermes API,
-// the k8s-event-watcher, and the drift-detector where an install has enabled it.
-//
-// None could follow the credential proxy into its own pod, and for the same
-// reason. The API authenticator forwards to 127.0.0.1:8642, which is the Hermes
-// gateway in this pod; the watcher and the detector post to the Session KV server
-// on 127.0.0.1:8699, which the agent container starts. All are loopback peers of
-// the agent, not of the credentials.
-//
-// What that leaves behind is a container with no credential path in it. It runs
-// the same image, with CREDENTIAL_PROXY_ROLE=api-proxy telling
-// deploy/shared/start-services.sh to start neither Envoy nor the executor, and
-// its environment is built here rather than by buildCredentialProxyEnv so that
-// the Slack and Google Chat tokens, the token-broker URL and the gcloud
-// bootstrap stay out of the gateway pod entirely. The agent container cannot
-// reach a credentialed endpoint on this pod's loopback because there is no
-// longer one to reach — which is the property the sandbox split is for.
-//
-// The only shape there is. The credential runtime always runs in its own pod —
-// see credential_proxy_manifests.go — so this is what the gateway Pod carries
-// on every install.
 // resolveAgentAPIAuthResources merges the CR's spec.deployment.agentAPIAuth
 // override over the operator's defaults, one key at a time, so a CR that sets
 // only limits.memory keeps every other default. A nil override returns the
@@ -3893,6 +3871,28 @@ func resolveAgentAPIAuthResources(deployment *agentv1alpha1.DeploymentSpec) core
 	return resolved
 }
 
+// buildAgentAPIAuthSidecar returns what is left in the gateway pod after the
+// credential runtime moved out: the authenticated front door for the Hermes API,
+// the k8s-event-watcher, and the drift-detector where an install has enabled it.
+//
+// None could follow the credential proxy into its own pod, and for the same
+// reason. The API authenticator forwards to 127.0.0.1:8642, which is the Hermes
+// gateway in this pod; the watcher and the detector post to the Session KV server
+// on 127.0.0.1:8699, which the agent container starts. All are loopback peers of
+// the agent, not of the credentials.
+//
+// What that leaves behind is a container with no credential path in it. It runs
+// the same image, with CREDENTIAL_PROXY_ROLE=api-proxy telling
+// deploy/shared/start-services.sh to start neither Envoy nor the executor, and
+// its environment is built here rather than by buildCredentialProxyEnv so that
+// the Slack and Google Chat tokens, the token-broker URL and the gcloud
+// bootstrap stay out of the gateway pod entirely. The agent container cannot
+// reach a credentialed endpoint on this pod's loopback because there is no
+// longer one to reach — which is the property the sandbox split is for.
+//
+// The only shape there is. The credential runtime always runs in its own pod —
+// see credential_proxy_manifests.go — so this is what the gateway Pod carries
+// on every install.
 func buildAgentAPIAuthSidecar(agent *agentv1alpha1.PlatformAgent, homeDir string) corev1.Container {
 	image := resolveCredentialProxyImage(agent.Spec.Deployment)
 	pullPolicy := corev1.PullAlways

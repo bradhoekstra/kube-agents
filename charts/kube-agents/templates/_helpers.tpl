@@ -1312,39 +1312,50 @@ please report it" message before the CR template could name the key. The checks 
 compare parsed values (zero limit, floor, crossed pair) stay in the CR template, after
 these have passed.
 */}}
-{{- define "kube-agents.credentialProxyResourcesCheck" -}}
-{{- $proxyResources := . | default dict -}}
-{{- $proxyPrefix := "platformAgent.deployment.credentialProxy.resources" -}}
-{{- $proxyUnknown := keys (omit $proxyResources "limits" "requests" "claims") | sortAlpha -}}
-{{- if $proxyUnknown -}}
-{{- fail (printf "%s carries %s, which the PlatformAgent CRD does not declare; the accepted keys are requests, limits and claims. The API server would prune it, and the override would be lost silently" $proxyPrefix (join ", " $proxyUnknown)) -}}
+{{- /* Shape, grammar and representability check for a container's resources override,
+       shared by the credential proxy and the agent-api-auth sidecar. Both the quota
+       preflight and the CR template call it, so a mistyped side key, an unsupported
+       claims, a non-map side, an unknown resource name or a quantity the preflight
+       arithmetic cannot represent (a value float64 reads as zero, a byte count over an
+       int64, a CPU past the millicore range) fails the render naming the key, rather
+       than being pruned silently or reaching the footprint math as garbage. Caller
+       passes resources, prefix, container, pod and consumer (the Downward API reader). */ -}}
+{{- define "kube-agents.containerResourcesCheck" -}}
+{{- $resources := .resources | default dict -}}
+{{- $prefix := .prefix -}}
+{{- $container := .container -}}
+{{- $pod := .pod -}}
+{{- $consumer := .consumer -}}
+{{- $unknown := keys (omit $resources "limits" "requests" "claims") | sortAlpha -}}
+{{- if $unknown -}}
+{{- fail (printf "%s carries %s, which the PlatformAgent CRD does not declare; the accepted keys are requests, limits and claims. The API server would prune it, and the override would be lost silently" $prefix (join ", " $unknown)) -}}
 {{- end -}}
-{{- if index $proxyResources "claims" -}}
-{{- fail (printf "%s.claims is not supported -- the credential-proxy pod declares no resourceClaims, so the operator refuses the key. Remove it." $proxyPrefix) -}}
+{{- if index $resources "claims" -}}
+{{- fail (printf "%s.claims is not supported -- the %s declares no resourceClaims, so the operator refuses the key. Remove it." $prefix $pod) -}}
 {{- end -}}
-{{- $proxyNames := list "cpu" "memory" "ephemeral-storage" -}}
+{{- $names := list "cpu" "memory" "ephemeral-storage" -}}
 {{- /* The CRD's quantity grammar, the sign already stripped, with the
        exponent narrowed to the integer form resource.ParseQuantity reads.
        parseCpuMillis and parseBytes read every form this admits. */ -}}
-{{- $proxyQuantityPattern := "^(([0-9]+(\\.[0-9]*)?)|(\\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE][-+]?[0-9]+))?$" -}}
+{{- $quantityPattern := "^(([0-9]+(\\.[0-9]*)?)|(\\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE][-+]?[0-9]+))?$" -}}
 {{- range $side := list "limits" "requests" -}}
-{{- $quantities := index $proxyResources $side -}}
+{{- $quantities := index $resources $side -}}
 {{- /* `--set ...limits=2Gi` hands range a string, which it cannot walk, and a list
        gives it integer names; either is a shape the CRD refuses. */ -}}
 {{- if not (or (empty $quantities) (kindIs "map" $quantities)) -}}
-{{- fail (printf "%s.%s is %v, which is not a map of resource name to quantity, for example `limits: {memory: 2Gi}`" $proxyPrefix $side $quantities) -}}
+{{- fail (printf "%s.%s is %v, which is not a map of resource name to quantity, for example `limits: {memory: 2Gi}`" $prefix $side $quantities) -}}
 {{- end -}}
 {{- range $name, $quantity := $quantities | default dict -}}
 {{- if not (or (kindIs "invalid" $quantity) (and (kindIs "string" $quantity) (eq $quantity ""))) -}}
 {{- $raw := toString $quantity | trim -}}
-{{- if not (has $name $proxyNames) -}}
-{{- fail (printf "%s.%s.%s: the credential-proxy container declares cpu, memory and ephemeral-storage only, and the operator refuses any other resource name" $proxyPrefix $side $name) -}}
+{{- if not (has $name $names) -}}
+{{- fail (printf "%s.%s.%s: the %s container declares cpu, memory and ephemeral-storage only, and the operator refuses any other resource name" $prefix $side $name $container) -}}
 {{- end -}}
 {{- if hasPrefix "-" $raw -}}
-{{- fail (printf "%s.%s.%s is %s; a quantity must not be negative, and the operator refuses it" $proxyPrefix $side $name $raw) -}}
+{{- fail (printf "%s.%s.%s is %s; a quantity must not be negative, and the operator refuses it" $prefix $side $name $raw) -}}
 {{- end -}}
-{{- if not (regexMatch $proxyQuantityPattern (trimPrefix "+" $raw)) -}}
-{{- fail (printf "%s.%s.%s is %q, which is not a Kubernetes quantity the operator can read (a number with an optional suffix: Ki, Mi, Gi, Ti, Pi, Ei, n, u, m, k, M, G, T, P, E, or an integer exponent such as e3)" $proxyPrefix $side $name $raw) -}}
+{{- if not (regexMatch $quantityPattern (trimPrefix "+" $raw)) -}}
+{{- fail (printf "%s.%s.%s is %q, which is not a Kubernetes quantity the operator can read (a number with an optional suffix: Ki, Mi, Gi, Ti, Pi, Ei, n, u, m, k, M, G, T, P, E, or an integer exponent such as e3)" $prefix $side $name $raw) -}}
 {{- end -}}
 {{- /* float64 holds 15 significant decimal digits exactly; a 16th lets two quantities
        within one part in 10^16 of each other, or of a bound, read as equal, and the
@@ -1354,31 +1365,35 @@ these have passed.
 {{- $significand := regexReplaceAll "([KMGTPE]i|[numkMGTPE])$" (regexReplaceAll "[eE][-+]?[0-9]+$" (trimPrefix "+" $raw) "") "" -}}
 {{- $significand = regexReplaceAll "0+$" (regexReplaceAll "^0+" (replace "." "" $significand) "") "" -}}
 {{- if gt (len $significand) 15 -}}
-{{- fail (printf "%s.%s.%s is %s, which has more than 15 significant digits: the chart compares quantities as float64, which holds 15 exactly, so it cannot check this one against the operator's rules. Write it with a larger unit or fewer digits" $proxyPrefix $side $name $raw) -}}
+{{- fail (printf "%s.%s.%s is %s, which has more than 15 significant digits: the chart compares quantities as float64, which holds 15 exactly, so it cannot check this one against the operator's rules. Write it with a larger unit or fewer digits" $prefix $side $name $raw) -}}
 {{- end -}}
 {{- if include "kube-agents.quantityOverflowsFloat64" $raw -}}
 {{- if eq $name "cpu" -}}
-{{- fail (printf "%s.%s.%s is %s, which is not a representable quantity: it is past the range of a float64, which the chart would read as zero, and its millicore value exceeds the 9223372036854775807 an int64 holds, so the operator refuses it" $proxyPrefix $side $name $raw) -}}
+{{- fail (printf "%s.%s.%s is %s, which is not a representable quantity: it is past the range of a float64, which the chart would read as zero, and its millicore value exceeds the 9223372036854775807 an int64 holds, so the operator refuses it" $prefix $side $name $raw) -}}
 {{- else -}}
-{{- fail (printf "%s.%s.%s is %s, which is not a representable byte count: it exceeds the 9223372036854775807 bytes an int64 holds, which is what the Downward API hands the broker, and the operator refuses it" $proxyPrefix $side $name $raw) -}}
+{{- fail (printf "%s.%s.%s is %s, which is not a representable byte count: it exceeds the 9223372036854775807 bytes an int64 holds, which is what the Downward API hands the %s, and the operator refuses it" $prefix $side $name $raw $consumer) -}}
 {{- end -}}
 {{- end -}}
 {{- if and (ne $name "cpu") (include "kube-agents.bytesExceedInt64" $raw) -}}
-{{- fail (printf "%s.%s.%s is %s, which is not a representable byte count: it exceeds the 9223372036854775807 bytes an int64 holds, which is what the Downward API hands the broker, and the operator refuses it" $proxyPrefix $side $name $raw) -}}
+{{- fail (printf "%s.%s.%s is %s, which is not a representable byte count: it exceeds the 9223372036854775807 bytes an int64 holds, which is what the Downward API hands the %s, and the operator refuses it" $prefix $side $name $raw $consumer) -}}
 {{- end -}}
 {{- /* The operator reads a CPU quantity in millicores (MilliValue), which wraps past
        2^63; it refuses one there, so the render does too. A suffix that carries a
        finite number past float64's range (a 1 and 306 zeros, then k) fails inside
        quantityExact, naming the key. */ -}}
 {{- if eq $name "cpu" -}}
-{{- $cores := include "kube-agents.quantityExact" (dict "raw" $raw "cpu" false "key" (printf "%s.%s.%s" $proxyPrefix $side $name)) | float64 -}}
+{{- $cores := include "kube-agents.quantityExact" (dict "raw" $raw "cpu" false "key" (printf "%s.%s.%s" $prefix $side $name)) | float64 -}}
 {{- if ge (mulf $cores 1000.0) 9223372036854775808.0 -}}
-{{- fail (printf "%s.%s.%s is %s, which is not a CPU count the scheduler can represent in millicores: its millicore value exceeds the 9223372036854775807 an int64 holds, and the operator refuses it" $proxyPrefix $side $name $raw) -}}
+{{- fail (printf "%s.%s.%s is %s, which is not a CPU count the scheduler can represent in millicores: its millicore value exceeds the 9223372036854775807 an int64 holds, and the operator refuses it" $prefix $side $name $raw) -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
+{{- end }}
+
+{{- define "kube-agents.credentialProxyResourcesCheck" -}}
+{{- include "kube-agents.containerResourcesCheck" (dict "resources" . "prefix" "platformAgent.deployment.credentialProxy.resources" "container" "credential-proxy" "pod" "credential-proxy pod" "consumer" "broker") -}}
 {{- end }}
 
 {{/*
@@ -1471,44 +1486,8 @@ The defaults carry no ephemeral-storage request because the operator renders non
    | toJson -}}
 {{- end }}
 
-{{- /* Shape and grammar check for spec.deployment.agentAPIAuth.resources, run by the
-       quota preflight (kube-agents.agentAPIAuthFootprint path) and the CR template, so a
-       mistyped side key, an unsupported `claims`, a non-map side or an unparseable
-       quantity fails the render with a message naming the key instead of being pruned
-       silently or reaching parseBytes as garbage. Leaner than the proxy's: the floor,
-       crossed-pair and representability checks are the operator's and the webhook's. */ -}}
 {{- define "kube-agents.agentAPIAuthResourcesCheck" -}}
-{{- $r := . | default dict -}}
-{{- $prefix := "platformAgent.deployment.agentAPIAuth.resources" -}}
-{{- $unknown := keys (omit $r "limits" "requests" "claims") | sortAlpha -}}
-{{- if $unknown -}}
-{{- fail (printf "%s carries %s, which the PlatformAgent CRD does not declare; the accepted keys are requests, limits and claims. The API server would prune it, and the override would be lost silently" $prefix (join ", " $unknown)) -}}
-{{- end -}}
-{{- if index $r "claims" -}}
-{{- fail (printf "%s.claims is not supported -- the gateway pod declares no resourceClaims, so the operator refuses the key. Remove it." $prefix) -}}
-{{- end -}}
-{{- $names := list "cpu" "memory" "ephemeral-storage" -}}
-{{- $pattern := "^(([0-9]+(\\.[0-9]*)?)|(\\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE][-+]?[0-9]+))?$" -}}
-{{- range $side := list "limits" "requests" -}}
-{{- $quantities := index $r $side -}}
-{{- if not (or (empty $quantities) (kindIs "map" $quantities)) -}}
-{{- fail (printf "%s.%s is %v, which is not a map of resource name to quantity, for example `limits: {memory: 4Gi}`" $prefix $side $quantities) -}}
-{{- end -}}
-{{- range $name, $quantity := $quantities | default dict -}}
-{{- if not (or (kindIs "invalid" $quantity) (and (kindIs "string" $quantity) (eq $quantity ""))) -}}
-{{- $raw := toString $quantity | trim -}}
-{{- if not (has $name $names) -}}
-{{- fail (printf "%s.%s.%s: the agent-api-auth container declares cpu, memory and ephemeral-storage only, and the operator refuses any other resource name" $prefix $side $name) -}}
-{{- end -}}
-{{- if hasPrefix "-" $raw -}}
-{{- fail (printf "%s.%s.%s is %s; a quantity must not be negative, and the operator refuses it" $prefix $side $name $raw) -}}
-{{- end -}}
-{{- if not (regexMatch $pattern (trimPrefix "+" $raw)) -}}
-{{- fail (printf "%s.%s.%s is %q, which is not a Kubernetes quantity (a number with an optional suffix: Ki, Mi, Gi, Ti, Pi, Ei, n, u, m, k, M, G, T, P, E, or an integer exponent such as e3)" $prefix $side $name $raw) -}}
-{{- end -}}
-{{- end -}}
-{{- end -}}
-{{- end -}}
+{{- include "kube-agents.containerResourcesCheck" (dict "resources" . "prefix" "platformAgent.deployment.agentAPIAuth.resources" "container" "agent-api-auth" "pod" "gateway pod" "consumer" "event watcher") -}}
 {{- end }}
 
 {{- define "kube-agents.credentialProxyMemoryFloorBytes" -}}
