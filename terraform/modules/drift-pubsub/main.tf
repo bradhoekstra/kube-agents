@@ -398,19 +398,21 @@ resource "google_logging_project_sink" "drift_audit" {
 # the host topic for that agent, derived from the source project's number so
 # the grant precedes the sink, a drain of its own, and the sink last. A drain
 # per source project rather than the host's shared one, because a source sink
-# is destroyed on its own: a project removed from the scope, excluded, or no
-# longer listed under its container takes its sink and its grant out of the
-# plan while the host's drain stays, and a drain that stays waits for nothing.
+# is destroyed on its own: a project removed from the scope, or excluded,
+# takes its sink and its grant out of the plan while the host's drain stays,
+# and a drain that stays waits for nothing.
 # Keyed on the project, a drain leaves with the sink it guards: that project's
 # sink is deleted, its drain waits, and only then is its grant revoked -- the
 # order a shrink needs in the SOURCE project, whose owners the mail would
 # otherwise reach. On a full destroy every drain runs, each behind its own
 # sink.
 #
-# A folder's or organisation's members are among these only while the plan
-# lists them -- the composition's scope_resolver does so while the scoped
-# service account pool is armed; otherwise a container's clusters are
-# discovered at runtime and their audit logs are not exported here. An
+# A folder's or organisation's members are never among these: the composition
+# feeds this list from the declaration and the selectors (kube-agents-iam's
+# scope_export_projects), not from the Cloud Asset Inventory listing the
+# scoped service account pool uses, whose gaps would churn a sink. A
+# container's clusters are discovered at runtime and their audit logs are not
+# exported here. An
 # aggregated sink on the container would cover them in one piece and is its
 # own design: Logging documents no writer-identity form for a folder or
 # organisation sink, so its grant could not precede it the way these do, and

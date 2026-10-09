@@ -121,10 +121,10 @@ output "scope_discovered_projects" {
     exact exclude.projects entry, and each declared container's listed
     members while the scoped service account pool lists them
     (scope_container_members; otherwise a container's members are discovered
-    at runtime and are not here). The pool's own set less the host, so the
-    drift-pubsub module's source_projects, which the composition feeds from
-    this, and the pool follow one list; tests/test_scoped_sa_pool_iam.py pins
-    the pool's half and tests/test_scope_iam.py this one. Known at plan time:
+    at runtime and are not here). The pool's own set less the host, for a
+    caller that wants that set; the drift ingress follows scope_export_projects
+    below instead, and the next output says why. tests/test_scoped_sa_pool_iam.py
+    pins the pool's half and tests/test_scope_iam.py this one. Known at plan time:
     it is computed from the module's inputs alone, so the composition's
     module-level depends_on does not defer it.
   EOT

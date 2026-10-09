@@ -33,7 +33,7 @@ for the agent bound on each member as a resource (never at project level). A con
 are the [`kube-agents-scope-resolver`](../kube-agents-scope-resolver/README.md) module's
 `container_members` output: listed at plan time with the reconcile's own Cloud Asset Inventory
 search while the pool is armed, and not read while it is off. A member gets a pool account on that
-apply and nothing else from this module (the composition also gives it a drift audit-log sink through drift-pubsub's `source_projects`) -- no per-project binding, because the container's grant is inherited, and
+apply and nothing else from this module, and no drift audit-log sink from the composition (which projects get one is the drift-pubsub README's "Exporting the scope's other projects") -- no per-project binding, because the container's grant is inherited, and
 no place in the `scope.max_projects` count -- so pool membership under a container lags where the
 grant and discovery do not: a project created beneath a declared folder since the last apply is
 refused by the broker until the next apply lists it. With the pool armed, every declared container

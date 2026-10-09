@@ -653,8 +653,8 @@ and the chart renders the mapping into the CR as `spec.security.scopedServiceAcc
 `enabled` set from the same variable, so the broker is armed by this switch alone and never by
 declaring projects. Two clusters in one project share an account by design
 ([`docs/designs/multi-project-scope.md`](../../../docs/designs/multi-project-scope.md) §6).
-A container's member gets a pool account on that apply and, with the drift ingress on, a drift
-sink, and nothing else: its grant is the
+A container's member gets a pool account on that apply and nothing else, no drift sink included
+(the ingress paragraph below says which projects get one): its grant is the
 container's, inherited, and it is not counted toward `scope.max_projects`. Pool membership under a
 container therefore lags where the grant and discovery do not: a project created beneath a declared
 folder since the last apply is discovered and readable, but refused by the broker until the next

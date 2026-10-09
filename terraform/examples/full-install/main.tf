@@ -308,6 +308,19 @@ check "slack_tokens_present" {
   }
 }
 
+# A warning rather than a refusal, for the same reason as slack_tokens_present:
+# an exclusion written before its project joins the scope, or left after it
+# leaves, is a legitimate order of operations. A misspelled one is not, and
+# its only other trace is the drift_pubsub_source_projects output: the
+# subtraction removes nothing, and the project's audit logs leave for the
+# host topic against the operator's stated intent, with the apply green.
+check "drift_source_exclusions_name_listed_projects" {
+  assert {
+    condition     = length(setsubtract(local.drift_pubsub_source_exclude_projects, toset(module.kube_agents_iam.scope_export_projects))) == 0
+    error_message = "drift_pubsub_source_exclude_projects names ${join(", ", sort(tolist(setsubtract(local.drift_pubsub_source_exclude_projects, toset(module.kube_agents_iam.scope_export_projects)))))}, which the scope does not list beyond the host (scope_export_projects: ${join(", ", module.kube_agents_iam.scope_export_projects)}), so the entry excludes nothing. A misspelled project ID keeps its sink; check the spelling against SCOPE_PROJECTS."
+  }
+}
+
 # Bearer token for the pod-local Session KV server on 127.0.0.1:8699. Both the
 # sandbox container (which serves and calls it) and the credential-proxy
 # container (whose event watcher posts to it) read this one value.
