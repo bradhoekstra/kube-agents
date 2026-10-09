@@ -547,12 +547,14 @@ case "$*" in
       found)     echo "platform-agent-host" ;;
       notfound)  echo "ERROR: (gcloud.container.clusters.describe) ResponseError: code=404, message=Not found: projects/p/locations/us-central1/clusters/platform-agent-host." >&2; exit 1 ;;
       forbidden) echo "ERROR: (gcloud.container.clusters.describe) ResponseError: code=403, message=Required container.clusters.get permission(s) for projects/p/locations/us-central1/clusters/platform-agent-host." >&2; exit 1 ;;
+      api-off)   echo "ERROR: (gcloud.container.clusters.describe) ResponseError: code=403, message=Kubernetes Engine API has not been used in project p before or it is disabled. Enable it by visiting https://console.developers.google.com/apis/api/container.googleapis.com/overview?project=p then retry." >&2; exit 1 ;;
     esac ;;
   *"storage cat"*)
     case "${FAKE_STATE}" in
       cluster-here)  echo '{"version": 4, "resources": [{"mode": "managed", "type": "google_container_cluster", "name": "autopilot", "instances": [{"attributes": {"name": "platform-agent-host", "project": "p", "location": "us-central1"}}]}]}' ;;
       cluster-else)  echo '{"version": 4, "resources": [{"mode": "managed", "type": "google_container_cluster", "name": "autopilot", "instances": [{"attributes": {"name": "platform-agent-host", "project": "p", "location": "us-east1"}}]}]}' ;;
       other-cluster) echo '{"version": 4, "resources": [{"mode": "managed", "type": "google_container_cluster", "name": "autopilot", "instances": [{"attributes": {"name": "somebody-elses-cluster", "project": "p", "location": "us-central1"}}]}]}' ;;
+      mixed)         echo '{"version": 4, "resources": [{"mode": "managed", "type": "google_container_cluster", "name": "autopilot", "instances": [{"attributes": {"name": "platform-agent-host", "project": "p", "location": "us-central1"}}, {"attributes": {"name": "somebody-elses-cluster", "project": "p", "location": "us-central1"}}]}]}' ;;
       no-cluster)    echo '{"version": 4, "resources": [{"mode": "managed", "type": "google_kms_key_ring", "name": "gke_keyring", "instances": [{"attributes": {"location": "us-central1"}}]}]}' ;;
       garbage)       echo 'not json' ;;
       absent)        echo "ERROR: (gcloud.storage.cat) The following URLs matched no objects or files: gs://p-kube-agents-tfstate/kube-agents/platform-agent-host/default.tfstate" >&2; exit 1 ;;
@@ -561,10 +563,9 @@ case "$*" in
 esac
 """
 
-_FAKE_DEFAULTS = """DEFAULT_KUBE_AGENTS_STATE_BUCKET="auto"
-DEFAULT_TF_STATE_BUCKET_SUFFIX="-kube-agents-tfstate"
-DEFAULT_TF_STATE_PREFIX_ROOT="kube-agents"
-"""
+# The real defaults file, so the object the step names is pinned against the
+# installer's own values rather than a copy of them.
+_FAKE_DEFAULTS = (_REPO_ROOT / "install.defaults.env").read_text()
 
 _FAKE_LEASE = """import json, os, sys
 with open(os.path.join(os.environ["FAKE_DIR"], "calls"), "a") as f:
@@ -660,6 +661,15 @@ class RebuildLeaseGuardTest(unittest.TestCase):
         self.assertIn("::error", out)
         self.assertIn("somebody-elses-cluster", out)
 
+    def test_state_recording_this_cluster_and_another_refuses(self):
+        """A destroy of the state takes every cluster in it, so this cluster
+        being gone does not make the other one safe to destroy unread."""
+        code, calls, out = self._run("notfound", state="mixed")
+        self.assertEqual(code, 1)
+        self.assertNotIn("lease ", calls)
+        self.assertIn("::error", out)
+        self.assertIn("somebody-elses-cluster", out)
+
     def test_a_candidate_without_the_state_defaults_is_refused_by_name(self):
         """A candidate between the lease check and the state-location defaults
         passes the predates guard; it must still fail with a named reason, not
@@ -714,6 +724,17 @@ class RebuildLeaseGuardTest(unittest.TestCase):
         code, calls, out = self._run("found", lease="held")
         self.assertEqual(code, 1)
         self.assertIn("::error", out)
+
+    def test_a_disabled_kubernetes_engine_api_is_named(self):
+        """A fresh project answers SERVICE_DISABLED, not NOT_FOUND. It is still
+        a refusal, but one that names the API to enable rather than a blind
+        teardown, because the project setup script enables it and the
+        installer's own probe would refuse the same answer later."""
+        code, calls, out = self._run("api-off")
+        self.assertEqual(code, 1)
+        self.assertNotIn("lease ", calls)
+        self.assertIn("::error", out)
+        self.assertIn("container.googleapis.com", out)
 
     def test_any_other_failure_to_reach_the_cluster_fails_closed(self):
         """A 403 is not an absent cluster; reading it as one would tear down blind."""

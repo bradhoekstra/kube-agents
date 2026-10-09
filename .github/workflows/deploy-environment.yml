@@ -298,10 +298,15 @@ jobs:
           # A project with no cluster yet has nothing to ask and nothing to
           # tear down: that is how a long-lived environment is first created,
           # and the install below builds it from nothing. Only a
-          # genuine NOT_FOUND is that case, as it is for the installer's own
-          # create-or-adopt decision. Any other failure to read the cluster --
-          # a 403, a network error -- still fails closed, because a cluster
-          # that could not be read has not answered "absent".
+          # genuine NOT_FOUND is that case (the same policy as the installer's
+          # create-or-adopt decision; this step's match is its own, stricter
+          # one, on gcloud's `code=404`). Any other failure to read the
+          # cluster -- a 403, a network error -- still fails closed, because a
+          # cluster that could not be read has not answered "absent". A
+          # project whose Kubernetes Engine API is still disabled answers
+          # SERVICE_DISABLED, which is named rather than read as a blind
+          # teardown: the project setup script enables the API, and the
+          # installer's own probe would refuse the same answer minutes later.
           #
           # NOT_FOUND alone is not enough. The teardown finds an install by
           # project and cluster name (uninstall.sh's resolve_state_location),
@@ -324,13 +329,17 @@ jobs:
           #     path clears the rest;
           #   - state that records this cluster elsewhere: the coordinates
           #     are wrong, and the cluster is probably alive. Refuse;
-          #   - state that records only some other cluster: a destroy of that
-          #     state would take it. Refuse.
+          #   - state that records any other cluster, with or without this
+          #     one: a destroy of that state takes every cluster in it. Refuse.
           # The absence pattern is a copy of GCS_OBJECT_ABSENT_PATTERN
           # (installer_common.sh), pinned by a test.
           if ! describe_err="$(gcloud container clusters describe "${GKE_CLUSTER_NAME}" \
                 --location "${GCP_REGION}" --project "${GCP_PROJECT_ID}" \
                 --format='value(name)' 2>&1 >/dev/null)"; then
+            if printf '%s' "${describe_err}" | grep -Eq 'SERVICE_DISABLED|has not been used in project'; then
+              echo "::error title=${TARGET}'s project has the Kubernetes Engine API disabled::gcloud could not describe '${GKE_CLUSTER_NAME}' in '${GCP_PROJECT_ID}' because container.googleapis.com is not enabled there, so whether a cluster exists is unknown. Enable it first (scripts/dev/setup-gcp-github-wif.sh does, as part of the project setup) and re-run. ${describe_err}"
+              exit 1
+            fi
             if ! printf '%s' "${describe_err}" | grep -Eq 'code=404|NOT_FOUND'; then
               echo "::error title=Could not read ${TARGET}'s cluster::gcloud could not describe '${GKE_CLUSTER_NAME}' in '${GCP_PROJECT_ID}', and the answer was not NOT_FOUND, so whether the cluster exists is unknown. Refusing to tear down blind. ${describe_err}"
               exit 1
@@ -342,7 +351,8 @@ jobs:
               exit 1
             fi
             state_object="gs://${GCP_PROJECT_ID}${DEFAULT_TF_STATE_BUCKET_SUFFIX}/${DEFAULT_TF_STATE_PREFIX_ROOT}/${GKE_CLUSTER_NAME}/default.tfstate"
-            state_err_file="${RUNNER_TEMP:-/tmp}/state-probe.err"
+            state_err_file="$(mktemp "${RUNNER_TEMP:-/tmp}/state-probe.XXXXXX")"
+            trap 'rm -f "${state_err_file}"' EXIT
             state_rc=0
             state_json="$(gcloud storage cat "${state_object}" 2>"${state_err_file}")" || state_rc=$?
             if [ "${state_rc}" -ne 0 ]; then
@@ -355,22 +365,24 @@ jobs:
               exit 0
             fi
             # Prints one line: `none` (no cluster in the state), `other <names>`
-            # (clusters in the state, none of them this one), or the locations
-            # the state records this cluster at.
+            # (clusters in the state that are not this one, whether or not this
+            # one is there too), or the locations the state records this
+            # cluster at.
             if ! recorded="$(printf '%s' "${state_json}" | STATE_PROJECT="${GCP_PROJECT_ID}" STATE_CLUSTER="${GKE_CLUSTER_NAME}" python3 -c '
           import json, os, sys
           state = json.load(sys.stdin)
           want_project, want_name = os.environ["STATE_PROJECT"], os.environ["STATE_CLUSTER"]
-          clusters = [inst.get("attributes", {})
+          clusters = [inst.get("attributes") or {}
                       for res in state.get("resources", [])
                       if res.get("mode") == "managed" and res.get("type") == "google_container_cluster"
                       for inst in res.get("instances", [])]
           mine = [c for c in clusters
                   if c.get("name") == want_name and c.get("project", want_project) == want_project]
+          others = sorted({c.get("name", "?") for c in clusters if c not in mine})
           if not clusters:
               print("none")
-          elif not mine:
-              print("other " + " ".join(sorted({c.get("name", "?") for c in clusters})))
+          elif others:
+              print("other " + " ".join(others))
           else:
               print(" ".join(sorted({c.get("location", "") for c in mine} - {""})))
           ')"; then

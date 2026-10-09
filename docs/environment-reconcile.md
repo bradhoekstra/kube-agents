@@ -80,16 +80,18 @@ as free.
 
 A project with no cluster yet passes that check: there is no cluster to hold a
 lease and nothing to tear down, and the install builds the environment from
-nothing. That is how a long-lived environment is first created. The in-place
-reconcile cannot create one, because it starts by connecting to the cluster,
-so between the GitHub environment gaining its `GCP_PROJECT_ID` and that first
-dispatch, the environment's deploy lane and its daily drift plan go red. Only
-a genuine NOT_FOUND passes, and then only when the install's Terraform state
-agrees: none, or state that records no cluster or records this cluster at the
-configured location, is an earlier attempt or a cluster that is gone, and the
-teardown clears what is left. State that records this cluster at another
-location means the coordinates are wrong and the cluster is probably alive, and
-state that records only some other cluster is not this install's, so the
+nothing. That is how a long-lived environment is first created, once the
+project setup has enabled the Kubernetes Engine API (the WIF setup script
+does). The in-place reconcile cannot create one, because it connects to the
+cluster before it plans or applies, so between the GitHub environment gaining
+its `GCP_PROJECT_ID` and that first dispatch, the environment's deploy lane
+and its daily drift plan go red. Only a genuine NOT_FOUND passes, and then
+only when the install's Terraform state agrees: none, or state that records
+no cluster or records this cluster at the configured location, is an earlier
+attempt or a cluster that is gone, and the teardown clears what is left. State
+that records this cluster at another location means the coordinates are wrong
+and the cluster is probably alive, and state that records any other cluster,
+with or without this one, would lose that cluster to the teardown, so the
 rebuild refuses in both cases. Any other failure to read either refuses too,
 because a cluster that could not be read has not answered "absent".
 
