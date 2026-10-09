@@ -99,7 +99,8 @@ and mirrors that file into the sandbox. The decision joins it as four more bulle
 - endpoint-remedy: Add the agent's Pod and node ranges to ...
 ```
 
-`authorized-networks` reads `unrestricted` when the config is absent or disabled. After the
+`authorized-networks` reads `unrestricted` when the config is absent or disabled, and the
+`endpoint-remedy` bullet is written only when there is a remedy to give. After the
 mirror, the scaffold probes the cluster with `kubectl version --request-timeout=5s` in the
 sandbox under the pinned kubeconfig. On failure it logs one line with the endpoint kind, the
 address, the authorized list and the remedy, and returns normally: a cluster that is
