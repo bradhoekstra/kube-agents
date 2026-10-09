@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"math"
 	"net"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -94,8 +95,9 @@ const (
 )
 
 // UsageCounterPoller produces status.usage's toolExecutionsTotal,
-// eventsIngestedTotal and lastActiveTime on every PlatformAgent, and the two
-// cluster gauges, from the broker's and the watcher's metrics listeners, as a
+// eventsIngestedTotal, remediationsProposedTotal and lastActiveTime on every
+// PlatformAgent, and the two cluster gauges, from the broker's and the
+// watcher's metrics listeners, as a
 // manager Runnable on the leader, off the reconcile path. docs/designs/usage-counters-producer.md is
 // the design; the rules the counters follow are in usage_counters_fold.go, the
 // scrape in usage_counters_scrape.go. This file is the loop and the two
@@ -160,13 +162,14 @@ type usageScrapeStreak struct {
 	count int
 }
 
-// usageTarget is a running pod whose listener the poll reads.
+// usageTarget is a running pod whose listener the poll reads, and the counters
+// its body feeds.
 type usageTarget struct {
-	uid     types.UID
-	name    string
-	created time.Time
-	counter string
-	addr    string
+	uid      types.UID
+	name     string
+	created  time.Time
+	counters []string
+	addr     string
 }
 
 // NewUsageCounterPoller returns the poller for r's PlatformAgents, reading
@@ -419,7 +422,7 @@ func (p *UsageCounterPoller) pollAgent(ctx context.Context, cached *agentv1alpha
 	scraped := make([]usageScrapedPod, 0, len(targets))
 	var failing []usageScrapeFailure
 	for _, target := range targets {
-		reading, err := p.source.Scrape(ctx, target.addr, target.counter)
+		reading, err := p.source.Scrape(ctx, target.addr, target.counters)
 		if err != nil {
 			if ctx.Err() != nil {
 				// A poll cut short by shutdown, a leader change, or the poll
@@ -433,15 +436,19 @@ func (p *UsageCounterPoller) pollAgent(ctx context.Context, cached *agentv1alpha
 			continue
 		}
 		p.noteScrapeRecovery(log, target)
-		scraped = append(scraped, usageScrapedPod{
-			UID:       string(target.uid),
-			Name:      target.name,
-			Created:   target.created,
-			Counter:   target.counter,
-			Sample:    reading.Sample,
-			StartTime: reading.StartTime,
-			Clusters:  reading.Clusters,
-		})
+		// One body, one entry per counter it feeds: the fold keeps a baseline
+		// per pod and counter.
+		for _, counter := range target.counters {
+			scraped = append(scraped, usageScrapedPod{
+				UID:       string(target.uid),
+				Name:      target.name,
+				Created:   target.created,
+				Counter:   counter,
+				Sample:    reading.Samples[counter],
+				StartTime: reading.StartTime,
+				Clusters:  reading.Clusters,
+			})
+		}
 	}
 	// Whether any gateway replica's body was read this poll: a watcher body
 	// always carries a cluster reading, zero or not, and no other body does.
@@ -568,13 +575,13 @@ func (p *UsageCounterPoller) reader() client.Reader {
 func (p *UsageCounterPoller) targets(ctx context.Context, agent *agentv1alpha1.PlatformAgent) ([]usageTarget, map[string]bool, error) {
 	groups := []struct {
 		selector  map[string]string
-		counter   string
+		counters  []string
 		container string
 		port      string
 		read      bool
 	}{
-		{gatewayPodSelector(agent), usageCounterEventsIngested, agentAPIAuthContainerName, eventWatcherMetricsPortName, eventWatcherEnabled(agent)},
-		{credentialProxySelector(agent), usageCounterToolExecutions, credentialProxyContainerName, credentialProxyMetricsPortName, true},
+		{gatewayPodSelector(agent), usageGatewayCounters, agentAPIAuthContainerName, eventWatcherMetricsPortName, eventWatcherEnabled(agent)},
+		{credentialProxySelector(agent), usageBrokerCounters, credentialProxyContainerName, credentialProxyMetricsPortName, true},
 	}
 	live := map[string]bool{}
 	var targets []usageTarget
@@ -607,11 +614,11 @@ func (p *UsageCounterPoller) targets(ctx context.Context, agent *agentv1alpha1.P
 				continue
 			}
 			targets = append(targets, usageTarget{
-				uid:     pod.UID,
-				name:    pod.Name,
-				created: pod.CreationTimestamp.Time,
-				counter: group.counter,
-				addr:    net.JoinHostPort(pod.Status.PodIP, strconv.Itoa(int(port))),
+				uid:      pod.UID,
+				name:     pod.Name,
+				created:  pod.CreationTimestamp.Time,
+				counters: group.counters,
+				addr:     net.JoinHostPort(pod.Status.PodIP, strconv.Itoa(int(port))),
 			})
 		}
 	}
@@ -727,12 +734,15 @@ func usageDocumentInvalid(doc *usageDocument, cm *corev1.ConfigMap, agent *agent
 			return "a total is below the status it projects to"
 		}
 	}
-	for _, entry := range doc.Pods {
+	for key, entry := range doc.Pods {
 		if entry == nil || entry.Sample < 0 || entry.Marker.IsZero() {
 			return "a pod entry is outside its bounds"
 		}
-		if entry.Counter != usageCounterToolExecutions && entry.Counter != usageCounterEventsIngested {
+		if !slices.Contains(usageCounters, entry.Counter) {
 			return "a pod entry names no counter"
+		}
+		if entry.PodUID == "" || key != usagePodEntryKey(entry.PodUID, entry.Counter) {
+			return "a pod entry is not keyed by its pod and counter"
 		}
 		if entry.StartTime != nil && (math.IsNaN(*entry.StartTime) || math.IsInf(*entry.StartTime, 0) || *entry.StartTime < 0) {
 			return "a pod entry's start time is outside its bounds"
@@ -750,8 +760,9 @@ func usageDocumentInvalid(doc *usageDocument, cm *corev1.ConfigMap, agent *agent
 // poll refuses, re-seeding the CR, and adding nothing, on every poll.
 func usageStatusSeed(agent *agentv1alpha1.PlatformAgent, now time.Time) usageSeed {
 	seed := usageSeed{Totals: map[string]int64{
-		usageCounterToolExecutions: usageStatusFloor(agent.Status.Usage.ToolExecutionsTotal),
-		usageCounterEventsIngested: usageStatusFloor(agent.Status.Usage.EventsIngestedTotal),
+		usageCounterToolExecutions:       usageStatusFloor(agent.Status.Usage.ToolExecutionsTotal),
+		usageCounterEventsIngested:       usageStatusFloor(agent.Status.Usage.EventsIngestedTotal),
+		usageCounterRemediationsProposed: usageStatusFloor(agent.Status.Usage.RemediationsProposedTotal),
 	}}
 	if last := agent.Status.Usage.LastActiveTime; last != nil && !last.Time.After(now) {
 		seed.LastMoved = last.DeepCopy()
@@ -894,11 +905,12 @@ func (p *UsageCounterPoller) writeDocument(ctx context.Context, agent *agentv1al
 func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1alpha1.PlatformAgent, doc *usageDocument, gauges *usageClusterGauges, gaugesKnown bool) error {
 	tool := doc.Totals[usageCounterToolExecutions]
 	events := doc.Totals[usageCounterEventsIngested]
+	proposed := doc.Totals[usageCounterRemediationsProposed]
 	usage := &agent.Status.Usage
 	wantRegistered, wantMonitored := usageGaugeFields(gauges)
 	gaugesMoved := gaugesKnown && !p.gaugesPruned(agent) &&
 		(!usageGaugeEqual(usage.ClustersRegistered, wantRegistered) || !usageGaugeEqual(usage.ClustersMonitored, wantMonitored))
-	behind := usage.ToolExecutionsTotal < tool || usage.EventsIngestedTotal < events || gaugesMoved ||
+	behind := usage.ToolExecutionsTotal < tool || usage.EventsIngestedTotal < events || usage.RemediationsProposedTotal < proposed || gaugesMoved ||
 		(doc.LastMoved != nil && (usage.LastActiveTime == nil || !usage.LastActiveTime.Equal(doc.LastMoved)))
 	if !behind || p.r.usageStatusPruned(agent) {
 		return nil
@@ -906,6 +918,7 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	base := agent.DeepCopy()
 	usage.ToolExecutionsTotal = tool
 	usage.EventsIngestedTotal = events
+	usage.RemediationsProposedTotal = proposed
 	if doc.LastMoved != nil {
 		usage.LastActiveTime = doc.LastMoved.DeepCopy()
 	}
@@ -922,8 +935,8 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	// serialises, that come back absent are the gauges' own record, since a
 	// CRD at the previous schema prunes them and serves the counters. A patch
 	// that wrote only a time, or cleared the gauges, says nothing either way.
-	if tool > 0 || events > 0 {
-		p.r.noteUsageEcho(ctx, agent, agent.Status.Usage.ToolExecutionsTotal == tool && agent.Status.Usage.EventsIngestedTotal == events)
+	if tool > 0 || events > 0 || proposed > 0 {
+		p.r.noteUsageEcho(ctx, agent, agent.Status.Usage.ToolExecutionsTotal == tool && agent.Status.Usage.EventsIngestedTotal == events && agent.Status.Usage.RemediationsProposedTotal == proposed)
 	}
 	if gauges != nil {
 		p.noteGaugeEcho(ctx, agent, usageGaugeEqual(agent.Status.Usage.ClustersRegistered, wantRegistered) && usageGaugeEqual(agent.Status.Usage.ClustersMonitored, wantMonitored))
@@ -966,9 +979,9 @@ func (p *UsageCounterPoller) noteScrapeFailure(log logr.Logger, target usageTarg
 	detail := usageScrapeDetail(err)
 	if count == 1 {
 		log.Info("a metrics listener could not be read; this pod is not counted and its baseline is not advanced until it recovers",
-			"pod", target.name, "counter", target.counter, "error", detail)
+			"pod", target.name, "counters", strings.Join(target.counters, ","), "error", detail)
 	}
-	return usageScrapeFailure{name: target.name, counter: target.counter, detail: detail, err: err}, count >= usageScrapeFailureEventStreak
+	return usageScrapeFailure{name: target.name, counter: strings.Join(target.counters, ","), detail: detail, err: err}, count >= usageScrapeFailureEventStreak
 }
 
 // recordStandingFailures records at most one Warning on the CR for this poll,
@@ -1047,7 +1060,7 @@ func (p *UsageCounterPoller) noteScrapeRecovery(log logr.Logger, target usageTar
 	delete(p.streaks, target.uid)
 	p.mu.Unlock()
 	if streak != nil {
-		log.Info("a metrics listener is readable again", "pod", target.name, "counter", target.counter, "failedPolls", streak.count)
+		log.Info("a metrics listener is readable again", "pod", target.name, "counters", strings.Join(target.counters, ","), "failedPolls", streak.count)
 	}
 }
 
