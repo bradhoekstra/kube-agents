@@ -3501,7 +3501,7 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
                 return run_of(0, "acme\n")
             return run_of(0, "acme\nother\n")
 
-        fs.declared_scope.set("", None)
+        fs.declared_scope.set(None, None)
         self.assertEqual(fs.get_target_projects(None, run=run), (["acme", "other"], None))
 
     def test_a_project_override_still_wins(self):
@@ -3514,6 +3514,15 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
         with patch.object(fs.declared_scope, "set", side_effect=SystemExit(0)) as handed, self.assertRaises(SystemExit):
             fs.main(["--scope-projects", "ops-mgmt,payments-prod", "--scope-unread", "payments-staging=denied"])
         handed.assert_called_once_with("ops-mgmt,payments-prod", "payments-staging=denied")
+
+    def test_a_declared_scope_with_nothing_readable_sweeps_nothing_and_lists_nothing(self):
+        # `--scope-unread` alone (what collector_args carries when no declared
+        # project was readable) is a boundary with nothing inside it: the run
+        # reports that and must not widen to MONITORED_PROJECT_IDS or the listing.
+        fs.declared_scope.set(None, "payments-staging=denied")
+        with self.assertRaises(fs.NoProjectInScope) as caught:
+            fs.get_target_projects(None, run=lambda *a, **k: (_ for _ in ()).throw(AssertionError("nothing should be listed")))
+        self.assertIn("no project this install could read", str(caught.exception))
 
     def test_the_flags_are_parsed_from_the_command_line(self):
         proc = subprocess.run([sys.executable, fs.__file__, "--help"], capture_output=True, text=True, timeout=120)

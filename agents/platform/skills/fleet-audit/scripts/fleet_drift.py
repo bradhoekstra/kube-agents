@@ -309,9 +309,13 @@ def discover_fleet(base_project: str | None, *, run: RunFn) -> Discovery:
     if base_project:
         return Discovery([base_project], None, SCOPED_RUN_NOTE.format(project=base_project))
 
-    if declared_scope.projects:
+    if declared_scope.declared:
         # The declared scope the agent carried from the fleet_scope tool: the
-        # sweep as given, nothing listed, the unread rows as the one note.
+        # sweep as given, nothing listed, the unread rows as the one note. A
+        # declared scope with nothing readable is a run that read no project,
+        # reported as such rather than widened to the listing.
+        if not declared_scope.projects:
+            return Discovery([], declared_scope.empty_error(), None)
         log(f"scope: the install's declared scope, {len(declared_scope.projects)} project(s) from the fleet_scope tool")
         return Discovery(list(declared_scope.projects), None, declared_scope.note())
 

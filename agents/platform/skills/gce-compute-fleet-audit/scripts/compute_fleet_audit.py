@@ -175,10 +175,6 @@ PROJECT_TARGET_PREFIX = "project/"
 # collide with it; fleet_drift.py names the same target, so every stream
 # reports the loss alike.
 UNENUMERATED_PROJECTS_TARGET = PROJECT_TARGET_PREFIX + "UNENUMERATED_PROJECTS"
-# A run narrowed on purpose -- `--project-id` or `MONITORED_PROJECT_IDS` --
-# skips discovery, so it reads the named projects and no other. Without a row
-# saying so the manifest reads as the whole fleet, and `finish` resolves every
-# ledger finding on a project the run never looked at.
 # Where the image and the shell sandbox ship the scripts the collectors share
 # (deploy/docker/Dockerfile and deploy/sandbox/Dockerfile copy them to
 # /opt/defaults/scripts), then the checkout's own copy for a run from the
@@ -205,6 +201,10 @@ import fleet_scope_args  # noqa: E402
 # The scope this collector was handed, set by main from the two flags.
 declared_scope = fleet_scope_args.DeclaredScope()
 
+# A run narrowed on purpose -- `--project-id` or `MONITORED_PROJECT_IDS` --
+# skips discovery, so it reads the named projects and no other. Without a row
+# saying so the manifest reads as the whole fleet, and `finish` resolves every
+# ledger finding on a project the run never looked at.
 SCOPED_RUN_NOTE = (
     "scope narrowed to {projects} by {source}: discovery was skipped, so no other project "
     "in this fleet was named or read"
@@ -669,9 +669,15 @@ def get_target_projects(
         if notes is not None:
             notes.append(SCOPED_RUN_NOTE.format(projects=project, source="`--project-id`"))
         return [project]
-    if declared_scope.projects:
+    if declared_scope.declared:
         # The declared scope the agent carried from the fleet_scope tool: the
-        # sweep as given, nothing listed, the unread rows as the one note.
+        # sweep as given, nothing listed, the unread rows as the one note. A
+        # declared scope with nothing readable sweeps nothing and says so,
+        # rather than widening to the listing.
+        if not declared_scope.projects:
+            if notes is not None:
+                notes.append(declared_scope.empty_error())
+            return []
         if notes is not None and declared_scope.note():
             notes.append(declared_scope.note())
         return sorted(declared_scope.projects)
@@ -1478,15 +1484,18 @@ def unenumerated_entry(notes: list[str]) -> dict:
     it never looked at. One row however many notes, because `finish` keys the
     manifest by name.
     """
+    # Under a declared scope the fleet's size is known exactly, so the tail says
+    # so rather than calling it unknown.
+    tail = fleet_scope_args.DECLARED_SCOPE_TAIL if declared_scope.declared else UNENUMERATED_TAIL
     return {
         "name": UNENUMERATED_PROJECTS_TARGET,
         "project": "",
         "location": GLOBAL_LOCATION,
         "outcome": OUTCOME_GATE_FAILED,
-        # The notes are clipped, not the tail: the tail is what says the
-        # fleet's size is unknown, and a long `projects list` refusal would
+        # The notes are clipped, not the tail: the tail is what says whether
+        # the fleet's size is known, and a long `projects list` refusal would
         # otherwise push it out.
-        "error": f"{'; '.join(notes)[: ERROR_CLIP_CHARS - len(UNENUMERATED_TAIL) - 2]}. {UNENUMERATED_TAIL}",
+        "error": f"{'; '.join(notes)[: ERROR_CLIP_CHARS - len(tail) - 2]}. {tail}",
     }
 
 

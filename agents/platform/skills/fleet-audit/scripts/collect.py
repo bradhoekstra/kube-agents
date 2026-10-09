@@ -167,15 +167,25 @@ UNENUMERATED_PROJECTS_TARGET = PROJECT_TARGET_PREFIX + "UNENUMERATED_PROJECTS"
 # names no other; without a row saying so, `finish` resolves every ledger
 # finding on a cluster in any other project. `fleet_drift.SCOPED_RUN_NOTE`
 # states the same rule.
-# Where the image and the shell sandbox ship the scripts the collectors share
-# (deploy/docker/Dockerfile and deploy/sandbox/Dockerfile copy them to
-# /opt/defaults/scripts), then the checkout's own copy for a run from the
-# repository.
-SHARED_SCRIPT_DIRS = (
-    "/opt/defaults/scripts",
-    "/opt/data/scripts",
-    str(Path(__file__).resolve().parents[3] / "scripts"),
-)
+# Where the image and the shell sandbox ship the platform scripts the collectors
+# share (deploy/docker/Dockerfile and deploy/sandbox/Dockerfile copy them to
+# /opt/defaults/scripts), then the checkout's own `scripts/` for a run from the
+# repository, which a copy run from three or fewer directories below `/` does
+# not have. One list: `_import_platform_script` walks the same one lazily for
+# the broker path.
+PLATFORM_SCRIPT_DIRS = ("/opt/defaults/scripts", "/opt/data/scripts")
+PLATFORM_SCRIPT_DIR_DEPTH = 3
+
+
+def _platform_script_dirs() -> tuple[str, ...]:
+    checkout = Path(__file__).resolve().parents
+    beside = (
+        (str(checkout[PLATFORM_SCRIPT_DIR_DEPTH] / "scripts"),)
+        if len(checkout) > PLATFORM_SCRIPT_DIR_DEPTH
+        else ()
+    )
+    return (*PLATFORM_SCRIPT_DIRS, *beside)
+
 
 # The install's declared scope, handed in by the agent from the platform_control
 # `fleet_scope` tool (the collectors run in the shell sandbox and cannot read
@@ -185,7 +195,7 @@ SHARED_SCRIPT_DIRS = (
 # the install could not read, recorded as a coverage gap. Without them the
 # collector enumerates every project the identity can list, the behaviour of
 # an install that declares no scope.
-for _shared_dir in SHARED_SCRIPT_DIRS:
+for _shared_dir in _platform_script_dirs():
     if _shared_dir not in sys.path:
         sys.path.append(_shared_dir)
 import fleet_scope_args  # noqa: E402
@@ -234,8 +244,6 @@ CREDENTIAL_PROXY_URL_ENV = "CREDENTIAL_PROXY_URL"
 # Where the platform scripts the broker client lives in are found, in the order
 # `audit_report.py` appends them: the image's defaults, the volume's copy, then
 # the repository checkout this file sits in (for tests and local runs).
-PLATFORM_SCRIPT_DIRS = ("/opt/defaults/scripts", "/opt/data/scripts")
-PLATFORM_SCRIPT_DIR_DEPTH = 3
 # How a leased workspace directory names its repository: `owner__name`.
 REPO_DIR_SEPARATOR = "__"
 # What `broker_repo` returns for a content-mode workspace it cannot resolve to a
@@ -583,9 +591,13 @@ def discover_fleet(base_project: str | None, *, run: RunFn = default_run) -> Dis
     if base_project:
         return Discovery([base_project], None, SCOPED_RUN_NOTE.format(project=base_project))
 
-    if declared_scope.projects:
+    if declared_scope.declared:
         # The declared scope the agent carried from the fleet_scope tool: the
-        # sweep as given, nothing listed, the unread rows as the one note.
+        # sweep as given, nothing listed, the unread rows as the one note. A
+        # declared scope with nothing readable is a run that read no project,
+        # reported as such rather than widened to the listing.
+        if not declared_scope.projects:
+            return Discovery([], declared_scope.empty_error(), None)
         log(f"scope: the install's declared scope, {len(declared_scope.projects)} project(s) from the fleet_scope tool")
         return Discovery(list(declared_scope.projects), None, declared_scope.note())
 
@@ -9384,19 +9396,13 @@ def _import_platform_script(name: str):
     """Import one of the platform scripts the broker path needs, or None.
 
     Lazy, and only on the content-mode path: a directory-mode run needs
-    nothing outside this skill's own scripts, and must not start depending on
-    the platform scripts being importable.
+    nothing outside this skill's own scripts beyond `fleet_scope_args`, which
+    every mode imports at load because every mode parses the scope flags, and
+    must not start depending on the rest being importable.
     """
     import importlib  # noqa: PLC0415 -- lazy with the rest of the broker path
 
-    checkout = Path(__file__).resolve().parents
-    # A copy run from three or fewer directories below `/` has no checkout.
-    beside = (
-        [str(checkout[PLATFORM_SCRIPT_DIR_DEPTH] / "scripts")]
-        if len(checkout) > PLATFORM_SCRIPT_DIR_DEPTH
-        else []
-    )
-    for directory in (*PLATFORM_SCRIPT_DIRS, *beside):
+    for directory in _platform_script_dirs():
         if directory not in sys.path:
             sys.path.append(directory)
     try:

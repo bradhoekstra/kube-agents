@@ -1134,6 +1134,7 @@ class ScopeTest(HomesMixin):
         self.assertEqual(created, [(self.MGMT, "m1", "us-central1")])
         self.assertEqual(self._snapshot()["declared"], rec._empty_scope())
         self.assertFalse(self._snapshot()[rec.SCOPE_PRESENT_KEY], "no scope block declared this run")
+        self.assertFalse(self._snapshot()[rec.SCOPE_READABLE_KEY], "and the render could not be read: the audits' reader keeps the last boundary on this shape")
 
     def test_projects_are_listed_concurrently_and_created_in_the_fixed_order(self):
         # The three explicit listings meet at a barrier, so each is held until all three are
@@ -1349,6 +1350,7 @@ class ScopeTest(HomesMixin):
         self.assertEqual(snap[rec.SCOPE_MAX_PROJECTS_KEY], 3)
         self.assertEqual(snap["declared"][rec.SCOPE_MAX_PROJECTS_KEY], 3)
         self.assertTrue(snap[rec.SCOPE_PRESENT_KEY], "a declared block is recorded as present, beside what it declares")
+        self.assertTrue(snap[rec.SCOPE_READABLE_KEY], "and the render it was read from as readable")
 
     def test_a_declaration_without_a_cap_or_with_a_bad_one_reads_the_default(self):
         # A render from an operator that predates the field carries no key; a value that is

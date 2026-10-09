@@ -2313,6 +2313,18 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
             cf.main(["--scope-projects", "ops-mgmt,payments-prod", "--scope-unread", "payments-staging=denied"])
         handed.assert_called_once_with("ops-mgmt,payments-prod", "payments-staging=denied")
 
+    def test_a_declared_scope_with_nothing_readable_sweeps_nothing_and_lists_nothing(self):
+        # `--scope-unread` alone (what collector_args carries when no declared
+        # project was readable) is a boundary with nothing inside it: the run
+        # reports that and must not widen to MONITORED_PROJECT_IDS or the listing.
+        notes: list[str] = []
+        cf.declared_scope.set(None, "payments-staging=denied")
+        with mock.patch.dict(os.environ, {**self.ENV, cf.MONITORED_PROJECTS_ENV: "acme-only"}):
+            self.assertEqual(cf.get_target_projects(None, notes, run=lambda *a, **k: (_ for _ in ()).throw(AssertionError("nothing should be listed"))), [])
+        self.assertEqual(len(notes), 1)
+        self.assertIn("no project this install could read", notes[0])
+        self.assertIn(cf.fleet_scope_args.DECLARED_SCOPE_TAIL, cf.unenumerated_entry(notes)["error"])
+
     def test_the_flags_are_parsed_from_the_command_line(self):
         proc = subprocess.run([sys.executable, cf.__file__, "--help"], capture_output=True, text=True, timeout=120)
         self.assertEqual(proc.returncode, 0, proc.stderr)

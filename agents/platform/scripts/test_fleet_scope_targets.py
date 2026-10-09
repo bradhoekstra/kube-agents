@@ -20,10 +20,12 @@ import fleet_scope_targets as fst  # noqa: E402
 DECLARED = {"projects": ["payments-prod"], "folders": [], "organizations": [], "sharedVpcHosts": [], "metricsScopes": [], "exclude": {}}
 
 
-def _snapshot(projects, declared=DECLARED, resolved_at="2026-10-09T12:00:00Z", present=None):
+def _snapshot(projects, declared=DECLARED, resolved_at="2026-10-09T12:00:00Z", present=None, readable=None):
     snapshot = {"resolvedAt": resolved_at, "declared": declared, "maxProjects": 100, "projects": projects}
     if present is not None:
         snapshot["present"] = present
+    if readable is not None:
+        snapshot["readable"] = readable
     return snapshot
 
 
@@ -92,21 +94,49 @@ class DeclaredScopeTargetsTest(unittest.TestCase):
         self._write(_snapshot([{"id": "ops-mgmt", "outcome": "ok", "state": "in-scope"}]))
         self.assertEqual(fst.declared_scope_targets(self.home).collector_args(), "--scope-projects ops-mgmt")
 
-    def test_a_carried_declaration_under_an_unreadable_block_is_still_a_boundary(self):
-        # A tick that cannot read the block keeps the last declaration and
-        # writes present: false beside non-empty lists; the audits keep the
-        # boundary too rather than listing every visible project.
+    def test_a_carried_declaration_under_an_unreadable_render_is_still_a_boundary(self):
+        # A tick that cannot read the render keeps the last declaration and
+        # writes present: false, readable: false; the audits keep the boundary
+        # too rather than listing every visible project.
         self._write(_snapshot([
             {"id": "ops-mgmt", "outcome": "ok", "state": "in-scope"},
             {"id": "payments-prod", "outcome": "ok", "state": "in-scope"},
-        ], present=False))
+        ], present=False, readable=False))
         self.assertEqual(fst.declared_scope_targets(self.home).projects, ("ops-mgmt", "payments-prod"))
+        # A snapshot from before the readable key is read by its lists.
+        self._write(_snapshot([{"id": "ops-mgmt", "outcome": "ok", "state": "in-scope"}], present=False))
+        self.assertEqual(fst.declared_scope_targets(self.home).projects, ("ops-mgmt",))
 
-    def test_nothing_readable_yields_empty_collector_args(self):
+    def test_a_carried_host_only_boundary_under_an_unreadable_render_stays_host_only(self):
+        # The stock install: a present block with empty lists. On a tick whose
+        # render cannot be read the reconcile carries those empty lists with
+        # present: false; that is still the host-only boundary, not an install
+        # that never declared one.
+        empty = {key: [] for key in fst.DECLARED_SCOPE_KEYS} | {"exclude": {"projects": []}}
+        self._write(_snapshot([{"id": "ops-mgmt", "via": ["management"], "outcome": "ok", "state": "in-scope"}], declared=empty, present=False, readable=False))
+        self.assertEqual(fst.declared_scope_targets(self.home).projects, ("ops-mgmt",))
+
+    def test_a_block_removed_from_a_readable_cr_is_no_boundary_whatever_is_carried(self):
+        # The operator removed spec.scope: the render is readable and carries
+        # no block. The reconcile keeps re-persisting the last declaration
+        # (removing the block retires nothing), so the lists stay non-empty for
+        # good; the audits must not read that as a boundary, or they would
+        # shrink to the host and pin every run partial indefinitely.
+        self._write(_snapshot([
+            {"id": "ops-mgmt", "outcome": "ok", "state": "in-scope"},
+            {"id": "payments-prod", "outcome": "unreachable", "state": "in-scope"},
+        ], present=False, readable=True))
+        self.assertIsNone(fst.declared_scope_targets(self.home))
+
+    def test_nothing_readable_still_hands_the_collector_the_unread_flag(self):
+        # The unread flag alone tells the collector a scope was declared, so a
+        # verbatim paste of collector_args cannot widen the run to the listing.
         self._write(_snapshot([{"id": "payments-prod", "outcome": "denied", "state": "in-scope"}]))
         targets = fst.declared_scope_targets(self.home)
         self.assertEqual(targets.projects, ())
-        self.assertEqual(targets.collector_args(), "")
+        self.assertEqual(targets.collector_args(), "--scope-unread payments-prod=denied")
+        self._write(_snapshot([]))
+        self.assertEqual(fst.declared_scope_targets(self.home).collector_args(), "")
 
     def test_rows_without_an_id_or_without_a_state_are_handled(self):
         self._write(_snapshot([{"outcome": "ok"}, {"id": "ops-mgmt", "outcome": "ok"}, "junk"]))

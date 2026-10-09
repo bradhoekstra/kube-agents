@@ -625,7 +625,6 @@ COPY agents/platform/scripts/forge.py \
      agents/platform/scripts/sandbox_exec.py \
      agents/platform/scripts/vcs_client.py \
      agents/platform/scripts/credential_proxy_client.py \
-     agents/platform/scripts/fleet_scope_args.py \
      agents/platform/scripts/github_token_refresh.py \
      agents/platform/scripts/wif_credentials.py \
      /opt/vcs/libexec/platform/

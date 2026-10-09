@@ -632,9 +632,13 @@ def get_target_projects(cli_project: str | None, *, run: RunFn) -> tuple[list[st
     if cli_project:
         return [cli_project], SCOPED_RUN_NOTE.format(project=cli_project)
 
-    if declared_scope.projects:
+    if declared_scope.declared:
         # The declared scope the agent carried from the fleet_scope tool: the
-        # sweep as given, nothing listed, the unread rows as the one note.
+        # sweep as given, nothing listed, the unread rows as the one note. A
+        # declared scope with nothing readable is no fleet, reported as such
+        # rather than widened to the listing.
+        if not declared_scope.projects:
+            raise NoProjectInScope(declared_scope.empty_error())
         log(f"scope: the install's declared scope, {len(declared_scope.projects)} project(s) from the fleet_scope tool")
         return list(declared_scope.projects), declared_scope.note()
 

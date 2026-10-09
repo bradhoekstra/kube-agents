@@ -926,6 +926,17 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
             report.main(["--scope-projects", "ops-mgmt,payments-prod", "--scope-unread", "payments-staging=denied"])
         handed.assert_called_once_with("ops-mgmt,payments-prod", "payments-staging=denied")
 
+    def test_a_declared_scope_with_nothing_readable_sweeps_nothing_and_lists_nothing(self):
+        # `--scope-unread` alone (what collector_args carries when no declared
+        # project was readable) is a boundary with nothing inside it: the run
+        # reports that and must not widen to MONITORED_PROJECT_IDS or the listing.
+        errors: list[str] = []
+        report.declared_scope.set(None, "payments-staging=denied")
+        with mock.patch.dict(os.environ, {**self.ENV, report.MONITORED_PROJECTS_ENV: "acme-only"}):
+            self.assertEqual(report.get_target_projects(None, errors), [])
+        self.assertEqual(len(errors), 1)
+        self.assertIn("no project this install could read", errors[0])
+
     def test_the_flags_are_parsed_from_the_command_line(self):
         proc = subprocess.run([sys.executable, report.__file__, "--help"], capture_output=True, text=True, timeout=120)
         self.assertEqual(proc.returncode, 0, proc.stderr)

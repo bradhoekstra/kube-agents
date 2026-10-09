@@ -74,6 +74,14 @@ STATE_IN_SCOPE = "in-scope"
 # boundary. A snapshot from a reconcile that predates the key is read by its
 # lists alone.
 PRESENT_KEY = "present"
+# Whether the reconcile could read the operator's render this run, written beside
+# `present` (cluster_agent_reconcile.py). Together they tell the two shapes of
+# `present: false` apart: the render was readable and carried no block, which
+# is an operator who removed the scope and so no boundary; or the render could
+# not be read, and the reconcile carried the last declaration forward, which is
+# still that boundary, host-only or not. A snapshot without this key is read by
+# its lists.
+READABLE_KEY = "readable"
 # The keys under `declared` whose presence means the install drew a boundary,
 # for a snapshot without the present flag.
 DECLARED_SCOPE_KEYS = ("projects", "folders", "organizations", "sharedVpcHosts", "metricsScopes")
@@ -97,14 +105,16 @@ class ScopeTargets:
     def collector_args(self) -> str:
         """The arguments that hand this scope to a collector: `--scope-projects`
         with the sweep, and `--scope-unread` naming each declared project the
-        install could not read, as `project=outcome`. Empty when nothing is
-        readable, which the SOPs treat as a run with no project."""
-        if not self.projects:
-            return ""
-        args = f"{SCOPE_PROJECTS_FLAG} {','.join(self.projects)}"
+        install could not read, as `project=outcome`. With nothing readable the
+        unread flag goes alone, so a collector handed it still knows a scope
+        was declared and reports that rather than listing; empty only when the
+        scope resolved to no row at all."""
+        args = []
+        if self.projects:
+            args.append(f"{SCOPE_PROJECTS_FLAG} {','.join(self.projects)}")
         if self.unread:
-            args += f" {SCOPE_UNREAD_FLAG} " + ",".join(f"{project}={outcome}" for project, outcome in self.unread)
-        return args
+            args.append(f"{SCOPE_UNREAD_FLAG} " + ",".join(f"{project}={outcome}" for project, outcome in self.unread))
+        return " ".join(args)
 
 
 def snapshot_path(agent_home: str | os.PathLike | None = None) -> Path:
@@ -128,13 +138,20 @@ def declared_scope_targets(agent_home: str | os.PathLike | None = None) -> Scope
     declared = parsed.get("declared")
     if not isinstance(declared, dict):
         return None
-    # A declaration is in force when the block was present this run, or when a
-    # run that could not read the block carried the last declaration forward
-    # (the reconcile keeps the boundary then and writes present: false beside
-    # the non-empty lists); only empty lists under an absent block are no
-    # scope.
-    if parsed.get(PRESENT_KEY) is not True and not any(isinstance(declared.get(key), list) and declared.get(key) for key in DECLARED_SCOPE_KEYS):
-        return None
+    # A declaration is in force when the block was present this run, or when the
+    # reconcile could not read the render and carried the last declaration
+    # forward (present: false, readable: false): the boundary stands, host-only
+    # or not. A readable render with no block is an operator who removed the
+    # scope: no boundary, whatever lists the reconcile still carries. A snapshot
+    # that predates the two keys is read by its lists.
+    present = parsed.get(PRESENT_KEY)
+    readable = parsed.get(READABLE_KEY)
+    if present is not True:
+        if isinstance(readable, bool):
+            if readable:
+                return None
+        elif not any(isinstance(declared.get(key), list) and declared.get(key) for key in DECLARED_SCOPE_KEYS):
+            return None
     projects: list[str] = []
     unread: list[tuple[str, str]] = []
     for row in parsed["projects"]:

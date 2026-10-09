@@ -360,9 +360,15 @@ def get_target_projects(cli_projects: list[str] | None = None, listing_errors: l
     """
     if cli_projects:
         return sorted({_normalise_project_id(p.strip()) or p.strip() for p in cli_projects if p.strip()})
-    if declared_scope.projects:
+    if declared_scope.declared:
         # The declared scope the agent carried from the fleet_scope tool: the
-        # sweep as given, nothing listed, the unread rows as the one note.
+        # sweep as given, nothing listed, the unread rows as the one note. A
+        # declared scope with nothing readable enumerates nothing and says so,
+        # rather than widening to the listing.
+        if not declared_scope.projects:
+            if listing_errors is not None:
+                listing_errors.append(declared_scope.empty_error())
+            return []
         if listing_errors is not None and declared_scope.note():
             listing_errors.append(declared_scope.note())
         return sorted(declared_scope.projects)
@@ -1103,7 +1109,7 @@ def main(argv: list[str] | None = None) -> int:
 
     listing_errors: list[str] = []
     projects = get_target_projects(args.project, listing_errors)
-    scope_label = DECLARED_SCOPE_ERROR_SCOPE if declared_scope.projects else PROJECTS_LIST_ERROR_SCOPE
+    scope_label = DECLARED_SCOPE_ERROR_SCOPE if declared_scope.declared else PROJECTS_LIST_ERROR_SCOPE
     if not projects:
         for error in listing_errors:
             sys.stderr.write(f"{scope_label}: {error}\n")

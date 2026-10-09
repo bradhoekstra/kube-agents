@@ -37,11 +37,7 @@ UNKNOWN_PROJECT = "unknown"
 # unknown and the run must read as partial rather than as a full sweep. Same
 # name fleet_drift.py uses, so every stream reports it alike.
 UNENUMERATED_PROJECTS = "UNENUMERATED_PROJECTS"
-# A run narrowed on purpose -- `--project-id` or `MONITORED_PROJECT_IDS` --
-# skips discovery, so it reads the named projects and no other. Without a row
-# saying so the document reads as the whole fleet, and `finish` resolves every
-# ledger finding on a project the run never looked at. fleet_drift.py records
-# the same `project/UNENUMERATED_PROJECTS` row for its `--project` runs.
+UNENUMERATED_TAIL = "How many other projects the fleet holds is unknown."
 # Where the image and the shell sandbox ship the scripts the collectors share
 # (deploy/docker/Dockerfile and deploy/sandbox/Dockerfile copy them to
 # /opt/defaults/scripts), then the checkout's own copy for a run from the
@@ -68,6 +64,11 @@ import fleet_scope_args  # noqa: E402
 # The scope this collector was handed, set by main from the two flags.
 declared_scope = fleet_scope_args.DeclaredScope()
 
+# A run narrowed on purpose -- `--project-id` or `MONITORED_PROJECT_IDS` --
+# skips discovery, so it reads the named projects and no other. Without a row
+# saying so the document reads as the whole fleet, and `finish` resolves every
+# ledger finding on a project the run never looked at. fleet_drift.py records
+# the same `project/UNENUMERATED_PROJECTS` row for its `--project` runs.
 SCOPED_RUN_NOTE = (
     "scope narrowed to {projects} by {source}: discovery was skipped, so no other project "
     "in this fleet was named or read"
@@ -278,9 +279,15 @@ def get_target_projects(cli_project: str | None = None, listing_errors: list[str
         if listing_errors is not None:
             listing_errors.append(SCOPED_RUN_NOTE.format(projects=project, source="`--project-id`"))
         return [project]
-    if declared_scope.projects:
+    if declared_scope.declared:
         # The declared scope the agent carried from the fleet_scope tool: the
-        # sweep as given, nothing listed, the unread rows as the one note.
+        # sweep as given, nothing listed, the unread rows as the one note. A
+        # declared scope with nothing readable sweeps nothing and says so,
+        # rather than widening to the listing.
+        if not declared_scope.projects:
+            if listing_errors is not None:
+                listing_errors.append(declared_scope.empty_error())
+            return []
         if listing_errors is not None and declared_scope.note():
             listing_errors.append(declared_scope.note())
         return sorted(declared_scope.projects)
@@ -925,6 +932,9 @@ def main():
     skipped_targets = []
     active_targets = []
 
+    # Under a declared scope the fleet's size is known exactly; the row says so
+    # rather than calling it unknown.
+    unenumerated_tail = fleet_scope_args.DECLARED_SCOPE_TAIL if declared_scope.declared else UNENUMERATED_TAIL
     for error in listing_errors:
         sys.stderr.write(f"{error}; auditing {target_projects or 'no project'}\n")
         skipped_targets.append({
@@ -932,7 +942,7 @@ def main():
             "name": f"{PROJECT_TARGET_PREFIX}{UNENUMERATED_PROJECTS}",
             "location": GLOBAL_LOCATION,
             "project": UNENUMERATED_PROJECTS,
-            "reason": f"{error}. How many other projects the fleet holds is unknown.",
+            "reason": f"{error}. {unenumerated_tail}",
         })
 
     if not target_projects:

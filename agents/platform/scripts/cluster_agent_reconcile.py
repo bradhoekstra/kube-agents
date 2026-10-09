@@ -92,6 +92,10 @@ EXTRA_EXCLUDE = {c for c in os.environ.get("RECONCILE_EXCLUDE", "").split(",") i
 SCOPE_FILE_ENV = "KUBEAGENTS_SCOPE_FILE"
 # The rendered file says whether the CR carries a scope block at all (see _load_scope).
 SCOPE_PRESENT_KEY = "present"
+# Written beside it: whether the render could be read this run. The audits' reader
+# (fleet_scope_targets.py) tells a removed block (readable, not present: no
+# boundary) from a carried one (not readable: the last boundary stands) by it.
+SCOPE_READABLE_KEY = "readable"
 # The resolved membership, rewritten by every run but --dry-run beside the profiles (design §5). The
 # previous run's copy is an input: a project in the resolved set last time and absent now
 # is marked `retiring`, and only a project the previous copy marked `retiring` is pruned,
@@ -1967,6 +1971,7 @@ def reconcile(dry_run: bool = False) -> dict:
             # an empty present block), which a reader of the snapshot cannot tell from
             # an absent one by `declared` alone. The audits' fleet_scope tool keys on it.
             SCOPE_PRESENT_KEY: scope_present,
+            SCOPE_READABLE_KEY: scope_readable,
             SCOPE_MAX_PROJECTS_KEY: cap,
             "resolver": RESOLVER_ASSET_INVENTORY if _container_ids(scope) else RESOLVER_EXPLICIT,
             "containers": sorted(containers, key=lambda c: c["id"]),

@@ -32,12 +32,30 @@ class FleetScopeArgsTest(unittest.TestCase):
 
     def test_the_holder_records_the_flags_and_reads_back_as_the_resolver_does(self):
         scope = fsa.DeclaredScope()
+        self.assertFalse(scope.declared)
         self.assertIsNone(scope.projects)
         scope.set("a,b", "p=denied")
+        self.assertTrue(scope.declared)
         self.assertEqual((scope.projects, scope.unread), (["a", "b"], [("p", "denied")]))
         self.assertIn("p (denied)", scope.note())
+        scope.set(None, None)
+        self.assertEqual((scope.declared, scope.projects, scope.note()), (False, None, None))
+
+    def test_a_declared_scope_with_nothing_readable_is_declared_and_empty_not_absent(self):
+        # `--scope-unread` alone, or a blank `--scope-projects`, is a boundary the
+        # install could read nothing inside: the collector reports that and
+        # must not fall through to the listing.
+        scope = fsa.DeclaredScope()
+        scope.set(None, "p=denied,q=unreachable")
+        self.assertEqual((scope.declared, scope.projects), (True, []))
+        self.assertIn("no project this install could read", scope.empty_error())
+        self.assertIn("p (denied), q (unreachable)", scope.empty_error())
         scope.set("", None)
-        self.assertEqual((scope.projects, scope.note()), (None, None))
+        self.assertEqual((scope.declared, scope.projects), (True, []))
+        self.assertNotIn("(", scope.empty_error().split("this run")[1][:2])
+
+    def test_a_repeated_project_id_is_swept_once(self):
+        self.assertEqual(fsa.parse_scope_projects("ops-mgmt,payments-prod,ops-mgmt"), ["ops-mgmt", "payments-prod"])
 
     def test_the_note_names_each_unread_project(self):
         self.assertIsNone(fsa.unread_note([]))
