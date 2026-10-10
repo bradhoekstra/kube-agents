@@ -20,12 +20,16 @@ import fleet_scope_targets as fst  # noqa: E402
 DECLARED = {"projects": ["payments-prod"], "folders": [], "organizations": [], "sharedVpcHosts": [], "metricsScopes": [], "exclude": {}}
 
 
-def _snapshot(projects, declared=DECLARED, resolved_at="2026-10-09T12:00:00Z", present=None, readable=None):
+def _snapshot(projects, declared=DECLARED, resolved_at="2026-10-09T12:00:00Z", present=None, boundary=None):
     snapshot = {"resolvedAt": resolved_at, "declared": declared, "maxProjects": 100, "projects": projects}
     if present is not None:
         snapshot["present"] = present
-    if readable is not None:
-        snapshot["readable"] = readable
+    # The reconcile writes `boundary` beside `present`, and a block read this
+    # run is a boundary; a carried or absent block says which it is itself.
+    if boundary is None and present is True:
+        boundary = True
+    if boundary is not None:
+        snapshot["boundary"] = boundary
     return snapshot
 
 
@@ -81,7 +85,7 @@ class DeclaredScopeTargetsTest(unittest.TestCase):
         # A snapshot that says boundary: false (a readable render with no block
         # last tick) yields to a render that has gained a block since.
         empty = {key: [] for key in fst.DECLARED_SCOPE_KEYS} | {"exclude": {"projects": []}}
-        snap = _snapshot([{"id": "ops-mgmt", "outcome": "ok", "state": "in-scope"}], declared=empty, present=False, readable=True); snap["boundary"] = False
+        snap = _snapshot([{"id": "ops-mgmt", "outcome": "ok", "state": "in-scope"}], declared=empty, present=False, boundary=False)
         self._write(snap)
         with mock.patch.dict(os.environ, {fst.SCOPE_FILE_ENV: str(render), "GCP_PROJECT_ID": "ops-mgmt"}):
             render.write_text(json.dumps({"present": True, "projects": ["payments-prod"]}), encoding="utf-8")
@@ -91,16 +95,13 @@ class DeclaredScopeTargetsTest(unittest.TestCase):
             self.assertIsNone(fst.declared_scope_targets(self.home))
 
     def test_the_boundary_key_decides_when_the_reconcile_wrote_it(self):
-        # A never-declared install on an unreadable tick: present false, readable
-        # false, empty lists, boundary false. Nothing is carried; no scope.
+        # A never-declared install on an unreadable tick: present false, empty
+        # lists, boundary false. Nothing is carried; no scope.
         empty = {key: [] for key in fst.DECLARED_SCOPE_KEYS} | {"exclude": {"projects": []}}
-        snap = _snapshot([{"id": "ops-mgmt", "outcome": "ok", "state": "in-scope"}], declared=empty, present=False, readable=False)
-        snap["boundary"] = False
-        self._write(snap)
+        self._write(_snapshot([{"id": "ops-mgmt", "outcome": "ok", "state": "in-scope"}], declared=empty, present=False, boundary=False))
         self.assertIsNone(fst.declared_scope_targets(self.home))
         # The stock install on the same tick: the reconcile carried its boundary.
-        snap["boundary"] = True
-        self._write(snap)
+        self._write(_snapshot([{"id": "ops-mgmt", "outcome": "ok", "state": "in-scope"}], declared=empty, present=False, boundary=True))
         self.assertEqual(fst.declared_scope_targets(self.home).projects, ("ops-mgmt",))
 
     def test_a_file_that_is_not_a_snapshot_is_none(self):
@@ -137,7 +138,7 @@ class DeclaredScopeTargetsTest(unittest.TestCase):
         # none, and must not vanish from a sweep that then reads as complete.
         declared = dict(DECLARED, projects=["payments-prod", "payments-net"])
         snap = _snapshot([{"id": "ops-mgmt", "via": ["management"], "outcome": "ok", "state": "in-scope"},
-                          {"id": "payments-prod", "outcome": "ok", "state": "in-scope"}], declared=declared, present=False, readable=False)
+                          {"id": "payments-prod", "outcome": "ok", "state": "in-scope"}], declared=declared, present=False)
         snap["boundary"] = True
         self._write(snap)
         targets = fst.declared_scope_targets(self.home)
@@ -188,7 +189,7 @@ class DeclaredScopeTargetsTest(unittest.TestCase):
         # A carried tick resolves no folder, organisation or selector; a
         # declaration that names one cannot publish a complete sweep from it.
         declared = dict(DECLARED, projects=[], folders=["123456789012"])
-        snap = _snapshot([{"id": "ops-mgmt", "via": ["management"], "outcome": "ok", "state": "in-scope"}], declared=declared, present=False, readable=False)
+        snap = _snapshot([{"id": "ops-mgmt", "via": ["management"], "outcome": "ok", "state": "in-scope"}], declared=declared, present=False)
         snap["boundary"] = True
         self._write(snap)
         targets = fst.declared_scope_targets(self.home)
@@ -246,6 +247,12 @@ class DeclaredScopeTargetsTest(unittest.TestCase):
         snap["projects"] = [host, {"id": "payments-prod", "via": ["folders/123456789012"], "outcome": "unreachable", "state": "in-scope", "frozen": True}]
         self._write(snap)
         self.assertEqual(fst.declared_scope_targets(self.home).unread, (("payments-prod", "unreachable"), ("declared-scope", "unresolved")))
+        # An over-cap lookup resolved: the members all have rows at over-cap,
+        # which is the whole gap by name, so the fixed row does not ride.
+        snap["containers"] = [{"id": "folders/123456789012", "outcome": "over-cap", "projects": 2}]
+        snap["projects"] = [host] + [{"id": p, "via": ["folders/123456789012"], "outcome": "over-cap", "state": "in-scope"} for p in ("m1", "m2")]
+        self._write(snap)
+        self.assertEqual(fst.declared_scope_targets(self.home).unread, (("m1", "over-cap"), ("m2", "over-cap")))
 
     def test_collector_args_without_an_unread_project_carries_the_sweep_alone(self):
         self._write(_snapshot([{"id": "ops-mgmt", "outcome": "ok", "state": "in-scope"}], declared=dict(DECLARED, projects=[]), present=True))
@@ -253,23 +260,22 @@ class DeclaredScopeTargetsTest(unittest.TestCase):
 
     def test_a_carried_declaration_under_an_unreadable_render_is_still_a_boundary(self):
         # A tick that cannot read the render keeps the last declaration and
-        # writes present: false, readable: false; the audits keep the boundary
+        # writes present: false, boundary: true; the audits keep the boundary
         # too rather than listing every visible project.
         self._write(_snapshot([
             {"id": "ops-mgmt", "outcome": "ok", "state": "in-scope"},
             {"id": "payments-prod", "outcome": "ok", "state": "in-scope"},
-        ], present=False, readable=False))
+        ], present=False, boundary=True))
         self.assertEqual(fst.declared_scope_targets(self.home).projects, ("ops-mgmt", "payments-prod"))
-        # A snapshot from before the readable key is read by its lists.
-        self._write(_snapshot([{"id": "ops-mgmt", "outcome": "ok", "state": "in-scope"}], present=False))
+        # A snapshot from before the boundary key is read by its lists.
+        self._write(_snapshot([{"id": "ops-mgmt", "outcome": "ok", "state": "in-scope"}]))
         self.assertEqual(fst.declared_scope_targets(self.home).projects, ("ops-mgmt",))
 
     def test_a_carried_host_only_boundary_under_an_unreadable_render_stays_host_only(self):
-        # A snapshot from before the boundary key, on the stock install's
-        # unreadable tick: present false, readable false, empty lists. Read as
-        # a carried boundary; the reconcile now writes `boundary` to settle it.
+        # The stock install's unreadable tick: present false, empty lists,
+        # boundary carried from the tick that read the block.
         empty = {key: [] for key in fst.DECLARED_SCOPE_KEYS} | {"exclude": {"projects": []}}
-        self._write(_snapshot([{"id": "ops-mgmt", "via": ["management"], "outcome": "ok", "state": "in-scope"}], declared=empty, present=False, readable=False))
+        self._write(_snapshot([{"id": "ops-mgmt", "via": ["management"], "outcome": "ok", "state": "in-scope"}], declared=empty, present=False, boundary=True))
         self.assertEqual(fst.declared_scope_targets(self.home).projects, ("ops-mgmt",))
 
     def test_a_block_removed_from_a_readable_cr_is_no_boundary_whatever_is_carried(self):
@@ -281,7 +287,7 @@ class DeclaredScopeTargetsTest(unittest.TestCase):
         self._write(_snapshot([
             {"id": "ops-mgmt", "outcome": "ok", "state": "in-scope"},
             {"id": "payments-prod", "outcome": "unreachable", "state": "in-scope"},
-        ], present=False, readable=True))
+        ], present=False, boundary=False))
         self.assertIsNone(fst.declared_scope_targets(self.home))
 
     def test_nothing_readable_still_hands_the_collector_the_unread_flag(self):

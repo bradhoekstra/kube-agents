@@ -286,15 +286,12 @@ def get_target_projects(cli_project: str | None = None, listing_errors: list[str
                 listing_errors.append(declared_scope.empty_error())
             return []
         resolved = _normalise_project_id(raw, listing_errors)
-        if resolved is None and raw.isdigit() and declared_scope.declared:
-            # Under a declared scope only: without one the raw number proceeds,
-            # as it always did, with the describe failure already recorded.
-            if listing_errors is not None:
-                listing_errors.append(fleet_scope_args.PROJECT_NUMBER_UNRESOLVED_ERROR.format(number=raw))
-            return []
         project = resolved or raw
         # On the resolved id: a project number given here names the same
-        # project the tool lists by id.
+        # project the tool lists by id. A number the describe could not resolve
+        # reaches the holder as digits, which it refuses under a declared scope
+        # with the remedy, and lets through without one, as it always did, with
+        # the describe failure already recorded.
         override_error = declared_scope.override_error(project)
         if override_error:
             if listing_errors is not None:

@@ -678,16 +678,12 @@ def get_target_projects(
                 notes.append(declared_scope.empty_error())
             return []
         resolved = _normalise_project_id(raw, notes, run=run)
-        if resolved is None and raw.isdigit() and declared_scope.declared:
-            # Under a declared scope an unresolved number cannot be compared
-            # with the ids the tool lists; without one the raw number proceeds,
-            # as it always did, with the describe failure already recorded.
-            if notes is not None:
-                notes.append(fleet_scope_args.PROJECT_NUMBER_UNRESOLVED_ERROR.format(number=raw))
-            return []
         project = resolved or raw
         # On the resolved id: a project number given here names the same
-        # project the tool lists by id.
+        # project the tool lists by id. A number the describe could not resolve
+        # reaches the holder as digits, which it refuses under a declared scope
+        # with the remedy, and lets through without one, as it always did, with
+        # the describe failure already recorded.
         override_error = declared_scope.override_error(project)
         if override_error:
             if notes is not None:

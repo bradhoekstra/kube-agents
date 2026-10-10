@@ -9,6 +9,7 @@ import argparse
 import pathlib
 import sys
 import os
+import tempfile
 import unittest
 from unittest import mock
 
@@ -103,9 +104,8 @@ class FleetScopeArgsTest(unittest.TestCase):
     def test_the_root_owned_file_outranks_the_environment(self):
         # A session can unset or override the variable in one word; the file the
         # entrypoint writes as root is what the guard reads first.
-        import tempfile, os as _os
         with tempfile.TemporaryDirectory() as tmp:
-            path = _os.path.join(tmp, "scope-declared")
+            path = os.path.join(tmp, "scope-declared")
             with open(path, "w", encoding="utf-8") as handle:
                 handle.write("true\n")
             scope = fsa.DeclaredScope()

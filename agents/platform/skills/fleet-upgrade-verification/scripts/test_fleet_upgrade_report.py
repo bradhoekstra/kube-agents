@@ -23,7 +23,7 @@ import fleet_upgrade_report as report  # noqa: E402
 # would turn this suite's listing tests into refusals. The suite is about the
 # collector, not the host it runs on, so both are neutralised at import.
 os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)  # module-level, on purpose
-import fleet_scope_args as _fleet_scope_args  # noqa: E402
+_fleet_scope_args = report.fleet_scope_args  # the collector's own import; one module, one path
 
 _fleet_scope_args.SCOPE_DECLARED_FILE = "/nonexistent/kube-agents-sandbox/scope-declared"
 

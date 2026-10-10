@@ -21,7 +21,7 @@ import networking_audit
 # would turn this suite's listing tests into refusals. The suite is about the
 # collector, not the host it runs on, so both are neutralised at import.
 os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)  # module-level, on purpose
-import fleet_scope_args as _fleet_scope_args  # noqa: E402
+_fleet_scope_args = networking_audit.fleet_scope_args  # the collector's own import; one module, one path
 
 _fleet_scope_args.SCOPE_DECLARED_FILE = "/nonexistent/kube-agents-sandbox/scope-declared"
 
@@ -1127,7 +1127,6 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
     def test_the_top_level_error_carries_every_listing_reason(self):
         # A numeric --project-id whose describe fails records two reasons; the
         # one with the remedy must not sit only in a skipped row.
-        import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             out = os.path.join(tmp, "networking.json")
             networking_audit.declared_scope.set("ops-mgmt", None)
@@ -1140,7 +1139,6 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
     def test_a_flagless_run_on_a_scoped_sandbox_exits_non_zero_with_a_top_level_error(self):
         # As the other seven collectors: a declared scope with nothing to sweep
         # is a failed run, not an exit-0 document with two skipped rows.
-        import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             out = os.path.join(tmp, "networking.json")
             with mock.patch.dict(os.environ, {**self.ENV, "KUBEAGENTS_SCOPE_DECLARED": "true"}), \

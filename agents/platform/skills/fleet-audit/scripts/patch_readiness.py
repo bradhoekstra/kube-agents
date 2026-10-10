@@ -113,9 +113,6 @@ PROJECT_TARGET_PREFIX = "project/"
 # The target standing for the projects discovery never named. Uppercase
 # because a GCP project id cannot be, so no real project collides with it.
 UNENUMERATED_PROJECTS_TARGET = PROJECT_TARGET_PREFIX + "UNENUMERATED_PROJECTS"
-# `--project` skips discovery, so a scoped run names no other project. Without
-# a row saying so the manifest reads as a fleet of one project, and `finish`
-# resolves every ledger finding on a cluster the run never looked at.
 # Where the image and the shell sandbox ship the scripts the collectors share
 # (deploy/docker/Dockerfile and deploy/sandbox/Dockerfile copy them to
 # /opt/defaults/scripts), then the checkout's own copy for a run from the
@@ -147,6 +144,9 @@ import fleet_scope_args  # noqa: E402
 # The scope this collector was handed, set by main from the two flags.
 declared_scope = fleet_scope_args.DeclaredScope()
 
+# `--project` skips discovery, so a scoped run names no other project. Without
+# a row saying so the manifest reads as a fleet of one project, and `finish`
+# resolves every ledger finding on a cluster the run never looked at.
 SCOPED_RUN_NOTE = (
     "scope narrowed to project {project!r} by `--project`: discovery was skipped, so no other "
     "project in this fleet was named or read, and this run cannot speak for their clusters."

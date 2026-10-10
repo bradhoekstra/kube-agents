@@ -1049,7 +1049,8 @@ class ScopeTest(HomesMixin):
         declared = {"projects": ["p2"], "exclude": {"projects": ["*-scratch"], "clusters": [
             {"projectId": self.MGMT, "location": "us-central1", "clusterName": "kept-out"}]}}
         (Path(self._tmp.name) / rec.SNAPSHOT_FILE).write_text(json.dumps(
-            {"projects": [{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE}], "declared": declared}),
+            {"projects": [{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE}], "declared": declared,
+             rec.SCOPE_EXCLUDED_KEY: ["team-a"]}),
             encoding="utf-8")
         os.environ.pop(rec.SCOPE_FILE_ENV, None)
         for _ in range(2):
@@ -1062,18 +1063,10 @@ class ScopeTest(HomesMixin):
             # the key and names p2, so the audits must not widen to the listing.
             self.assertTrue(self._snapshot()[rec.SCOPE_BOUNDARY_KEY], "a carried declaration is a boundary in force")
             self.assertFalse(self._snapshot()[rec.SCOPE_PRESENT_KEY])
-
-    def test_a_previous_present_block_without_the_boundary_key_is_carried(self):
-        # A snapshot from a reconcile that wrote `present` but not yet `boundary`
-        # (the host-only default: present, every list empty) carries on an
-        # unreadable tick by its present flag, not by its empty lists.
-        declared = {"projects": [], "exclude": {"projects": [], "clusters": []}}
-        (Path(self._tmp.name) / rec.SNAPSHOT_FILE).write_text(json.dumps(
-            {"projects": [{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE}], "declared": declared, rec.SCOPE_PRESENT_KEY: True}),
-            encoding="utf-8")
-        os.environ.pop(rec.SCOPE_FILE_ENV, None)
-        self._run(None, {self.MGMT: []})
-        self.assertTrue(self._snapshot()[rec.SCOPE_BOUNDARY_KEY], "present: true on the last readable tick is a boundary to carry")
+            # The carried tick resolves no explicit project, so it drops none
+            # itself; the projects the last readable tick dropped by id or by
+            # number ride on, or the audits' reader would carry them as unresolved.
+            self.assertEqual(self._snapshot()[rec.SCOPE_EXCLUDED_KEY], ["team-a"], "the carried tick repeats the last readable tick's dropped projects")
 
     def test_a_declaration_with_scalar_fields_is_read_as_absent_fields(self):
         # A hand-edited file or snapshot must not abort the run or come apart into characters.
@@ -1152,7 +1145,6 @@ class ScopeTest(HomesMixin):
         self.assertEqual(created, [(self.MGMT, "m1", "us-central1")])
         self.assertEqual(self._snapshot()["declared"], rec._empty_scope())
         self.assertFalse(self._snapshot()[rec.SCOPE_PRESENT_KEY], "no scope block declared this run")
-        self.assertFalse(self._snapshot()[rec.SCOPE_READABLE_KEY], "and the render could not be read")
         self.assertFalse(self._snapshot()[rec.SCOPE_BOUNDARY_KEY], "with no previous snapshot nothing is carried: an install that never declared a scope has no boundary on an unreadable tick")
 
     def test_projects_are_listed_concurrently_and_created_in_the_fixed_order(self):
@@ -1369,7 +1361,6 @@ class ScopeTest(HomesMixin):
         self.assertEqual(snap[rec.SCOPE_MAX_PROJECTS_KEY], 3)
         self.assertEqual(snap["declared"][rec.SCOPE_MAX_PROJECTS_KEY], 3)
         self.assertTrue(snap[rec.SCOPE_PRESENT_KEY], "a declared block is recorded as present, beside what it declares")
-        self.assertTrue(snap[rec.SCOPE_READABLE_KEY], "and the render it was read from as readable")
         self.assertTrue(snap[rec.SCOPE_BOUNDARY_KEY], "a read block is a boundary in force")
 
     def test_a_declaration_without_a_cap_or_with_a_bad_one_reads_the_default(self):

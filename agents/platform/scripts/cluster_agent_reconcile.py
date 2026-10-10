@@ -92,10 +92,6 @@ EXTRA_EXCLUDE = {c for c in os.environ.get("RECONCILE_EXCLUDE", "").split(",") i
 SCOPE_FILE_ENV = "KUBEAGENTS_SCOPE_FILE"
 # The rendered file says whether the CR carries a scope block at all (see _load_scope).
 SCOPE_PRESENT_KEY = "present"
-# Written beside it: whether the render could be read this run. The audits' reader
-# (fleet_scope_targets.py) tells a removed block (readable, not present: no
-# boundary) from a carried one (not readable: the last boundary stands) by it.
-SCOPE_READABLE_KEY = "readable"
 # Whether a declaration is in force this run: the block was read, or the render
 # could not be read and the last run that could had one. An install that never
 # declared a scope carries nothing on an unreadable tick, and a readable render
@@ -524,14 +520,13 @@ def _normalize_scope(parsed: dict) -> dict:
 
 def _previous_boundary(previous: dict | None) -> bool:
     """Whether the last run had a declaration in force: its `boundary` key, else
-    its `present` key, else (a snapshot from before either) whether its
+    (a snapshot from a reconcile that shipped before the key) whether its
     declaration named anything. An install that never declared a scope reads
-    False on every form, so an unreadable tick carries nothing for it."""
+    False on both forms, so an unreadable tick carries nothing for it."""
     if not isinstance(previous, dict):
         return False
-    for key in (SCOPE_BOUNDARY_KEY, SCOPE_PRESENT_KEY):
-        if isinstance(previous.get(key), bool):
-            return previous[key]
+    if isinstance(previous.get(SCOPE_BOUNDARY_KEY), bool):
+        return previous[SCOPE_BOUNDARY_KEY]
     last = _previous_declaration(previous)
     return bool(last) and any(last.get(kind) for kind in ("projects", "folders", "organizations", "sharedVpcHosts", "metricsScopes"))
 
@@ -2001,12 +1996,14 @@ def reconcile(dry_run: bool = False) -> dict:
         _write_snapshot({
             "resolvedAt": datetime.now(timezone.utc).strftime(SNAPSHOT_TIME_FORMAT),
             "declared": declared,
-            # Whether the CR carried a spec.scope block at all: a present block with
-            # empty lists is the host-only boundary (the operator's own definition of
-            # an empty present block), which a reader of the snapshot cannot tell from
-            # an absent one by `declared` alone. The audits' fleet_scope tool keys on it.
+            # `boundary` is the reconcile's answer to whether a declaration is in
+            # force, and what the audits' fleet_scope tool keys on. `present` is
+            # whether the CR carried a spec.scope block this run: a present block
+            # with empty lists is the host-only boundary (the operator's own
+            # definition of an empty present block), which a reader cannot tell
+            # from an absent one by `declared` alone, and a carried tick (present
+            # false, boundary true) is one whose containers were not resolved.
             SCOPE_PRESENT_KEY: scope_present,
-            SCOPE_READABLE_KEY: scope_readable,
             SCOPE_BOUNDARY_KEY: scope_boundary,
             SCOPE_MAX_PROJECTS_KEY: cap,
             "resolver": RESOLVER_ASSET_INVENTORY if _container_ids(scope) else RESOLVER_EXPLICIT,

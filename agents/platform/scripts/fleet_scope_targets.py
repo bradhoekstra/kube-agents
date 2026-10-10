@@ -67,6 +67,10 @@ OUTCOME_OK = "ok"
 # would pin every run partial"), and the Compute and networking audits read it
 # like any other.
 OUTCOME_API_DISABLED = "api-disabled"
+# A folder or organisation whose search succeeded but whose members would
+# cross `maxProjects`: the members all have rows at `over-cap`, so the lookup
+# resolved and the gap is already in `unread` by name.
+OUTCOME_OVER_CAP = "over-cap"
 OUTCOME_UNKNOWN = "unknown"
 # A declared project the reconcile has not resolved yet (the render answered).
 OUTCOME_UNRESOLVED = "unresolved"
@@ -104,14 +108,6 @@ STATE_IN_SCOPE = "in-scope"
 # boundary. A snapshot from a reconcile that predates the key is read by its
 # lists alone.
 PRESENT_KEY = "present"
-# Whether the reconcile could read the operator's render this run, written beside
-# `present` (cluster_agent_reconcile.py). Together they tell the two shapes of
-# `present: false` apart: the render was readable and carried no block, which
-# is an operator who removed the scope and so no boundary; or the render could
-# not be read, and the reconcile carried the last declaration forward, which is
-# still that boundary, host-only or not. A snapshot without this key is read by
-# its lists.
-READABLE_KEY = "readable"
 # The explicit projects the reconcile dropped on an exclude entry, by id or by
 # number (cluster_agent_reconcile.py, SCOPE_EXCLUDED_KEY): skipped here, so
 # the by-number match is made in the one place that knows the numbers. The
@@ -263,17 +259,11 @@ def declared_scope_targets(agent_home: str | os.PathLike | None = None) -> Scope
         # already says so through the operator), so the render decides until
         # the next tick writes the resolved set.
         return _from_render(path)
-    if boundary is not True:
-        # A snapshot from before `boundary`: present, then readable, then the
-        # lists; empty lists with none of the flags ask the render.
-        present = parsed.get(PRESENT_KEY)
-        readable = parsed.get(READABLE_KEY)
-        if present is not True:
-            if isinstance(readable, bool):
-                if readable:
-                    return None
-            elif not any(isinstance(declared.get(key), list) and declared.get(key) for key in DECLARED_SCOPE_KEYS):
-                return _from_render(path)
+    if boundary is not True and not any(isinstance(declared.get(key), list) and declared.get(key) for key in DECLARED_SCOPE_KEYS):
+        # A snapshot from before `boundary` (a reconcile that shipped before
+        # the key) is read by its lists: a declaration that names something
+        # is a boundary, and empty lists ask the render.
+        return _from_render(path)
     projects: list[str] = []
     unread: list[tuple[str, str]] = []
     for row in parsed["projects"]:
@@ -310,9 +300,10 @@ def declared_scope_targets(agent_home: str | os.PathLike | None = None) -> Scope
     # next readable tick, whatever the explicit projects say. A readable tick
     # whose lookup of one failed is partial for the same reason: the members
     # it carried, if any, have rows under the lookup's outcome, and the ones it
-    # never had have none, so the lookup's own record decides.
+    # never had have none, so the lookup's own record decides. An over-cap
+    # lookup resolved: every member has a row, already named under `unread`.
     carried_containers = parsed.get(PRESENT_KEY) is not True and any(isinstance(declared.get(key), list) and declared.get(key) for key in CONTAINER_AND_SELECTOR_KEYS)
-    failed_lookup = any(isinstance(entry, dict) and entry.get("outcome") != OUTCOME_OK for entry in (parsed.get(CONTAINERS_KEY) or []))
+    failed_lookup = any(isinstance(entry, dict) and entry.get("outcome") not in (OUTCOME_OK, OUTCOME_OVER_CAP) for entry in (parsed.get(CONTAINERS_KEY) or []))
     if carried_containers or failed_lookup:
         unread.append((UNRESOLVED_SCOPE_ROW, OUTCOME_UNRESOLVED))
     resolved_at = parsed.get("resolvedAt")

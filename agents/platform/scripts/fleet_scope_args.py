@@ -59,7 +59,7 @@ SCOPE_DECLARED_FILE = "/run/kube-agents-sandbox/scope-declared"
 SCOPE_DECLARED_TRUE = "true"
 # A --project that is a project number the collector could not resolve to an id.
 PROJECT_NUMBER_UNRESOLVED_ERROR = (
-    "--project names project number {number}, which this collector could not resolve to a project id; on an "
+    "the project override names project number {number}, which this collector could not resolve to a project id; on an "
     "install with a declared scope pass the id the fleet_scope tool lists"
 )
 DECLARED_SCOPE_ARGS_MISSING_ERROR = (
@@ -68,8 +68,8 @@ DECLARED_SCOPE_ARGS_MISSING_ERROR = (
 )
 # A `--project` on an install with a declared scope must name a project inside it.
 DECLARED_SCOPE_OVERRIDE_OUTSIDE_ERROR = (
-    "--project names {project}, which the install's declared scope does not list ({projects}); nothing was swept. "
-    "Pass the fleet_scope tool's collector_args, or a --project it lists"
+    "the project override names {project}, which the install's declared scope does not list ({projects}); nothing was swept. "
+    "Pass the fleet_scope tool's collector_args, or override with a project it lists"
 )
 # The tail the project-level audits put on an unenumerated-projects row when the
 # scope was declared: the fleet's size is known there, which is the point.
@@ -87,11 +87,11 @@ UNRESOLVED_SCOPE_NOTE = (
 DECLARED_SCOPE_NOTE_PREFIX = "the install's declared scope"
 # A --project that is a declared project this install could not read.
 DECLARED_SCOPE_OVERRIDE_UNREAD_ERROR = (
-    "--project names {project}, which the install's declared scope lists but this install could not read "
+    "the project override names {project}, which the install's declared scope lists but this install could not read "
     "({outcome}); nothing was swept. The fleet_scope tool's --scope-unread already records it as a coverage gap"
 )
 # A --project with no value, as `--project \"$VAR\"` with the variable unset produces.
-EMPTY_PROJECT_OVERRIDE_ERROR = "--project was given with no value; pass a project id, or omit the flag to sweep the declared scope"
+EMPTY_PROJECT_OVERRIDE_ERROR = "the project override was given with no value; pass a project id, or omit the flag to sweep the declared scope"
 SCOPE_ARG_SEPARATORS = r"[,\s]+"
 SCOPE_UNREAD_OUTCOME_SEPARATOR = "="
 SCOPE_UNREAD_DEFAULT_OUTCOME = "unknown"
