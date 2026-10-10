@@ -32,6 +32,7 @@ snapshot and owns its shape: that module's import has side effects.
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import os
 from dataclasses import dataclass
@@ -72,6 +73,13 @@ OUTCOME_UNRESOLVED = "unresolved"
 # organisations or selectors the render declares. Not a project id on purpose.
 UNRESOLVED_SCOPE_ROW = "declared-scope"
 RENDER_NOTE = "no reconcile snapshot answers; the render declares a scope, so the sweep is the management project alone, partial, until the next reconcile writes the resolved set"
+RENDER_NUMERIC_HOST_NOTE = "no reconcile snapshot answers; the render declares a scope, and the management project is known here by number only, so nothing is swept until the next reconcile writes the resolved set by id"
+# The lists under `declared` whose members get rows only on a readable tick:
+# on a carried tick the reconcile resolves no container or selector, so a
+# non-empty one is an unresolved part of the scope the sweep has to carry.
+CONTAINER_AND_SELECTOR_KEYS = ("folders", "organizations", "sharedVpcHosts", "metricsScopes")
+# The row the reconcile writes for the install's own project.
+VIA_MANAGEMENT = "management"
 
 
 class ScopeRenderUnreadable(Exception):
@@ -188,11 +196,13 @@ def _from_render(path: Path) -> ScopeTargets | None:
     if render is None or render.get(RENDER_PRESENT_KEY) is not True:
         return None
     host = next((os.environ.get(name) for name in MANAGEMENT_PROJECT_ENVS if os.environ.get(name)), None)
+    note = RENDER_NOTE
     if host and host.isdigit():
         # The operator lets spec.harness.projectId be a project number; every
         # snapshot row and every --project check uses the id, so a number is
         # not handed on. Nothing is swept, and the row below keeps it partial.
         host = None
+        note = RENDER_NUMERIC_HOST_NOTE
     declared = [str(p) for p in render.get("projects") or [] if isinstance(p, str) and p != host]
     # The fixed row first, so a render that names folders, organisations or
     # selectors alone is partial too; the explicit projects follow by name.
@@ -201,14 +211,15 @@ def _from_render(path: Path) -> ScopeTargets | None:
         unread=((UNRESOLVED_SCOPE_ROW, OUTCOME_UNRESOLVED), *((p, OUTCOME_UNRESOLVED) for p in declared)),
         resolved_at=None,
         path=os.environ.get(SCOPE_FILE_ENV) or str(path),
-        note=RENDER_NOTE,
+        note=note,
     )
 
 
 def declared_scope_targets(agent_home: str | os.PathLike | None = None) -> ScopeTargets | None:
     """The declared scope's resolved projects, or None when the install declared
-    no scope, no snapshot exists, or the file is not a snapshot -- the cases in
-    which the caller enumerates as it did before this module existed."""
+    no scope, in which case the caller enumerates as it did before this module
+    existed. With no snapshot, or a file that is not one, the operator's render
+    answers (see `_from_render`); a named render that cannot be read raises."""
     path = snapshot_path(agent_home)
     try:
         parsed = json.loads(path.read_text(encoding="utf-8"))
@@ -248,7 +259,10 @@ def declared_scope_targets(agent_home: str | os.PathLike | None = None) -> Scope
         if row.get("state", STATE_IN_SCOPE) != STATE_IN_SCOPE:
             continue
         project = str(row["id"])
-        if row.get("outcome") in (OUTCOME_OK, OUTCOME_API_DISABLED):
+        # The install's own project is always swept: the collectors read it
+        # themselves and record what they could not, so one failed listing at
+        # the reconcile tick must not stop every audit for an hour.
+        if row.get("outcome") in (OUTCOME_OK, OUTCOME_API_DISABLED) or VIA_MANAGEMENT in (row.get("via") or []):
             projects.append(project)
         else:
             unread.append((project, str(row.get("outcome") or OUTCOME_UNKNOWN)))
@@ -256,11 +270,22 @@ def declared_scope_targets(agent_home: str | os.PathLike | None = None) -> Scope
     # the management project and the projects that hold a profile, so a
     # declared project with no cluster (the GCE and networking streams'
     # ordinary target) would otherwise vanish from a complete-looking sweep.
+    # An explicit project an exclude pattern matches gets no row on any tick
+    # and is not unread: the operator left it out on purpose.
+    exclude_patterns = [p for p in ((declared.get("exclude") or {}).get("projects") or []) if isinstance(p, str)]
     seen = set(projects) | {project for project, _ in unread}
     for project in declared.get("projects") or []:
-        if isinstance(project, str) and project and project not in seen:
-            unread.append((project, OUTCOME_UNRESOLVED))
-            seen.add(project)
+        if not isinstance(project, str) or not project or project in seen:
+            continue
+        if any(fnmatch.fnmatchcase(project, pattern) for pattern in exclude_patterns):
+            continue
+        unread.append((project, OUTCOME_UNRESOLVED))
+        seen.add(project)
+    # A carried tick resolves no folder, organisation or selector, so their
+    # members have no rows; a declaration that names one is partial until the
+    # next readable tick, whatever the explicit projects say.
+    if parsed.get(PRESENT_KEY) is not True and any(isinstance(declared.get(key), list) and declared.get(key) for key in CONTAINER_AND_SELECTOR_KEYS):
+        unread.append((UNRESOLVED_SCOPE_ROW, OUTCOME_UNRESOLVED))
     resolved_at = parsed.get("resolvedAt")
     return ScopeTargets(
         projects=tuple(projects),

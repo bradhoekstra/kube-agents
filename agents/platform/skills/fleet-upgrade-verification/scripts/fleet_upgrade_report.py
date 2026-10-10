@@ -373,7 +373,9 @@ def get_target_projects(cli_projects: list[str] | None = None, listing_errors: l
         resolved: set[str] = set()
         for raw in (p.strip() for p in cli_projects if p.strip()):
             project = _normalise_project_id(raw, listing_errors)
-            if project is None and raw.isdigit():
+            if project is None and raw.isdigit() and declared_scope.declared:
+                # Under a declared scope only: without one the raw number
+                # proceeds, as it always did, with the failure recorded.
                 if listing_errors is not None:
                     listing_errors.append(fleet_scope_args.PROJECT_NUMBER_UNRESOLVED_ERROR.format(number=raw))
                 return []

@@ -152,6 +152,39 @@ class DeclaredScopeTargetsTest(unittest.TestCase):
             targets = fst.declared_scope_targets(self.home)
             self.assertEqual(targets.projects, ())
             self.assertEqual(targets.collector_args(), "--scope-unread declared-scope=unresolved")
+            self.assertIn("known here by number only", targets.note, "the note must not say the host is swept when nothing is")
+
+    def test_the_management_project_is_swept_whatever_the_reconciles_listing_said(self):
+        # One failed `clusters list` at the tick must not stop every audit for
+        # an hour: the collectors read the host themselves and record failures.
+        self._write(_snapshot([{"id": "ops-mgmt", "via": ["management"], "outcome": "unreachable", "state": "in-scope"}], declared=dict(DECLARED, projects=[]), present=True))
+        targets = fst.declared_scope_targets(self.home)
+        self.assertEqual((targets.projects, targets.unread), (("ops-mgmt",), ()))
+
+    def test_an_excluded_explicit_project_is_not_unread(self):
+        # The reconcile writes no row for an explicit project an exclude
+        # pattern matches; the operator left it out, so it is not a coverage gap.
+        declared = dict(DECLARED, projects=["payments-prod", "team-sandbox", "legacy"], exclude={"projects": ["*-sandbox", "legacy"], "clusters": []})
+        self._write(_snapshot([{"id": "ops-mgmt", "via": ["management"], "outcome": "ok", "state": "in-scope"},
+                               {"id": "payments-prod", "outcome": "ok", "state": "in-scope"}], declared=declared, present=True))
+        targets = fst.declared_scope_targets(self.home)
+        self.assertEqual((targets.projects, targets.unread), (("ops-mgmt", "payments-prod"), ()))
+
+    def test_a_carried_tick_on_a_folder_scoped_install_is_partial(self):
+        # A carried tick resolves no folder, organisation or selector; a
+        # declaration that names one cannot publish a complete sweep from it.
+        declared = dict(DECLARED, projects=[], folders=["123456789012"])
+        snap = _snapshot([{"id": "ops-mgmt", "via": ["management"], "outcome": "ok", "state": "in-scope"}], declared=declared, present=False, readable=False)
+        snap["boundary"] = True
+        self._write(snap)
+        targets = fst.declared_scope_targets(self.home)
+        self.assertEqual(targets.projects, ("ops-mgmt",))
+        self.assertEqual(targets.unread, (("declared-scope", "unresolved"),))
+        # On a readable tick the folder's members have rows, and nothing rides.
+        snap = _snapshot([{"id": "ops-mgmt", "via": ["management"], "outcome": "ok", "state": "in-scope"},
+                          {"id": "member-a", "via": ["folders/123456789012"], "outcome": "ok", "state": "in-scope"}], declared=declared, present=True)
+        self._write(snap)
+        self.assertEqual(fst.declared_scope_targets(self.home).unread, ())
 
     def test_a_declared_scope_yields_the_ok_projects_in_snapshot_order(self):
         self._write(_snapshot([

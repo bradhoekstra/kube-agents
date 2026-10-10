@@ -287,7 +287,9 @@ def get_target_projects(cli_project: str | None = None, listing_errors: list[str
                 listing_errors.append(declared_scope.empty_error())
             return []
         resolved = _normalise_project_id(raw, listing_errors)
-        if resolved is None and raw.isdigit():
+        if resolved is None and raw.isdigit() and declared_scope.declared:
+            # Under a declared scope only: without one the raw number proceeds,
+            # as it always did, with the describe failure already recorded.
             if listing_errors is not None:
                 listing_errors.append(fleet_scope_args.PROJECT_NUMBER_UNRESOLVED_ERROR.format(number=raw))
             return []
@@ -958,7 +960,7 @@ def main():
 
     # Under a declared scope the fleet's size is known exactly; the row says so
     # rather than calling it unknown.
-    unenumerated_tail = fleet_scope_args.DECLARED_SCOPE_TAIL if declared_scope.sweep_is_declared(args.project_id) else UNENUMERATED_TAIL
+    unenumerated_tail = fleet_scope_args.DECLARED_SCOPE_TAIL if declared_scope.sweep_is_declared((args.project_id or "").strip()) else UNENUMERATED_TAIL
     for error in listing_errors:
         sys.stderr.write(f"{error}; auditing {target_projects or 'no project'}\n")
         skipped_targets.append({

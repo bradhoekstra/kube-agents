@@ -678,8 +678,10 @@ def get_target_projects(
                 notes.append(declared_scope.empty_error())
             return []
         resolved = _normalise_project_id(raw, notes, run=run)
-        if resolved is None and raw.isdigit():
-            # The describe failed: the recorded reason, not "outside the scope".
+        if resolved is None and raw.isdigit() and declared_scope.declared:
+            # Under a declared scope an unresolved number cannot be compared
+            # with the ids the tool lists; without one the raw number proceeds,
+            # as it always did, with the describe failure already recorded.
             if notes is not None:
                 notes.append(fleet_scope_args.PROJECT_NUMBER_UNRESOLVED_ERROR.format(number=raw))
             return []
@@ -1558,7 +1560,7 @@ def collect_fleet(
     api_off = [project for project, entry in zip(projects, entries) if entry is None]
     entries = [entry for entry in entries if entry is not None]
     if notes:
-        entries.append(unenumerated_entry(notes, declared_scope.sweep_is_declared(project)))
+        entries.append(unenumerated_entry(notes, declared_scope.sweep_is_declared((project or "").strip())))
 
     manifest = {
         "version": MANIFEST_VERSION,

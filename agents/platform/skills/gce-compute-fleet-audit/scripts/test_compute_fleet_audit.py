@@ -18,11 +18,15 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(__file__))
 import compute_fleet_audit as cf  # noqa: E402
 
-# Every resolver reads KUBEAGENTS_SCOPE_DECLARED when a run passes neither scope
-# flag, and a shell that exports it (the sandbox session, a developer reproducing
-# the guard) would turn this suite's listing tests into refusals. The suite is
-# about the collector, not the shell it runs in.
+# Every resolver asks the operator's answer when a run passes neither scope flag:
+# the root-owned file the sandbox writes, else KUBEAGENTS_SCOPE_DECLARED. A shell
+# that carries either (the sandbox session, a developer reproducing the guard)
+# would turn this suite's listing tests into refusals. The suite is about the
+# collector, not the host it runs on, so both are neutralised at import.
 os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)  # module-level, on purpose
+import fleet_scope_args as _fleet_scope_args  # noqa: E402
+
+_fleet_scope_args.SCOPE_DECLARED_FILE = "/nonexistent/kube-agents-sandbox/scope-declared"
 
 FLEET_AUDIT_SCRIPTS = os.path.join(os.path.dirname(__file__), "..", "..", "fleet-audit", "scripts")
 sys.path.insert(0, os.path.abspath(FLEET_AUDIT_SCRIPTS))
@@ -2278,8 +2282,8 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
     ENV = {cf.MONITORED_PROJECTS_ENV: "", "GCP_PROJECT_ID": "ops-mgmt", "GKE_PROJECT_ID": "", "PROJECT_ID": ""}
 
     def setUp(self):
-        # The holder reads KUBEAGENTS_SCOPE_DECLARED when neither flag is passed;
-        # a shell that exports it must not decide these tests.
+        # The variable half of the operator's answer, per test as well as at
+        # import; the file half is pointed at a path that does not exist above.
         env = mock.patch.dict(os.environ, {}, clear=False)
         env.start()
         self.addCleanup(env.stop)
@@ -2356,6 +2360,16 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
         self.assertNotIn("MONITORED_PROJECT_IDS", manifest["error"])
         self.assertEqual([e["name"] for e in manifest["clusters"]], [cf.UNENUMERATED_PROJECTS_TARGET])
         self.assertIn(cf.UNENUMERATED_TAIL, manifest["clusters"][0]["error"], "a run that was not the declared sweep does not claim the fleet is fully accounted for")
+
+    def test_without_a_declared_scope_an_unresolved_project_number_proceeds_as_before(self):
+        # The refusal of an unresolved number belongs to the declared-scope
+        # case alone; a checkout or an install with no scope keeps main's
+        # behaviour, the raw number with the describe failure recorded.
+        notes: list[str] = []
+        cf.declared_scope.set(None, None)
+        with mock.patch.dict(os.environ, self.ENV):
+            self.assertEqual(cf.get_target_projects("123456789012", notes, run=lambda *a, **k: run_of(1, "", "denied")), ["123456789012"])
+        self.assertFalse(any("could not resolve" in n for n in notes), notes)
 
     def test_main_hands_the_flags_to_the_resolver(self):
         # The wiring the SOP relies on: the two flags main parses reach the

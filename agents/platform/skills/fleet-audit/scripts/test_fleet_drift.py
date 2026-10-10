@@ -18,11 +18,15 @@ from datetime import datetime, timezone
 sys.path.insert(0, os.path.dirname(__file__))
 import fleet_drift as fd  # noqa: E402
 
-# Every resolver reads KUBEAGENTS_SCOPE_DECLARED when a run passes neither scope
-# flag, and a shell that exports it (the sandbox session, a developer reproducing
-# the guard) would turn this suite's listing tests into refusals. The suite is
-# about the collector, not the shell it runs in.
+# Every resolver asks the operator's answer when a run passes neither scope flag:
+# the root-owned file the sandbox writes, else KUBEAGENTS_SCOPE_DECLARED. A shell
+# that carries either (the sandbox session, a developer reproducing the guard)
+# would turn this suite's listing tests into refusals. The suite is about the
+# collector, not the host it runs on, so both are neutralised at import.
 os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)  # module-level, on purpose
+import fleet_scope_args as _fleet_scope_args  # noqa: E402
+
+_fleet_scope_args.SCOPE_DECLARED_FILE = "/nonexistent/kube-agents-sandbox/scope-declared"
 
 NOW = datetime(2026, 8, 1, tzinfo=timezone.utc)
 
@@ -2642,8 +2646,8 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
     listing runs as before."""
 
     def setUp(self):
-        # The holder reads KUBEAGENTS_SCOPE_DECLARED when neither flag is passed;
-        # a shell that exports it must not decide these tests.
+        # The variable half of the operator's answer, per test as well as at
+        # import; the file half is pointed at a path that does not exist above.
         env = mock.patch.dict(os.environ, {}, clear=False)
         env.start()
         self.addCleanup(env.stop)
