@@ -11,9 +11,10 @@ discovery (docs/designs/multi-project-scope.md) did not bound the audits.
 This module hands an audit the resolved set instead: the reconcile's snapshot,
 `fleet_scope.json`, rewritten at the data volume's root on every run, lists each
 project the scope resolved to with the outcome the reconcile read it with. An
-audit sweeps the projects read `ok` or `api-disabled`, names the ones the scope declares but the
-reconcile could not read, so the run accounts for them rather than reading as
-a full sweep, and lists nothing. An install that declares no scope has drawn
+audit sweeps the projects read `ok` or `api-disabled` and the management
+project whatever its row read (the collectors read it themselves), names the
+ones the scope declares but the reconcile could not read, so the run accounts
+for them rather than reading as a full sweep, and lists nothing. An install that declares no scope has drawn
 no boundary; the answer is None there, and the audit keeps the listing it had.
 With no snapshot yet, or one that does not parse, the operator's render answers
 instead: a present block is the management project alone, partial, until the
@@ -116,21 +117,30 @@ READABLE_KEY = "readable"
 # the by-number match is made in the one place that knows the numbers. The
 # glob match below is for a snapshot from before the key.
 EXCLUDED_KEY = "excludedProjects"
+# The reconcile's record of every folder, organisation and selector lookup this
+# run, with its outcome: a lookup that failed carried the last members it had,
+# which on a first tick or a just-added container is none, so no row stands for
+# the members and the sweep must say so itself.
+CONTAINERS_KEY = "containers"
 # The reconcile's own answer to the question this module asks (cluster_agent_reconcile.py,
 # SCOPE_BOUNDARY_KEY): a declaration is in force this run, read or carried from a run
 # that read one. Keyed on first; the two keys above and the lists are for a snapshot
 # written before it.
 BOUNDARY_KEY = "boundary"
 # The operator's render of spec.scope, the file the reconcile reads (the same
-# KUBEAGENTS_SCOPE_FILE the agent pod's env names). Read here only when there is
-# no usable snapshot: a fresh install before its first reconcile tick, or one
-# whose last snapshot predates every flag above and declared nothing. It says
-# whether a block is present; the resolved set is the reconcile's to write.
+# KUBEAGENTS_SCOPE_FILE the agent pod's env names). Read here when no snapshot
+# answers that a boundary is in force: a fresh install before its first
+# reconcile tick, a snapshot that does not parse, one from before every flag
+# above that declared nothing, or one that says `boundary: false`, since the
+# render may have gained a block since that tick. It says whether a block is
+# present; the resolved set is the reconcile's to write.
 SCOPE_FILE_ENV = "KUBEAGENTS_SCOPE_FILE"
 RENDER_PRESENT_KEY = "present"
 # Where the management project's id is read when the render alone answers: the
-# sweep is then that project, until the next tick writes the resolved set.
-MANAGEMENT_PROJECT_ENVS = ("GCP_PROJECT_ID", "GKE_PROJECT_ID")
+# sweep is then that project, until the next tick writes the resolved set. One
+# name: it is what the platform_control env block forwards to the only
+# production reader, the fleet_scope tool (agents/platform/config.yaml).
+MANAGEMENT_PROJECT_ENVS = ("GCP_PROJECT_ID",)
 
 # The keys under `declared` whose presence means the install drew a boundary,
 # for a snapshot without the present flag.
@@ -297,8 +307,13 @@ def declared_scope_targets(agent_home: str | os.PathLike | None = None) -> Scope
         seen.add(project)
     # A carried tick resolves no folder, organisation or selector, so their
     # members have no rows; a declaration that names one is partial until the
-    # next readable tick, whatever the explicit projects say.
-    if parsed.get(PRESENT_KEY) is not True and any(isinstance(declared.get(key), list) and declared.get(key) for key in CONTAINER_AND_SELECTOR_KEYS):
+    # next readable tick, whatever the explicit projects say. A readable tick
+    # whose lookup of one failed is partial for the same reason: the members
+    # it carried, if any, have rows under the lookup's outcome, and the ones it
+    # never had have none, so the lookup's own record decides.
+    carried_containers = parsed.get(PRESENT_KEY) is not True and any(isinstance(declared.get(key), list) and declared.get(key) for key in CONTAINER_AND_SELECTOR_KEYS)
+    failed_lookup = any(isinstance(entry, dict) and entry.get("outcome") != OUTCOME_OK for entry in (parsed.get(CONTAINERS_KEY) or []))
+    if carried_containers or failed_lookup:
         unread.append((UNRESOLVED_SCOPE_ROW, OUTCOME_UNRESOLVED))
     resolved_at = parsed.get("resolvedAt")
     return ScopeTargets(

@@ -978,6 +978,12 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
         with mock.patch.dict(os.environ, self.ENV):
             self.assertEqual(report.get_target_projects([""], errors), [])
         self.assertTrue(any("no value" in e for e in errors), errors)
+        # Without a declared scope the usage line main prints is the answer;
+        # this remedy would name a scope the install does not have.
+        report.declared_scope.set(None, None)
+        errors = []
+        self.assertEqual(report.get_target_projects([""], errors), [])
+        self.assertEqual(errors, [])
 
     def test_main_hands_the_flags_to_the_resolver(self):
         # The wiring the SOP relies on: the two flags main parses reach the

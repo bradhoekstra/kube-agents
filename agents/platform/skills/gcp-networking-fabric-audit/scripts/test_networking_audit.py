@@ -1183,6 +1183,14 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
         self.assertEqual(len(errors), 1)
         self.assertIn("no project this install could read", errors[0])
 
+    def test_an_unresolved_declaration_is_not_the_declared_sweep(self):
+        # main picks the unenumerated row's tail from sweep_is_declared; under
+        # the fixed unresolved row the fleet's size is unknown, so the tail
+        # must stay the unknown one.
+        networking_audit.declared_scope.set("ops-mgmt", f"{networking_audit.fleet_scope_args.UNRESOLVED_SCOPE_ROW}=unresolved")
+        self.assertFalse(networking_audit.declared_scope.sweep_is_declared(""))
+        self.assertEqual(networking_audit.fleet_scope_args.DECLARED_SCOPE_TAIL if networking_audit.declared_scope.sweep_is_declared("") else networking_audit.UNENUMERATED_TAIL, networking_audit.UNENUMERATED_TAIL)
+
     def test_the_flags_are_parsed_from_the_command_line(self):
         proc = subprocess.run([sys.executable, networking_audit.__file__, "--help"], capture_output=True, text=True, timeout=120)
         self.assertEqual(proc.returncode, 0, proc.stderr)

@@ -69,7 +69,7 @@ class DeclaredScopeTargetsTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {fst.SCOPE_FILE_ENV: str(render), "GCP_PROJECT_ID": "ops-mgmt"}):
             targets = fst.declared_scope_targets(self.home)
             self.assertEqual(targets.unread, (("declared-scope", "unresolved"),))
-            self.assertIsNotNone(targets.unread)
+            self.assertIn("until the next reconcile", targets.note)
         # A named render that cannot be read is a fault, not "no scope".
         render.write_text("<not json>", encoding="utf-8")
         with mock.patch.dict(os.environ, {fst.SCOPE_FILE_ENV: str(render), "GCP_PROJECT_ID": "ops-mgmt"}):
@@ -78,7 +78,6 @@ class DeclaredScopeTargetsTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {fst.SCOPE_FILE_ENV: str(self.home / "absent.json"), "GCP_PROJECT_ID": "ops-mgmt"}):
             with self.assertRaises(fst.ScopeRenderUnreadable):
                 fst.declared_scope_targets(self.home)
-            self.assertIn("until the next reconcile", targets.note)
         # A snapshot that says boundary: false (a readable render with no block
         # last tick) yields to a render that has gained a block since.
         empty = {key: [] for key in fst.DECLARED_SCOPE_KEYS} | {"exclude": {"projects": []}}
@@ -223,6 +222,30 @@ class DeclaredScopeTargetsTest(unittest.TestCase):
         declared = {key: [] for key in fst.DECLARED_SCOPE_KEYS} | {"folders": ["123456789012"]}
         self._write(_snapshot([{"id": "ops-mgmt", "via": ["management"], "outcome": "ok", "state": "in-scope"}], declared=declared))
         self.assertEqual(fst.declared_scope_targets(self.home).projects, ("ops-mgmt",))
+
+    def test_a_failed_lookup_with_no_carried_members_is_partial_on_a_readable_tick(self):
+        # The first tick after a folder is declared, with its search refused:
+        # the reconcile carries no members (it never had any), records the
+        # lookup under its outcome, and the sweep must not publish complete
+        # over a fleet nobody looked at.
+        declared = {key: [] for key in fst.DECLARED_SCOPE_KEYS} | {"folders": ["123456789012"]}
+        host = {"id": "ops-mgmt", "via": ["management"], "outcome": "ok", "state": "in-scope"}
+        snap = _snapshot([host], declared=declared, present=True)
+        snap["containers"] = [{"id": "folders/123456789012", "outcome": "denied", "projects": 0}]
+        self._write(snap)
+        targets = fst.declared_scope_targets(self.home)
+        self.assertEqual((targets.projects, targets.unread), (("ops-mgmt",), (("declared-scope", "unresolved"),)))
+        self.assertEqual(targets.collector_args(), "--scope-projects ops-mgmt --scope-unread declared-scope=unresolved")
+        # A lookup that succeeded and found nothing is a resolved, empty folder.
+        snap["containers"] = [{"id": "folders/123456789012", "outcome": "ok", "projects": 0}]
+        self._write(snap)
+        self.assertEqual(fst.declared_scope_targets(self.home).unread, ())
+        # A failed lookup that carried members: they ride under its outcome,
+        # and the fixed row says the rest of the folder is unknown too.
+        snap["containers"] = [{"id": "folders/123456789012", "outcome": "unreachable", "projects": 1}]
+        snap["projects"] = [host, {"id": "payments-prod", "via": ["folders/123456789012"], "outcome": "unreachable", "state": "in-scope", "frozen": True}]
+        self._write(snap)
+        self.assertEqual(fst.declared_scope_targets(self.home).unread, (("payments-prod", "unreachable"), ("declared-scope", "unresolved")))
 
     def test_collector_args_without_an_unread_project_carries_the_sweep_alone(self):
         self._write(_snapshot([{"id": "ops-mgmt", "outcome": "ok", "state": "in-scope"}], declared=dict(DECLARED, projects=[]), present=True))

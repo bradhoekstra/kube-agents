@@ -372,8 +372,11 @@ def get_target_projects(cli_projects: list[str] | None = None, listing_errors: l
             return []
         resolved: set[str] = set()
         if not any(p.strip() for p in cli_projects):
-            # `--project "$VAR"` with the variable unset: say so, on every install.
-            if listing_errors is not None:
+            # `--project "$VAR"` with the variable unset. Under a declared scope
+            # say so, with the remedy; without one the "no project" usage line
+            # main prints is the right answer, and this remedy would name a
+            # scope the install does not have.
+            if listing_errors is not None and declared_scope.declared:
                 listing_errors.append(fleet_scope_args.EMPTY_PROJECT_OVERRIDE_ERROR)
             return []
         for raw in (p.strip() for p in cli_projects if p.strip()):

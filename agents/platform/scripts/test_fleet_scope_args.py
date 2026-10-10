@@ -16,9 +16,11 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 import fleet_scope_args as fsa  # noqa: E402
 
-# The holder reads KUBEAGENTS_SCOPE_DECLARED when neither flag is passed; the
-# shell running this suite must not decide its answers.
+# The holder reads the sandbox's root-owned scope file first, then
+# KUBEAGENTS_SCOPE_DECLARED, when neither flag is passed; the host running this
+# suite must not decide its answers through either.
 os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)  # module-level, on purpose
+fsa.SCOPE_DECLARED_FILE = "/nonexistent/kube-agents-sandbox/scope-declared"
 
 
 class FleetScopeArgsTest(unittest.TestCase):
@@ -90,6 +92,13 @@ class FleetScopeArgsTest(unittest.TestCase):
             self.assertFalse(scope.sweep_is_declared(), "declared by the env alone is not the declared sweep")
         scope.set(None, None)
         self.assertFalse(scope.sweep_is_declared())
+        # The unresolved-scope row: the members are what is unknown, so the
+        # sweep is not the declared scope and the row's tail must not say it is.
+        scope.set("ops-mgmt", f"{fsa.UNRESOLVED_SCOPE_ROW}=unresolved")
+        self.assertTrue(scope.declared)
+        self.assertFalse(scope.sweep_is_declared(), "an unresolved declaration is not the declared sweep")
+        scope.set("ops-mgmt", "payments-prod=denied")
+        self.assertTrue(scope.sweep_is_declared(), "an unread project is a known gap, not an unknown size")
 
     def test_the_root_owned_file_outranks_the_environment(self):
         # A session can unset or override the variable in one word; the file the

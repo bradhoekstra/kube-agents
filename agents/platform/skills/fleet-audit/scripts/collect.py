@@ -32,8 +32,10 @@ the first one happened to need.
 What this file does for the checks it covers:
 
   1. Discovers the install's scope: the projects the agent passes from the platform_control
-     `fleet_scope` tool (`--scope-projects`), or, without them, every project the caller can see (`gcloud projects list`,
-     or the one `--project` names) and enumerates each one's clusters
+     `fleet_scope` tool (`--scope-projects`); without them, on an install that declares no
+     scope, every project the caller can see (`gcloud projects list`) or the one `--project`
+     names, and on a sandbox whose operator says a scope is declared, nothing: the run
+     refuses and names the tool. Then enumerates each project's clusters
      (`gcloud container clusters list`), naming every cluster
      `<project>/<location>/<name>` because a bare name is unique only inside
      one project and location.

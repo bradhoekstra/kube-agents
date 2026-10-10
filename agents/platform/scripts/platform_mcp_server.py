@@ -442,7 +442,8 @@ def fleet_scope() -> str:
        "source": "<the snapshot's path>"}
     `projects` is the sweep: every project the scope resolved to that this
     install could read (its Kubernetes Engine API off included; the collectors
-    count such a project empty). `unread` names each declared project the
+    count such a project empty), plus the management project whatever the
+    tick read of it, since the collectors read it themselves. `unread` names each declared project the
     install could not read (denied, unreachable, over-cap), or has not
     resolved yet (`unresolved`); the collectors record them as a coverage gap.
     One entry, `declared-scope=unresolved`, is not a project: it rides when
@@ -451,9 +452,10 @@ def fleet_scope() -> str:
     selector is declared), and the collectors render it as its own sentence. `collector_args` is the string to append to
     a collector command verbatim (`--scope-projects ... --scope-unread ...`);
     when nothing is readable it carries `--scope-unread` alone, and the
-    collector then reports that and sweeps nothing. Before the reconcile's
-    first tick the answer comes from the operator's render: the management
-    project alone, with a `note` saying so. `{"declared": false, "note":
+    collector then reports that and sweeps nothing. When no snapshot answers
+    that a boundary is in force (before the reconcile's first tick, or when
+    the last tick wrote `boundary: false`) the answer comes from the
+    operator's render: the management project alone, with a `note` saying so. `{"declared": false, "note":
     "..."}` means the install declares no scope: the collectors then enumerate
     every project the identity can list, as before scopes existed. A spec.scope block that
     is present with empty lists is a declared scope of the management project

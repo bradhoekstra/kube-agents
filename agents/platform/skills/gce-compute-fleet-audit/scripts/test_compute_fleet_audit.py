@@ -2390,6 +2390,19 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
         self.assertIn("no project this install could read", notes[0])
         self.assertIn(cf.fleet_scope_args.DECLARED_SCOPE_TAIL, cf.unenumerated_entry(notes, True)["error"])
 
+    def test_an_unresolved_declaration_keeps_the_unknown_size_tail(self):
+        # A render answer or a carried container tick hands the fixed
+        # unresolved row; the members are what is unknown, so the row the
+        # collector writes (collect_fleet keys it on sweep_is_declared) must
+        # not say the scope names no other project.
+        cf.declared_scope.set("ops-mgmt", f"{cf.fleet_scope_args.UNRESOLVED_SCOPE_ROW}=unresolved")
+        notes = [cf.declared_scope.note()]
+        self.assertIn("not resolved yet", notes[0])
+        self.assertFalse(cf.declared_scope.sweep_is_declared(""))
+        row = cf.unenumerated_entry(notes, cf.declared_scope.sweep_is_declared(""))
+        self.assertTrue(row["error"].endswith(cf.UNENUMERATED_TAIL), row["error"])
+        self.assertNotIn(cf.fleet_scope_args.DECLARED_SCOPE_TAIL, row["error"])
+
     def test_the_flags_are_parsed_from_the_command_line(self):
         proc = subprocess.run([sys.executable, cf.__file__, "--help"], capture_output=True, text=True, timeout=120)
         self.assertEqual(proc.returncode, 0, proc.stderr)

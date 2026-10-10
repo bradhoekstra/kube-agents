@@ -1490,8 +1490,11 @@ class FleetScopeToolTest(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
 
     def _call(self, snapshot):
+        # None is "no snapshot": remove what an earlier call in the test wrote.
         if snapshot is not None:
             (Path(self.tmp.name) / "fleet_scope.json").write_text(json.dumps(snapshot), encoding="utf-8")
+        else:
+            (Path(self.tmp.name) / "fleet_scope.json").unlink(missing_ok=True)
         # The worker's HERMES_HOME is the profile home; the snapshot is at the root.
         with patch.dict(os.environ, {"PLATFORM_AGENT_HOME": self.tmp.name, "HERMES_HOME": str(Path(self.tmp.name) / "profiles" / "platform")}):
             # No render from the shell running the tests: the tool would answer from it.

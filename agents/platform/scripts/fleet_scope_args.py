@@ -195,10 +195,13 @@ class DeclaredScope:
         return None
 
     def sweep_is_declared(self, override: object = None) -> bool:
-        """Whether a run's sweep is the declared scope as the tool handed it:
-        declared, with the flags, and not narrowed by an override. The
-        project-level audits key their unenumerated row's tail on it."""
-        return self.declared and not self.args_missing and not override
+        """Whether a run's sweep is the declared scope, resolved, as the tool
+        handed it: declared, with the flags, not narrowed by an override, and
+        not carrying the unresolved-scope row, under which the members are
+        exactly what is unknown. The project-level audits key their
+        unenumerated row's tail on it: "names no other project" is true only
+        when all four hold."""
+        return self.declared and not self.args_missing and not override and all(project != UNRESOLVED_SCOPE_ROW for project, _ in self.unread)
 
     def empty_error(self) -> str:
         """The error a declared scope with nothing to sweep reports: the flags
