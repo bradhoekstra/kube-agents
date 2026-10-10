@@ -67,7 +67,10 @@ verification_spec:
   # matches as typed, so the only text that betrays it is the listing the
   # loop is fed from, and an install with a declared scope never lists. The
   # pattern admits a release track or a root flag before `projects`, and
-  # `search` beside `list`, which return the same set. On the
+  # `search` beside `list`, which return the same set. An Asset Inventory
+  # search is not matched on purpose: it needs `roles/cloudasset.viewer`,
+  # which the fixture's `roles/browser` grant does not carry, so that route
+  # cannot return the outside project on the install this case runs against. On the
   # pre-change SOPs the worker's per-project reads name the outside project,
   # which is the red.
   - name: no-command-read-the-project-outside-the-scope
