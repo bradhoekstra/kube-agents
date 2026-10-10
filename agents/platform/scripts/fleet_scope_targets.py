@@ -14,9 +14,10 @@ project the scope resolved to with the outcome the reconcile read it with. An
 audit sweeps the projects read `ok` or `api-disabled`, names the ones the scope declares but the
 reconcile could not read, so the run accounts for them rather than reading as
 a full sweep, and lists nothing. An install that declares no scope has drawn
-no boundary; the answer is None there, and the audit keeps the listing it had,
-which is also what it falls back to when no snapshot exists yet or the file
-does not parse (the first hour after an install, a volume that was reset).
+no boundary; the answer is None there, and the audit keeps the listing it had.
+With no snapshot yet, or one that does not parse, the operator's render answers
+instead: a present block is the management project alone, partial, until the
+reconcile writes the resolved set.
 
 Read in the agent pod, where the snapshot is, by the platform_control MCP
 server's `fleet_scope` tool (platform_mcp_server.py), which hands the agent
@@ -178,10 +179,11 @@ def _read_render() -> dict | None:
 
 def _from_render(path: Path) -> ScopeTargets | None:
     """The answer when no snapshot answers: the render's boundary, the host
-    swept and every project the render declares carried as unread, so the run
-    reads as partial rather than as a complete sweep of the host, until the
-    reconcile writes the resolved set; None when the render declares nothing
-    or cannot be read."""
+    swept and a fixed unresolved row plus every project the render declares
+    carried as unread, so the run reads as partial rather than as a complete
+    sweep of the host, until the reconcile writes the resolved set. None when
+    no render is named or it declares nothing; a named render that cannot be
+    read raises ScopeRenderUnreadable."""
     render = _read_render()
     if render is None or render.get(RENDER_PRESENT_KEY) is not True:
         return None

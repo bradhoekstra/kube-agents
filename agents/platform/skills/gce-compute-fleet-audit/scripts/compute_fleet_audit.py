@@ -179,10 +179,12 @@ UNENUMERATED_PROJECTS_TARGET = PROJECT_TARGET_PREFIX + "UNENUMERATED_PROJECTS"
 # (deploy/docker/Dockerfile and deploy/sandbox/Dockerfile copy them to
 # /opt/defaults/scripts), then the checkout's own copy for a run from the
 # repository.
+# The checkout's copy only when there is a checkout: a file three or fewer
+# directories below `/` has no parents[3], as collect.py guards the same path.
 SHARED_SCRIPT_DIRS = (
     "/opt/defaults/scripts",
     "/opt/data/scripts",
-    str(Path(__file__).resolve().parents[3] / "scripts"),
+    *([str(Path(__file__).resolve().parents[3] / "scripts")] if len(Path(__file__).resolve().parents) > 3 else []),
 )
 
 # The install's declared scope, handed in by the agent from the platform_control

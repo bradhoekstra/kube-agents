@@ -1498,6 +1498,15 @@ class FleetScopeToolTest(unittest.TestCase):
             os.environ.pop("KUBEAGENTS_SCOPE_FILE", None)
             return json.loads(platform_mcp_server.fleet_scope())
 
+    def test_the_render_reaches_the_tool_through_the_env_block(self):
+        # Hermes hands this stdio child only the keys config.yaml's env block
+        # names; without this line the render fallback never runs in the agent
+        # pod and a fresh install's first audits list every visible project.
+        config = (Path(__file__).resolve().parent.parent / "config.yaml").read_text(encoding="utf-8")
+        self.assertRegex(config, r'(?m)^\s+KUBEAGENTS_SCOPE_FILE: "\$\{KUBEAGENTS_SCOPE_FILE\}"\s*$', "platform_control's env block must forward KUBEAGENTS_SCOPE_FILE for fleet_scope's render fallback")
+        for name in platform_mcp_server.fleet_scope_targets.MANAGEMENT_PROJECT_ENVS[:1]:
+            self.assertRegex(config, rf'(?m)^\s+{name}: "\$\{{{name}\}}"\s*$')
+
     def test_an_unreadable_render_is_an_error_answer_not_no_scope(self):
         # The SOPs' declared: false branch lists every visible project; an
         # install whose render the tool cannot read must not be sent there.

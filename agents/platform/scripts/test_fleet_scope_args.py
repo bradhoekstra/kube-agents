@@ -109,6 +109,14 @@ class FleetScopeArgsTest(unittest.TestCase):
                 scope.set(None, None)
                 self.assertFalse(scope.declared, "the file says no scope; a variable cannot invent one either")
 
+    def test_a_project_number_override_is_refused_with_the_remedy_not_as_outside(self):
+        scope = fsa.DeclaredScope()
+        scope.set("ops-mgmt", None)
+        self.assertIn("could not resolve", scope.override_error("123456789012"))
+        self.assertNotIn("does not list", scope.override_error("123456789012"))
+        scope.set(None, None)
+        self.assertIsNone(scope.override_error("123456789012"), "without a declared scope an override is free")
+
     def test_a_repeated_project_id_is_swept_once(self):
         self.assertEqual(fsa.parse_scope_projects("ops-mgmt,payments-prod,ops-mgmt"), ["ops-mgmt", "payments-prod"])
 

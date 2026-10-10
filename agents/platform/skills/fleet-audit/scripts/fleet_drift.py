@@ -89,10 +89,12 @@ UNENUMERATED_PROJECTS_TARGET = PROJECT_TARGET_PREFIX + "UNENUMERATED_PROJECTS"
 # (deploy/docker/Dockerfile and deploy/sandbox/Dockerfile copy them to
 # /opt/defaults/scripts), then the checkout's own copy for a run from the
 # repository.
+# The checkout's copy only when there is a checkout: a file three or fewer
+# directories below `/` has no parents[3], as collect.py guards the same path.
 SHARED_SCRIPT_DIRS = (
     "/opt/defaults/scripts",
     "/opt/data/scripts",
-    str(Path(__file__).resolve().parents[3] / "scripts"),
+    *([str(Path(__file__).resolve().parents[3] / "scripts")] if len(Path(__file__).resolve().parents) > 3 else []),
 )
 
 # The install's declared scope, handed in by the agent from the platform_control
@@ -400,9 +402,9 @@ def enumerate_project_clusters(project: str, *, run: RunFn) -> tuple[list[dict],
 
     One failure is not a loss: a project whose Kubernetes Engine API is off
     cannot hold a GKE cluster, so it answers with zero clusters and no error.
-    §1.1 puts every project in the scope -- the declared scope the agent passes, else
-    every project the credential can see -- in scope "whether or not
-    they hold a cluster", and that sentence only reads as intended if a project
+    §1.1 puts every project in scope -- the declared scope the agent passes,
+    else every project the credential can see -- "whether or not it holds a
+    cluster", and that sentence only reads as intended if a project
     that cannot hold one reads as empty rather than as unread -- otherwise a
     credential with organisation-wide visibility turns every non-GKE project
     into a permanent coverage gap. See `API_DISABLED_MARKERS`.

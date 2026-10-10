@@ -59,8 +59,8 @@ SCOPE_DECLARED_FILE = "/run/kube-agents-sandbox/scope-declared"
 SCOPE_DECLARED_TRUE = "true"
 # A --project that is a project number the collector could not resolve to an id.
 PROJECT_NUMBER_UNRESOLVED_ERROR = (
-    "--project names project number {number}, which could not be resolved to a project id (gcloud projects "
-    "describe failed); on an install with a declared scope pass the id the fleet_scope tool lists"
+    "--project names project number {number}, which this collector could not resolve to a project id; on an "
+    "install with a declared scope pass the id the fleet_scope tool lists"
 )
 DECLARED_SCOPE_ARGS_MISSING_ERROR = (
     "this install declares a scope but the collector got no collector_args: call the platform_control "
@@ -156,6 +156,10 @@ class DeclaredScope:
             return None
         if self.args_missing:
             return DECLARED_SCOPE_ARGS_MISSING_ERROR
+        if project.isdigit():
+            # The tool emits ids; a collector with no resolver cannot tell which
+            # id a number names, and must not guess it is outside the scope.
+            return PROJECT_NUMBER_UNRESOLVED_ERROR.format(number=project)
         if project not in (self.projects or []):
             return DECLARED_SCOPE_OVERRIDE_OUTSIDE_ERROR.format(project=project, projects=", ".join(self.projects or []) or "none readable")
         return None

@@ -138,10 +138,12 @@ NO_PROJECT_IN_SCOPE_ERROR = (
 # operator says a scope is declared (KUBEAGENTS_SCOPE_DECLARED, forwarded into
 # the session) a run without them refuses instead, and so does a --project
 # the scope does not list.
+# The checkout's copy only when there is a checkout: a file three or fewer
+# directories below `/` has no parents[3], as collect.py guards the same path.
 SHARED_SCRIPT_DIRS = (
     "/opt/defaults/scripts",
     "/opt/data/scripts",
-    str(Path(__file__).resolve().parents[3] / "scripts"),
+    *([str(Path(__file__).resolve().parents[3] / "scripts")] if len(Path(__file__).resolve().parents) > 3 else []),
 )
 
 for _shared_dir in SHARED_SCRIPT_DIRS:

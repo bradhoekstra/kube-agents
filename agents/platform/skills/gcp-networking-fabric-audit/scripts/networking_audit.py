@@ -42,10 +42,12 @@ UNENUMERATED_TAIL = "How many other projects the fleet holds is unknown."
 # (deploy/docker/Dockerfile and deploy/sandbox/Dockerfile copy them to
 # /opt/defaults/scripts), then the checkout's own copy for a run from the
 # repository.
+# The checkout's copy only when there is a checkout: a file three or fewer
+# directories below `/` has no parents[3], as collect.py guards the same path.
 SHARED_SCRIPT_DIRS = (
     "/opt/defaults/scripts",
     "/opt/data/scripts",
-    str(Path(__file__).resolve().parents[3] / "scripts"),
+    *([str(Path(__file__).resolve().parents[3] / "scripts")] if len(Path(__file__).resolve().parents) > 3 else []),
 )
 
 # The install's declared scope, handed in by the agent from the platform_control
@@ -935,7 +937,7 @@ def node_blocks_that_fit(cidr: str, utilization: float, prefix: int | None) -> i
 
 def main():
     parser = argparse.ArgumentParser(description="Audit GCP VPC Networking Fabric")
-    parser.add_argument("--project-id", help="Optional GCP Project ID")
+    parser.add_argument("--project-id", help="single project to audit (on an install with a declared scope, one the fleet_scope tool lists, passed with its collector_args); omit to sweep --scope-projects when given, else MONITORED_PROJECT_IDS, or else the configured project plus every project `gcloud projects list` returns")
     fleet_scope_args.add_scope_arguments(parser)
     parser.add_argument("--output", help="Optional path to write findings JSON")
     parser.add_argument("--check", choices=CHECK_CHOICES, default=CHECK_ALL,
