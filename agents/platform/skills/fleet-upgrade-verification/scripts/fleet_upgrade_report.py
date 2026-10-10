@@ -362,12 +362,15 @@ def get_target_projects(cli_projects: list[str] | None = None, listing_errors: l
     configured project: it is filtered, not complete, as fleet_drift.py treats it.
     """
     if cli_projects:
-        override_errors = [declared_scope.override_error(p.strip()) for p in cli_projects if p.strip()]
+        resolved = sorted({_normalise_project_id(p.strip()) or p.strip() for p in cli_projects if p.strip()})
+        # On the resolved ids: a project number given here names the same
+        # project the tool lists by id.
+        override_errors = [declared_scope.override_error(p) for p in resolved]
         if any(override_errors):
             if listing_errors is not None:
                 listing_errors.extend(e for e in override_errors if e)
             return []
-        return sorted({_normalise_project_id(p.strip()) or p.strip() for p in cli_projects if p.strip()})
+        return resolved
     if declared_scope.declared:
         # The declared scope the agent carried from the fleet_scope tool: the
         # sweep as given, nothing listed, the unread rows as the one note. A
@@ -1121,7 +1124,8 @@ def main(argv: list[str] | None = None) -> int:
     if not projects:
         for error in listing_errors:
             sys.stderr.write(f"{scope_label}: {error}\n")
-        sys.stderr.write("no project: pass --project, or set MONITORED_PROJECT_IDS or GCP_PROJECT_ID\n")
+        if not declared_scope.declared:
+            sys.stderr.write("no project: pass --project, or set MONITORED_PROJECT_IDS or GCP_PROJECT_ID\n")
         return EXIT_USAGE
 
     report = build_report(projects, args.target_version, readiness_options)

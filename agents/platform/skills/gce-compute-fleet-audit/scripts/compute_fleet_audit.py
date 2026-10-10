@@ -667,13 +667,15 @@ def get_target_projects(
     is always part of the scope, alongside any `GCP_PROJECT_ID`-style variable.
     """
     if cli_project and cli_project.strip():
-        override_error = declared_scope.override_error(cli_project.strip())
+        raw = cli_project.strip()
+        project = _normalise_project_id(raw, run=run) or raw
+        # On the resolved id: a project number given here names the same
+        # project the tool lists by id.
+        override_error = declared_scope.override_error(project)
         if override_error:
             if notes is not None:
                 notes.append(override_error)
             return []
-        raw = cli_project.strip()
-        project = _normalise_project_id(raw, run=run) or raw
         if notes is not None:
             notes.append(SCOPED_RUN_NOTE.format(projects=project, source="`--project-id`"))
         return [project]

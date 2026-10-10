@@ -34,6 +34,13 @@ class DeclaredScopeTargetsTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.home = pathlib.Path(self.tmp.name)
+        # The reader consults the operator's render and the project env when no
+        # snapshot answers; neither may leak in from the shell running the tests.
+        env = mock.patch.dict(os.environ, {}, clear=False)
+        env.start()
+        self.addCleanup(env.stop)
+        for name in (fst.SCOPE_FILE_ENV, *fst.MANAGEMENT_PROJECT_ENVS):
+            os.environ.pop(name, None)
 
     def _write(self, snapshot) -> None:
         (self.home / fst.SNAPSHOT_FILE).write_text(json.dumps(snapshot), encoding="utf-8")
@@ -51,9 +58,19 @@ class DeclaredScopeTargetsTest(unittest.TestCase):
         render.write_text(json.dumps({"present": True, "projects": ["payments-prod"], "exclude": {"projects": [], "clusters": []}}), encoding="utf-8")
         with mock.patch.dict(os.environ, {fst.SCOPE_FILE_ENV: str(render), "GCP_PROJECT_ID": "ops-mgmt"}):
             targets = fst.declared_scope_targets(self.home)
-            self.assertEqual((targets.projects, targets.unread, targets.resolved_at), (("ops-mgmt",), (), None))
-            self.assertEqual(targets.collector_args(), "--scope-projects ops-mgmt")
+            # The render's declared projects ride as unread, so the host-only
+            # sweep publishes as partial rather than resolving their findings.
+            self.assertEqual((targets.projects, targets.unread, targets.resolved_at), (("ops-mgmt",), (("payments-prod", "unresolved"),), None))
+            self.assertEqual(targets.collector_args(), "--scope-projects ops-mgmt --scope-unread payments-prod=unresolved")
             self.assertIn("until the next reconcile", targets.note)
+        # A snapshot that says boundary: false (a readable render with no block
+        # last tick) yields to a render that has gained a block since.
+        empty = {key: [] for key in fst.DECLARED_SCOPE_KEYS} | {"exclude": {"projects": []}}
+        snap = _snapshot([{"id": "ops-mgmt", "outcome": "ok", "state": "in-scope"}], declared=empty, present=False, readable=True); snap["boundary"] = False
+        self._write(snap)
+        with mock.patch.dict(os.environ, {fst.SCOPE_FILE_ENV: str(render), "GCP_PROJECT_ID": "ops-mgmt"}):
+            render.write_text(json.dumps({"present": True, "projects": ["payments-prod"]}), encoding="utf-8")
+            self.assertEqual(fst.declared_scope_targets(self.home).projects, ("ops-mgmt",))
         render.write_text(json.dumps({"present": False}), encoding="utf-8")
         with mock.patch.dict(os.environ, {fst.SCOPE_FILE_ENV: str(render), "GCP_PROJECT_ID": "ops-mgmt"}):
             self.assertIsNone(fst.declared_scope_targets(self.home))

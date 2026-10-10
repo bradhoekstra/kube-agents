@@ -277,13 +277,15 @@ def get_target_projects(cli_project: str | None = None, listing_errors: list[str
     is always part of the scope, alongside any `GCP_PROJECT_ID`-style variable.
     """
     if cli_project and cli_project.strip():
-        override_error = declared_scope.override_error(cli_project.strip())
+        raw = cli_project.strip()
+        project = _normalise_project_id(raw) or raw
+        # On the resolved id: a project number given here names the same
+        # project the tool lists by id.
+        override_error = declared_scope.override_error(project)
         if override_error:
             if listing_errors is not None:
                 listing_errors.append(override_error)
             return []
-        raw = cli_project.strip()
-        project = _normalise_project_id(raw) or raw
         if listing_errors is not None:
             listing_errors.append(SCOPED_RUN_NOTE.format(projects=project, source="`--project-id`"))
         return [project]
@@ -935,6 +937,7 @@ def main():
         pathlib.Path(args.output).unlink(missing_ok=True)
 
     listing_errors: list[str] = []
+    declared_empty_error: str | None = None
     target_projects = get_target_projects(args.project_id, listing_errors)
     all_findings = []
     skipped_targets = []
@@ -962,13 +965,9 @@ def main():
         # two skipped rows gets copied in as a check that ran.
         reason = listing_errors[0] if listing_errors else declared_scope.empty_error()
         sys.stderr.write(f"{reason}\n")
-        if args.output:
-            os.makedirs(os.path.dirname(os.path.abspath(args.output)) or ".", exist_ok=True)
-            with open(args.output, "w", encoding="utf-8") as f:
-                json.dump({"error": reason, "audit": AUDIT_SLUG, "scope": {"clusters": [], "skipped": skipped_targets}, "findings": []}, f, indent=JSON_INDENT)
-        sys.exit(1)
+        declared_empty_error = reason
 
-    if not target_projects:
+    if not target_projects and not declared_empty_error:
         sys.stderr.write("No target projects resolved from CLI, environment, or gcloud.\n")
         skipped_targets.append({
             "cluster": f"{PROJECT_TARGET_PREFIX}{UNKNOWN_PROJECT}",
@@ -994,6 +993,10 @@ def main():
         },
         "findings": all_findings
     }
+    if declared_empty_error:
+        # Written through the one writer below, then a non-zero exit: the SOP's
+        # "exits non-zero or writes no file" rule is what routes this state.
+        findings_document["error"] = declared_empty_error
 
     if args.output:
         try:
@@ -1004,6 +1007,8 @@ def main():
             sys.stderr.write(f"Failed to write output to {args.output}: {e}\n")
             sys.exit(1)
 
+    if declared_empty_error:
+        sys.exit(1)
     written = f"; wrote {args.output}" if args.output else "; no --output, nothing written"
     print(f"Found {len(all_findings)} networking findings across {len(active_targets)} audited targets. "
           f"{len(skipped_targets)} targets skipped{written}.")

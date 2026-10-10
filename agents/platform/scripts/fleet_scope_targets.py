@@ -63,6 +63,8 @@ OUTCOME_OK = "ok"
 # like any other.
 OUTCOME_API_DISABLED = "api-disabled"
 OUTCOME_UNKNOWN = "unknown"
+# A declared project the reconcile has not resolved yet (the render answered).
+OUTCOME_UNRESOLVED = "unresolved"
 # The collectors' two scope flags, which `collector_args` spells with the
 # constants the collectors parse them by, so the two cannot drift apart.
 from fleet_scope_args import SCOPE_PROJECTS_FLAG, SCOPE_UNREAD_FLAG  # noqa: E402
@@ -142,10 +144,9 @@ def snapshot_path(agent_home: str | os.PathLike | None = None) -> Path:
     return Path(root) / SNAPSHOT_FILE
 
 
-def _render_declares_scope() -> bool | None:
-    """Whether the operator's render carries a spec.scope block: True, False, or
-    None when there is no readable render (a checkout, an image ahead of its
-    operator)."""
+def _read_render() -> dict | None:
+    """The operator's render of spec.scope, or None when there is no readable
+    render (a checkout, an image ahead of its operator)."""
     render = os.environ.get(SCOPE_FILE_ENV)
     if not render:
         return None
@@ -153,18 +154,27 @@ def _render_declares_scope() -> bool | None:
         parsed = json.loads(Path(render).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    return parsed.get(RENDER_PRESENT_KEY) is True if isinstance(parsed, dict) else None
+    return parsed if isinstance(parsed, dict) else None
 
 
 def _from_render(path: Path) -> ScopeTargets | None:
-    """The answer when no usable snapshot exists: the render's boundary, host
-    only, until the reconcile writes the resolved set; None when the render
-    declares nothing or cannot be read."""
-    if _render_declares_scope() is not True:
+    """The answer when no snapshot answers: the render's boundary, the host
+    swept and every project the render declares carried as unread, so the run
+    reads as partial rather than as a complete sweep of the host, until the
+    reconcile writes the resolved set; None when the render declares nothing
+    or cannot be read."""
+    render = _read_render()
+    if render is None or render.get(RENDER_PRESENT_KEY) is not True:
         return None
     host = next((os.environ.get(name) for name in MANAGEMENT_PROJECT_ENVS if os.environ.get(name)), None)
-    render = os.environ.get(SCOPE_FILE_ENV) or str(path)
-    return ScopeTargets(projects=(host,) if host else (), unread=(), resolved_at=None, path=render, note=RENDER_NOTE)
+    declared = [str(p) for p in render.get("projects") or [] if isinstance(p, str) and p != host]
+    return ScopeTargets(
+        projects=(host,) if host else (),
+        unread=tuple((p, OUTCOME_UNRESOLVED) for p in declared),
+        resolved_at=None,
+        path=os.environ.get(SCOPE_FILE_ENV) or str(path),
+        note=RENDER_NOTE,
+    )
 
 
 def declared_scope_targets(agent_home: str | os.PathLike | None = None) -> ScopeTargets | None:
@@ -186,7 +196,11 @@ def declared_scope_targets(agent_home: str | os.PathLike | None = None) -> Scope
     # readable render with no block and for an install that never declared one.
     boundary = parsed.get(BOUNDARY_KEY)
     if boundary is False:
-        return None
+        # The reconcile read a render with no block last tick. The render may
+        # have gained one since (a hand-applied CR given a scope; the sandbox
+        # already says so through the operator), so the render decides until
+        # the next tick writes the resolved set.
+        return _from_render(path)
     if boundary is not True:
         # A snapshot from before `boundary`: present, then readable, then the
         # lists; empty lists with none of the flags ask the render.

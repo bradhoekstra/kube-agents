@@ -1494,6 +1494,8 @@ class FleetScopeToolTest(unittest.TestCase):
             (Path(self.tmp.name) / "fleet_scope.json").write_text(json.dumps(snapshot), encoding="utf-8")
         # The worker's HERMES_HOME is the profile home; the snapshot is at the root.
         with patch.dict(os.environ, {"PLATFORM_AGENT_HOME": self.tmp.name, "HERMES_HOME": str(Path(self.tmp.name) / "profiles" / "platform")}):
+            # No render from the shell running the tests: the tool would answer from it.
+            os.environ.pop("KUBEAGENTS_SCOPE_FILE", None)
             return json.loads(platform_mcp_server.fleet_scope())
 
     def test_a_declared_scope_is_reported_with_the_collector_arguments(self):

@@ -162,11 +162,6 @@ QUALIFIED_TARGET_SEPARATOR = "/"
 # named. Uppercase because a GCP project id cannot be, so no real project can
 # collide with it.
 UNENUMERATED_PROJECTS_TARGET = PROJECT_TARGET_PREFIX + "UNENUMERATED_PROJECTS"
-# What that same target stands for when the operator narrowed the scope on
-# purpose. `--project` skips discovery, so a scoped run reads one project and
-# names no other; without a row saying so, `finish` resolves every ledger
-# finding on a cluster in any other project. `fleet_drift.SCOPED_RUN_NOTE`
-# states the same rule.
 # Where the image and the shell sandbox ship the platform scripts the collectors
 # share (deploy/docker/Dockerfile and deploy/sandbox/Dockerfile copy them to
 # /opt/defaults/scripts), then the checkout's own `scripts/` for a run from the
@@ -206,6 +201,11 @@ import fleet_scope_args  # noqa: E402
 # The scope this collector was handed, set by main from the two flags.
 declared_scope = fleet_scope_args.DeclaredScope()
 
+# What that same target stands for when the operator narrowed the scope on
+# purpose. `--project` skips discovery, so a scoped run reads one project and
+# names no other; without a row saying so, `finish` resolves every ledger
+# finding on a cluster in any other project. `fleet_drift.SCOPED_RUN_NOTE`
+# states the same rule.
 SCOPED_RUN_NOTE = (
     "scope narrowed to project {project!r} by `--project`: discovery was skipped, so no other "
     "project in this fleet was named or read, and this run cannot speak for their clusters."

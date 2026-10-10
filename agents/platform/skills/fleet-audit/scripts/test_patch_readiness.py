@@ -1637,7 +1637,7 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
     def test_a_declared_scope_with_nothing_readable_sweeps_nothing_and_lists_nothing(self):
         # `--scope-unread` alone (what collector_args carries when no declared
         # project was readable) is a boundary with nothing inside it: the run
-        # reports that and must not widen to MONITORED_PROJECT_IDS or the listing.
+        # reports that and must not widen to the listing.
         pr.declared_scope.set(None, "payments-staging=denied")
         discovery = pr.discover_fleet(None, run=lambda *a, **k: (_ for _ in ()).throw(AssertionError("nothing should be listed")))
         self.assertEqual(discovery.projects, [])

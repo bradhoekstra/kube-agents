@@ -31,9 +31,10 @@ If `pending_remediation_requests` is non-empty, inspect each requested finding i
 
 ```bash
 # DECLARED and PROJECTS come from the fleet_scope tool's answer: its `declared`,
-# and its `projects` joined by spaces. The listing runs only when it reported
-# declared: false; on an install with a declared scope nothing is listed.
-if [ "$DECLARED" != "true" ]; then
+# and its `projects` joined by spaces. Set both before this block. The listing
+# runs only when the tool reported declared: false; on an install with a
+# declared scope, and when DECLARED was never set, nothing is listed.
+if [ "$DECLARED" = "false" ]; then   # assign DECLARED from the tool first: unset is not false, and lists nothing
   HOST=$(gcloud config get-value project)
   PROJECTS=$(printf '%s\n' "$HOST" $(gcloud projects list --format="value(projectId)") | sort -u)
 fi

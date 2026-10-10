@@ -8015,7 +8015,7 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
     def test_a_declared_scope_with_nothing_readable_sweeps_nothing_and_lists_nothing(self):
         # `--scope-unread` alone (what collector_args carries when no declared
         # project was readable) is a boundary with nothing inside it: the run
-        # reports that and must not widen to MONITORED_PROJECT_IDS or the listing.
+        # reports that and must not widen to the listing.
         fw.declared_scope.set(None, "payments-staging=denied")
         with self.assertRaises(fw.NoProjectInScope) as caught:
             fw.get_target_projects(None, run=lambda *a, **k: (_ for _ in ()).throw(AssertionError("nothing should be listed")))

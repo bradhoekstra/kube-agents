@@ -35,7 +35,7 @@ differently:
   is what sets their scope too, and a project the identity can list but the
   scope never named is not swept. Every install the installer or the Terraform
   composition makes declares a scope: the chart renders `spec.scope` on each,
-  empty lists included, so with nothing in `SCOPE_PROJECTS` the audits sweep the
+  empty lists included, so with no `SCOPE_*` key set the audits sweep the
   host project alone, and a project reached by an IAM grant alone is not swept
   until it is named there. Only a `PlatformAgent` applied by hand without a
   `scope` block declares none; there the audits discover every project the

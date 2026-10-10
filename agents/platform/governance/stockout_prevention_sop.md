@@ -37,9 +37,10 @@ The helper owns every git and forge operation and renders the ledger issue body 
 Call the platform_control `fleet_scope` tool first. When it reports `declared: true`, the fleet is its `projects` and nothing else: pass its `collector_args` to the collector verbatim, and run any manual per-project command over that list alone, never over `gcloud projects list` (when no declared project is readable they carry `--scope-unread` alone; pass them anyway, and the collector reports that nothing was readable and exits with a top-level `error`). When it reports `declared: false`, the install declares no scope and the collector enumerates every project the identity can list:
 
 ```bash
-# DECLARED and PROJECTS come from the fleet_scope tool's answer. The listing
-# runs only when it reported declared: false.
-if [ "$DECLARED" != "true" ]; then
+# DECLARED and PROJECTS come from the fleet_scope tool's answer; set both before
+# this block. The listing runs only when the tool reported declared: false, and
+# never when DECLARED was left unset.
+if [ "$DECLARED" = "false" ]; then   # assign DECLARED from the tool first: unset is not false, and lists nothing
   PROJECTS=$(printf '%s\n' "$(gcloud config get-value project)" $(gcloud projects list --format="value(projectId)") | sort -u)
 fi
 for PROJECT in $PROJECTS; do

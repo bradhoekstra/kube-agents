@@ -63,7 +63,9 @@ verification_spec:
   # at all. The second pattern is what catches a leak the first cannot see:
   # the SOP's fallback loop reads `--project="$PROJECT"`, which the verifier
   # matches as typed, so the only text that betrays it is the listing the
-  # loop is fed from, and an install with a declared scope never lists. On the
+  # loop is fed from, and an install with a declared scope never lists. The
+  # pattern admits a release track or a root flag before `projects`, and
+  # `search` beside `list`, which return the same set. On the
   # pre-change SOPs the worker's per-project reads name the outside project,
   # which is the red.
   - name: no-command-read-the-project-outside-the-scope
@@ -73,7 +75,7 @@ verification_spec:
       type: worker_commands
       forbidden_patterns:
         - '--project(?:=|\s+)["'']?[a-z0-9-]*outside-scope\b'
-        - '\bgcloud\s+projects\s+list\b'
+        - '\bgcloud\b[^|;&\n]*\bprojects\s+(?:list|search)\b'
   # The ledger was published for the declared scope: its body carries the
   # project-level targets the SOP records, and none of them is the outside
   # project. Against the body rather than the ids, because the body's evidence

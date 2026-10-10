@@ -31,7 +31,8 @@ Neither reads versions against a target.
   --output /opt/data/scratch/fleet_versions.json
 ```
 
-- `--project` is repeatable and, when given, is the whole scope. Otherwise `--scope-projects`, passed once as one
+- `--project` is repeatable and, when given, is the whole scope; on an install with a declared scope each one must be a
+  project the `fleet_scope` tool lists and the `collector_args` must be passed beside it, or the script refuses. Otherwise `--scope-projects`, passed once as one
   comma-separated list, is the whole scope: the install's declared scope as the platform_control `fleet_scope`
   tool reports it. Call that tool first and paste its `collector_args`, which spells each flag once
   (`declared: false` means the fallback that follows). `--scope-unread` sets no scope: it names the declared

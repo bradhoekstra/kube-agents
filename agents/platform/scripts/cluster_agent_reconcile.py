@@ -517,6 +517,20 @@ def _normalize_scope(parsed: dict) -> dict:
     return scope
 
 
+def _previous_boundary(previous: dict | None) -> bool:
+    """Whether the last run had a declaration in force: its `boundary` key, else
+    its `present` key, else (a snapshot from before either) whether its
+    declaration named anything. An install that never declared a scope reads
+    False on every form, so an unreadable tick carries nothing for it."""
+    if not isinstance(previous, dict):
+        return False
+    for key in (SCOPE_BOUNDARY_KEY, SCOPE_PRESENT_KEY):
+        if isinstance(previous.get(key), bool):
+            return previous[key]
+    last = _previous_declaration(previous)
+    return bool(last) and any(last.get(kind) for kind in ("projects", "folders", "organizations", "sharedVpcHosts", "metricsScopes"))
+
+
 def _previous_declaration(previous: dict | None) -> dict | None:
     """The declaration the last run read, from the snapshot's `declared`, or None.
 
@@ -1424,7 +1438,9 @@ def reconcile(dry_run: bool = False) -> dict:
     # such tick reads the same exclusions, and a project it named stays carried in scope
     # rather than retiring: removing the whole block retires nothing.
     declared = scope
-    previous_boundary = bool(previous.get(SCOPE_BOUNDARY_KEY, previous.get(SCOPE_PRESENT_KEY))) if isinstance(previous, dict) else False
+    # A previous snapshot from before the keys is read by its lists: a declaration
+    # with any project, folder, organisation or selector named was a boundary.
+    previous_boundary = _previous_boundary(previous)
     scope_boundary = scope_present or (not scope_readable and previous_boundary)
     if not scope_present:
         last = _previous_declaration(previous)
