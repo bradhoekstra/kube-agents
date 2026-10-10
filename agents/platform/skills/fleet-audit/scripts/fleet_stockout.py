@@ -624,7 +624,10 @@ def not_running_entry(c: dict, project: str) -> dict:
 
 
 class NoProjectInScope(Exception):
-    """Discovery named no project at all, which is not a fleet of empty projects."""
+    """The run has no project to read, which is not a fleet of empty projects:
+    discovery named none, or, under a declared scope, the holder refused the
+    run (nothing readable, the flags missing on a scoped sandbox, or a
+    `--project` the scope does not list) and the message says which."""
 
 
 def get_target_projects(cli_project: str | None, *, run: RunFn) -> tuple[list[str], str | None]:
