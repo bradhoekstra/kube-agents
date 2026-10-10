@@ -18,6 +18,12 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(__file__))
 import compute_fleet_audit as cf  # noqa: E402
 
+# Every resolver reads KUBEAGENTS_SCOPE_DECLARED when a run passes neither scope
+# flag, and a shell that exports it (the sandbox session, a developer reproducing
+# the guard) would turn this suite's listing tests into refusals. The suite is
+# about the collector, not the shell it runs in.
+os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)  # module-level, on purpose
+
 FLEET_AUDIT_SCRIPTS = os.path.join(os.path.dirname(__file__), "..", "..", "fleet-audit", "scripts")
 sys.path.insert(0, os.path.abspath(FLEET_AUDIT_SCRIPTS))
 
@@ -2271,7 +2277,17 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
 
     ENV = {cf.MONITORED_PROJECTS_ENV: "", "GCP_PROJECT_ID": "ops-mgmt", "GKE_PROJECT_ID": "", "PROJECT_ID": ""}
 
+    def setUp(self):
+        # The holder reads KUBEAGENTS_SCOPE_DECLARED when neither flag is passed;
+        # a shell that exports it must not decide these tests.
+        env = mock.patch.dict(os.environ, {}, clear=False)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)
+        cf.declared_scope.set(None, None)
+
     def tearDown(self):
+        os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)
         cf.declared_scope.set(None, None)
 
     def test_the_declared_scope_is_swept_and_nothing_is_listed(self):

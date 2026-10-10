@@ -60,8 +60,24 @@ class DeclaredScopeTargetsTest(unittest.TestCase):
             targets = fst.declared_scope_targets(self.home)
             # The render's declared projects ride as unread, so the host-only
             # sweep publishes as partial rather than resolving their findings.
-            self.assertEqual((targets.projects, targets.unread, targets.resolved_at), (("ops-mgmt",), (("payments-prod", "unresolved"),), None))
-            self.assertEqual(targets.collector_args(), "--scope-projects ops-mgmt --scope-unread payments-prod=unresolved")
+            self.assertEqual((targets.projects, targets.unread, targets.resolved_at), (("ops-mgmt",), (("declared-scope", "unresolved"), ("payments-prod", "unresolved")), None))
+            self.assertEqual(targets.collector_args(), "--scope-projects ops-mgmt --scope-unread declared-scope=unresolved,payments-prod=unresolved")
+        # A render that names a folder and no project is partial too: the fixed
+        # row rides whatever the render names, so a complete host-only sweep
+        # never publishes from a render answer.
+        render.write_text(json.dumps({"present": True, "projects": [], "folders": ["folders/1"]}), encoding="utf-8")
+        with mock.patch.dict(os.environ, {fst.SCOPE_FILE_ENV: str(render), "GCP_PROJECT_ID": "ops-mgmt"}):
+            targets = fst.declared_scope_targets(self.home)
+            self.assertEqual(targets.unread, (("declared-scope", "unresolved"),))
+            self.assertIsNotNone(targets.unread)
+        # A named render that cannot be read is a fault, not "no scope".
+        render.write_text("<not json>", encoding="utf-8")
+        with mock.patch.dict(os.environ, {fst.SCOPE_FILE_ENV: str(render), "GCP_PROJECT_ID": "ops-mgmt"}):
+            with self.assertRaises(fst.ScopeRenderUnreadable):
+                fst.declared_scope_targets(self.home)
+        with mock.patch.dict(os.environ, {fst.SCOPE_FILE_ENV: str(self.home / "absent.json"), "GCP_PROJECT_ID": "ops-mgmt"}):
+            with self.assertRaises(fst.ScopeRenderUnreadable):
+                fst.declared_scope_targets(self.home)
             self.assertIn("until the next reconcile", targets.note)
         # A snapshot that says boundary: false (a readable render with no block
         # last tick) yields to a render that has gained a block since.
@@ -183,8 +199,11 @@ class DeclaredScopeTargetsTest(unittest.TestCase):
         targets = fst.declared_scope_targets(self.home)
         self.assertEqual(targets.projects, ())
         self.assertEqual(targets.collector_args(), "--scope-unread payments-prod=denied")
+        # A declared scope with no row at all still hands the collector something
+        # that says "declared": an empty string would have the guard tell the
+        # agent to call the tool it has just called.
         self._write(_snapshot([]))
-        self.assertEqual(fst.declared_scope_targets(self.home).collector_args(), "")
+        self.assertEqual(fst.declared_scope_targets(self.home).collector_args(), "--scope-unread declared-scope=unresolved")
 
     def test_rows_without_an_id_or_without_a_state_are_handled(self):
         self._write(_snapshot([{"outcome": "ok"}, {"id": "ops-mgmt", "outcome": "ok"}, "junk"]))

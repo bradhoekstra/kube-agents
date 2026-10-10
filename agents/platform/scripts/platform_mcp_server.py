@@ -459,6 +459,11 @@ def fleet_scope() -> str:
     """
     try:
         targets = fleet_scope_targets.declared_scope_targets()
+    except fleet_scope_targets.ScopeRenderUnreadable as e:
+        # Not "no scope": the operator always writes the render, so an
+        # unreadable one is a fault, and the SOPs' declared: false branch
+        # would list every visible project on an install that declares one.
+        return f"ERROR: the operator's scope render could not be read, so the scope is unknown; do not enumerate projects: {e}"
     except Exception as e:  # noqa: BLE001 - a tool answers, it does not raise
         return f"ERROR: Could not read the scope snapshot: {e}"
     if targets is None:

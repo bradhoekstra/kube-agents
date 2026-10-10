@@ -65,6 +65,18 @@ OUTCOME_API_DISABLED = "api-disabled"
 OUTCOME_UNKNOWN = "unknown"
 # A declared project the reconcile has not resolved yet (the render answered).
 OUTCOME_UNRESOLVED = "unresolved"
+# The unread row every render answer carries, whatever the render names: the
+# reconcile has not resolved the declaration yet, so the sweep is partial by
+# construction, and `finish` resolves nothing on the projects, folders,
+# organisations or selectors the render declares. Not a project id on purpose.
+UNRESOLVED_SCOPE_ROW = "declared-scope"
+RENDER_NOTE = "no reconcile snapshot answers; the render declares a scope, so the sweep is the management project alone, partial, until the next reconcile writes the resolved set"
+
+
+class ScopeRenderUnreadable(Exception):
+    """KUBEAGENTS_SCOPE_FILE names a render this process cannot read or parse.
+    On the agent pod the operator always writes it, so this is a fault to
+    report, not an install that declares no scope."""
 # The collectors' two scope flags, which `collector_args` spells with the
 # constants the collectors parse them by, so the two cannot drift apart.
 from fleet_scope_args import SCOPE_PROJECTS_FLAG, SCOPE_UNREAD_FLAG  # noqa: E402
@@ -99,7 +111,7 @@ RENDER_PRESENT_KEY = "present"
 # Where the management project's id is read when the render alone answers: the
 # sweep is then that project, until the next tick writes the resolved set.
 MANAGEMENT_PROJECT_ENVS = ("GCP_PROJECT_ID", "GKE_PROJECT_ID")
-RENDER_NOTE = "no reconcile snapshot yet; the render declares a scope, so the sweep is the management project alone until the next reconcile writes the resolved set"
+
 # The keys under `declared` whose presence means the install drew a boundary,
 # for a snapshot without the present flag.
 DECLARED_SCOPE_KEYS = ("projects", "folders", "organizations", "sharedVpcHosts", "metricsScopes")
@@ -127,13 +139,16 @@ class ScopeTargets:
         with the sweep, and `--scope-unread` naming each declared project the
         install could not read, as `project=outcome`. With nothing readable the
         unread flag goes alone, so a collector handed it still knows a scope
-        was declared and reports that rather than listing; empty only when the
-        scope resolved to no row at all."""
+        was declared and reports that rather than listing. Never empty: a
+        declared scope with no row at all hands the collector the fixed
+        unresolved row, so it reports "nothing readable" rather than telling
+        the agent to call the tool it has just called."""
         args = []
         if self.projects:
             args.append(f"{SCOPE_PROJECTS_FLAG} {','.join(self.projects)}")
-        if self.unread:
-            args.append(f"{SCOPE_UNREAD_FLAG} " + ",".join(f"{project}={outcome}" for project, outcome in self.unread))
+        unread = self.unread or ((UNRESOLVED_SCOPE_ROW, OUTCOME_UNRESOLVED),) if not self.projects else self.unread
+        if unread:
+            args.append(f"{SCOPE_UNREAD_FLAG} " + ",".join(f"{project}={outcome}" for project, outcome in unread))
         return " ".join(args)
 
 
@@ -145,16 +160,20 @@ def snapshot_path(agent_home: str | os.PathLike | None = None) -> Path:
 
 
 def _read_render() -> dict | None:
-    """The operator's render of spec.scope, or None when there is no readable
-    render (a checkout, an image ahead of its operator)."""
+    """The operator's render of spec.scope; None when no render is named (a
+    checkout, an image ahead of its operator). A named render that cannot be
+    read or parsed raises: answering "no scope" there would send the SOPs'
+    manual path to the listing on an install that may well declare one."""
     render = os.environ.get(SCOPE_FILE_ENV)
     if not render:
         return None
     try:
         parsed = json.loads(Path(render).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    return parsed if isinstance(parsed, dict) else None
+    except (OSError, ValueError) as e:
+        raise ScopeRenderUnreadable(f"{SCOPE_FILE_ENV}={render} cannot be read: {e}") from e
+    if not isinstance(parsed, dict):
+        raise ScopeRenderUnreadable(f"{SCOPE_FILE_ENV}={render} is not a JSON object")
+    return parsed
 
 
 def _from_render(path: Path) -> ScopeTargets | None:
@@ -168,9 +187,11 @@ def _from_render(path: Path) -> ScopeTargets | None:
         return None
     host = next((os.environ.get(name) for name in MANAGEMENT_PROJECT_ENVS if os.environ.get(name)), None)
     declared = [str(p) for p in render.get("projects") or [] if isinstance(p, str) and p != host]
+    # The fixed row first, so a render that names folders, organisations or
+    # selectors alone is partial too; the explicit projects follow by name.
     return ScopeTargets(
         projects=(host,) if host else (),
-        unread=tuple((p, OUTCOME_UNRESOLVED) for p in declared),
+        unread=((UNRESOLVED_SCOPE_ROW, OUTCOME_UNRESOLVED), *((p, OUTCOME_UNRESOLVED) for p in declared)),
         resolved_at=None,
         path=os.environ.get(SCOPE_FILE_ENV) or str(path),
         note=RENDER_NOTE,

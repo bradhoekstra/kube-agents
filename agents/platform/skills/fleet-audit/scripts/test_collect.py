@@ -28,6 +28,12 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import collect  # noqa: E402
+
+# Every resolver reads KUBEAGENTS_SCOPE_DECLARED when a run passes neither scope
+# flag, and a shell that exports it (the sandbox session, a developer reproducing
+# the guard) would turn this suite's listing tests into refusals. The suite is
+# about the collector, not the shell it runs in.
+os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)  # module-level, on purpose
 from collect import Run  # noqa: E402
 
 
@@ -12409,7 +12415,17 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
     an unread declared project is the one note, and without the flags the
     listing runs as before."""
 
+    def setUp(self):
+        # The holder reads KUBEAGENTS_SCOPE_DECLARED when neither flag is passed;
+        # a shell that exports it must not decide these tests.
+        env = mock.patch.dict(os.environ, {}, clear=False)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)
+        collect.declared_scope.set(None, None)
+
     def tearDown(self):
+        os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)
         collect.declared_scope.set(None, None)
 
     def test_the_declared_scope_is_swept_and_nothing_is_listed(self):

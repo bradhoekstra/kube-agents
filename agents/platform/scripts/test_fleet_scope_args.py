@@ -76,6 +76,17 @@ class FleetScopeArgsTest(unittest.TestCase):
             scope.set(None, None)
             self.assertEqual((scope.declared, scope.projects), (False, None))
 
+    def test_the_sweep_counts_as_declared_only_with_the_flags_and_no_override(self):
+        scope = fsa.DeclaredScope()
+        scope.set("ops-mgmt,payments-prod", None)
+        self.assertTrue(scope.sweep_is_declared())
+        self.assertFalse(scope.sweep_is_declared("ops-mgmt"), "a --project narrows the sweep below the declared scope")
+        with mock.patch.dict(os.environ, {fsa.SCOPE_DECLARED_ENV: "true"}):
+            scope.set(None, None)
+            self.assertFalse(scope.sweep_is_declared(), "declared by the env alone is not the declared sweep")
+        scope.set(None, None)
+        self.assertFalse(scope.sweep_is_declared())
+
     def test_a_repeated_project_id_is_swept_once(self):
         self.assertEqual(fsa.parse_scope_projects("ops-mgmt,payments-prod,ops-mgmt"), ["ops-mgmt", "payments-prod"])
 

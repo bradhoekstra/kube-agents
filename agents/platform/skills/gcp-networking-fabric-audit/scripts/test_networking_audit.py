@@ -15,6 +15,12 @@ import sys
 sys.path.insert(0, os.path.dirname(__file__))
 import networking_audit
 
+# Every resolver reads KUBEAGENTS_SCOPE_DECLARED when a run passes neither scope
+# flag, and a shell that exports it (the sandbox session, a developer reproducing
+# the guard) would turn this suite's listing tests into refusals. The suite is
+# about the collector, not the shell it runs in.
+os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)  # module-level, on purpose
+
 class TestNetworkingAudit(unittest.TestCase):
     def setUp(self):
         # Project numbers are remembered for a run; each test is its own run.
@@ -1047,7 +1053,17 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
 
     ENV = {networking_audit.MONITORED_PROJECTS_ENV: "", "GCP_PROJECT_ID": "ops-mgmt", "GKE_PROJECT_ID": "", "PROJECT_ID": ""}
 
+    def setUp(self):
+        # The holder reads KUBEAGENTS_SCOPE_DECLARED when neither flag is passed;
+        # a shell that exports it must not decide these tests.
+        env = mock.patch.dict(os.environ, {}, clear=False)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)
+        networking_audit.declared_scope.set(None, None)
+
     def tearDown(self):
+        os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)
         networking_audit.declared_scope.set(None, None)
 
     def test_the_declared_scope_is_swept_and_nothing_is_listed(self):

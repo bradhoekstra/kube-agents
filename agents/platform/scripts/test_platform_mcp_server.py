@@ -1498,6 +1498,14 @@ class FleetScopeToolTest(unittest.TestCase):
             os.environ.pop("KUBEAGENTS_SCOPE_FILE", None)
             return json.loads(platform_mcp_server.fleet_scope())
 
+    def test_an_unreadable_render_is_an_error_answer_not_no_scope(self):
+        # The SOPs' declared: false branch lists every visible project; an
+        # install whose render the tool cannot read must not be sent there.
+        with patch.dict(os.environ, {"PLATFORM_AGENT_HOME": self.tmp.name, "KUBEAGENTS_SCOPE_FILE": str(Path(self.tmp.name) / "absent-render.json")}):
+            answer = platform_mcp_server.fleet_scope()
+        self.assertTrue(answer.startswith("ERROR:"), answer)
+        self.assertIn("do not enumerate projects", answer)
+
     def test_a_declared_scope_is_reported_with_the_collector_arguments(self):
         out = self._call(self.SNAPSHOT)
         self.assertTrue(out["declared"])
