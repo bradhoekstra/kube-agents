@@ -101,6 +101,11 @@ SCOPE_READABLE_KEY = "readable"
 # declared a scope carries nothing on an unreadable tick, and a readable render
 # with no block clears it. The audits' reader keys on this one bit.
 SCOPE_BOUNDARY_KEY = "boundary"
+# The explicit projects an exclude entry dropped this run, by id or by the number
+# a Metrics Scope named them by. The audits' reader skips them rather than
+# carrying them as unresolved: the reconcile is the one place the by-number
+# match can be made, so the reader does not re-implement it.
+SCOPE_EXCLUDED_KEY = "excludedProjects"
 # The resolved membership, rewritten by every run but --dry-run beside the profiles (design §5). The
 # previous run's copy is an input: a project in the resolved set last time and absent now
 # is marked `retiring`, and only a project the previous copy marked `retiring` is pruned,
@@ -863,10 +868,11 @@ def _resolve_projects(management: str | None, scope: dict,
                       searches: dict[str, tuple[dict | None, str]] | None = None,
                       previous: dict | None = None,
                       selections: dict[str, tuple[dict | None, str]] | None = None,
-                      cap: int | None = None) -> tuple[list[dict], list[dict], list[dict]]:
+                      cap: int | None = None) -> tuple[list[dict], list[dict], list[dict], list[str]]:
     """Turn the declaration into the ordered resolved set (design §3).
 
-    Returns (entries, ignored_excludes, containers). Each entry is {id, via, outcome},
+    Returns (entries, ignored_excludes, containers, dropped_excludes), the last the
+    explicit projects an exclude entry dropped, by id or by number. Each entry is {id, via, outcome},
     where outcome is None for a project still to be listed, `ok` for a container member
     whose clusters Asset Inventory already named (kept under `clusters`), a container's or
     selector's own outcome for a member carried forward under the freeze rule, the naming
@@ -913,6 +919,7 @@ def _resolve_projects(management: str | None, scope: dict,
         return sum(1 for e in entries if e["outcome"] != OUTCOME_OVER_CAP and not e.get("uncounted"))
 
     ignored: list[dict] = []
+    dropped: list[str] = []
     seen: set[str] = set()
     if management:
         # By ID, or by the number a Metrics Scope named it by: an entry an operator wrote to
@@ -939,6 +946,7 @@ def _resolve_projects(management: str | None, scope: dict,
             continue
         seen.add(project)
         if excluded(project, number_of(project)):
+            dropped.append(project)
             continue
         outcome = OUTCOME_OVER_CAP if listed_count() >= cap else None
         if outcome:
@@ -1107,7 +1115,7 @@ def _resolve_projects(management: str | None, scope: dict,
     for entry in entries:
         entry.pop("frozen", None)
         entry.pop("uncounted", None)
-    return entries, ignored, containers
+    return entries, ignored, containers, sorted(dropped)
 
 
 def _snapshot_path() -> Path:
@@ -1502,7 +1510,11 @@ def reconcile(dry_run: bool = False) -> dict:
         # a day as an index lag rather than retired as the declaration asks.
         return numbers_named.get(project) or _previous_number(previous, project)
 
-    entries, ignored_excludes, containers = _resolve_projects(management or carried_management, scope, searches, previous, selections, cap)
+    entries, ignored_excludes, containers, dropped_excludes = _resolve_projects(management or carried_management, scope, searches, previous, selections, cap)
+    if not scope_present and isinstance(previous, dict):
+        # A carried tick resolves no explicit project, so it drops none; the
+        # last readable tick's list stands with the declaration it carried.
+        dropped_excludes = [p for p in (previous.get(SCOPE_EXCLUDED_KEY) or []) if isinstance(p, str)]
     report["containers"] = [dict(c) for c in containers]
     if carried_management:
         for entry in entries:
@@ -2012,6 +2024,7 @@ def reconcile(dry_run: bool = False) -> dict:
             "projects": snapshot_projects,
             "unmanaged": sorted(unmanaged, key=lambda u: u["profile"]),
             "ignoredExcludes": ignored_excludes,
+            SCOPE_EXCLUDED_KEY: dropped_excludes,
             NUMBERS_KEY: _numbers_memo(previous, selector_reports, numbers_named,
                                        scope_readable and scope_present and selectors_known, exclude_patterns),
         })

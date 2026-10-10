@@ -443,8 +443,12 @@ def fleet_scope() -> str:
     `projects` is the sweep: every project the scope resolved to that this
     install could read (its Kubernetes Engine API off included; the collectors
     count such a project empty). `unread` names each declared project the
-    install could not read (denied, unreachable, over-cap); the collectors
-    record them as a coverage gap. `collector_args` is the string to append to
+    install could not read (denied, unreachable, over-cap), or has not
+    resolved yet (`unresolved`); the collectors record them as a coverage gap.
+    One entry, `declared-scope=unresolved`, is not a project: it rides when
+    the reconcile has not resolved the declaration (before its first tick, or
+    on a tick that could not read the render while a folder, organisation or
+    selector is declared), and the collectors render it as its own sentence. `collector_args` is the string to append to
     a collector command verbatim (`--scope-projects ... --scope-unread ...`);
     when nothing is readable it carries `--scope-unread` alone, and the
     collector then reports that and sweeps nothing. Before the reconcile's
@@ -468,7 +472,7 @@ def fleet_scope() -> str:
         return f"ERROR: Could not read the scope snapshot: {e}"
     if targets is None:
         return json.dumps({"declared": False, "projects": [], "unread": [], "collector_args": "",
-                           "note": "no declared scope (or no snapshot yet): the collectors enumerate every project the identity can list"}, indent=2)
+                           "note": "no declared scope: the collectors enumerate every project the identity can list"}, indent=2)
     return json.dumps({
         "declared": True,
         "resolved_at": targets.resolved_at,

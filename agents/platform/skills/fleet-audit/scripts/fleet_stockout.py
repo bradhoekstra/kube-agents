@@ -2492,11 +2492,12 @@ def _before(deadline: float) -> bool:
 
 def _only_a_scope_note(entry: dict, project: str | None) -> bool:
     """Whether a target's error is the discovery entry's note on what a run
-    skipped -- a `--project` scope or a filtered listing -- rather than a
-    failure that explains why nothing was collected."""
+    skipped -- a `--project` scope, a filtered listing, or the declared
+    projects the install could not read -- rather than a failure that explains
+    why nothing was collected."""
     if entry.get("name") != UNENUMERATED_PROJECTS_TARGET:
         return False
-    return bool(project) or entry["error"].startswith(FILTERED_LISTING_NOTE)
+    return bool(project) or entry["error"].startswith(FILTERED_LISTING_NOTE) or entry["error"].startswith(fleet_scope_args.DECLARED_SCOPE_NOTE_PREFIX)
 
 
 def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_workers: int = MAX_WORKERS, project_budget_s: float = PROJECT_READ_DEADLINE_S) -> dict:

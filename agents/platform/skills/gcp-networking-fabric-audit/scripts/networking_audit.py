@@ -17,7 +17,6 @@ import re
 import shlex
 import subprocess
 import sys
-from pathlib import Path
 
 MONITORED_PROJECTS_ENV = "MONITORED_PROJECT_IDS"
 PROJECT_ENV_VARS = ("GCP_PROJECT_ID", "GKE_PROJECT_ID", "PROJECT_ID")
@@ -47,7 +46,7 @@ UNENUMERATED_TAIL = "How many other projects the fleet holds is unknown."
 SHARED_SCRIPT_DIRS = (
     "/opt/defaults/scripts",
     "/opt/data/scripts",
-    *([str(Path(__file__).resolve().parents[3] / "scripts")] if len(Path(__file__).resolve().parents) > 3 else []),
+    *([str(pathlib.Path(__file__).resolve().parents[3] / "scripts")] if len(pathlib.Path(__file__).resolve().parents) > 3 else []),
 )
 
 # The install's declared scope, handed in by the agent from the platform_control
@@ -978,7 +977,7 @@ def main():
         # report it: a top-level error and a non-zero exit, so the SOP's
         # "exits non-zero or writes no file" rule applies and no document with
         # two skipped rows gets copied in as a check that ran.
-        reason = listing_errors[0] if listing_errors else declared_scope.empty_error()
+        reason = "; ".join(listing_errors) if listing_errors else declared_scope.empty_error()
         sys.stderr.write(f"{reason}\n")
         declared_empty_error = reason
 

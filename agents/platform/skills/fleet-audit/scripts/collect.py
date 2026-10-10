@@ -244,9 +244,6 @@ GIT_DIR_NAME = ".git"
 # them. The lease marker above the workspace names the repository; the broker
 # endpoint is the one every other content-mode call uses.
 CREDENTIAL_PROXY_URL_ENV = "CREDENTIAL_PROXY_URL"
-# Where the platform scripts the broker client lives in are found, in the order
-# `audit_report.py` appends them: the image's defaults, the volume's copy, then
-# the repository checkout this file sits in (for tests and local runs).
 # How a leased workspace directory names its repository: `owner__name`.
 REPO_DIR_SEPARATOR = "__"
 # What `broker_repo` returns for a content-mode workspace it cannot resolve to a

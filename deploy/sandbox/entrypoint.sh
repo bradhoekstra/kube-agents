@@ -57,8 +57,9 @@ PREPARE_IMAGE_TREES_ARG="--prepare-image-trees"
 AGENT_POD_DATABASES="${AGENT_POD_DATABASES:-kanban.db state.db}"
 AGENT_POD_DATABASE_NOTE="NOT-THE-AGENT-POD-DATABASE.txt"
 # KUBEAGENTS_SCOPE_DECLARED: the operator's one bit about the scope, read by the
-# fleet-audit collectors (fleet_scope_args.py); set on the container, it reaches a
-# collector only through this list, as the GKE_* variables do.
+# fleet-audit collectors (fleet_scope_args.py) from the root-owned file below
+# first, then from the session's environment, which it reaches only through this
+# list, as the GKE_* variables do.
 # Where the scope answer is written for the collectors, root-owned (step 4).
 SANDBOX_SCOPE_DECLARED_FILE="/run/kube-agents-sandbox/scope-declared"
 SANDBOX_FORWARDED_ENV_NAMES="CREDENTIAL_PROXY_URL CREDENTIAL_PROXY_TOKEN_FILE KUBE_CONTEXT_NAME GKE_PROJECT_ID GKE_CLUSTER_NAME GKE_LOCATION KUBEAGENTS_SCOPE_DECLARED"

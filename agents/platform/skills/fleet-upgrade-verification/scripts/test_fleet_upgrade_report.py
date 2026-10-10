@@ -972,6 +972,13 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
             self.assertEqual(report.get_target_projects(["123456789012"], notes), ["123456789012"])
         self.assertFalse(any("could not resolve" in n for n in notes), notes)
 
+    def test_a_blank_project_says_so_under_a_declared_scope(self):
+        errors: list[str] = []
+        report.declared_scope.set("ops-mgmt", None)
+        with mock.patch.dict(os.environ, self.ENV):
+            self.assertEqual(report.get_target_projects([""], errors), [])
+        self.assertTrue(any("no value" in e for e in errors), errors)
+
     def test_main_hands_the_flags_to_the_resolver(self):
         # The wiring the SOP relies on: the two flags main parses reach the
         # holder the resolver reads, before anything else runs.

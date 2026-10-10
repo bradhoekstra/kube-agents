@@ -117,6 +117,19 @@ class FleetScopeArgsTest(unittest.TestCase):
         scope.set(None, None)
         self.assertIsNone(scope.override_error("123456789012"), "without a declared scope an override is free")
 
+    def test_the_unresolved_scope_row_is_rendered_as_a_sentence_not_a_project(self):
+        note = fsa.unread_note([(fsa.UNRESOLVED_SCOPE_ROW, "unresolved"), ("payments-staging", "denied")])
+        self.assertIn("not resolved yet", note)
+        self.assertIn("names 1 project(s)", note, "the sentinel is not counted among the projects")
+        self.assertNotIn("declared-scope (", note)
+        self.assertIn("not resolved yet", fsa.unread_note([(fsa.UNRESOLVED_SCOPE_ROW, "unresolved")]))
+
+    def test_an_override_naming_an_unread_declared_project_says_so(self):
+        scope = fsa.DeclaredScope()
+        scope.set("ops-mgmt", "payments-staging=denied")
+        self.assertIn("could not read (denied)", scope.override_error("payments-staging"))
+        self.assertIn("does not list", scope.override_error("acme-only"))
+
     def test_a_repeated_project_id_is_swept_once(self):
         self.assertEqual(fsa.parse_scope_projects("ops-mgmt,payments-prod,ops-mgmt"), ["ops-mgmt", "payments-prod"])
 

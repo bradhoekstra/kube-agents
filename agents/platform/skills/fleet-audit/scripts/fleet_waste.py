@@ -6277,11 +6277,12 @@ def _pooled_by_project(projects: list[str], work, *, max_workers: int, deadline:
 
 def _only_a_scope_note(entry: dict, project: str | None) -> bool:
     """Whether a target's error is the discovery entry's note on what a run
-    skipped -- a `--project` scope or a filtered listing -- rather than a
-    failure that explains why nothing was collected."""
+    skipped -- a `--project` scope, a filtered listing, or the declared
+    projects the install could not read -- rather than a failure that explains
+    why nothing was collected."""
     if entry.get("name") != UNENUMERATED_PROJECTS_TARGET:
         return False
-    return bool(project) or entry["error"].startswith(FILTERED_LISTING_NOTE)
+    return bool(project) or entry["error"].startswith(FILTERED_LISTING_NOTE) or entry["error"].startswith(fleet_scope_args.DECLARED_SCOPE_NOTE_PREFIX)
 
 
 def collect_fleet(project: str | None = None, *, run: RunFn = default_run, session: SessionFn = None, max_workers: int = MAX_WORKERS, now: datetime | None = None, workspace: Path | None = None, project_budget_s: float = PROJECT_READ_DEADLINE_S) -> dict:
@@ -6305,7 +6306,10 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
         projects, partial_discovery = get_target_projects(project, run=run)
     except NoProjectInScope as exc:
         # No active project and a `projects list` that answered with nothing:
-        # the credential sees no project, which is not an empty fleet. Projects
+        # the credential sees no project, which is not an empty fleet. Or, under
+        # a declared scope, nothing readable, the flags missing on a scoped
+        # sandbox, or a --project the scope does not list: the same top-level
+        # error, with the reason the holder gave. Projects
         # that were listed but hold no cluster do not land here: their project
         # reads still run, and only a run that reads nothing at all ends in
         # `NOTHING_COLLECTED_ERROR` below. The manifest contract's top-level `error`, as

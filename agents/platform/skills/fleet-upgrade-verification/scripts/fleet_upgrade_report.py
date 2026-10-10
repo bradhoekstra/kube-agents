@@ -371,6 +371,11 @@ def get_target_projects(cli_projects: list[str] | None = None, listing_errors: l
                 listing_errors.append(declared_scope.empty_error())
             return []
         resolved: set[str] = set()
+        if not any(p.strip() for p in cli_projects):
+            # `--project "$VAR"` with the variable unset: say so, on every install.
+            if listing_errors is not None:
+                listing_errors.append(fleet_scope_args.EMPTY_PROJECT_OVERRIDE_ERROR)
+            return []
         for raw in (p.strip() for p in cli_projects if p.strip()):
             project = _normalise_project_id(raw, listing_errors)
             if project is None and raw.isdigit() and declared_scope.declared:
@@ -1106,7 +1111,7 @@ def render_progress(report: dict, previous: dict | None) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Per-member GKE version table against a target version.")
-    parser.add_argument("--project", action="append", help="GCP project to enumerate; repeatable. Defaults to the fleet's configured projects.")
+    parser.add_argument("--project", action="append", help="GCP project to enumerate; repeatable. On an install with a declared scope, one the fleet_scope tool lists, passed with its collector_args; omit to sweep --scope-projects when given, else the fleet's configured projects")
     fleet_scope_args.add_scope_arguments(parser)
     parser.add_argument("--target-version", help="Target for every member, e.g. 1.31.4-gke.1183000. Default: each cluster's channel defaultVersion.")
     parser.add_argument("--output", help="Path to write the report as JSON.")

@@ -145,6 +145,13 @@ class DeclaredScopeTargetsTest(unittest.TestCase):
         self.assertEqual(targets.projects, ("ops-mgmt", "payments-prod"))
         self.assertEqual(targets.unread, (("payments-net", "unresolved"),))
 
+    def test_the_render_answer_honours_the_renders_own_exclusions(self):
+        render = self.home / "scope.json"
+        render.write_text(json.dumps({"present": True, "projects": ["payments-prod", "team-sandbox"], "exclude": {"projects": ["*-sandbox"], "clusters": []}}), encoding="utf-8")
+        with mock.patch.dict(os.environ, {fst.SCOPE_FILE_ENV: str(render), "GCP_PROJECT_ID": "ops-mgmt"}):
+            targets = fst.declared_scope_targets(self.home)
+            self.assertEqual(targets.unread, (("declared-scope", "unresolved"), ("payments-prod", "unresolved")))
+
     def test_a_numeric_host_is_not_handed_on_by_the_render_answer(self):
         render = self.home / "scope.json"
         render.write_text(json.dumps({"present": True, "projects": []}), encoding="utf-8")
@@ -169,6 +176,14 @@ class DeclaredScopeTargetsTest(unittest.TestCase):
                                {"id": "payments-prod", "outcome": "ok", "state": "in-scope"}], declared=declared, present=True))
         targets = fst.declared_scope_targets(self.home)
         self.assertEqual((targets.projects, targets.unread), (("ops-mgmt", "payments-prod"), ()))
+        # Excluded by number: only the reconcile can match that, and it writes
+        # the dropped ids for the reader.
+        declared = dict(DECLARED, projects=["payments-prod", "team-prod"], exclude={"projects": ["123456789012"], "clusters": []})
+        snap = _snapshot([{"id": "ops-mgmt", "via": ["management"], "outcome": "ok", "state": "in-scope"},
+                          {"id": "payments-prod", "outcome": "ok", "state": "in-scope"}], declared=declared, present=True)
+        snap["excludedProjects"] = ["team-prod"]
+        self._write(snap)
+        self.assertEqual(fst.declared_scope_targets(self.home).unread, ())
 
     def test_a_carried_tick_on_a_folder_scoped_install_is_partial(self):
         # A carried tick resolves no folder, organisation or selector; a

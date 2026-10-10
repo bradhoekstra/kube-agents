@@ -38,6 +38,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+import fleet_scope_args
+
 # Where the reconcile writes the snapshot: the data volume's root, beside the
 # profiles directory. PLATFORM_AGENT_HOME names it in every process on the
 # agent pod (docker-entrypoint.sh), where HERMES_HOME does not: the gateway
@@ -67,11 +69,12 @@ OUTCOME_API_DISABLED = "api-disabled"
 OUTCOME_UNKNOWN = "unknown"
 # A declared project the reconcile has not resolved yet (the render answered).
 OUTCOME_UNRESOLVED = "unresolved"
-# The unread row every render answer carries, whatever the render names: the
-# reconcile has not resolved the declaration yet, so the sweep is partial by
-# construction, and `finish` resolves nothing on the projects, folders,
-# organisations or selectors the render declares. Not a project id on purpose.
-UNRESOLVED_SCOPE_ROW = "declared-scope"
+# The unread row every render answer and every carried container tick carries:
+# the reconcile has not resolved the declaration yet, so the sweep is partial
+# by construction, and `finish` resolves nothing on what the declaration names.
+# fleet_scope_args owns the constant, because the collectors render it as its
+# own sentence rather than as a project.
+UNRESOLVED_SCOPE_ROW = fleet_scope_args.UNRESOLVED_SCOPE_ROW
 RENDER_NOTE = "no reconcile snapshot answers; the render declares a scope, so the sweep is the management project alone, partial, until the next reconcile writes the resolved set"
 RENDER_NUMERIC_HOST_NOTE = "no reconcile snapshot answers; the render declares a scope, and the management project is known here by number only, so nothing is swept until the next reconcile writes the resolved set by id"
 # The lists under `declared` whose members get rows only on a readable tick:
@@ -86,9 +89,12 @@ class ScopeRenderUnreadable(Exception):
     """KUBEAGENTS_SCOPE_FILE names a render this process cannot read or parse.
     On the agent pod the operator always writes it, so this is a fault to
     report, not an install that declares no scope."""
+
+
 # The collectors' two scope flags, which `collector_args` spells with the
 # constants the collectors parse them by, so the two cannot drift apart.
-from fleet_scope_args import SCOPE_PROJECTS_FLAG, SCOPE_UNREAD_FLAG  # noqa: E402
+SCOPE_PROJECTS_FLAG = fleet_scope_args.SCOPE_PROJECTS_FLAG
+SCOPE_UNREAD_FLAG = fleet_scope_args.SCOPE_UNREAD_FLAG
 STATE_IN_SCOPE = "in-scope"
 # Whether the CR carried a spec.scope block this run, which the reconcile records
 # beside `declared`: a present block with every list empty is the host-only
@@ -105,6 +111,11 @@ PRESENT_KEY = "present"
 # still that boundary, host-only or not. A snapshot without this key is read by
 # its lists.
 READABLE_KEY = "readable"
+# The explicit projects the reconcile dropped on an exclude entry, by id or by
+# number (cluster_agent_reconcile.py, SCOPE_EXCLUDED_KEY): skipped here, so
+# the by-number match is made in the one place that knows the numbers. The
+# glob match below is for a snapshot from before the key.
+EXCLUDED_KEY = "excludedProjects"
 # The reconcile's own answer to the question this module asks (cluster_agent_reconcile.py,
 # SCOPE_BOUNDARY_KEY): a declaration is in force this run, read or carried from a run
 # that read one. Keyed on first; the two keys above and the lists are for a snapshot
@@ -203,7 +214,9 @@ def _from_render(path: Path) -> ScopeTargets | None:
         # not handed on. Nothing is swept, and the row below keeps it partial.
         host = None
         note = RENDER_NUMERIC_HOST_NOTE
-    declared = [str(p) for p in render.get("projects") or [] if isinstance(p, str) and p != host]
+    exclude_patterns = [p for p in ((render.get("exclude") or {}).get("projects") or []) if isinstance(p, str)]
+    declared = [str(p) for p in render.get("projects") or []
+                if isinstance(p, str) and p != host and not any(fnmatch.fnmatchcase(p, pattern) for pattern in exclude_patterns)]
     # The fixed row first, so a render that names folders, organisations or
     # selectors alone is partial too; the explicit projects follow by name.
     return ScopeTargets(
@@ -273,11 +286,12 @@ def declared_scope_targets(agent_home: str | os.PathLike | None = None) -> Scope
     # An explicit project an exclude pattern matches gets no row on any tick
     # and is not unread: the operator left it out on purpose.
     exclude_patterns = [p for p in ((declared.get("exclude") or {}).get("projects") or []) if isinstance(p, str)]
+    dropped = {p for p in (parsed.get(EXCLUDED_KEY) or []) if isinstance(p, str)}
     seen = set(projects) | {project for project, _ in unread}
     for project in declared.get("projects") or []:
         if not isinstance(project, str) or not project or project in seen:
             continue
-        if any(fnmatch.fnmatchcase(project, pattern) for pattern in exclude_patterns):
+        if project in dropped or any(fnmatch.fnmatchcase(project, pattern) for pattern in exclude_patterns):
             continue
         unread.append((project, OUTCOME_UNRESOLVED))
         seen.add(project)

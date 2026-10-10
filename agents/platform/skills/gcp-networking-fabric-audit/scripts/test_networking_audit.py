@@ -1124,6 +1124,19 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
         self.assertTrue(any("could not be resolved" in e for e in errors), errors)
         self.assertFalse(any("declared scope does not list" in e for e in errors), errors)
 
+    def test_the_top_level_error_carries_every_listing_reason(self):
+        # A numeric --project-id whose describe fails records two reasons; the
+        # one with the remedy must not sit only in a skipped row.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "networking.json")
+            networking_audit.declared_scope.set("ops-mgmt", None)
+            with mock.patch.dict(os.environ, self.ENV), mock.patch.object(sys, "argv", [networking_audit.__file__, "--project-id", "123456789012", "--scope-projects", "ops-mgmt", "--output", out]), mock.patch.object(networking_audit, "run_cmd", side_effect=lambda *a, **k: (1, "", "denied")), self.assertRaises(SystemExit):
+                networking_audit.main()
+            with open(out, encoding="utf-8") as f:
+                document = json.load(f)
+            self.assertIn("could not resolve", document["error"])
+
     def test_a_flagless_run_on_a_scoped_sandbox_exits_non_zero_with_a_top_level_error(self):
         # As the other seven collectors: a declared scope with nothing to sweep
         # is a failed run, not an exit-0 document with two skipped rows.

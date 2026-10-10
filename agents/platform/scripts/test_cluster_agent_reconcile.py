@@ -869,6 +869,8 @@ class ScopeTest(HomesMixin):
         snap = self._snapshot()
         self.assertEqual([p["id"] for p in snap["projects"]], sorted([self.MGMT, "team-prod"]))
         self.assertEqual(snap["ignoredExcludes"], [{"project": self.MGMT, "pattern": "mgmt-*"}])
+        self.assertEqual(self._snapshot()[rec.SCOPE_EXCLUDED_KEY], ["legacy", "team-sandbox"],
+                         "the explicit projects an exclude entry dropped are written for the audits' reader")
 
     def test_exclude_clusters_by_triple_skips_create_and_prunes_the_existing_profile(self):
         scope = {"projects": ["other"],

@@ -74,6 +74,24 @@ DECLARED_SCOPE_OVERRIDE_OUTSIDE_ERROR = (
 # The tail the project-level audits put on an unenumerated-projects row when the
 # scope was declared: the fleet's size is known there, which is the point.
 DECLARED_SCOPE_TAIL = "The declared scope names no other project."
+# The unread row the fleet_scope tool emits when the reconcile has not resolved
+# the declaration (a render answer, or a carried tick on a container- or
+# selector-scoped install); not a project id, and rendered as the gap it is.
+UNRESOLVED_SCOPE_ROW = "declared-scope"
+UNRESOLVED_SCOPE_NOTE = (
+    "the install's declared scope is not resolved yet (the reconcile has not written its resolved set); its "
+    "members are not in this run"
+)
+# What every declared-scope note starts with; the collectors that classify
+# the unenumerated row by its text key on it.
+DECLARED_SCOPE_NOTE_PREFIX = "the install's declared scope"
+# A --project that is a declared project this install could not read.
+DECLARED_SCOPE_OVERRIDE_UNREAD_ERROR = (
+    "--project names {project}, which the install's declared scope lists but this install could not read "
+    "({outcome}); nothing was swept. The fleet_scope tool's --scope-unread already records it as a coverage gap"
+)
+# A --project with no value, as `--project \"$VAR\"` with the variable unset produces.
+EMPTY_PROJECT_OVERRIDE_ERROR = "--project was given with no value; pass a project id, or omit the flag to sweep the declared scope"
 SCOPE_ARG_SEPARATORS = r"[,\s]+"
 SCOPE_UNREAD_OUTCOME_SEPARATOR = "="
 SCOPE_UNREAD_DEFAULT_OUTCOME = "unknown"
@@ -103,11 +121,19 @@ def parse_scope_unread(value: str | None) -> list[tuple[str, str]]:
 
 
 def unread_note(unread: list[tuple[str, str]]) -> str | None:
-    """The coverage gap the unread projects are, or None when there are none."""
+    """The coverage gap the unread projects are, or None when there are none.
+    The unresolved-scope row is not a project and is rendered as its own
+    sentence, so a ledger never names a project that does not exist."""
     if not unread:
         return None
-    named = ", ".join(f"{project} ({outcome})" for project, outcome in unread)
-    return DECLARED_SCOPE_UNREAD_NOTE.format(count=len(unread), named=named)
+    projects = [(project, outcome) for project, outcome in unread if project != UNRESOLVED_SCOPE_ROW]
+    sentences = []
+    if len(projects) != len(unread):
+        sentences.append(UNRESOLVED_SCOPE_NOTE)
+    if projects:
+        named = ", ".join(f"{project} ({outcome})" for project, outcome in projects)
+        sentences.append(DECLARED_SCOPE_UNREAD_NOTE.format(count=len(projects), named=named))
+    return "; ".join(sentences)
 
 
 def sandbox_declares_scope() -> bool:
@@ -138,9 +164,10 @@ class DeclaredScope:
         """Records `--scope-projects` and `--scope-unread`. Either flag passed,
         even blank, is a declared scope; `projects` is then the list, possibly
         empty. Neither flag on a sandbox whose operator says the install
-        declares a scope (SCOPE_DECLARED_ENV) is a declared scope too, with
-        nothing to sweep and `args_missing` set, so the run reports rather than
-        lists. `projects` is None only when nothing declares a scope."""
+        declares a scope (the root-owned SCOPE_DECLARED_FILE first, else
+        SCOPE_DECLARED_ENV) is a declared scope too, with nothing to sweep and
+        `args_missing` set, so the run reports rather than lists. `projects`
+        is None only when nothing declares a scope."""
         flagged = scope_projects is not None or scope_unread is not None
         self.args_missing = not flagged and sandbox_declares_scope()
         self.declared = flagged or self.args_missing
@@ -161,6 +188,9 @@ class DeclaredScope:
             # id a number names, and must not guess it is outside the scope.
             return PROJECT_NUMBER_UNRESOLVED_ERROR.format(number=project)
         if project not in (self.projects or []):
+            unread = dict(self.unread)
+            if project in unread:
+                return DECLARED_SCOPE_OVERRIDE_UNREAD_ERROR.format(project=project, outcome=unread[project])
             return DECLARED_SCOPE_OVERRIDE_OUTSIDE_ERROR.format(project=project, projects=", ".join(self.projects or []) or "none readable")
         return None
 

@@ -8025,6 +8025,14 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
         fw.declared_scope.set(None, None)
         self.assertEqual(fw.get_target_projects("acme-only", run=lambda *a, **k: run_of(1))[0], ["acme-only"])
 
+    def test_the_declared_scope_note_is_a_scope_note_not_a_discovery_failure(self):
+        # The unenumerated row that carries the tool's unread projects explains
+        # a partial sweep, not why nothing was collected.
+        note = fw.fleet_scope_args.unread_note([("payments-staging", "denied")])
+        entry = {"name": fw.UNENUMERATED_PROJECTS_TARGET, "error": note}
+        self.assertTrue(fw._only_a_scope_note(entry, None))
+        self.assertFalse(fw._only_a_scope_note({"name": fw.UNENUMERATED_PROJECTS_TARGET, "error": "`gcloud projects list` rc=1: boom"}, None))
+
     def test_main_hands_the_flags_to_the_resolver(self):
         # The wiring the SOP relies on: the two flags main parses reach the
         # holder the resolver reads, before anything else runs.
