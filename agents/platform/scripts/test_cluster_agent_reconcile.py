@@ -1056,6 +1056,22 @@ class ScopeTest(HomesMixin):
             self.assertEqual(deleted, [])
             self.assertEqual(self._snapshot()["declared"], rec._normalize_scope(declared))
             self.assertEqual([p["id"] for p in self._snapshot()["projects"]], [self.MGMT])
+            # The carried tick keeps the boundary: the previous snapshot predates
+            # the key and names p2, so the audits must not widen to the listing.
+            self.assertTrue(self._snapshot()[rec.SCOPE_BOUNDARY_KEY], "a carried declaration is a boundary in force")
+            self.assertFalse(self._snapshot()[rec.SCOPE_PRESENT_KEY])
+
+    def test_a_previous_present_block_without_the_boundary_key_is_carried(self):
+        # A snapshot from a reconcile that wrote `present` but not yet `boundary`
+        # (the host-only default: present, every list empty) carries on an
+        # unreadable tick by its present flag, not by its empty lists.
+        declared = {"projects": [], "exclude": {"projects": [], "clusters": []}}
+        (Path(self._tmp.name) / rec.SNAPSHOT_FILE).write_text(json.dumps(
+            {"projects": [{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE}], "declared": declared, rec.SCOPE_PRESENT_KEY: True}),
+            encoding="utf-8")
+        os.environ.pop(rec.SCOPE_FILE_ENV, None)
+        self._run(None, {self.MGMT: []})
+        self.assertTrue(self._snapshot()[rec.SCOPE_BOUNDARY_KEY], "present: true on the last readable tick is a boundary to carry")
 
     def test_a_declaration_with_scalar_fields_is_read_as_absent_fields(self):
         # A hand-edited file or snapshot must not abort the run or come apart into characters.

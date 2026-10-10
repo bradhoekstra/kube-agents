@@ -230,7 +230,8 @@ FIXTURE_NOT_READY = {
         "agent's service account can list but the scope does not declare; the "
         "evaluation fleet has one project per install today, so no CI tier can run "
         "it; run it by hand against such an install, substituting the outside "
-        "project's id in the case's two patterns"
+        "project's id at the case's three sites: the two forbidden patterns and the "
+        "ledger check's forbidden phrase"
     ),
     "networking-audit-second-project": (
         "#1865: needs a second GCP project per pool project that the agent's "

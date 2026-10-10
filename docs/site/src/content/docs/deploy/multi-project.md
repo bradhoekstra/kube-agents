@@ -37,10 +37,7 @@ differently:
   composition makes declares a scope: the chart renders `spec.scope` on each,
   empty lists included, so with no `SCOPE_*` key set the audits sweep the
   host project alone, and a project reached by an IAM grant alone is not swept
-  until it is named there. Only a `PlatformAgent` applied by hand without a
-  `scope` block declares none; there the audits discover every project the
-  agent's identity can list (`gcloud projects list` unioned with the host
-  project), so the IAM grant sets their scope. Audits that target GKE clusters name each one
+  until it is named there. Two installs declare none: a `PlatformAgent` applied by hand without a `scope` block, and a `helm install` on the chart's default values, where `platformAgent.scope` is `null` and the chart renders no block. There the audits discover every project the agent's identity can list (`gcloud projects list` unioned with the host project), so the IAM grant sets their scope. Audits that target GKE clusters name each one
   `<project>/<location>/<name>`, and the project-level audits name their targets
   `project/<id>` (and subnets `<project>/<region>/<subnet>`), so identically named
   resources in different projects never collide. If the project listing fails or

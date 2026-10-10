@@ -50,7 +50,18 @@ DECLARED_SCOPE_EMPTY_ERROR = (
 # instead and the agent passes collector_args. Unset, as in a checkout, means
 # nothing is known and the flags alone decide.
 SCOPE_DECLARED_ENV = "KUBEAGENTS_SCOPE_DECLARED"
+# The same answer as a root-owned file, written by the sandbox entrypoint from
+# the container's environment at boot and read before the variable: a session
+# can unset or override an exported variable with one word, and the guard would
+# be worth nothing against a run that did. Absent on a checkout and on the
+# agent pod, where the variable (if any) decides.
+SCOPE_DECLARED_FILE = "/run/kube-agents-sandbox/scope-declared"
 SCOPE_DECLARED_TRUE = "true"
+# A --project that is a project number the collector could not resolve to an id.
+PROJECT_NUMBER_UNRESOLVED_ERROR = (
+    "--project names project number {number}, which could not be resolved to a project id (gcloud projects "
+    "describe failed); on an install with a declared scope pass the id the fleet_scope tool lists"
+)
 DECLARED_SCOPE_ARGS_MISSING_ERROR = (
     "this install declares a scope but the collector got no collector_args: call the platform_control "
     "fleet_scope tool and pass its collector_args verbatim; nothing was swept or listed"
@@ -99,6 +110,16 @@ def unread_note(unread: list[tuple[str, str]]) -> str | None:
     return DECLARED_SCOPE_UNREAD_NOTE.format(count=len(unread), named=named)
 
 
+def sandbox_declares_scope() -> bool:
+    """Whether the operator says this install declares a scope: the root-owned
+    file the sandbox entrypoint writes, else the environment variable."""
+    try:
+        with open(SCOPE_DECLARED_FILE, encoding="utf-8") as handle:
+            return handle.read().strip().lower() == SCOPE_DECLARED_TRUE
+    except OSError:
+        return os.environ.get(SCOPE_DECLARED_ENV, "").strip().lower() == SCOPE_DECLARED_TRUE
+
+
 class DeclaredScope:
     """The scope a collector was handed, one instance per collector module:
     `set` from the parsed flags in main, read by the project resolver. Not
@@ -121,7 +142,7 @@ class DeclaredScope:
         nothing to sweep and `args_missing` set, so the run reports rather than
         lists. `projects` is None only when nothing declares a scope."""
         flagged = scope_projects is not None or scope_unread is not None
-        self.args_missing = not flagged and os.environ.get(SCOPE_DECLARED_ENV, "").strip().lower() == SCOPE_DECLARED_TRUE
+        self.args_missing = not flagged and sandbox_declares_scope()
         self.declared = flagged or self.args_missing
         self.projects = parse_scope_projects(scope_projects) if self.declared else None
         self.unread = parse_scope_unread(scope_unread)

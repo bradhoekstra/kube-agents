@@ -59,6 +59,8 @@ AGENT_POD_DATABASE_NOTE="NOT-THE-AGENT-POD-DATABASE.txt"
 # KUBEAGENTS_SCOPE_DECLARED: the operator's one bit about the scope, read by the
 # fleet-audit collectors (fleet_scope_args.py); set on the container, it reaches a
 # collector only through this list, as the GKE_* variables do.
+# Where the scope answer is written for the collectors, root-owned (step 4).
+SANDBOX_SCOPE_DECLARED_FILE="/run/kube-agents-sandbox/scope-declared"
 SANDBOX_FORWARDED_ENV_NAMES="CREDENTIAL_PROXY_URL CREDENTIAL_PROXY_TOKEN_FILE KUBE_CONTEXT_NAME GKE_PROJECT_ID GKE_CLUSTER_NAME GKE_LOCATION KUBEAGENTS_SCOPE_DECLARED"
 
 # Nearly every name under $DATA is owned by uid 1000 -- the image trees step 1a
@@ -612,6 +614,14 @@ install -d -m 0755 /etc/ssh/sshd_config.d
   echo "SetEnv $setenv_args"
 } >"$SANDBOX_SSHD_DROPIN"
 chmod 0644 "$SANDBOX_SSHD_DROPIN"
+# The scope answer as a root-owned file too: the SetEnv above hands sessions a
+# variable they can unset or override in one word, and the fleet-audit
+# collectors (fleet_scope_args.py) read this file before the variable so a run
+# that did would still be refused. Written whatever the value, so a session
+# cannot supply the file either.
+install -d -m 0755 "$(dirname "$SANDBOX_SCOPE_DECLARED_FILE")"
+printf '%s\n' "${KUBEAGENTS_SCOPE_DECLARED:-false}" >"$SANDBOX_SCOPE_DECLARED_FILE"
+chmod 0644 "$SANDBOX_SCOPE_DECLARED_FILE"
 # Fail here rather than in sshd. An invalid drop-in makes sshd exit during
 # startup with a message about /etc/ssh/sshd_config.d/10-sandbox-env.conf, a
 # file that exists in no source tree; `-t` names it while the entrypoint is

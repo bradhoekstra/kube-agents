@@ -654,6 +654,13 @@ class SandboxEntrypointForwardedEnvTest(unittest.TestCase):
             f"expected {required} to be subset of {names}",
         )
 
+    def test_the_scope_answer_is_also_written_as_a_root_owned_file(self) -> None:
+        """A session can unset the forwarded variable; the collectors read this file first."""
+        content = _ENTRYPOINT.read_text()
+        self.assertIn('SANDBOX_SCOPE_DECLARED_FILE="/run/kube-agents-sandbox/scope-declared"', content)
+        self.assertRegex(content, r'printf \'%s\\n\' "\$\{KUBEAGENTS_SCOPE_DECLARED:-false\}" >"\$SANDBOX_SCOPE_DECLARED_FILE"')
+        self.assertIn('chmod 0644 "$SANDBOX_SCOPE_DECLARED_FILE"', content)
+
 
 if __name__ == "__main__":
     unittest.main()

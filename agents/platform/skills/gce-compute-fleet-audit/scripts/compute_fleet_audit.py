@@ -668,7 +668,20 @@ def get_target_projects(
     """
     if cli_project and cli_project.strip():
         raw = cli_project.strip()
-        project = _normalise_project_id(raw, run=run) or raw
+        # Refused before anything is read: a scoped sandbox without the flags
+        # must not describe a project the worker named, since the refusal that
+        # follows says the collector may not touch it.
+        if declared_scope.args_missing:
+            if notes is not None:
+                notes.append(declared_scope.empty_error())
+            return []
+        resolved = _normalise_project_id(raw, notes, run=run)
+        if resolved is None and raw.isdigit():
+            # The describe failed: the recorded reason, not "outside the scope".
+            if notes is not None:
+                notes.append(fleet_scope_args.PROJECT_NUMBER_UNRESOLVED_ERROR.format(number=raw))
+            return []
+        project = resolved or raw
         # On the resolved id: a project number given here names the same
         # project the tool lists by id.
         override_error = declared_scope.override_error(project)

@@ -278,7 +278,18 @@ def get_target_projects(cli_project: str | None = None, listing_errors: list[str
     """
     if cli_project and cli_project.strip():
         raw = cli_project.strip()
-        project = _normalise_project_id(raw) or raw
+        # Refused before anything is read: a scoped sandbox without the flags
+        # must not describe a project the worker named.
+        if declared_scope.args_missing:
+            if listing_errors is not None:
+                listing_errors.append(declared_scope.empty_error())
+            return []
+        resolved = _normalise_project_id(raw, listing_errors)
+        if resolved is None and raw.isdigit():
+            if listing_errors is not None:
+                listing_errors.append(fleet_scope_args.PROJECT_NUMBER_UNRESOLVED_ERROR.format(number=raw))
+            return []
+        project = resolved or raw
         # On the resolved id: a project number given here names the same
         # project the tool lists by id.
         override_error = declared_scope.override_error(project)

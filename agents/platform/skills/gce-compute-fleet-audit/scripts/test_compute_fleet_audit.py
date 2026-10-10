@@ -2330,6 +2330,21 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
             self.assertEqual(cf.get_target_projects("acme-only", notes, run=lambda *a, **k: run_of(1)), [])
         self.assertTrue(any("declared scope does not list" in n for n in notes))
 
+    def test_a_project_id_without_the_flags_on_a_scoped_sandbox_is_refused_before_any_read(self):
+        notes: list[str] = []
+        with mock.patch.dict(os.environ, {**self.ENV, "KUBEAGENTS_SCOPE_DECLARED": "true"}):
+            cf.declared_scope.set(None, None)
+            self.assertEqual(cf.get_target_projects("123456789012", notes, run=lambda *a, **k: (_ for _ in ()).throw(AssertionError("nothing may be read"))), [])
+        self.assertIn("got no collector_args", notes[0])
+
+    def test_a_project_number_whose_describe_fails_is_reported_as_unresolved_not_outside(self):
+        notes: list[str] = []
+        cf.declared_scope.set("ops-mgmt", None)
+        with mock.patch.dict(os.environ, self.ENV):
+            self.assertEqual(cf.get_target_projects("123456789012", notes, run=lambda *a, **k: run_of(1, "", "denied")), [])
+        self.assertTrue(any("could not be resolved" in n for n in notes), notes)
+        self.assertFalse(any("declared scope does not list" in n for n in notes), notes)
+
     def test_a_flagless_run_on_a_scoped_sandbox_names_the_tool_as_the_top_level_error(self):
         # The manifest's top-level error is what the SOP tells the worker to
         # report; under a declared scope it must be the real reason, not the

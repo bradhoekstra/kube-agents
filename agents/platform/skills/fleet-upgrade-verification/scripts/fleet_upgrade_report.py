@@ -362,15 +362,28 @@ def get_target_projects(cli_projects: list[str] | None = None, listing_errors: l
     configured project: it is filtered, not complete, as fleet_drift.py treats it.
     """
     if cli_projects:
-        resolved = sorted({_normalise_project_id(p.strip()) or p.strip() for p in cli_projects if p.strip()})
+        # Refused before anything is read: a scoped sandbox without the flags
+        # must not describe a project the worker named.
+        if declared_scope.args_missing:
+            if listing_errors is not None:
+                listing_errors.append(declared_scope.empty_error())
+            return []
+        resolved: set[str] = set()
+        for raw in (p.strip() for p in cli_projects if p.strip()):
+            project = _normalise_project_id(raw, listing_errors)
+            if project is None and raw.isdigit():
+                if listing_errors is not None:
+                    listing_errors.append(fleet_scope_args.PROJECT_NUMBER_UNRESOLVED_ERROR.format(number=raw))
+                return []
+            resolved.add(project or raw)
         # On the resolved ids: a project number given here names the same
         # project the tool lists by id.
-        override_errors = [declared_scope.override_error(p) for p in resolved]
+        override_errors = [declared_scope.override_error(p) for p in sorted(resolved)]
         if any(override_errors):
             if listing_errors is not None:
                 listing_errors.extend(e for e in override_errors if e)
             return []
-        return resolved
+        return sorted(resolved)
     if declared_scope.declared:
         # The declared scope the agent carried from the fleet_scope tool: the
         # sweep as given, nothing listed, the unread rows as the one note. A

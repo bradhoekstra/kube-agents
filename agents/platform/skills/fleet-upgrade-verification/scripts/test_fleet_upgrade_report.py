@@ -943,6 +943,21 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
             self.assertEqual(report.get_target_projects(["acme-only"], errors), [])
         self.assertTrue(any("declared scope does not list" in e for e in errors))
 
+    def test_a_project_without_the_flags_on_a_scoped_sandbox_is_refused_before_any_read(self):
+        errors: list[str] = []
+        with mock.patch.dict(os.environ, {**self.ENV, "KUBEAGENTS_SCOPE_DECLARED": "true"}), mock.patch.object(report, "run_cmd", side_effect=lambda *a, **k: (_ for _ in ()).throw(AssertionError("nothing may be read"))):
+            report.declared_scope.set(None, None)
+            self.assertEqual(report.get_target_projects(["123456789012"], errors), [])
+        self.assertIn("got no collector_args", errors[0])
+
+    def test_a_project_number_whose_describe_fails_is_reported_as_unresolved_not_outside(self):
+        errors: list[str] = []
+        report.declared_scope.set("ops-mgmt", None)
+        with mock.patch.dict(os.environ, self.ENV), mock.patch.object(report, "run_cmd", side_effect=lambda *a, **k: (1, "", "denied")):
+            self.assertEqual(report.get_target_projects(["123456789012"], errors), [])
+        self.assertTrue(any("could not be resolved" in e for e in errors), errors)
+        self.assertFalse(any("declared scope does not list" in e for e in errors), errors)
+
     def test_main_hands_the_flags_to_the_resolver(self):
         # The wiring the SOP relies on: the two flags main parses reach the
         # holder the resolver reads, before anything else runs.

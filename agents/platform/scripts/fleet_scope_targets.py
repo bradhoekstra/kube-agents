@@ -186,6 +186,11 @@ def _from_render(path: Path) -> ScopeTargets | None:
     if render is None or render.get(RENDER_PRESENT_KEY) is not True:
         return None
     host = next((os.environ.get(name) for name in MANAGEMENT_PROJECT_ENVS if os.environ.get(name)), None)
+    if host and host.isdigit():
+        # The operator lets spec.harness.projectId be a project number; every
+        # snapshot row and every --project check uses the id, so a number is
+        # not handed on. Nothing is swept, and the row below keeps it partial.
+        host = None
     declared = [str(p) for p in render.get("projects") or [] if isinstance(p, str) and p != host]
     # The fixed row first, so a render that names folders, organisations or
     # selectors alone is partial too; the explicit projects follow by name.
@@ -245,6 +250,15 @@ def declared_scope_targets(agent_home: str | os.PathLike | None = None) -> Scope
             projects.append(project)
         else:
             unread.append((project, str(row.get("outcome") or OUTCOME_UNKNOWN)))
+    # A declared project with no row at all: the carried tick writes rows for
+    # the management project and the projects that hold a profile, so a
+    # declared project with no cluster (the GCE and networking streams'
+    # ordinary target) would otherwise vanish from a complete-looking sweep.
+    seen = set(projects) | {project for project, _ in unread}
+    for project in declared.get("projects") or []:
+        if isinstance(project, str) and project and project not in seen:
+            unread.append((project, OUTCOME_UNRESOLVED))
+            seen.add(project)
     resolved_at = parsed.get("resolvedAt")
     return ScopeTargets(
         projects=tuple(projects),

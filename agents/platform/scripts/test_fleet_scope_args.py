@@ -16,6 +16,10 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 import fleet_scope_args as fsa  # noqa: E402
 
+# The holder reads KUBEAGENTS_SCOPE_DECLARED when neither flag is passed; the
+# shell running this suite must not decide its answers.
+os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)  # module-level, on purpose
+
 
 class FleetScopeArgsTest(unittest.TestCase):
     def test_the_two_flags_parse_as_the_tool_spells_them(self):
@@ -86,6 +90,24 @@ class FleetScopeArgsTest(unittest.TestCase):
             self.assertFalse(scope.sweep_is_declared(), "declared by the env alone is not the declared sweep")
         scope.set(None, None)
         self.assertFalse(scope.sweep_is_declared())
+
+    def test_the_root_owned_file_outranks_the_environment(self):
+        # A session can unset or override the variable in one word; the file the
+        # entrypoint writes as root is what the guard reads first.
+        import tempfile, os as _os
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _os.path.join(tmp, "scope-declared")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("true\n")
+            scope = fsa.DeclaredScope()
+            with mock.patch.object(fsa, "SCOPE_DECLARED_FILE", path), mock.patch.dict(os.environ, {fsa.SCOPE_DECLARED_ENV: "false"}):
+                scope.set(None, None)
+                self.assertTrue(scope.args_missing, "the file says declared; the session's variable does not get a vote")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("false\n")
+            with mock.patch.object(fsa, "SCOPE_DECLARED_FILE", path), mock.patch.dict(os.environ, {fsa.SCOPE_DECLARED_ENV: "true"}):
+                scope.set(None, None)
+                self.assertFalse(scope.declared, "the file says no scope; a variable cannot invent one either")
 
     def test_a_repeated_project_id_is_swept_once(self):
         self.assertEqual(fsa.parse_scope_projects("ops-mgmt,payments-prod,ops-mgmt"), ["ops-mgmt", "payments-prod"])

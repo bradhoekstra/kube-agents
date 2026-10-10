@@ -1105,6 +1105,21 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
             self.assertEqual(networking_audit.get_target_projects("acme-only", errors), [])
         self.assertTrue(any("declared scope does not list" in e for e in errors))
 
+    def test_a_project_id_without_the_flags_on_a_scoped_sandbox_is_refused_before_any_read(self):
+        errors: list[str] = []
+        with mock.patch.dict(os.environ, {**self.ENV, "KUBEAGENTS_SCOPE_DECLARED": "true"}), mock.patch.object(networking_audit, "run_cmd", side_effect=lambda *a, **k: (_ for _ in ()).throw(AssertionError("nothing may be read"))):
+            networking_audit.declared_scope.set(None, None)
+            self.assertEqual(networking_audit.get_target_projects("123456789012", errors), [])
+        self.assertIn("got no collector_args", errors[0])
+
+    def test_a_project_number_whose_describe_fails_is_reported_as_unresolved_not_outside(self):
+        errors: list[str] = []
+        networking_audit.declared_scope.set("ops-mgmt", None)
+        with mock.patch.dict(os.environ, self.ENV), mock.patch.object(networking_audit, "run_cmd", side_effect=lambda *a, **k: (1, "", "denied")):
+            self.assertEqual(networking_audit.get_target_projects("123456789012", errors), [])
+        self.assertTrue(any("could not be resolved" in e for e in errors), errors)
+        self.assertFalse(any("declared scope does not list" in e for e in errors), errors)
+
     def test_a_flagless_run_on_a_scoped_sandbox_exits_non_zero_with_a_top_level_error(self):
         # As the other seven collectors: a declared scope with nothing to sweep
         # is a failed run, not an exit-0 document with two skipped rows.

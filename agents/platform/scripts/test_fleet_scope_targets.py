@@ -132,6 +132,27 @@ class DeclaredScopeTargetsTest(unittest.TestCase):
         self.assertEqual(targets.projects, ("ops-mgmt",))
         self.assertEqual(targets.collector_args(), "--scope-projects ops-mgmt")
 
+    def test_a_declared_project_with_no_row_rides_as_unread(self):
+        # The carried tick writes rows for the management project and the
+        # projects holding a profile; a declared project with no cluster has
+        # none, and must not vanish from a sweep that then reads as complete.
+        declared = dict(DECLARED, projects=["payments-prod", "payments-net"])
+        snap = _snapshot([{"id": "ops-mgmt", "via": ["management"], "outcome": "ok", "state": "in-scope"},
+                          {"id": "payments-prod", "outcome": "ok", "state": "in-scope"}], declared=declared, present=False, readable=False)
+        snap["boundary"] = True
+        self._write(snap)
+        targets = fst.declared_scope_targets(self.home)
+        self.assertEqual(targets.projects, ("ops-mgmt", "payments-prod"))
+        self.assertEqual(targets.unread, (("payments-net", "unresolved"),))
+
+    def test_a_numeric_host_is_not_handed_on_by_the_render_answer(self):
+        render = self.home / "scope.json"
+        render.write_text(json.dumps({"present": True, "projects": []}), encoding="utf-8")
+        with mock.patch.dict(os.environ, {fst.SCOPE_FILE_ENV: str(render), "GCP_PROJECT_ID": "123456789012"}):
+            targets = fst.declared_scope_targets(self.home)
+            self.assertEqual(targets.projects, ())
+            self.assertEqual(targets.collector_args(), "--scope-unread declared-scope=unresolved")
+
     def test_a_declared_scope_yields_the_ok_projects_in_snapshot_order(self):
         self._write(_snapshot([
             {"id": "ops-mgmt", "via": ["management"], "outcome": "ok", "state": "in-scope"},
@@ -156,7 +177,7 @@ class DeclaredScopeTargetsTest(unittest.TestCase):
         self.assertEqual(fst.declared_scope_targets(self.home).projects, ("ops-mgmt",))
 
     def test_collector_args_without_an_unread_project_carries_the_sweep_alone(self):
-        self._write(_snapshot([{"id": "ops-mgmt", "outcome": "ok", "state": "in-scope"}]))
+        self._write(_snapshot([{"id": "ops-mgmt", "outcome": "ok", "state": "in-scope"}], declared=dict(DECLARED, projects=[]), present=True))
         self.assertEqual(fst.declared_scope_targets(self.home).collector_args(), "--scope-projects ops-mgmt")
 
     def test_a_carried_declaration_under_an_unreadable_render_is_still_a_boundary(self):
@@ -199,10 +220,11 @@ class DeclaredScopeTargetsTest(unittest.TestCase):
         targets = fst.declared_scope_targets(self.home)
         self.assertEqual(targets.projects, ())
         self.assertEqual(targets.collector_args(), "--scope-unread payments-prod=denied")
+        # Every declared project has a row here, so nothing else rides as unread.
         # A declared scope with no row at all still hands the collector something
         # that says "declared": an empty string would have the guard tell the
         # agent to call the tool it has just called.
-        self._write(_snapshot([]))
+        self._write(_snapshot([], declared=dict(DECLARED, projects=[]), present=True))
         self.assertEqual(fst.declared_scope_targets(self.home).collector_args(), "--scope-unread declared-scope=unresolved")
 
     def test_rows_without_an_id_or_without_a_state_are_handled(self):
@@ -217,7 +239,9 @@ class DeclaredScopeTargetsTest(unittest.TestCase):
         profile_home.mkdir(parents=True)
         with mock.patch.dict(os.environ, {fst.AGENT_HOME_ENV: str(self.home), "HERMES_HOME": str(profile_home)}):
             self.assertEqual(fst.declared_scope_targets().projects, ("ops-mgmt",))
-        with mock.patch.dict(os.environ, {"HERMES_HOME": str(self.home)}, clear=False):
+        empty_default = self.home / "empty-default"
+        empty_default.mkdir()
+        with mock.patch.dict(os.environ, {"HERMES_HOME": str(self.home)}, clear=False), mock.patch.object(fst, "DEFAULT_AGENT_HOME", str(empty_default)):
             os.environ.pop(fst.AGENT_HOME_ENV, None)
             self.assertIsNone(fst.declared_scope_targets(), "HERMES_HOME must not be the key: on the pod it names the profile home")
         self.assertEqual(fst.snapshot_path("/elsewhere"), pathlib.Path("/elsewhere") / fst.SNAPSHOT_FILE)
