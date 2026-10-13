@@ -770,16 +770,41 @@ class VcsRequestCountingTest(_BrokerFixture):
         self.assertEqual(1, self.vcs_count("proposal-list", "busy"))
 
     def test_a_repository_field_that_cannot_be_read_counts_as_error_and_an_unserved_host_as_blocked(self):
-        for status, want in ((400, "error"), (403, "blocked")):
+        # The exceptions `registry.resolve` raises: an unreadable field, an
+        # allowlist refusal (GitLab's 403), and a host no forge serves, which is
+        # `ForgeUnsupported` and fixes its own 501.
+        cases = (
+            (credential_proxy.providers.WorkspaceError("bad repository", status=400), 400, "error"),
+            (credential_proxy.providers.WorkspaceError("not allowed", status=403), 403, "blocked"),
+            (credential_proxy.providers.ForgeUnsupported("bitbucket.example is not a forge this install serves"), 501, "blocked"),
+        )
+        counted = {}
+        for exc, status, want in cases:
             broker = mock.Mock()
-            broker.registry.resolve.side_effect = credential_proxy.providers.WorkspaceError("bad repository", status=status)
+            broker.registry.resolve.side_effect = exc
             with (
                 mock.patch.object(CredentialProxyHandler, "vcs", broker, create=True),
                 mock.patch.object(credential_proxy.vcs_broker, "route_table", return_value={"proposal-list": lambda payload: {"items": []}}),
             ):
                 got, _ = self.post_vcs("proposal-list", {"repository": "nonsense"})
             self.assertEqual(status, got)
-            self.assertEqual(1, self.vcs_count("proposal-list", want), (status, want))
+            counted[want] = counted.get(want, 0) + 1
+            self.assertEqual(counted[want], self.vcs_count("proposal-list", want), (status, want))
+
+    def test_a_caller_that_leaves_the_queue_counts_as_abandoned(self):
+        @contextlib.contextmanager
+        def caller_gone(caller=None):
+            raise credential_proxy.CallerHungUp()
+            yield  # pragma: no cover
+
+        with (
+            self.vcs_route("proposal-list", lambda payload: {"items": []}),
+            mock.patch.object(CredentialProxyHandler.executor, "request_slot", caller_gone),
+        ):
+            # Nothing is written back, so the client sees the connection close.
+            with self.assertRaises((urllib.error.URLError, ConnectionError, OSError)):
+                self.post_vcs("proposal-list")
+        self.assertEqual(1, self.vcs_count("proposal-list", "abandoned"))
 
     def test_an_unreadable_managed_list_counts_as_error_not_blocked(self):
         broker = mock.Mock()

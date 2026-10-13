@@ -8962,11 +8962,13 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                     try:
                         forge, repository = self.vcs.registry.resolve(payload.get("repository"))
                     except providers.WorkspaceError as exc:
-                        # A repository this install serves no credential for is a
-                        # refusal; a repository field that cannot be read is a
-                        # request the broker could not use.
+                        # A repository this install serves no credential for
+                        # (`ForgeUnsupported`, a 501) or one an allowlist declines
+                        # (a 403) is a refusal; a repository field that cannot be
+                        # read is a request the broker could not use.
                         self._json(HTTPStatus(exc.status), _redacted_fields(exc))
-                        return TOOL_STATUS_BLOCKED if exc.status == HTTPStatus.FORBIDDEN else TOOL_STATUS_ERROR
+                        refused = exc.status == HTTPStatus.FORBIDDEN or isinstance(exc, providers.ForgeUnsupported)
+                        return TOOL_STATUS_BLOCKED if refused else TOOL_STATUS_ERROR
                     if not self._repository_is_permitted(repository, forge):
                         # Refused on the managed list, or the list itself could
                         # not be read: the first is a refusal, the second a fault.

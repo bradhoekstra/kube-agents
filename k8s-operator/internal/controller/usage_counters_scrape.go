@@ -248,8 +248,9 @@ func newPodUsageSource() *podUsageSource {
 	}}
 }
 
-// Scrape GETs the listener at addr and folds the body for counter. Any status
-// other than 200 is a failed scrape.
+// Scrape GETs the listener at addr and folds the body for each of counters,
+// one sample per counter from the one body. Any status other than 200 is a
+// failed scrape.
 func (s *podUsageSource) Scrape(ctx context.Context, addr string, counters []string) (usageReading, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, usageScrapeScheme+addr+usageMetricsPath, nil)
 	if err != nil {
