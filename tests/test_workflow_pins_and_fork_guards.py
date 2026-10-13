@@ -19,9 +19,9 @@ a third:
   - a Docker Hub image is pulled through `mirror.gcr.io`, because Docker Hub's
     anonymous limit is per source IP and GitHub-hosted runners share theirs:
     a `docker/setup-buildx-action` step takes its builder image from the
-    mirror (`driver-opts: image=mirror.gcr.io/moby/buildkit:...`), one in a job
-    that also runs `docker/build-push-action` reads `.github/buildkitd.toml`
-    so the builder resolves `docker.io` there, and a job `container:`, a
+    mirror (`driver-opts: image=mirror.gcr.io/moby/buildkit:...`) and reads
+    `.github/buildkitd.toml` so the builder resolves `docker.io` there, and a
+    job `container:`, a
     `services:` image or a `docker://` action never names Docker Hub, whether
     as `docker.io/...` or as a bare `python:3.14-slim` / `semgrep/semgrep:...`.
 
@@ -73,6 +73,7 @@ from __future__ import annotations
 import re
 import tempfile
 import textwrap
+import tomllib
 import unittest
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -145,10 +146,10 @@ _ON_KEY = "on"
 # The mirror rule (.agents/rules/github_actions.md, "Pull Docker Hub images
 # through mirror.gcr.io"). A setup-buildx step's builder image is pulled by the
 # runner's daemon before the builder exists, so it is named on the mirror
-# directly; the builder's own docker.io pulls go through the shared config,
-# which only a step that builds needs.
+# directly; the builder's own docker.io pulls go through the shared config.
+# Every setup-buildx step carries both: whether a job builds is not something
+# a `uses:` prefix can tell (a `run: docker buildx build` builds too).
 _BUILDX_ACTION_PREFIX = "docker/setup-buildx-action@"
-_BUILD_ACTION_PREFIX = "docker/build-push-action@"
 _WITH_KEY = "with"
 _DRIVER_OPTS_KEY = "driver-opts"
 _BUILDKITD_CONFIG_KEY = "buildkitd-config"
@@ -158,19 +159,27 @@ _BUILDER_IMAGE_OPT = f"image={_MIRROR_HOST}/moby/buildkit"
 _CONTAINER_KEY = "container"
 _SERVICES_KEY = "services"
 _IMAGE_KEY = "image"
-# Hosts that name Docker Hub explicitly. A reference whose first path segment
-# is not a host at all (`python:3.14-slim`, `semgrep/semgrep:1.155.0`) names it
-# implicitly: a registry host carries a dot or a port, or is localhost.
-_DOCKER_HUB_HOSTS = {"docker.io", "index.docker.io", "registry-1.docker.io"}
+# Hosts that name Docker Hub explicitly, compared lower-cased with any `:port`
+# removed. A
+# reference whose first path segment is not a host at all (`python:3.14-slim`,
+# `semgrep/semgrep:1.155.0`) names it implicitly: a registry host carries a dot
+# or a port, or is localhost.
+_DOCKER_HUB_HOSTS = {
+    "docker.io",
+    "index.docker.io",
+    "registry-1.docker.io",
+    "registry.hub.docker.com",
+}
 _LOCALHOST = "localhost"
-_REGISTRY_HOST_MARKERS = (".", ":")
+_PORT_SEPARATOR = ":"
+_REGISTRY_HOST_MARKERS = (".", _PORT_SEPARATOR)
 _EXPRESSION_OPEN = "${{"
-# The shared buildkitd config, read as text rather than parsed so the check
-# needs no TOML library: the docker.io registry entry with the mirror.
+# The shared buildkitd config, parsed as buildkitd parses it: the docker.io
+# registry table's mirrors list.
 _BUILDKITD_CONFIG_FILE = REPO_ROOT / _BUILDKITD_CONFIG_PATH
-_BUILDKITD_MIRROR_RE = re.compile(
-    r'\[registry\."docker\.io"\]\s*\n\s*mirrors\s*=\s*\[\s*"' + re.escape(_MIRROR_HOST) + r'"\s*\]'
-)
+_REGISTRY_TABLE = "registry"
+_DOCKER_HUB_REGISTRY = "docker.io"
+_MIRRORS_KEY = "mirrors"
 
 # Floors for the real-tree test, so an empty or partial walk fails. Each sits
 # at roughly two thirds of what the tree carries as this file lands, so a
@@ -415,7 +424,7 @@ def _is_docker_hub_ref(ref: str) -> bool:
     host, has_path, _ = ref.partition("/")
     if not has_path:
         return True
-    if host in _DOCKER_HUB_HOSTS:
+    if host.rsplit(_PORT_SEPARATOR, 1)[0].lower() in _DOCKER_HUB_HOSTS:
         return True
     return host != _LOCALHOST and not any(marker in host for marker in _REGISTRY_HOST_MARKERS)
 
@@ -457,19 +466,15 @@ def _buildx_problems(job: dict) -> list[str]:
     steps = job.get(_STEPS_KEY)
     if not isinstance(steps, list):
         return []
-    steps = [step for step in steps if isinstance(step, dict)]
-    builds = any(str(step.get(_USES_KEY, "")).startswith(_BUILD_ACTION_PREFIX) for step in steps)
     problems: list[str] = []
     for step in steps:
-        if not str(step.get(_USES_KEY, "")).startswith(_BUILDX_ACTION_PREFIX):
+        if not isinstance(step, dict) or not str(step.get(_USES_KEY, "")).startswith(_BUILDX_ACTION_PREFIX):
             continue
         with_ = step.get(_WITH_KEY) if isinstance(step.get(_WITH_KEY), dict) else {}
         if _BUILDER_IMAGE_OPT not in str(with_.get(_DRIVER_OPTS_KEY, "")):
             problems.append(f"setup-buildx step has no `{_DRIVER_OPTS_KEY}: {_BUILDER_IMAGE_OPT}:<tag>`")
-        if builds and with_.get(_BUILDKITD_CONFIG_KEY) != _BUILDKITD_CONFIG_PATH:
-            problems.append(
-                f"setup-buildx step in a job that builds has no `{_BUILDKITD_CONFIG_KEY}: {_BUILDKITD_CONFIG_PATH}`"
-            )
+        if with_.get(_BUILDKITD_CONFIG_KEY) != _BUILDKITD_CONFIG_PATH:
+            problems.append(f"setup-buildx step has no `{_BUILDKITD_CONFIG_KEY}: {_BUILDKITD_CONFIG_PATH}`")
     return problems
 
 
@@ -513,9 +518,20 @@ def check_mirror(directory: Path) -> MirrorReport:
 def check_buildkitd_config(path: Path) -> list[str]:
     """The shared buildkitd config exists and mirrors docker.io to the mirror."""
     if not path.is_file():
-        return [f"{path}: missing; every building setup-buildx step reads it"]
-    if not _BUILDKITD_MIRROR_RE.search(path.read_text(encoding="utf-8")):
-        return [f'{path}: no `[registry."docker.io"]` entry with `mirrors = ["{_MIRROR_HOST}"]`']
+        return [f"{path}: missing; every setup-buildx step reads it"]
+    try:
+        config = tomllib.loads(path.read_text(encoding="utf-8"))
+    except tomllib.TOMLDecodeError as exc:
+        return [f"{path}: not valid TOML: {exc}"]
+    registry = config.get(_REGISTRY_TABLE)
+    table = registry.get(_DOCKER_HUB_REGISTRY) if isinstance(registry, dict) else None
+    mirrors = table.get(_MIRRORS_KEY) if isinstance(table, dict) else None
+    # A list, as buildkitd decodes it: a string would make the daemon refuse
+    # the file, and `in` on a string is a substring test.
+    if not isinstance(mirrors, list) or _MIRROR_HOST not in mirrors:
+        return [
+            f'{path}: `[{_REGISTRY_TABLE}."{_DOCKER_HUB_REGISTRY}"]` has no `{_MIRRORS_KEY}` list naming {_MIRROR_HOST}'
+        ]
     return []
 
 
@@ -794,6 +810,7 @@ jobs:
 
 _PINNED_BUILDX = "docker/setup-buildx-action@" + "b" * 40 + " # v4.4.1"
 _PINNED_BUILD_PUSH = "docker/build-push-action@" + "c" * 40 + " # v7.4.0"
+# A setup-buildx step as the rule wants it: the builder image and the config.
 _MIRROR_BUILDX_WITH = f"""
         with:
           buildkitd-config: {_BUILDKITD_CONFIG_PATH}
@@ -819,9 +836,7 @@ jobs:
   promote:
     runs-on: ubuntu-latest
     steps:
-      - uses: {_PINNED_BUILDX}
-        with:
-          driver-opts: {_BUILDER_IMAGE_OPT}:buildx-stable-1
+      - uses: {_PINNED_BUILDX}{_MIRROR_BUILDX_WITH}
       - run: docker buildx imagetools inspect ghcr.io/example/app:1
 """
 
@@ -838,7 +853,8 @@ jobs:
       - uses: {_PINNED_BUILD_PUSH}
 """
 
-BUILDING_WITHOUT_CONFIG_WORKFLOW = f"""
+# No build-push step: the config is owed whatever the job goes on to do.
+BUILDX_WITHOUT_CONFIG_WORKFLOW = f"""
 name: no-config
 on: pull_request
 jobs:
@@ -848,7 +864,7 @@ jobs:
       - uses: {_PINNED_BUILDX}
         with:
           driver-opts: {_BUILDER_IMAGE_OPT}:buildx-stable-1
-      - uses: {_PINNED_BUILD_PUSH}
+      - run: docker buildx build .
 """
 
 HUB_IMAGES_WORKFLOW = f"""
@@ -1095,17 +1111,11 @@ class FixtureTests(unittest.TestCase):
         self.assertIn("nodriver.yml", violations[0])
         self.assertIn(_DRIVER_OPTS_KEY, violations[0])
 
-    def test_building_job_without_buildkitd_config_is_a_violation(self) -> None:
-        _write_workflows(self.dir, noconfig=BUILDING_WITHOUT_CONFIG_WORKFLOW)
+    def test_buildx_step_without_buildkitd_config_is_a_violation(self) -> None:
+        _write_workflows(self.dir, noconfig=BUILDX_WITHOUT_CONFIG_WORKFLOW)
         violations = check_mirror(self.dir).violations
         self.assertEqual(len(violations), 1, violations)
         self.assertIn(_BUILDKITD_CONFIG_PATH, violations[0])
-
-    def test_non_building_buildx_step_needs_no_config(self) -> None:
-        # The `promote` job in the mirrored fixture has no build-push step and no
-        # buildkitd-config, and passes; a config there would be read by nothing.
-        _write_workflows(self.dir, mirrored=MIRRORED_WORKFLOW)
-        self.assertEqual(check_mirror(self.dir).violations, [])
 
     def test_docker_hub_images_are_violations_in_every_form(self) -> None:
         _write_workflows(self.dir, hub=HUB_IMAGES_WORKFLOW)
@@ -1120,7 +1130,15 @@ class FixtureTests(unittest.TestCase):
         self.assertIn("not a literal reference", joined)
 
     def test_docker_hub_reference_forms(self) -> None:
-        for ref in ("python:3", "semgrep/semgrep:1@sha256:x", "docker.io/library/python", "index.docker.io/x/y"):
+        for ref in (
+            "python:3",
+            "semgrep/semgrep:1@sha256:x",
+            "docker.io/library/python",
+            "index.docker.io/x/y",
+            "registry.hub.docker.com/semgrep/semgrep:1",
+            "docker.io:443/library/python",
+            "Docker.io/library/python",
+        ):
             self.assertTrue(_is_docker_hub_ref(ref), ref)
         for ref in ("mirror.gcr.io/library/python:3", "ghcr.io/x/y", "localhost/x", "registry:5000/x", "gcr.io/x/y"):
             self.assertFalse(_is_docker_hub_ref(ref), ref)
@@ -1130,8 +1148,24 @@ class FixtureTests(unittest.TestCase):
         self.assertEqual(len(check_buildkitd_config(config)), 1, "missing file is a problem")
         config.write_text('[registry."docker.io"]\n  mirrors = ["example.com"]\n', encoding="utf-8")
         self.assertEqual(len(check_buildkitd_config(config)), 1, "another mirror is a problem")
+        config.write_text(f'# [registry."docker.io"]\nmirrors = ["{_MIRROR_HOST}"]\n', encoding="utf-8")
+        self.assertEqual(len(check_buildkitd_config(config)), 1, "a commented-out header mirrors nothing")
+        config.write_text(f'[registry."docker.io"]\n  mirrors = "{_MIRROR_HOST}"\n', encoding="utf-8")
+        self.assertEqual(len(check_buildkitd_config(config)), 1, "a string is not the list buildkitd decodes")
+        config.write_text('registry = "x"\n', encoding="utf-8")
+        self.assertEqual(len(check_buildkitd_config(config)), 1, "a non-table registry key is a problem, not a crash")
+        config.write_text("[registry\n", encoding="utf-8")
+        problems = check_buildkitd_config(config)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("not valid TOML", problems[0])
         config.write_text(f'[registry."docker.io"]\n  mirrors = ["{_MIRROR_HOST}"]\n', encoding="utf-8")
         self.assertEqual(check_buildkitd_config(config), [])
+        config.write_text(
+            f'[registry."docker.io"]\n  # a comment\n  http = false\n'
+            f'  mirrors = ["other.example", \'{_MIRROR_HOST}\']\n',
+            encoding="utf-8",
+        )
+        self.assertEqual(check_buildkitd_config(config), [], "other keys, a comment and a second mirror are fine")
 
 
 class RealTreeTests(unittest.TestCase):

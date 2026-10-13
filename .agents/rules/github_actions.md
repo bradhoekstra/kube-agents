@@ -96,11 +96,12 @@ starting. A workflow on a GitHub-hosted runner therefore pulls Docker Hub images
 `mirror.gcr.io`, which serves public Docker Hub images without that limit and takes no credential,
 so a fork keeps the same path.
 
-- A `docker/setup-buildx-action` step that builds takes `buildkitd-config: .github/buildkitd.toml`,
-  which mirrors `docker.io` for the builder; a reference the mirror does not hold falls through to
-  Docker Hub. Every such step, building or not, takes
-  `driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1`: the action pulls the builder
-  image on the runner's own daemon before the builder exists, so the config cannot cover it.
+- Every `docker/setup-buildx-action` step takes `buildkitd-config: .github/buildkitd.toml`, which
+  mirrors `docker.io` for the builder (a reference the mirror does not hold falls through to
+  Docker Hub), and `driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1`, because the
+  action pulls the builder image on the runner's own daemon before the builder exists, so the
+  config cannot cover it. Both on every step, whether or not the job builds today: a job's build
+  can be a `run:` line, which no check can tell from one that does not.
 - A job `container:`, a `services:` image, a `docker://` action, or a `docker run` or
   `docker pull` of a Docker Hub image, names it as `mirror.gcr.io/<repository>` with the same tag
   and digest.
