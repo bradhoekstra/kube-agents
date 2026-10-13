@@ -56,7 +56,7 @@
 #      stops there, sometimes with the resource created and tainted, and a bare
 #      re-run replaces it and 409s (1 again). An approved `apply` (-auto-approve,
 #      which the front doors and CI pass) retries on that message after a wait,
-#      untainting first (`adopt_kms`); an `apply` that prompts for approval
+#      untainting first (`adopt_kms`); an unapproved `apply` at a terminal
 #      runs once, and its re-run untaints the same way.
 #      KMS_API_PROPAGATION_ATTEMPTS and KMS_API_PROPAGATION_WAIT_SECONDS size it.
 #
@@ -204,6 +204,11 @@ KMS_API_PROPAGATION_ATTEMPTS="${KMS_API_PROPAGATION_ATTEMPTS:-5}"
 KMS_API_PROPAGATION_WAIT_SECONDS="${KMS_API_PROPAGATION_WAIT_SECONDS:-60}"
 # Where run_apply keeps the apply's output for that grep; set per run.
 APPLY_OUTPUT_FILE=""
+# What Terraform prints when it is interrupted: it traps SIGINT, cancels the
+# walk, prints the diagnostics it had collected -- a 403 among them, if one
+# had landed -- and exits 1 like any failed apply. run_apply reads this line
+# as the operator's decision and retries nothing after it.
+readonly TERRAFORM_INTERRUPT_PATTERN='^(Interrupt received|Two interrupts received)'
 readonly HELM_RELEASE_ADDRESS="helm_release.kube_agents"
 readonly CERT_MANAGER_RELEASE_ADDRESS="helm_release.cert_manager[0]"
 # The releases' own `timeout = 600` in main.tf, for the uninstall that runs ahead of terraform destroy.
@@ -382,7 +387,7 @@ load_state() {
   STATE_LIST=$(terraform state list 2>/dev/null || true)
   STATE_LIST_FRESH=true
 }
-state_changed() { STATE_LIST_FRESH=false; TAINTED_LIST_FRESH=false; }
+state_changed() { STATE_LIST_FRESH=false; }
 in_state() { grep -Fxq "$1" <<<"$STATE_LIST"; }
 
 # The tainted instances, for adopt_kms alone, which is why this is a second
@@ -396,16 +401,14 @@ in_state() { grep -Fxq "$1" <<<"$STATE_LIST"; }
 # means a tainted key ring or key goes to the replacement adopt_kms exists to
 # prevent. Whatever it printed before failing is kept: a header that was read
 # is a taint that is real. An empty state is "No state." and exit 0, not a
-# failure. Invalidated with the state list, by state_changed, and read at the
-# first key ring or key found in state, so a fresh project never pays it.
+# failure. Read at the first key ring or key found in state and once per
+# adopt_kms, which keeps its own flag for that, so a fresh project never
+# pays it and nothing here needs a cache.
 TAINTED_LIST=""
-TAINTED_LIST_FRESH=false
 load_tainted() {
-  [[ "$TAINTED_LIST_FRESH" == "true" ]] && return 0
   if ! TAINTED_LIST=$(terraform show -no-color 2>/dev/null | sed -n 's/^# \(.*\): (tainted)$/\1/p'); then
     warn "could not read the state for tainted resources (terraform show failed); a tainted CMEK key ring or key, if any, will be planned for replacement"
   fi
-  TAINTED_LIST_FRESH=true
 }
 in_tainted() { grep -Fxq "$1" <<<"$TAINTED_LIST"; }
 
@@ -1202,11 +1205,19 @@ CLUSTER_CONTEXT=""
 # SIGINT (-i) for the reason redact_helm_release_metadata does: on Ctrl-C the
 # tail of the pipeline has to outlive Terraform, or Terraform's next write
 # meets a closed pipe and SIGPIPE kills it before it has saved state and
-# released the lock. The temporary file goes with the function or with the
-# process: an EXIT trap covers a Ctrl-C in the wait, re-armed each round
-# because adopt_kms clears the trap it sets for its own override file, and the
-# path is a script-level variable because an errexit exit unwinds a local
-# before the trap runs.
+# released the lock. Terraform's own exit code is the one returned
+# (PIPESTATUS[0]), as the filter's header promises: a tee that could not write
+# its copy -- a TMPDIR that filled during the apply -- is a warning, not a
+# failed apply, and the retry decision then reads whatever copy there is.
+# Because every process in the pipeline survives Ctrl-C, bash does not stop
+# the script on it; Terraform's own "Interrupt received" line in the output
+# is read as the stop instead (TERRAFORM_INTERRUPT_PATTERN), before any
+# retry, because a 403 collected earlier in the walk is printed beside it.
+# The temporary file goes with the function or with the process: an EXIT
+# trap covers a Ctrl-C in the wait, re-armed each round because adopt_kms
+# clears the trap it sets for its own override file, and the path is a
+# script-level variable because an errexit exit unwinds a local before the
+# trap runs.
 # The terminal case stays outside the loop on purpose: it is the one path
 # that shows Terraform's own colour and prompt, and the operator who answered
 # the prompt is there to run it again; adopt_kms untaints for that re-run.
@@ -1215,13 +1226,26 @@ run_apply() {
     terraform apply "$@"
     return
   fi
-  local attempt=1 status
+  local attempt=1 status copy_status
+  local -a pipe_status
   APPLY_OUTPUT_FILE=$(mktemp)
   while :; do
     trap 'rm -f "$APPLY_OUTPUT_FILE"' EXIT
-    status=0
-    terraform apply "$@" 2>&1 | redact_helm_release_metadata | tee -i "$APPLY_OUTPUT_FILE" || status=$?
+    # PIPESTATUS is read in both branches because the if is what keeps a
+    # failed pipeline from tripping errexit, and it is reset by the next
+    # command either way.
+    if terraform apply "$@" 2>&1 | redact_helm_release_metadata | tee -i "$APPLY_OUTPUT_FILE"; then
+      pipe_status=("${PIPESTATUS[@]}")
+    else
+      pipe_status=("${PIPESTATUS[@]}")
+    fi
+    status="${pipe_status[0]}"
+    copy_status="${pipe_status[2]}"
+    if [[ "$copy_status" -ne 0 ]]; then
+      warn "could not keep a full copy of the apply output (tee exited $copy_status: a TMPDIR that filled, or 141 for a stdout closed early); a Cloud KMS retry is decided from what was kept"
+    fi
     [[ "$status" -ne 0 ]] || break
+    grep -Eq "$TERRAFORM_INTERRUPT_PATTERN" "$APPLY_OUTPUT_FILE" && break
     grep -Eq "$KMS_API_PROPAGATION_PATTERN" "$APPLY_OUTPUT_FILE" || break
     if [[ "$attempt" -ge "$KMS_API_PROPAGATION_ATTEMPTS" ]]; then
       warn "Cloud KMS still rejects requests $attempt attempts after this apply enabled it."

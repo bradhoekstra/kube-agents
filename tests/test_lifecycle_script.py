@@ -108,7 +108,8 @@ class LifecycleScriptGuardTest(unittest.TestCase):
                    show_rc=0,
                    untaint_stub="exit 0",
                    stdout_path=None,
-                   sigint_after=None):
+                   sigint_after=None,
+                   tee_fails=False):
         """Run a lifecycle.sh function against stubbed terraform and gcloud commands."""
         with tempfile.TemporaryDirectory() as tmp:
             bin_dir = pathlib.Path(tmp) / "bin"
@@ -241,6 +242,12 @@ fi
 exit 0
 """)
             terraform_stub.chmod(0o755)
+            if tee_fails:
+                # A tee whose file write failed: POSIX has it keep copying to
+                # stdout and exit non-zero, as on a TMPDIR that filled.
+                tee_stub = bin_dir / "tee"
+                tee_stub.write_text("#!/usr/bin/env bash\ncat\nexit 1\n")
+                tee_stub.chmod(0o755)
 
             script = f"""
 KUBE_AGENTS_SOURCE_ONLY=true source "{_LIFECYCLE_SH}"
@@ -1204,7 +1211,7 @@ resource "google_service_account" "agent" {
         with tempfile.NamedTemporaryFile(delete=False) as out:
             out_path = out.name
         apply_stub = (
-            'trap \'echo "interrupt received, saving state"; exit 1\' INT; '
+            'trap \'echo "Interrupt received."; exit 1\' INT; '
             'echo "apply started"; sleep 20; echo "apply finished"; exit 0'
         )
         try:
@@ -1218,7 +1225,56 @@ resource "google_service_account" "agent" {
         finally:
             os.unlink(out_path)
         self.assertNotEqual(proc.returncode, 0)
-        self.assertIn("interrupt received, saving state", text)
+        self.assertIn("Interrupt received.", text)
+
+    def test_run_apply_returns_terraforms_code_when_tee_cannot_write_its_copy(self):
+        proc, log = self._run_with_stub_log(
+            "run_apply -auto-approve -input=false",
+            apply_stub='echo "Apply complete!"; exit 0',
+            tee_fails=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("Apply complete!", proc.stdout)
+        self.assertIn("could not keep a full copy of the apply output", proc.stderr)
+        self.assertEqual(log.count("apply -auto-approve -input=false"), 1, log)
+
+    def test_run_apply_does_not_retry_from_a_copy_tee_could_not_keep(self):
+        """The apply failed and the copy is what tee managed; the decision is
+        made from that copy, and here it holds the 403, so one retry."""
+        proc, log = self._run_with_stub_log(
+            "KMS_API_PROPAGATION_WAIT_SECONDS=0 run_apply -auto-approve -input=false",
+            apply_stub=self._apply_stub_failing_first(99, "Error: Error creating Cluster: googleapi: Error 409"),
+            tee_fails=True,
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("could not keep a full copy", proc.stderr)
+        self.assertEqual(log.count("apply -auto-approve -input=false"), 1, log)
+
+    def test_run_apply_does_not_retry_an_apply_the_operator_interrupted(self):
+        """Terraform traps SIGINT and exits 1 after printing what it had
+        collected, a 403 included; its own interrupt line is the stop."""
+        with tempfile.NamedTemporaryFile(delete=False) as out:
+            out_path = out.name
+        # A second invocation exits at once, so a regression fails on the
+        # apply count below rather than on the harness deadline with a
+        # sleeping stub left behind.
+        apply_stub = (
+            'if [[ $(grep -c "^apply" "$TF_STUB_LOG") -gt 1 ]]; then echo "second apply"; exit 1; fi; '
+            'trap \'echo "Interrupt received."; echo "' + self._KMS_403 + '"; exit 1\' INT; '
+            'echo "apply started"; sleep 20; echo "apply finished"; exit 0'
+        )
+        try:
+            proc, log = self._run_with_stub_log(
+                "KMS_API_PROPAGATION_WAIT_SECONDS=0 run_apply -auto-approve -input=false",
+                apply_stub=apply_stub,
+                stdout_path=out_path,
+                sigint_after="apply started",
+            )
+        finally:
+            os.unlink(out_path)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(log.count("apply -auto-approve -input=false"), 1, log)
+        self.assertNotIn("attempt 2", proc.stderr)
 
     def test_run_apply_passes_a_clean_apply_through_once(self):
         proc, log = self._run_with_stub_log(
