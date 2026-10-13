@@ -1558,7 +1558,9 @@ class VcsBroker:
         return (bound.forge.name, bound.repo.casefold(), number)
 
     def _merged_viewer_for(self, bound: Binding) -> str:
-        """The credential's login for the count, remembered per repository.
+        """The credential's login for the count, remembered per repository,
+        keyed the way the seen set is: the login is the credential's, not the
+        spelling's.
 
         "" is a real answer, a credential that cannot name itself, and is
         remembered too, with one INFO line per process so that a flat
@@ -1566,7 +1568,7 @@ class VcsBroker:
         a lookup that raises is left to the caller's guard and asked again next
         time.
         """
-        key = (bound.forge.name, bound.repo)
+        key = (bound.forge.name, bound.repo.casefold())
         with self._merged_lock:
             if key in self._merged_viewer:
                 return self._merged_viewer[key]

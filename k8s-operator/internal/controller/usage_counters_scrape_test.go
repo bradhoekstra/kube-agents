@@ -225,8 +225,9 @@ func TestPodUsageSource_RefusesAClusterGaugePastTheCeiling(t *testing.T) {
 }
 
 // One broker body yields every counter the broker feeds: the tool invocations
-// summed over the counted statuses and the proposals opened, which is the
-// version-control counter under verb proposal-create and status success alone.
+// summed over the counted statuses, the proposals opened, which is the
+// version-control counter under verb proposal-create and status success alone,
+// and the proposals merged, read whole.
 func TestPodUsageSource_CountsTheBrokersProposals(t *testing.T) {
 	body := strings.Join([]string{
 		"# TYPE kubeagents_tool_invocations_total counter",

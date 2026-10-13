@@ -532,11 +532,15 @@ class MergedProposalCountingTest(unittest.TestCase):
         self.assertEqual([2], self.counts, "a proposal already counted was counted again")
 
     def test_a_proposal_counts_once_however_the_repository_is_spelled(self):
-        """GitHub resolves owner/name without regard to case; the seen set must too."""
-        self.forge_with(self.merged(11))
+        """GitHub resolves owner/name without regard to case; the seen set and the
+        identity cache must too: one count, one lookup, over two spellings."""
+        transport = CountingSelfAware("kube-agents")
+        self.broker._transport = lambda _forge, _repo: transport
+        self.forge_with(self.merged(11), self.merged(12))
         self.broker.proposal_view({"repository": "local.test/Acme/Infra", "number": 11})
         self.broker.proposal_list({"repository": "local.test/acme/infra"})
-        self.assertEqual([1], self.counts, "one proposal counted once per spelling of its repository")
+        self.assertEqual([1, 1], self.counts, "one proposal counted once per spelling of its repository")
+        self.assertEqual(1, transport.asked, "the identity was asked once per spelling of one repository")
 
     def test_a_view_counts_what_a_list_has_not_seen(self):
         self.forge_with(self.merged(9))
