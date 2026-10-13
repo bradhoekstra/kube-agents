@@ -89,9 +89,9 @@ into the scheduled audits: a role granted by hand in another project widened
 them before they followed the scope, and on an installer-made install, which
 always carries a `spec.scope` block, it no longer does. `SCOPE_EXCLUDE_PROJECTS` and
 `SCOPE_EXCLUDE_CLUSTERS` (`project/location/cluster`) declare exclusions the
-same way; a project an exact `SCOPE_EXCLUDE_PROJECTS` entry names gets no drift
-sink, while one a glob matches is excluded at runtime and still exported. To keep
-a project in the scope and out of the export, add
+same way; a project a `SCOPE_EXCLUDE_PROJECTS` entry names, or a glob there
+matches, gets no drift sink. To keep a project in the scope and out of the
+export, add
 `TF_VAR_drift_pubsub_source_exclude_projects=<project id>` to `install.env`: the
 lever for a project where the applying identity cannot mint the Logging service
 agent or create the sink, which otherwise stops the apply at that project's

@@ -814,7 +814,9 @@ The ingress follows the scope. The module's `source_projects` is fed from
 `scope_export_projects`, the projects the declaration lists in `scope` beyond
 `project_id` — `scope.projects` and the selectors' members, each less an exact
 `exclude.projects` entry, never a folder's or organisation's members, whose
-Asset-Inventory listing has no grace and would churn a sink — less
+Asset-Inventory listing has no grace and would churn a sink — less a project
+an `exclude.projects` glob matches, which the composition matches here the way
+the reconcile does at runtime, and less
 `drift_pubsub_source_exclude_projects`, so each gets a sink of its own, in
 that project, named `drift_pubsub_sink` with `project_id` appended and routed
 into this install's topic, with that project's Logging service agent granted

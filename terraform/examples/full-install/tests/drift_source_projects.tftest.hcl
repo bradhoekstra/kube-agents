@@ -80,6 +80,58 @@ run "an_excluded_project_stays_in_the_scope_and_out_of_the_export" {
   }
 }
 
+run "a_glob_in_the_scopes_own_exclusions_drops_the_project_from_the_export" {
+  command = plan
+  variables {
+    scope = {
+      projects = ["payments-prod", "ops-mgmt", "ops-mgmt-2"]
+      exclude  = { projects = ["*-prod", "ops-mgmt-?"] }
+    }
+  }
+  assert {
+    condition     = jsonencode(local.drift_pubsub_source_projects) == jsonencode(["ops-mgmt"])
+    error_message = "a project a scope.exclude.projects glob matches is dropped by the reconcile, so it gets no sink either: ${jsonencode(local.drift_pubsub_source_projects)}"
+  }
+  assert {
+    condition     = contains(module.kube_agents_iam.scope_export_projects, "payments-prod")
+    error_message = "the glob is matched for the export alone; the IAM module's listing leaves a glob to the reconcile"
+  }
+}
+
+run "bracket_classes_an_exact_entry_and_the_operator_exclusion_combine" {
+  command = plan
+  variables {
+    scope = {
+      projects = ["pay-prod", "ops-mgmt", "ops-mgmt-2", "lab-one", "lab-two", "lab-six"]
+      exclude  = { projects = ["ops-mgmt-2", "lab-[ot]*", "[!lo]*"] }
+    }
+    drift_pubsub_source_exclude_projects = "ops-mgmt"
+  }
+  assert {
+    condition     = jsonencode(local.drift_pubsub_source_projects) == jsonencode(["lab-six"])
+    error_message = "an exact entry, a [seq] class, a [!seq] class and the operator's exclusion must each take their project out of the export: ${jsonencode(local.drift_pubsub_source_projects)}"
+  }
+  assert {
+    condition     = !contains(module.kube_agents_iam.scope_export_projects, "ops-mgmt-2") && contains(module.kube_agents_iam.scope_export_projects, "lab-one")
+    error_message = "the IAM module's listing leaves out the exact entry and leaves a glob to the reconcile: ${jsonencode(module.kube_agents_iam.scope_export_projects)}"
+  }
+}
+
+run "an_entry_the_plan_cannot_match_warns_and_keeps_the_sink" {
+  command = plan
+  variables {
+    scope = {
+      projects = ["ops-alpha", "ops-mgmt"]
+      exclude  = { projects = ["ops-[!z-a]*"] }
+    }
+  }
+  expect_failures = [check.drift_scope_exclude_globs_compile]
+  assert {
+    condition     = jsonencode(local.drift_pubsub_source_projects) == jsonencode(["ops-alpha", "ops-mgmt"])
+    error_message = "a reversed range is a pattern RE2 rejects; the plan keeps both sinks and the check says so: ${jsonencode(local.drift_pubsub_source_projects)}"
+  }
+}
+
 run "a_space_separated_exclusion_parses_too" {
   command = plan
   variables {

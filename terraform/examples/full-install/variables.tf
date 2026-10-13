@@ -194,7 +194,8 @@ variable "scope" {
     exclusion changes IAM, except that an `exclude.projects` entry naming a
     Shared VPC service project by ID, or a monitored project by its project
     number, withholds its grant (a monitored project excluded by ID keeps
-    it, for the reconcile's naming call); a glob is the reconcile's alone. `folders`
+    it, for the reconcile's naming call); a glob is the reconcile's alone for
+    IAM, and the drift export matches it too (drift_pubsub_source_projects). `folders`
     and `organizations` are numeric Resource
     Manager IDs: each is bound on the container itself with the same allowlist
     plus roles/cloudasset.viewer, so every project beneath it inherits the
@@ -765,7 +766,7 @@ variable "drift_pubsub_sink_writer_identity_override" {
 }
 
 variable "drift_pubsub_source_exclude_projects" {
-  description = "Projects the scope lists whose audit logs the drift topic must NOT receive, comma- or space-separated project IDs. Each stays in the scope (its clusters are still read and get Cluster Agent profiles) and gets no drift audit-log sink, no Logging service agent mint and no publish grant: the lever for a project where the identity applying cannot mint the agent or write the sink, which would otherwise stop the apply at that project. Empty, the default, exports every project scope_export_projects lists. Reaches a front-door install as a TF_VAR_drift_pubsub_source_exclude_projects line in install.env."
+  description = "Projects the scope lists whose audit logs the drift topic must NOT receive, comma- or space-separated project IDs. Each stays in the scope (its clusters are still read and get Cluster Agent profiles) and gets no drift audit-log sink, no Logging service agent mint and no publish grant: the lever for a project where the identity applying cannot mint the agent or write the sink, which would otherwise stop the apply at that project. Empty, the default, exports every project scope_export_projects lists that no scope.exclude.projects glob matches. Reaches a front-door install as a TF_VAR_drift_pubsub_source_exclude_projects line in install.env."
   type        = string
   default     = ""
   nullable    = false

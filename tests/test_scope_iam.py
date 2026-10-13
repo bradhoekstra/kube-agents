@@ -670,8 +670,16 @@ class DriftSinksFollowTheScopeTest(unittest.TestCase):
         call = _block(self.main_tf, "module", "drift_pubsub")
         self.assertIn("source_projects                       = local.drift_pubsub_source_projects", call,
                       "the drift module's source_projects must come from the composition's export local")
-        self.assertRegex(self.main_tf, r"drift_pubsub_source_projects\s*=\s*sort\(tolist\(setsubtract\(toset\(module\.kube_agents_iam\.scope_export_projects\), local\.drift_pubsub_source_exclude_projects\)\)\)",
-                         "the export local must be the IAM module's scope_export_projects less the operator's exclusions; the pool's scope_discovered_projects carries Asset-Inventory members an index gap can drop")
+        export_local = re.search(r"drift_pubsub_source_projects\s*=\s*sort\(\[(.*?)\n  \]\)", self.main_tf, re.DOTALL)
+        self.assertIsNotNone(export_local, "the export local must be a filtered comprehension over the IAM module's listing")
+        self.assertIn("module.kube_agents_iam.scope_export_projects", export_local.group(1),
+                      "the export local must read the IAM module's scope_export_projects; the pool's scope_discovered_projects carries Asset-Inventory members an index can skip for a plan")
+        self.assertIn("local.drift_pubsub_source_exclude_projects", export_local.group(1),
+                      "the export local must subtract the operator's exclusions")
+        self.assertIn("local.drift_pubsub_scope_exclude_patterns", export_local.group(1),
+                      "the export local must match the scope's own exclusions, globs included, as the reconcile does")
+        self.assertRegex(self.main_tf, r'for entry in var\.scope\.exclude\.projects :\s*"\^\$\{replace\(replace\(replace\(entry, "\*", "\.\*"\), "\?", "\."\), "\[!", "\[\^"\)\}\$"',
+                         "each scope.exclude.projects entry becomes one anchored regex with fnmatch's * ? and [!seq] carried over, which is what fleet_scope_targets.py matches at runtime")
         exclude = _block((_COMPOSITION / "variables.tf").read_text(), "variable", "drift_pubsub_source_exclude_projects")
         self.assertIn("type        = string", exclude, "the exclusion list is a string so a TF_VAR_ line can carry it and a blanked line reads as none")
         self.assertIn('default     = ""', exclude)
