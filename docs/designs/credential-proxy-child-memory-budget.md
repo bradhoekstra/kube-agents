@@ -250,11 +250,14 @@ A budget that would admit fewer than `BUDGET_MINIMUM_ADMITTED_REQUESTS` (two) re
 treated as absent: the broker logs one WARNING at startup naming the limit it read and the floor,
 `child_memory_budget_floor_bytes` (672 MiB at the 8 MiB output cap: the two fixed reserves plus two
 requests' cost), and admits by slot alone. The case is real. GKE Autopilot without bursting sets a
-container's limits equal to its requests, so the proxy's limit there is its 512Mi request, under
-which the budget would admit one request and serialise every brokered command; a listing phase
-that cannot run two at once costs more than the out-of-memory exposure the budget prevents. The
-operator's sizing test holds its own limit to the same floor
-(`credentialProxyMinimumAdmittedRequests`).
+container's limits equal to its requests, so the proxy's limit there is its memory request. At
+the 512Mi the operator first declared, the budget would admit one request and serialise every
+brokered command; a listing phase that cannot run two at once costs more than the out-of-memory
+exposure the budget prevents. The operator now declares the request at 1Gi, above the floor, so
+that the budget engages on Autopilot without bursting as well, admitting four there; the floor
+still applies to a CR override whose `requests.memory` is smaller. The operator's sizing test
+holds its own limit to the same floor (`credentialProxyMinimumAdmittedRequests`) and its request
+to it too (`TestCredentialProxyBudgetArithmeticAtTheDefaults`).
 
 ### 2.4 Where the limit comes from
 
@@ -292,7 +295,7 @@ env list, as it does the two caps: a CR that could set it would detach the budge
 ### 2.5 The sizing test's child term
 
 `TestCredentialProxyOutputCapClearsTheLargestFleetDump` asserts
-`request + output_burst(all slots) <= limit`, with the container's 512Mi memory request as the
+`request + output_burst(all slots) <= limit`, with the container's 1Gi memory request as the
 resting term, upstream's statement of what the pod holds with nothing in flight. It also makes a second assertion in the broker's own terms, with the broker's fixed reserves as the
 resting term, because those are the numbers the broker subtracts and so the budget the children
 see. A slot in use is a request holding a reservation, so the slot count and the reservation

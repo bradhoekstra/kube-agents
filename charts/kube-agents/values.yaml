@@ -776,7 +776,7 @@ platformAgent:
     env: []
     # The credential-proxy container's requests and limits, forwarded to the CR as
     # spec.deployment.credentialProxy.resources when any key is set. Each key
-    # merges over the operator's defaults (500m CPU and 512Mi requests; 1 CPU,
+    # merges over the operator's defaults (500m CPU and 1Gi requests; 1 CPU,
     # 2Gi memory and 2Gi ephemeral-storage limits), so
     #
     #   credentialProxy:
@@ -801,7 +801,7 @@ platformAgent:
     # unchanged, because Autopilot then raises the smaller request into the
     # band, and for each of cpu and memory set under limits without the same
     # key under requests, because Autopilot without bursting sets the limits
-    # equal to the requests: the limits.memory example above runs at the 512Mi
+    # equal to the requests: the limits.memory example above runs at the 1Gi
     # request there unless requests.memory is set to match or bursting is on.
     # On an existing install the chart fails the upgrade
     # when the installed CRD predates the field; apply crds/ first (upgrade.sh
