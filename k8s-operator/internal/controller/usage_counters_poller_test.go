@@ -256,12 +256,14 @@ func gaugeValue(v *int64) int64 {
 	return *v
 }
 
-// expireNewerFieldsRecordForTest ages the CR's gauge pruning record past the reprobe
-// interval, as the clock would.
+// expireNewerFieldsRecordForTest ages every newer-field pruning record of the
+// CR past the reprobe interval, as the clock would.
 func (p *UsageCounterPoller) expireNewerFieldsRecordForTest(agent *agentv1alpha1.PlatformAgent) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.prunedNewerFields[usagePollKey(agent)] = p.now().Add(-2 * usageStatusReprobeInterval)
+	for field := range p.prunedNewerFields[usagePollKey(agent)] {
+		p.prunedNewerFields[usagePollKey(agent)][field] = p.now().Add(-2 * usageStatusReprobeInterval)
+	}
 }
 
 // usageHarness is a poller over a fake client, with the writes it makes
@@ -288,8 +290,11 @@ type usageHarness struct {
 	pruning bool
 	// pruningGauges makes the fake behave like a served CRD at a previous
 	// schema: status.usage with its first three counters, without the fields
-	// added later (the cluster gauges, the merged counter).
+	// added later (the cluster gauges, the merged counter). pruningMerged is
+	// the CRD from the release between: the gauges served, the merged counter
+	// not.
 	pruningGauges bool
+	pruningMerged bool
 }
 
 func newUsageHarness(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...client.Object) *usageHarness {
@@ -303,8 +308,11 @@ func newUsageHarness(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...c
 			// the echo, so the store is stripped with a second patch the poller
 			// never sees, and the echo the poller reads is stripped the same way.
 			pa, isAgent := obj.(*agentv1alpha1.PlatformAgent)
-			if err == nil && isAgent && (h.pruning || h.pruningGauges) {
+			if err == nil && isAgent && (h.pruning || h.pruningGauges || h.pruningMerged) {
 				strip := `{"status":{"usage":{"clustersRegistered":null,"clustersMonitored":null,"remediationsMergedTotal":null}}}`
+				if h.pruningMerged {
+					strip = `{"status":{"usage":{"remediationsMergedTotal":null}}}`
+				}
 				if h.pruning {
 					strip = `{"status":{"usage":null}}`
 				}
@@ -317,6 +325,8 @@ func newUsageHarness(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...c
 			if isAgent && h.pruningGauges {
 				pa.Status.Usage.ClustersRegistered = nil
 				pa.Status.Usage.ClustersMonitored = nil
+			}
+			if isAgent && (h.pruningGauges || h.pruningMerged) {
 				pa.Status.Usage.RemediationsMergedTotal = 0
 			}
 			return err
@@ -986,9 +996,10 @@ func TestUsagePoller_TwoGatewayReplicas(t *testing.T) {
 	}
 }
 
-// The broker pod feeds three counters from one body. Each has its own baseline
-// entry under the pod, they advance together, they survive the pod's restart,
-// and the proposals move lastActiveTime as a brokered action does.
+// The broker pod's counters come from one body. Each has its own baseline
+// entry under the pod; the two this test moves advance together and survive
+// the pod's restart, and the proposals move lastActiveTime as a brokered action
+// does. The merged counter's test beside it walks the same phases.
 func TestUsagePoller_ProposalsCountBesideToolExecutions(t *testing.T) {
 	created := usageClock(0).Add(-time.Hour)
 	h := newUsageHarness(t, usageTestAgent(created), usageDefaultObjects(created)...)
@@ -1053,8 +1064,6 @@ func TestUsagePoller_MergedProposalsCount(t *testing.T) {
 	}
 }
 
-// A current-layout document that predates a counter, as the previous release
-// wrote it, gains the counter's total on read rather than being re-seeded.
 // A current-layout document that predates a counter is written back with the
 // counter added even when the poll read nothing that changed it: the broker
 // unread, the gateway level. Otherwise it would be re-migrated and re-logged
@@ -1092,6 +1101,8 @@ func TestUsagePoller_ADocumentWithoutANewerCounterIsWrittenWhenNothingElseMoved(
 	}
 }
 
+// A current-layout document that predates a counter, as the previous release
+// wrote it, gains the counter's total on read rather than being re-seeded.
 func TestUsagePoller_ADocumentWithoutANewerCounterKeepsItsTotals(t *testing.T) {
 	created := usageClock(0).Add(-time.Hour)
 	h := newUsageHarness(t, usageTestAgent(created), usageDefaultObjects(created)...)
@@ -1266,7 +1277,7 @@ func TestUsagePoller_MigratesAVersionOneDocumentUnderAStatusFloor(t *testing.T) 
 	}
 }
 
-// A failing broker's Warning names both status fields its counters project
+// A failing broker's Warning names each status field its counters project
 // to, through the poll rather than the message builder alone.
 func TestUsagePoller_WarningNamesEveryFieldOfAFailingBroker(t *testing.T) {
 	created := usageClock(0).Add(-time.Hour)
@@ -1504,6 +1515,67 @@ func TestUsagePoller_GaugeOnlyProbeUnderAPruningCRD(t *testing.T) {
 // move, the shared record stays clear because the newer fields' absence is
 // their own condition, and the merged counter moving alone does not re-patch
 // every poll while that record is fresh.
+// A served CRD from between the gauges and the merged counter serves the
+// gauges and prunes the counter: the counter's absence stamps its own record,
+// the gauges keep landing every poll they move, and the log names the one
+// field that is pruned.
+func TestUsagePoller_AGaugeServingCRDWithoutTheMergedCounterKeepsTheGaugesFlowing(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	agent := usageTestAgent(created)
+	h := newUsageHarness(t, agent, usageDefaultObjects(created)...)
+	h.pruningMerged = true
+	var mu sync.Mutex
+	var lines []string
+	ctx := logf.IntoContext(context.Background(), funcr.New(func(_, args string) {
+		mu.Lock()
+		lines = append(lines, args)
+		mu.Unlock()
+	}, funcr.Options{}))
+	pollAt := func(minute int) {
+		h.clock = usageClock(minute)
+		h.p.pollOnce(ctx)
+	}
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.stub.setClusters(gatewayAddr(), 3, 3)
+	h.stub.set(brokerAddr(), 10, nil)
+	h.stub.setSample(brokerAddr(), usageCounterRemediationsMerged, 1)
+	pollAt(5)
+	// A merge is counted: the patch carries the merged total, the CRD drops
+	// it, and the counter's own record is stamped; the gauges came back.
+	h.stub.setSample(brokerAddr(), usageCounterRemediationsMerged, 2)
+	pollAt(10)
+	if status := h.status(); status.ClustersRegistered == nil || *status.ClustersRegistered != 3 || status.RemediationsMergedTotal != 0 {
+		t.Fatalf("after the merge: %+v, want the gauges at 3 and no merged counter", status)
+	}
+	if h.p.newerFieldPruned(agent, usageNewerFieldGauges) || !h.p.newerFieldPruned(agent, usageCounterRemediationsMerged) {
+		t.Fatal("the merged counter's absence was recorded against the gauges")
+	}
+	// The gauges move while the merged counter's record is fresh (inside the
+	// reprobe interval, so the counter is not re-probed): they land.
+	h.stub.setClusters(gatewayAddr(), 4, 4)
+	pollAt(14)
+	if status := h.status(); status.ClustersRegistered == nil || *status.ClustersRegistered != 4 {
+		t.Fatalf("a gauge change waited on the merged counter's record: %+v", status)
+	}
+	if h.r.usageStatusPruned(agent) {
+		t.Fatal("the merged counter's absence was recorded as the counters' pruning")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	named := 0
+	for _, l := range lines {
+		if strings.Contains(l, "does not serve a status.usage field") {
+			named++
+			if !strings.Contains(l, `"field"="remediationsMergedTotal"`) || strings.Contains(l, "clustersRegistered") {
+				t.Fatalf("the log named the wrong field: %s", l)
+			}
+		}
+	}
+	if named != 1 {
+		t.Fatalf("%d pruning log lines, want 1 naming remediationsMergedTotal", named)
+	}
+}
+
 func TestUsagePoller_APartialPruneKeepsTheCountersFlowing(t *testing.T) {
 	created := usageClock(0).Add(-time.Hour)
 	agent := usageTestAgent(created)
@@ -1532,8 +1604,8 @@ func TestUsagePoller_APartialPruneKeepsTheCountersFlowing(t *testing.T) {
 	}
 	// Each counter write re-probed the newer fields and found them absent again, so
 	// the record is still fresh, re-stamped rather than re-created.
-	if !h.p.newerFieldsPruned(agent) {
-		t.Fatal("the newer-fields record did not survive the counter writes that re-probed it")
+	if !h.p.newerFieldPruned(agent, usageNewerFieldGauges) || !h.p.newerFieldPruned(agent, usageCounterRemediationsMerged) {
+		t.Fatal("a newer field's record did not survive the counter writes that re-probed it")
 	}
 	// A merge alone, inside the reprobe interval: lastActiveTime, which the CRD
 	// serves, moves, and that is the one patch; the quiet poll after it, with
@@ -1559,13 +1631,13 @@ func TestUsagePoller_ForgetsTheGaugeRecordsOfDepartedCRs(t *testing.T) {
 	h.clock = usageClock(5)
 	departed := usageTestAgent(created)
 	departed.Name = "departed"
-	h.p.noteNewerFieldsEcho(context.Background(), agent, false)
-	h.p.noteNewerFieldsEcho(context.Background(), departed, false)
+	h.p.noteNewerFieldEcho(context.Background(), agent, usageNewerFieldGauges, false)
+	h.p.noteNewerFieldEcho(context.Background(), departed, usageNewerFieldGauges, false)
 	h.p.forgetDepartedNewerFieldRecords(map[string]bool{usagePollKey(agent): true})
-	if !h.p.newerFieldsPruned(agent) {
+	if !h.p.newerFieldPruned(agent, usageNewerFieldGauges) {
 		t.Error("a live CR's record was dropped by the sweep")
 	}
-	if h.p.newerFieldsPruned(departed) {
+	if h.p.newerFieldPruned(departed, usageNewerFieldGauges) {
 		t.Error("a departed CR's record survived the sweep")
 	}
 }

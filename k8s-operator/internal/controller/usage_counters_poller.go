@@ -41,6 +41,9 @@ import (
 )
 
 const (
+	// usageNewerFieldGauges names the two cluster gauges' shared pruning
+	// record: they arrived in one release and a CRD serves both or neither.
+	usageNewerFieldGauges = "clustersRegistered and clustersMonitored"
 	// usageCountersPollInterval is how often the poller reads the listeners
 	// and, when a total moved, writes the status: the interval the controller
 	// already uses for the RBAC re-probe and the pruned-status re-probe, on
@@ -124,17 +127,19 @@ type UsageCounterPoller struct {
 	// line.
 	mu      sync.Mutex
 	streaks map[types.UID]*usageScrapeStreak
-	// prunedNewerFields records, per CR, the last poll in which a field added
-	// after status.usage's first schema -- the cluster gauges,
-	// remediationsMergedTotal -- was written and came back absent: a served
-	// CRD at a previous schema, which has the three first counters (every CRD
-	// with status.usage has carried remediationsProposedTotal) and not every
-	// later field. Its own record rather than the
-	// counters' shared one, because that record suppresses every status.usage
-	// write for the interval and the fields such a CRD does serve should keep
-	// landing. Fresh for usageStatusReprobeInterval, then the newer fields are
-	// probed again. In memory only, like streaks; keyed like the cursor.
-	prunedNewerFields map[string]time.Time
+	// prunedNewerFields records, per CR and per newer field -- the cluster
+	// gauges as one, remediationsMergedTotal -- the last poll in which that
+	// field was written and came back absent: a served CRD at a previous
+	// schema, which has the three first counters (every CRD with status.usage
+	// has carried remediationsProposedTotal) and not every later field. A
+	// record per field rather than the counters' shared one, or one for all
+	// the newer fields, because each record suppresses the writes it covers
+	// for the interval and the fields such a CRD does serve should keep
+	// landing: a CRD from between the gauges and the merged counter serves
+	// the gauges and prunes the counter. Fresh for usageStatusReprobeInterval,
+	// then that field is probed again. In memory only, like streaks; keyed
+	// like the cursor, then by field.
+	prunedNewerFields map[string]map[string]time.Time
 	// gatewayMisses counts, per CR, the consecutive polls in which no gateway
 	// replica's body was read while the watcher is on: listeners failing, pods
 	// Pending or without an IP, or none running. At usageScrapeFailureEventStreak
@@ -207,42 +212,45 @@ func (p *UsageCounterPoller) Start(ctx context.Context) error {
 	}
 }
 
-// newerFieldsPruned reports whether the CR's newer-fields pruning record is
+// newerFieldPruned reports whether the CR's pruning record for field is
 // fresh, dropping it once it has expired.
-func (p *UsageCounterPoller) newerFieldsPruned(agent *agentv1alpha1.PlatformAgent) bool {
+func (p *UsageCounterPoller) newerFieldPruned(agent *agentv1alpha1.PlatformAgent, field string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	key := usagePollKey(agent)
-	recorded, ok := p.prunedNewerFields[key]
+	recorded, ok := p.prunedNewerFields[key][field]
 	if !ok {
 		return false
 	}
 	if p.now().Sub(recorded) >= usageStatusReprobeInterval {
-		delete(p.prunedNewerFields, key)
+		delete(p.prunedNewerFields[key], field)
 		return false
 	}
 	return true
 }
 
-// noteNewerFieldsEcho is the newer fields' own echo record: echoed false is a
-// write whose newer fields came back absent, recorded with the poll's time and
-// logged once per record; echoed true clears it.
-func (p *UsageCounterPoller) noteNewerFieldsEcho(ctx context.Context, agent *agentv1alpha1.PlatformAgent, echoed bool) {
+// noteNewerFieldEcho is one newer field's own echo record: echoed false is a
+// write whose field came back absent, recorded with the poll's time and
+// logged once per record, naming the field; echoed true clears it.
+func (p *UsageCounterPoller) noteNewerFieldEcho(ctx context.Context, agent *agentv1alpha1.PlatformAgent, field string, echoed bool) {
 	key := usagePollKey(agent)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.prunedNewerFields == nil {
-		p.prunedNewerFields = map[string]time.Time{}
+		p.prunedNewerFields = map[string]map[string]time.Time{}
 	}
 	if echoed {
-		delete(p.prunedNewerFields, key)
+		delete(p.prunedNewerFields[key], field)
 		return
 	}
-	_, fresh := p.prunedNewerFields[key]
-	p.prunedNewerFields[key] = p.now()
+	if p.prunedNewerFields[key] == nil {
+		p.prunedNewerFields[key] = map[string]time.Time{}
+	}
+	_, fresh := p.prunedNewerFields[key][field]
+	p.prunedNewerFields[key][field] = p.now()
 	if !fresh {
-		logf.FromContext(ctx).Info("the served CRD does not serve every status.usage field this operator writes; apply this release's CRD to get the cluster gauges and remediationsMergedTotal, which are probed again after the interval",
-			"platformagent", key, "reprobeAfter", usageStatusReprobeInterval.String())
+		logf.FromContext(ctx).Info("the served CRD does not serve a status.usage field this operator writes; apply this release's CRD to get it, which is probed again after the interval",
+			"platformagent", key, "field", field, "reprobeAfter", usageStatusReprobeInterval.String())
 	}
 }
 
@@ -932,13 +940,15 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	usage := &agent.Status.Usage
 	wantRegistered, wantMonitored := usageGaugeFields(gauges)
 	// The first three counters are in every served CRD that has status.usage;
-	// the gauges and the merged counter arrived later, and a CRD at a previous
-	// schema prunes them, so a difference in one of them alone waits while the
-	// newer-fields record is fresh rather than re-patching every poll.
-	newerPruned := p.newerFieldsPruned(agent)
-	gaugesMoved := gaugesKnown && !newerPruned &&
+	// the gauges and the merged counter arrived later, each at its own
+	// release, and a CRD at a previous schema prunes one or both, so a
+	// difference in one of them alone waits while that field's record is
+	// fresh rather than re-patching every poll, and the other keeps landing.
+	gaugesPruned := p.newerFieldPruned(agent, usageNewerFieldGauges)
+	mergedPruned := p.newerFieldPruned(agent, usageCounterRemediationsMerged)
+	gaugesMoved := gaugesKnown && !gaugesPruned &&
 		(!usageGaugeEqual(usage.ClustersRegistered, wantRegistered) || !usageGaugeEqual(usage.ClustersMonitored, wantMonitored))
-	newerBehind := !newerPruned && usage.RemediationsMergedTotal < merged
+	newerBehind := !mergedPruned && usage.RemediationsMergedTotal < merged
 	behind := usage.ToolExecutionsTotal < tool || usage.EventsIngestedTotal < events || usage.RemediationsProposedTotal < proposed || newerBehind || gaugesMoved ||
 		(doc.LastMoved != nil && (usage.LastActiveTime == nil || !usage.LastActiveTime.Equal(doc.LastMoved)))
 	if !behind || p.r.usageStatusPruned(agent) {
@@ -963,19 +973,18 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	// absent are the pruning of status.usage, recorded in the record the Ready
 	// writer shares; a newer field written -- a gauge reading, a zero one
 	// included since a pointer to zero serialises, or the merged counter
-	// non-zero -- that comes back absent is the newer-fields record, since a
-	// CRD at a previous schema prunes those and serves the first counters. A
-	// patch that wrote only a time, or cleared the gauges, says nothing either
-	// way.
+	// non-zero -- that comes back absent is that field's own record, since a
+	// CRD at a previous schema prunes one or both and serves the first
+	// counters. A patch that wrote only a time, or cleared the gauges, says
+	// nothing either way.
 	if tool > 0 || events > 0 || proposed > 0 {
 		p.r.noteUsageEcho(ctx, agent, agent.Status.Usage.ToolExecutionsTotal == tool && agent.Status.Usage.EventsIngestedTotal == events && agent.Status.Usage.RemediationsProposedTotal == proposed)
 	}
-	if gauges != nil || merged > 0 {
-		echoed := agent.Status.Usage.RemediationsMergedTotal == merged
-		if gauges != nil {
-			echoed = echoed && usageGaugeEqual(agent.Status.Usage.ClustersRegistered, wantRegistered) && usageGaugeEqual(agent.Status.Usage.ClustersMonitored, wantMonitored)
-		}
-		p.noteNewerFieldsEcho(ctx, agent, echoed)
+	if gauges != nil {
+		p.noteNewerFieldEcho(ctx, agent, usageNewerFieldGauges, usageGaugeEqual(agent.Status.Usage.ClustersRegistered, wantRegistered) && usageGaugeEqual(agent.Status.Usage.ClustersMonitored, wantMonitored))
+	}
+	if merged > 0 {
+		p.noteNewerFieldEcho(ctx, agent, usageCounterRemediationsMerged, agent.Status.Usage.RemediationsMergedTotal == merged)
 	}
 	return nil
 }

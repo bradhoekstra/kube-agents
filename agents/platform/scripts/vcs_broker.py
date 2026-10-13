@@ -322,9 +322,9 @@ class VcsBroker:
     `scratch_root` is on the broker's own volume. Nothing under it outlives a
     request, which is what makes these routes stateless to their callers: there
     is no handle to leak, no tree to collide with another caller's, and no
-    cleanup an interrupted client can skip. The one thing the process keeps
-    across requests is the merged-proposal count's seen set (`_count_merges`),
-    which no answer depends on.
+    cleanup an interrupted client can skip. What the process keeps across
+    requests is the merged-proposal count's seen set and the identity cache
+    beside it (`_count_merges`), which no answer depends on.
     """
 
     def __init__(

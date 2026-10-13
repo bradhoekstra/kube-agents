@@ -443,11 +443,13 @@ the last of them moved. After its own
 patch the poller reads the echo the same way `noteUsageStatusEcho` does: counters it wrote that
 come back absent mean the pruning, recorded in the shared map; counters that come back clear it.
 The fields added after `status.usage`'s first schema, the two cluster gauges and
-`remediationsMergedTotal`, have a record of their own, in the poller, because a CRD at a
-previous schema prunes one or both of those and serves the first three counters (every CRD with
-`status.usage` has carried `remediationsProposedTotal`), and the shared record would hold those
-back for the interval too; the newer fields are probed again after the same interval, and a
-difference in one of them alone waits on that record rather than re-patching every poll.
+`remediationsMergedTotal`, have a record each, in the poller, because a CRD at a previous
+schema prunes one or both of those and serves the first three counters (every CRD with
+`status.usage` has carried `remediationsProposedTotal`), the shared record would hold those back
+for the interval too, and one record for both newer fields would hold the gauges back on the CRD
+from the release between them, which serves the gauges and prunes the counter; each field is
+probed again after the same interval, and a difference in it alone waits on its record rather
+than re-patching every poll, while the other keeps landing. The log line names the field.
 The echo check moves from a function that knows about `activeInterfaces` to one that takes
 whether the fields a writer wrote came back, and both writers call it.
 
