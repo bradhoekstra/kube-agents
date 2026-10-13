@@ -101,8 +101,13 @@ so a fork keeps the same path.
   Docker Hub. Every such step, building or not, takes
   `driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1`: the action pulls the builder
   image on the runner's own daemon before the builder exists, so the config cannot cover it.
-- A job `container:`, or a `docker run` or `docker pull` of a Docker Hub image, names it as
-  `mirror.gcr.io/<repository>` with the same tag and digest.
+- A job `container:`, a `services:` image, a `docker://` action, or a `docker run` or
+  `docker pull` of a Docker Hub image, names it as `mirror.gcr.io/<repository>` with the same tag
+  and digest.
+
+`tests/test_workflow_pins_and_fork_guards.py` checks the buildx steps, job containers, service
+images and `docker://` actions of every workflow against this rule, and that the config file holds
+the mirror.
 
 A floating tag resolves to the manifest the mirror last refreshed, which can trail Docker Hub by
 days; pin a digest where that matters. The kind node image the installer matrix starts is the one
