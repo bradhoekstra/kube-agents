@@ -119,9 +119,9 @@ REMEDY_ADMIT_POD_RANGE = (
 )
 POD_RANGE_UNKNOWN = "the agent cluster's Pod range"
 
-# gcloud is slow to start, so both answers are memoised — but only one of them
-# keeps for the life of the process. The installed gcloud cannot grow a flag
-# while we run, so its answer is remembered outright.
+# gcloud is slow to start, so every answer is memoised, each for as long as it
+# can stay true. The installed gcloud cannot grow a flag while we run, so its
+# answer is remembered outright.
 #
 # A cluster's endpoint configuration can change under us, and this repository
 # ships the instruction to change it: the `gke-networking` footer in
@@ -520,10 +520,11 @@ def endpoint_decision(
 ) -> EndpointDecision | None:
     """Decide which endpoint `get-credentials` should name for this cluster.
 
-    None when nothing could be decided — an incomplete identity, a gcloud
-    without `--dns-endpoint`, a describe that failed with nothing cached —
-    which every caller treats as "run the command gcloud ran before this
-    module existed". Reaching a perfectly ordinary public cluster must not
+    None when nothing could be decided — a target missing its project, cluster
+    or location, a help probe that did not answer, a describe that failed with
+    nothing cached — which every caller treats as "run the command gcloud ran
+    before this module existed". A gcloud that answered the probe and lacks
+    `--dns-endpoint` is the settled `_NO_FLAG_DECISION` instead. Reaching a perfectly ordinary public cluster must not
     become contingent on an extra API call succeeding.
 
     Otherwise an EndpointDecision, remembered per cluster for

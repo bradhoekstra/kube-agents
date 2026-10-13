@@ -3478,10 +3478,11 @@ class CommandExecutorTest(unittest.TestCase):
         self.assertNotIn("--internal-ip", fetches[0])
         decide.assert_not_called()
 
-    def test_a_kubeconfig_fetched_on_a_provisional_decision_is_refetched_next_time(self):
+    def test_a_kubeconfig_fetched_on_a_provisional_decision_is_refetched_after_its_window(self):
         # The decision fell back because the broker's own-cluster describe
-        # failed. The file it produced serves the request in flight, and the
-        # next request fetches again rather than reusing it until a restart.
+        # failed. The file it produced serves requests inside its window, and
+        # the first request after the window fetches again rather than reusing
+        # it until a restart.
         executor = self.fake_gcloud(self.executor())
         seen = []
         original = executor._execute

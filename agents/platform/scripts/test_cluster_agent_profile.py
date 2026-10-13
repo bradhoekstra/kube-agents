@@ -487,7 +487,7 @@ class CreateProfileTest(unittest.TestCase):
         self.assertNotIn("- endpoint", user_md)
         self.assertNotIn("authorized-networks", user_md)
 
-    def test_probes_the_cluster_under_the_pinned_kubeconfig_after_the_mirror(self):
+    def test_probes_the_cluster_once_after_get_credentials_with_the_request_timeout(self):
         self.decision = a_decision()
         self.create()
         probe = [c for c in self.runs if c[:2] == ["kubectl", "version"]]

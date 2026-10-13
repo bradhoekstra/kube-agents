@@ -114,8 +114,8 @@ resource (`projects/<host>/global/networks/<name>`) in `networkConfig.network`.
 ## What the decision carries
 
 `endpoint_decision()` returns an `EndpointDecision`, or `None` when nothing could be decided
-now (an incomplete identity, a describe that failed with nothing cached, a help probe that
-could not run or did not answer). A gcloud that answered the probe and lacks `--dns-endpoint`
+now (a target missing its project, cluster or location, a describe that failed with nothing
+cached, a help probe that could not run or did not answer). A gcloud that answered the probe and lacks `--dns-endpoint`
 is a settled answer rather than `None`: an empty decision with no address, which no caller
 records and the credential proxy does not treat as provisional, since the installed gcloud
 cannot grow the flag while the pod runs; a probe that did not answer says nothing about which
@@ -228,7 +228,8 @@ Other copies of the endpoint rule exist. None changes here.
   a private endpoint, so switching it changes every install at once. That is a separate change,
   decided on evidence the live validation below gathered.
 - **`ClientConfigForIdentity` in `k8s-operator/internal/clusterprofiles/endpoint.go`** serves
-  the event watcher and the drift detector, which run in the agent image. Rule 3 would apply
+  the event watcher and the drift detector, which run in the gateway Pod's `agent-api-auth`
+  container on the credential-proxy image. Rule 3 would apply
   to it unchanged, with its own describe of the host cluster; it does not yet, and its comment
   names the gap until a follow-up closes it.
 - **`dns_endpoint_args()` in the fleet-upgrade-verification skill** decides from the record

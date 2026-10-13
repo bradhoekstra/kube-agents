@@ -35,7 +35,8 @@ is enabled, or the list explicitly does not gate the private endpoint
 (`masterAuthorizedNetworksConfig.privateEndpointEnforcementEnabled: false`), or the two
 clusters share a subnet, or the agent cluster's Pod range (`clusterIpv4Cidr`) lies inside a
 listed range. Otherwise the kubeconfig names the endpoint `gcloud` writes by default. The
-scaffold records the endpoint it chose in the profile's `USER.md`, probes the cluster once,
+scaffold records the endpoint it chose, when one was decided, in the profile's `USER.md`,
+probes the cluster once,
 and when the connection fails the onboarding log and the Cluster Agent's preflight repeat that
 record and name what would open the cluster: the Pod range to add when the private endpoint's
 list is the block, the agent's egress address when the public endpoint's is, control-plane

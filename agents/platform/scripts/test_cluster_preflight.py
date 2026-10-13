@@ -153,8 +153,8 @@ This Cluster Agent is permanently scoped to the following GKE cluster:
 """
 
 # What the scaffold writes when the private endpoint's list does not admit the
-# agent's Pod range (gke_endpoint.REMEDY_ADMIT_POD_RANGE), the one decision that
-# carries a remedy.
+# agent's Pod range (gke_endpoint.REMEDY_ADMIT_POD_RANGE), one of the decisions that
+# carry a remedy.
 ENDPOINT_BULLETS = (
     "- endpoint: ip\n"
     "- endpoint-address: 203.0.113.10\n"

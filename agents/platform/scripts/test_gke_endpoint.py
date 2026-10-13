@@ -1,4 +1,4 @@
-"""Unit tests for gke_endpoint.dns_endpoint_args (the --dns-endpoint decision).
+"""Unit tests for gke_endpoint.endpoint_decision and dns_endpoint_args (the endpoint decision).
 
 Run: python3 -m unittest agents.platform.scripts.test_gke_endpoint
 

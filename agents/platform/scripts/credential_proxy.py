@@ -105,7 +105,7 @@ KUBECTL_WATCH_FLAGS = ("-w", "--watch", "--watch-only")
 KUBECTL_TIMEOUT_FLAGS = ("--request-timeout", "--timeout")
 # The two endpoint selectors a caller's `get-credentials` may carry; with
 # neither, the broker splices in gke_endpoint's decision (see
-# `_endpoint_flags_for_callers_fetch`).
+# `_decision_for_callers_fetch`).
 GET_CREDENTIALS_ENDPOINT_FLAGS = ("--dns-endpoint", "--internal-ip")
 # gcloud's spellings of the location and project on that command, with or
 # without `=`.

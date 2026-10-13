@@ -759,8 +759,8 @@ Consequences:
   rejected with `400` rather than honored.
 - A cache miss costs one `get-credentials`, preceded by one
   `clusters describe` to decide which control-plane endpoint to reach (DNS,
-  private, or gcloud's default), plus, once per process, a describe of the
-  agent's own cluster when the private endpoint is a candidate. A caller's
+  private, or gcloud's default), plus a describe of the agent's own cluster
+  when the private endpoint is a candidate. A caller's
   own `get-credentials` that names no endpoint flag, and names its cluster
   and location (the project may come from the broker's own), gets the same
   decision spliced in, since its output
@@ -771,7 +771,8 @@ Consequences:
   for a minute rather than for the life of the broker: the endpoint can be
   opened or closed on a running cluster, and the proxy is a daemon that would
   otherwise keep acting on the configuration it first saw. The own-cluster
-  describe has no such window, because the install's VPC does not move.
+  describe is kept for the life of the broker once it has answered, because
+  the install's VPC does not move; a failed one is retried after a minute.
 - `current-context` is read with a real YAML parser, so a valid kubeconfig in
   any legal spelling is recognized, but deliberately with PyYAML's pure-Python
   `safe_load`. The C loader recurses in C and terminates the broker with
