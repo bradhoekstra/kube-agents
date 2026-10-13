@@ -67,7 +67,7 @@ python3 /opt/data/scripts/cluster_agent_profile.py delete \
 
 This deregisters the profile and removes its home directory. Do not delete a profile while its cluster still exists.
 
-To stop managing a cluster that still exists, exclude it instead; the reconcile below recreates a deleted profile for every in-scope cluster. The route is `manage-cluster`, "Stop managing", and it depends on who manages the `PlatformAgent`: on an installer-managed install (the CR carries the `meta.helm.sh/release-name` annotation) the user records `project/location/cluster` in `SCOPE_EXCLUDE_CLUSTERS` in `install.env` and runs `./upgrade.sh --upgrade-mode=full`, because the next full upgrade refuses to apply over a `spec.scope` that `install.env` does not record; on a hand-managed `PlatformAgent` the triple goes in `spec.scope.exclude.clusters` directly. Neither is a Helm values edit: the installer generates the chart values from `install.env`.
+To stop managing a cluster that still exists, exclude it instead; the reconcile below recreates a deleted profile for every in-scope cluster. Follow `manage-cluster`, "Stop managing": the exclusion is declared where the install's scope is declared (`SCOPE_EXCLUDE_CLUSTERS` in `install.env` on an install made with `install.sh`, applied with `./upgrade.sh --upgrade-mode=full`), and that section says how to tell the install shapes apart.
 
 ## Automatic reconciliation (create and prune)
 
