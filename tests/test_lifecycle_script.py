@@ -223,7 +223,7 @@ elif [[ "$cmd" == "console" ]]; then
     echo 'null'
     exit 0
 elif [[ "$cmd" == "show" ]]; then
-    # The one read load_state makes for the tainted list; state_show stands
+    # The one read load_tainted makes for the tainted list; state_show stands
     # in for the whole state, header lines included.
     echo "show" >> "${{TF_STUB_LOG:-/dev/null}}"
     cat << 'EOF'
@@ -1239,11 +1239,11 @@ resource "google_service_account" "agent" {
         self.assertEqual(log.count("apply -auto-approve -input=false"), 1, log)
 
     def test_run_apply_does_not_retry_from_a_copy_tee_could_not_keep(self):
-        """The apply failed and the copy is what tee managed; the decision is
-        made from that copy, and here it holds the 403, so one retry."""
+        """The apply failed on the 403 but tee kept no copy of it; the
+        decision reads the copy, not the stream, so no retry."""
         proc, log = self._run_with_stub_log(
             "KMS_API_PROPAGATION_WAIT_SECONDS=0 run_apply -auto-approve -input=false",
-            apply_stub=self._apply_stub_failing_first(99, "Error: Error creating Cluster: googleapi: Error 409"),
+            apply_stub=self._apply_stub_failing_first(99, self._KMS_403),
             tee_fails=True,
         )
         self.assertEqual(proc.returncode, 1)
