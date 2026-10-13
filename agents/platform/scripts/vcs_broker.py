@@ -1553,10 +1553,10 @@ class VcsBroker:
     def _merged_scope(forge: Forge) -> str:
         """What the merged count and its identity cache are keyed on besides
         the repository: the forge's canonical host, as `_pinned_base` keys the
-        pins, since one provider serves several hosts (two GitLab forges on
-        different hosts carry the same `name` and may carry the same path)
-        and the same path on another host is another repository with its own
-        credential."""
+        pins, since one provider serves several hosts (two forges of one
+        provider on different hosts carry the same `name` and may carry the
+        same path) and the same path on another host is another repository
+        with its own credential."""
         return forge.hosts[0] if forge.hosts else forge.name
 
     @classmethod
