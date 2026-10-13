@@ -1,6 +1,6 @@
 ---
 name: manage-cluster
-description: Bring an existing GKE cluster under management on user request (e.g. "manage my cluster <name> in <location>") by creating its Cluster Agent profile. Use whenever a user asks to manage/onboard/watch a specific existing cluster.
+description: Bring an existing GKE cluster under management on user request (e.g. "manage my cluster <name> in <location>") by creating its Cluster Agent profile, or take one out of management by excluding it. Use whenever a user asks to manage/onboard/watch a specific existing cluster, or to stop managing, exclude or offboard one.
 ---
 
 # Manage Cluster Skill

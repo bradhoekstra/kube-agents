@@ -1,6 +1,6 @@
 ---
 name: cluster-agent-lifecycle
-description: Create, delegate to, and tear down per-cluster Cluster Agent Hermes profiles. Use whenever a GKE cluster is onboarded or deleted, or whenever a single-cluster runtime debugging/operations task should be delegated to that cluster's Cluster Agent.
+description: Create, delegate to, and tear down per-cluster Cluster Agent Hermes profiles. Use whenever a GKE cluster is onboarded, deleted or taken out of management, or whenever a single-cluster runtime debugging/operations task should be delegated to that cluster's Cluster Agent.
 ---
 
 # Cluster Agent Lifecycle Skill
@@ -66,6 +66,8 @@ python3 /opt/data/scripts/cluster_agent_profile.py delete \
 ```
 
 This deregisters the profile and removes its home directory. Do not delete a profile while its cluster still exists.
+
+To stop managing a cluster that still exists, exclude it instead; the reconcile below recreates a deleted profile for every in-scope cluster. The route is `manage-cluster`, "Stop managing", and it depends on who manages the `PlatformAgent`: on an installer-managed install (the CR carries the `meta.helm.sh/release-name` annotation) the user records `project/location/cluster` in `SCOPE_EXCLUDE_CLUSTERS` in `install.env` and runs `./upgrade.sh --upgrade-mode=full`, because the next full upgrade refuses to apply over a `spec.scope` that `install.env` does not record; on a hand-managed `PlatformAgent` the triple goes in `spec.scope.exclude.clusters` directly. Neither is a Helm values edit: the installer generates the chart values from `install.env`.
 
 ## Automatic reconciliation (create and prune)
 
