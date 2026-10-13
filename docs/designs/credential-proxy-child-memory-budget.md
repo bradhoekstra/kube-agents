@@ -255,7 +255,8 @@ the 512Mi the operator first declared, the budget would admit one request and se
 brokered command; a listing phase that cannot run two at once costs more than the out-of-memory
 exposure the budget prevents. The operator now declares the request at 1Gi, above the floor, so
 that the budget engages on Autopilot without bursting as well, admitting four there; the floor
-still applies to a CR override whose `requests.memory` is smaller. The operator's sizing test
+still applies to a CR override whose `requests.memory` is smaller, and a `limits.memory` set
+alone under 1Gi is refused as crossing the default request. The operator's sizing test
 holds its own limit to the same floor (`credentialProxyMinimumAdmittedRequests`) and its request
 to it too (`TestCredentialProxyBudgetArithmeticAtTheDefaults`).
 
@@ -330,7 +331,9 @@ The slot cap and output cap, their values and their reservation. The sandbox shi
 requests at once the eight-wide burst of both listing pools coinciding waits one listing, so no
 retry is added here. (Those are the 1Gi figures; at the 2Gi default the budget admits nine and
 the slot cap of eight binds.) The proxy container's requests and limits, and so the
-chart's generated footprint and quota preflight. No agent-visible behaviour: no eval case.
+chart's generated footprint and quota preflight (the request has since moved to 1Gi so that
+the budget runs on Autopilot without bursting, §2.3; the footprint moved with it). No
+agent-visible behaviour: no eval case.
 
 The reconciler's and the stall watch's listing pools are the caller settings the change moved.
 The reconciler's had been eight at the default `maxProjects` cap and up to sixteen when the cap

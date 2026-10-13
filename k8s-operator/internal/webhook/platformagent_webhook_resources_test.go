@@ -75,7 +75,7 @@ func TestCredentialProxyMemoryLimitBelowTheFloorIsRefusedWithTheNumbers(t *testi
 }
 
 // A limit under the floor is refused once. It also sits under the default
-// 512Mi request, and is set without requests.memory; neither restates it,
+// 1Gi request, and is set without requests.memory; neither restates it,
 // because raising requests.memory cannot make it valid and the
 // limit-without-request note is advice about a quantity already refused.
 func TestCredentialProxyMemoryLimitBelowTheFloorIsRefusedOnce(t *testing.T) {
