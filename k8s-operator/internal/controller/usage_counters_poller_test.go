@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -644,6 +645,8 @@ func TestUsagePoller_ReseedsAnInvalidDocument(t *testing.T) {
 		{"a first-recorded time before the CR", func(d *usageDocument) { d.FirstRecorded = metav1.NewTime(created.Add(-time.Minute)) }},
 		{"a negative sample", func(d *usageDocument) { podEntry(d, "broker-b").Sample = -1 }},
 		{"an unknown version", func(d *usageDocument) { d.Version = usageDocumentVersion + 1 }},
+		{"an unfolded name that is no counter", func(d *usageDocument) { d.Unfolded = []string{"bogus"} }},
+		{"an unfolded counter with a total", func(d *usageDocument) { d.Unfolded = []string{usageCounterToolExecutions} }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1074,6 +1077,52 @@ func TestUsagePoller_MigratesAVersionOneDocument(t *testing.T) {
 	}
 	if doc.Pods[usagePodEntryKey("broker-b", usageCounterRemediationsProposed)].Sample != 2 {
 		t.Fatalf("the new counter was not recorded at its sample: %+v", doc.Pods)
+	}
+}
+
+// The migrating poll could not read the broker, so the migrated document is
+// written at the current layout with the new counter still unseen. The
+// unfolded set persists with it: the broker's first sample on the recovery
+// poll still adds whole, and the set is cleared once a pod has been recorded
+// for the counter, so a later pod older than the document is baselined.
+func TestUsagePoller_MigratesAVersionOneDocument_BrokerFailsTheMigratingPoll(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	h := newUsageHarness(t, usageTestAgent(created), usageDefaultObjects(created)...)
+	moved := metav1.NewTime(usageClock(3))
+	h.writeDocument(&usageDocument{
+		Version:       usageDocumentVersionPodKeyed,
+		AgentUID:      usageTestAgentUID,
+		FirstRecorded: metav1.NewTime(usageClock(1)),
+		Totals:        map[string]int64{usageCounterToolExecutions: 10, usageCounterEventsIngested: 4},
+		LastMoved:     &moved,
+		Pods: map[string]*usagePodEntry{
+			"gw-a":     {Name: "agent-gateway-aaa", Counter: usageCounterEventsIngested, Sample: 40, Marker: moved},
+			"broker-b": {Name: "agent-credential-proxy-bbb", Counter: usageCounterToolExecutions, Sample: 100, Marker: moved},
+		},
+	})
+	h.stub.set(gatewayAddr(), 46, nil)
+	h.stub.fail(brokerAddr(), usageScrapeKindRefused)
+	h.poll(10)
+	doc := h.document()
+	if doc.Version != usageDocumentVersion || doc.Totals[usageCounterRemediationsProposed] != 0 {
+		t.Fatalf("after the migrating poll: version %d, totals %v; want version %d and the new counter at 0", doc.Version, doc.Totals, usageDocumentVersion)
+	}
+	if !slices.Contains(doc.Unfolded, usageCounterRemediationsProposed) {
+		t.Fatalf("the written document does not carry the unseen counter: unfolded %v", doc.Unfolded)
+	}
+
+	h.stub.set(brokerAddr(), 103, nil)
+	h.stub.setSample(brokerAddr(), usageCounterRemediationsProposed, 2)
+	h.poll(15)
+	doc = h.document()
+	if doc.Totals[usageCounterRemediationsProposed] != 2 || doc.Totals[usageCounterToolExecutions] != 13 {
+		t.Fatalf("totals after the recovery poll: %v, want remediationsProposedTotal 2 (the whole sample) and toolExecutionsTotal 13", doc.Totals)
+	}
+	if len(doc.Unfolded) != 0 {
+		t.Fatalf("the unfolded set outlived the first recorded sample: %v", doc.Unfolded)
+	}
+	if got := h.status().RemediationsProposedTotal; got != 2 {
+		t.Fatalf("status.usage.remediationsProposedTotal = %d, want 2", got)
 	}
 }
 

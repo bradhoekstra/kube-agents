@@ -743,6 +743,11 @@ func usageDocumentInvalid(doc *usageDocument, cm *corev1.ConfigMap, agent *agent
 			return "a total is below the status it projects to"
 		}
 	}
+	for _, counter := range doc.Unfolded {
+		if !slices.Contains(usageCounters, counter) || doc.Totals[counter] != 0 {
+			return "an unfolded counter is not a counter at zero"
+		}
+	}
 	for key, entry := range doc.Pods {
 		if entry == nil || entry.Sample < 0 || entry.Marker.IsZero() {
 			return "a pod entry is outside its bounds"

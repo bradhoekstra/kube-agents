@@ -16,6 +16,7 @@ package controller
 
 import (
 	"math"
+	"slices"
 	"sort"
 	"time"
 
@@ -135,12 +136,23 @@ type usageDocument struct {
 	// layout, so the poll writes it back at the current one even when the fold
 	// changed nothing. Not serialised.
 	migrated bool
-	// unfolded names the counters migrateUsageDocument added to Totals at zero
-	// on this read: the status carried nothing for them and no pod's sample has
-	// been folded into them through this document, so nothing of any pod's
-	// sample has been seen, and a pod older than the document adds its whole
-	// sample the way a pod created after FirstRecorded does. Not serialised.
-	unfolded map[string]bool
+	// Unfolded names the counters migrateUsageDocument added to Totals at
+	// zero and no pod has been recorded for since: the status carried nothing
+	// for them and no pod's sample has been folded into them through this
+	// document, so nothing of any pod's sample has been seen, and a pod older
+	// than the document adds its whole sample the way a pod created after
+	// FirstRecorded does. Serialised, since the migrating poll may not read
+	// the pod that feeds the counter: the document is written at the current
+	// layout regardless, and a set that lived only in memory would be gone by
+	// the poll that does read it, which would baseline the pod and lose what
+	// it counted before the upgrade. A counter leaves the set in the poll
+	// that first records a pod for it.
+	Unfolded []string `json:"unfolded,omitempty"`
+}
+
+// usageUnfolded reports whether counter is in doc's unfolded set.
+func usageUnfolded(doc *usageDocument, counter string) bool {
+	return slices.Contains(doc.Unfolded, counter)
 }
 
 // migrateUsageDocument brings a version-1 document, entries keyed by pod UID
@@ -158,8 +170,9 @@ type usageDocument struct {
 // interval's counts on every counter. What the listeners counted during the
 // rollback is not recovered: the pods are baselined at their samples, and
 // only a counter whose floor is zero, so that none of any sample can be in
-// the total, is marked unfolded for foldUsage to add whole. Any other version
-// is left for usageDocumentInvalid to refuse.
+// the total, is recorded in Unfolded for foldUsage to add whole, on this poll
+// or on the first that reads the pod. Any other version is left for
+// usageDocumentInvalid to refuse.
 func migrateUsageDocument(doc *usageDocument, floors map[string]int64) {
 	if doc.Version != usageDocumentVersionPodKeyed || doc.Pods == nil || doc.Totals == nil {
 		return
@@ -180,13 +193,11 @@ func migrateUsageDocument(doc *usageDocument, floors map[string]int64) {
 			continue
 		}
 		doc.Totals[counter] = floors[counter]
-		if floors[counter] == 0 {
-			if doc.unfolded == nil {
-				doc.unfolded = map[string]bool{}
-			}
-			doc.unfolded[counter] = true
+		if floors[counter] == 0 && !usageUnfolded(doc, counter) {
+			doc.Unfolded = append(doc.Unfolded, counter)
 		}
 	}
+	slices.Sort(doc.Unfolded)
 	doc.Version = usageDocumentVersion
 	doc.migrated = true
 }
@@ -319,6 +330,14 @@ func foldUsage(doc *usageDocument, agentUID string, seed usageSeed, live map[str
 	}
 
 	candidates := map[string][]usageCandidate{}
+	// The unfolded counters a pod was recorded for this poll, cleared from the
+	// set after the loop so that every pod first read in the same poll adds
+	// whole. A pod first read on a later poll is baselined: the counter has a
+	// recorded baseline by then, and the rule for a pod older than the document
+	// applies to it as to any other counter. A second pod of a Sum counter
+	// first read later is the under-count that rule already accepts, taken
+	// over a set kept per pod.
+	folded := map[string]bool{}
 	for _, s := range ordered {
 		key := usagePodEntryKey(s.UID, s.Counter)
 		entry, known := doc.Pods[key]
@@ -332,6 +351,10 @@ func foldUsage(doc *usageDocument, agentUID string, seed usageSeed, live map[str
 			entry = &usagePodEntry{Name: s.Name, PodUID: s.UID, Counter: s.Counter, Sample: s.Sample, StartTime: s.StartTime, Marker: stamp}
 			doc.Pods[key] = entry
 			changed = true
+			unfolded := usageUnfolded(doc, s.Counter)
+			if unfolded {
+				folded[s.Counter] = true
+			}
 			// A new replica feeding a Max counter beside a live sibling is
 			// recorded with the sibling's as-read marker, not this poll's
 			// stamp. A sibling counted after this replica started supplied the
@@ -359,7 +382,7 @@ func foldUsage(doc *usageDocument, agentUID string, seed usageSeed, live map[str
 					entry.Marker = doc.FirstRecorded
 				}
 			}
-			if (s.Created.After(doc.FirstRecorded.Time) || doc.unfolded[s.Counter]) && s.Sample <= usageDeltaCeiling {
+			if (s.Created.After(doc.FirstRecorded.Time) || unfolded) && s.Sample <= usageDeltaCeiling {
 				candidates[s.Counter] = append(candidates[s.Counter], usageCandidate{entry: entry, delta: s.Sample, sample: s.Sample, startTime: s.StartTime})
 			}
 			continue
@@ -403,6 +426,13 @@ func foldUsage(doc *usageDocument, agentUID string, seed usageSeed, live map[str
 			continue
 		}
 		candidates[s.Counter] = append(candidates[s.Counter], usageCandidate{entry: entry, delta: delta, sample: s.Sample, startTime: s.StartTime})
+	}
+
+	if len(folded) > 0 {
+		doc.Unfolded = slices.DeleteFunc(doc.Unfolded, func(counter string) bool { return folded[counter] })
+		if len(doc.Unfolded) == 0 {
+			doc.Unfolded = nil
+		}
 	}
 
 	moved := false
