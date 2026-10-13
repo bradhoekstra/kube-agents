@@ -542,6 +542,27 @@ class MergedProposalCountingTest(unittest.TestCase):
         self.assertEqual([1, 1], self.counts, "one proposal counted once per spelling of its repository")
         self.assertEqual(1, transport.asked, "the identity was asked once per spelling of one repository")
 
+    def test_two_hosts_of_one_provider_are_two_repositories(self):
+        """Two GitLab forges on different hosts share a provider name and may
+        carry the same path with different credentials: each host's merges count
+        on their own, and each host's credential is asked who it is."""
+        here = self.forge_with(self.merged(13))
+        there = MergedListingForge(Path(self.tmp.name) / "forges-there", (self.merged(13, author="svc-kubeagents"),))
+        there.hosts = ("other.test",)
+        self.broker.registry.hosts["other.test"] = there
+        asked = {}
+
+        def transport(forge, _repo):
+            login = "kube-agents" if forge is here else "svc-kubeagents"
+            asked.setdefault(login, CountingSelfAware(login))
+            return asked[login]
+
+        self.broker._transport = transport
+        self.broker.proposal_list({"repository": "local.test/acme/infra"})
+        self.broker.proposal_list({"repository": "other.test/acme/infra"})
+        self.assertEqual([1, 1], self.counts, "the same number on another host was not counted as its own merge")
+        self.assertEqual({"kube-agents": 1, "svc-kubeagents": 1}, {k: v.asked for k, v in asked.items()}, "each host's credential is asked once")
+
     def test_a_view_counts_what_a_list_has_not_seen(self):
         self.forge_with(self.merged(9))
         self.broker.proposal_view({"repository": "local.test/acme/infra", "number": 9})

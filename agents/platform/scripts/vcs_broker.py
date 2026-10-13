@@ -1550,12 +1550,22 @@ class VcsBroker:
             LOGGER.debug("merged-proposal count skipped type=%s", type(exc).__name__)
 
     @staticmethod
-    def _merged_key(bound: Binding, number: Any) -> tuple[str, str, Any]:
-        """The seen-set key: forge, repository and number. The repository is
-        casefolded, since a caller may spell `Acme/Infra` and `acme/infra` for
-        the one repository the forge resolves them to, and the count is per
+    def _merged_scope(forge: Forge) -> str:
+        """What the merged count and its identity cache are keyed on besides
+        the repository: the forge's canonical host, as `_pinned_base` keys the
+        pins, since one provider serves several hosts (two GitLab forges on
+        different hosts carry the same `name` and may carry the same path)
+        and the same path on another host is another repository with its own
+        credential."""
+        return forge.hosts[0] if forge.hosts else forge.name
+
+    @classmethod
+    def _merged_key(cls, bound: Binding, number: Any) -> tuple[str, str, Any]:
+        """The seen-set key: forge host, repository and number. The repository
+        is casefolded, since a caller may spell `Acme/Infra` and `acme/infra`
+        for the one repository the forge resolves them to, and the count is per
         proposal, not per spelling."""
-        return (bound.forge.name, bound.repo.casefold(), number)
+        return (cls._merged_scope(bound.forge), bound.repo.casefold(), number)
 
     def _merged_viewer_for(self, bound: Binding) -> str:
         """The credential's login for the count, remembered per repository,
@@ -1568,7 +1578,7 @@ class VcsBroker:
         a lookup that raises is left to the caller's guard and asked again next
         time.
         """
-        key = (bound.forge.name, bound.repo.casefold())
+        key = (self._merged_scope(bound.forge), bound.repo.casefold())
         with self._merged_lock:
             if key in self._merged_viewer:
                 return self._merged_viewer[key]
@@ -1582,7 +1592,7 @@ class VcsBroker:
             LOGGER.info(
                 "merged-proposal count is off for %s: the credential cannot name itself, "
                 "so no proposal can be told to be this install's own",
-                bound.forge.name,
+                self._merged_scope(bound.forge),
             )
         return viewer
 
