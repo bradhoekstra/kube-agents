@@ -539,9 +539,18 @@ class DriftWorkflowTest(unittest.TestCase):
 _FAKE_GCLOUD = """#!/usr/bin/env bash
 # Every read of the cluster answers what FAKE_CLUSTER says, as the real
 # gcloud does: describe and get-credentials both 404 on an absent cluster.
-# The Terraform state probe answers what FAKE_STATE says.
+# The project's cluster list answers what FAKE_PROJECT_CLUSTERS says (empty
+# by default, with gcloud's "Listed 0 items." on stderr, which the step must
+# not read as a cluster). The Terraform state probe answers what FAKE_STATE
+# says.
 echo "$*" >> "${FAKE_DIR}/calls"
 case "$*" in
+  *"container clusters list"*)
+    case "${FAKE_PROJECT_CLUSTERS:-}" in
+      fail) echo "ERROR: (gcloud.container.clusters.list) ResponseError: code=403, message=Required container.clusters.list permission(s) for projects/p." >&2; exit 1 ;;
+      "")   echo "Listed 0 items." >&2 ;;
+      *)    printf '%b\n' "${FAKE_PROJECT_CLUSTERS}" ;;
+    esac ;;
   *"container clusters "*)
     case "${FAKE_CLUSTER}" in
       found)     echo "platform-agent-host" ;;
@@ -590,7 +599,7 @@ class RebuildLeaseGuardTest(unittest.TestCase):
         self.script = next(s for s in steps
                            if s["name"] == "Refuse while somebody is live-testing")["run"]
 
-    def _run(self, cluster, lease="free", state="absent", defaults=_FAKE_DEFAULTS):
+    def _run(self, cluster, lease="free", state="absent", defaults=_FAKE_DEFAULTS, project_clusters=""):
         with tempfile.TemporaryDirectory() as tmp:
             fake = pathlib.Path(tmp)
             (fake / "calls").write_text("")
@@ -613,6 +622,7 @@ class RebuildLeaseGuardTest(unittest.TestCase):
                 "FAKE_CLUSTER": cluster,
                 "FAKE_LEASE": lease,
                 "FAKE_STATE": state,
+                "FAKE_PROJECT_CLUSTERS": project_clusters,
                 "TARGET": "autopush-next",
                 "GCP_PROJECT_ID": "p",
                 "GCP_REGION": "us-central1",
@@ -629,6 +639,27 @@ class RebuildLeaseGuardTest(unittest.TestCase):
         self.assertNotIn("get-credentials", calls)
         self.assertNotIn("lease ", calls)
         self.assertIn("::notice", out)
+
+    def test_a_project_that_already_has_a_cluster_is_a_misnamed_environment(self):
+        """A mistyped GKE_CLUSTER_NAME 404s on describe and names a state
+        object nothing wrote, which is the empty-project shape exactly. Each
+        long-lived environment owns its project, so a project with a cluster
+        under any name is a misnamed environment, and a build there would
+        start a second cluster beside the live one."""
+        code, calls, out = self._run("notfound", project_clusters="platform-agent-hots\tus-central1")
+        self.assertEqual(code, 1)
+        self.assertNotIn("storage cat", calls)
+        self.assertNotIn("lease ", calls)
+        self.assertIn("::error", out)
+        self.assertIn("platform-agent-hots/us-central1", out)
+
+    def test_a_cluster_list_that_fails_fails_closed(self):
+        code, calls, out = self._run("notfound", project_clusters="fail")
+        self.assertEqual(code, 1)
+        self.assertNotIn("storage cat", calls)
+        self.assertNotIn("lease ", calls)
+        self.assertIn("::error", out)
+        self.assertIn("container.clusters.list", out)
 
     def test_state_recording_the_cluster_elsewhere_is_a_coordinates_mismatch(self):
         """The teardown finds an install by project and cluster name, not by
@@ -659,7 +690,9 @@ class RebuildLeaseGuardTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertNotIn("lease ", calls)
         self.assertIn("::error", out)
-        self.assertIn("somebody-elses-cluster", out)
+        # Labelled by project and name: an entry with this cluster's name in
+        # another project is refused too, and the label has to say what differs.
+        self.assertIn("p/somebody-elses-cluster", out)
 
     def test_state_recording_this_cluster_and_another_refuses(self):
         """A destroy of the state takes every cluster in it, so this cluster

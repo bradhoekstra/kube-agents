@@ -86,7 +86,9 @@ does). The in-place reconcile cannot create one, because it connects to the
 cluster before it plans or applies, so between the GitHub environment gaining
 its `GCP_PROJECT_ID` and that first dispatch, the environment's deploy lane
 and its daily drift plan go red. Only a genuine NOT_FOUND passes, and then
-only when the install's Terraform state agrees: none, or state that records
+only when the project has no cluster under any name, since each long-lived
+environment owns its project and a cluster there under another name means
+`GKE_CLUSTER_NAME` is wrong, and when the install's Terraform state agrees: none, or state that records
 no cluster or records this cluster at the configured location, is an earlier
 attempt or a cluster that is gone, and the teardown clears what is left. State
 that records this cluster at another location means the coordinates are wrong

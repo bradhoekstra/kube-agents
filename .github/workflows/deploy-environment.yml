@@ -331,8 +331,15 @@ jobs:
           #     are wrong, and the cluster is probably alive. Refuse;
           #   - state that records any other cluster, with or without this
           #     one: a destroy of that state takes every cluster in it. Refuse.
-          # The absence pattern is a copy of GCS_OBJECT_ABSENT_PATTERN
-          # (installer_common.sh), pinned by a test.
+          # The name is the other coordinate, and the state object is named
+          # by it too, so a mistyped GKE_CLUSTER_NAME would 404 here and
+          # probe an object nothing wrote: the empty-project shape exactly,
+          # and the install would start a second cluster beside the live one
+          # and fail on the service account it already owns. Each long-lived
+          # environment owns its project (scripts/release/README.md), so the
+          # project's cluster list is asked first, and any cluster in it
+          # refuses. The absence pattern is a copy of
+          # GCS_OBJECT_ABSENT_PATTERN (installer_common.sh), pinned by a test.
           if ! describe_err="$(gcloud container clusters describe "${GKE_CLUSTER_NAME}" \
                 --location "${GCP_REGION}" --project "${GCP_PROJECT_ID}" \
                 --format='value(name)' 2>&1 >/dev/null)"; then
@@ -344,6 +351,19 @@ jobs:
               echo "::error title=Could not read ${TARGET}'s cluster::gcloud could not describe '${GKE_CLUSTER_NAME}' in '${GCP_PROJECT_ID}', and the answer was not NOT_FOUND, so whether the cluster exists is unknown. Refusing to tear down blind. ${describe_err}"
               exit 1
             fi
+            probe_err_file="$(mktemp "${RUNNER_TEMP:-/tmp}/probe.XXXXXX")"
+            trap 'rm -f "${probe_err_file}"' EXIT
+            # stderr apart from stdout: gcloud reports an empty list there
+            # ("Listed 0 items."), which must not read as a cluster.
+            if ! project_clusters="$(gcloud container clusters list --project "${GCP_PROJECT_ID}" \
+                  --format='value(name,location)' 2>"${probe_err_file}")"; then
+              echo "::error title=Could not list ${TARGET}'s clusters::No cluster '${GKE_CLUSTER_NAME}' in '${GCP_PROJECT_ID}', and listing the project's clusters failed, so whether another cluster is live there is unknown. Refusing to build blind. $(cat "${probe_err_file}")"
+              exit 1
+            fi
+            if [ -n "${project_clusters}" ]; then
+              echo "::error title=${TARGET}'s project already has a cluster::No cluster '${GKE_CLUSTER_NAME}' at '${GCP_REGION}' in '${GCP_PROJECT_ID}', but the project has: $(printf '%s\n' "${project_clusters}" | tr '\t' '/' | paste -sd ' ' -). Each long-lived environment owns its project, so this is a misnamed or misplaced environment, not an empty one: check GKE_CLUSTER_NAME and GCP_REGION on the GitHub environment. A build here would start a second cluster beside the live one. Refusing."
+              exit 1
+            fi
             # shellcheck disable=SC1091
             . ./install.defaults.env
             if [ -z "${DEFAULT_TF_STATE_BUCKET_SUFFIX:-}" ] || [ -z "${DEFAULT_TF_STATE_PREFIX_ROOT:-}" ]; then
@@ -351,12 +371,10 @@ jobs:
               exit 1
             fi
             state_object="gs://${GCP_PROJECT_ID}${DEFAULT_TF_STATE_BUCKET_SUFFIX}/${DEFAULT_TF_STATE_PREFIX_ROOT}/${GKE_CLUSTER_NAME}/default.tfstate"
-            state_err_file="$(mktemp "${RUNNER_TEMP:-/tmp}/state-probe.XXXXXX")"
-            trap 'rm -f "${state_err_file}"' EXIT
             state_rc=0
-            state_json="$(gcloud storage cat "${state_object}" 2>"${state_err_file}")" || state_rc=$?
+            state_json="$(gcloud storage cat "${state_object}" 2>"${probe_err_file}")" || state_rc=$?
             if [ "${state_rc}" -ne 0 ]; then
-              state_err="$(cat "${state_err_file}")"
+              state_err="$(cat "${probe_err_file}")"
               if ! printf '%s' "${state_err}" | grep -qiE 'matched no objects|NotFoundException|HTTPError 404|not found|does not exist'; then
                 echo "::error title=Could not read ${TARGET}'s Terraform state::No cluster '${GKE_CLUSTER_NAME}' in '${GCP_PROJECT_ID}', and the state probe at ${state_object} failed for a reason other than absence, so whether an install exists is unknown. Refusing to tear down blind. ${state_err}"
                 exit 1
@@ -364,10 +382,11 @@ jobs:
               echo "::notice title=${TARGET} has no cluster yet::No cluster '${GKE_CLUSTER_NAME}' in '${GCP_PROJECT_ID}' and no Terraform state at ${state_object}, so there is no live-test lease to ask and nothing to tear down. The install builds it from nothing."
               exit 0
             fi
-            # Prints one line: `none` (no cluster in the state), `other <names>`
-            # (clusters in the state that are not this one, whether or not this
-            # one is there too), or the locations the state records this
-            # cluster at.
+            # Prints one line: `none` (no cluster in the state), `other
+            # <project/name ...>` (clusters in the state that are not this one,
+            # whether or not this one is there too; labelled by project as well
+            # as name, since an entry with this name in another project is one
+            # of them), or the locations the state records this cluster at.
             if ! recorded="$(printf '%s' "${state_json}" | STATE_PROJECT="${GCP_PROJECT_ID}" STATE_CLUSTER="${GKE_CLUSTER_NAME}" python3 -c '
           import json, os, sys
           state = json.load(sys.stdin)
@@ -378,7 +397,7 @@ jobs:
                       for inst in res.get("instances", [])]
           mine = [c for c in clusters
                   if c.get("name") == want_name and c.get("project", want_project) == want_project]
-          others = sorted({c.get("name", "?") for c in clusters if c not in mine})
+          others = sorted({c.get("project", want_project) + "/" + c.get("name", "?") for c in clusters if c not in mine})
           if not clusters:
               print("none")
           elif others:
