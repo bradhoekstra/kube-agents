@@ -1527,7 +1527,7 @@ class VcsBroker:
                     and p.get("state") == MERGED_PROPOSAL_STATE
                     and (closed := _iso_timestamp(p.get("closed"))) is not None
                     and closed >= self.started_at
-                    and (bound.forge.name, bound.repo, p.get("number")) not in self._merged_seen
+                    and self._merged_key(bound, p.get("number")) not in self._merged_seen
                 ]
             if not candidates:
                 return
@@ -1539,7 +1539,7 @@ class VcsBroker:
                 for proposal in candidates:
                     if _login_key(str(proposal.get("author") or "")) != _login_key(viewer):
                         continue
-                    key = (bound.forge.name, bound.repo, proposal.get("number"))
+                    key = self._merged_key(bound, proposal.get("number"))
                     if key in self._merged_seen:
                         continue
                     self._merged_seen.add(key)
@@ -1548,6 +1548,14 @@ class VcsBroker:
                 self.merge_observer(count)
         except Exception as exc:  # noqa: BLE001 -- the count never fails the read
             LOGGER.debug("merged-proposal count skipped type=%s", type(exc).__name__)
+
+    @staticmethod
+    def _merged_key(bound: Binding, number: Any) -> tuple[str, str, Any]:
+        """The seen-set key: forge, repository and number. The repository is
+        casefolded, since a caller may spell `Acme/Infra` and `acme/infra` for
+        the one repository the forge resolves them to, and the count is per
+        proposal, not per spelling."""
+        return (bound.forge.name, bound.repo.casefold(), number)
 
     def _merged_viewer_for(self, bound: Binding) -> str:
         """The credential's login for the count, remembered per repository.
