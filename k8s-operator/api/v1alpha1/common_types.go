@@ -2130,9 +2130,9 @@ type AgentUsageStatus struct {
 	// user's message counts and nothing the gateway never hands to the hook
 	// does. Read from the chat_metrics plugin's
 	// kubeagents_chat_messages_inbound_total on the platform-agent container
-	// every five minutes, summed across gateway replicas, since each receives
-	// its own messages, and kept monotonic the same way as
-	// ToolExecutionsTotal. Moves LastActiveTime, so a chat turn that runs no
+	// every five minutes, from the gateway pod that runs Hermes (above one
+	// replica, the leader alone), summed across the pods that have led, and
+	// kept monotonic the same way as ToolExecutionsTotal. Moves LastActiveTime, so a chat turn that runs no
 	// brokered command is activity.
 	// +optional
 	ChatMessagesInboundTotal int64 `json:"chatMessagesInboundTotal,omitempty"`

@@ -1077,6 +1077,81 @@ func TestUsagePoller_ProposalsCountBesideToolExecutions(t *testing.T) {
 // read as two targets of one pod: the chat counter lands in its own entry,
 // summed across replicas, and moves lastActiveTime; a failing chat listener
 // has a streak of its own and does not count as the watcher failing.
+// Above one replica the gateway container runs leader_elect.py, which starts
+// Hermes on the lease holder alone and labels that pod: the standby runs no
+// gateway, nothing listens on its chat port, and reading it would put a
+// standing Warning on a healthy install. It stays live, keeps its entry, and
+// is not read; the watcher's sidecar runs on both and is read on both.
+func TestUsagePoller_ChatListenerIsReadFromTheLeaderAlone(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	agent := usageTestAgent(created)
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Availability: &agentv1alpha1.AvailabilitySpec{Replicas: ptr.To(int32(2))}}
+	a := usageGatewayPod("agent-gateway-aaa", "gw-a", usageTestGatewayIP, created)
+	a.Labels[gatewayLeaderLabel] = gatewayLeaderLabelValue
+	b := usageGatewayPod("agent-gateway-bbb", "gw-b", usageTestGatewayB, created)
+	objs := append([]client.Object{a, b}, usageDefaultObjects(created)[1:]...)
+	h := newUsageHarness(t, agent, objs...)
+	bChat := usageTestGatewayB + ":9097"
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.stub.set(usageTestGatewayB+":9095", 0, nil)
+	h.stub.set(chatAddr(), 10, ptr.To(1.0))
+	h.stub.fail(bChat, usageScrapeKindRefused)
+	h.stub.set(brokerAddr(), 0, nil)
+	h.poll(5)
+	h.poll(10)
+	h.poll(15)
+	if h.stub.scraped(bChat) {
+		t.Fatal("the standby's chat port was read")
+	}
+	if !h.stub.scraped(usageTestGatewayB + ":9095") {
+		t.Fatal("the standby's watcher was not read")
+	}
+	select {
+	case ev := <-h.recorder.Events:
+		t.Fatalf("a Warning on a healthy install: %q", ev)
+	default:
+	}
+	// Leadership moves: the old leader's port is no longer read, the new
+	// leader's is. The new leader is a pod older than the document with no
+	// entry for the counter, so its first sample is baselined, as for any
+	// such pod: the fold cannot tell a standby never read from a pod whose
+	// count the status already holds, and the first interval after a
+	// leadership change is lost, as it is at a re-seed. From the next poll
+	// its advances add, and the total keeps both pods' counts.
+	h.stub.set(chatAddr(), 14, ptr.To(1.0))
+	h.poll(20)
+	if got := h.status().ChatMessagesInboundTotal; got != 4 {
+		t.Fatalf("after 4 messages on the leader: %d, want 4", got)
+	}
+	a.Labels = map[string]string{"app": usageTestAgentName + "-gateway"}
+	b.Labels[gatewayLeaderLabel] = gatewayLeaderLabelValue
+	if err := h.cl.Update(context.Background(), a); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.cl.Update(context.Background(), b); err != nil {
+		t.Fatal(err)
+	}
+	h.stub.set(bChat, 3, ptr.To(2.0))
+	h.stub.fail(chatAddr(), usageScrapeKindRefused)
+	h.poll(25)
+	if got := h.status().ChatMessagesInboundTotal; got != 4 {
+		t.Fatalf("the new leader's first sample was not baselined: %d, want 4", got)
+	}
+	h.stub.set(bChat, 6, ptr.To(2.0))
+	h.poll(30)
+	if got := h.status().ChatMessagesInboundTotal; got != 7 {
+		t.Fatalf("after 3 more messages on the new leader: %d, want 7", got)
+	}
+	if !h.stub.scraped(chatAddr()) {
+		t.Fatal("the old leader was never read")
+	}
+	select {
+	case ev := <-h.recorder.Events:
+		t.Fatalf("a Warning after leadership moved: %q", ev)
+	default:
+	}
+}
+
 func TestUsagePoller_ChatMessagesCountFromTheGatewaysSecondListener(t *testing.T) {
 	created := usageClock(0).Add(-time.Hour)
 	b := usageGatewayPod("agent-gateway-bbb", "gw-b", usageTestGatewayB, created)
@@ -1096,7 +1171,9 @@ func TestUsagePoller_ChatMessagesCountFromTheGatewaysSecondListener(t *testing.T
 	if doc := h.document(); doc.Pods[usagePodEntryKey("gw-a", usageCounterChatMessagesInbound)] == nil || doc.Pods[usagePodEntryKey("gw-b", usageCounterChatMessagesInbound)] == nil {
 		t.Fatalf("the chat entries were not recorded: %v", doc.Pods)
 	}
-	// Each replica receives its own messages: the deltas sum.
+	// At one replica every gateway pod is read (a rollout has two), and
+	// leadership moves between pods above it, so each pod's own count is
+	// summed: the deltas sum.
 	h.stub.set(chatAddr(), 13, ptr.To(1.0))
 	h.stub.set(bChat, 22, ptr.To(1.0))
 	h.poll(10)

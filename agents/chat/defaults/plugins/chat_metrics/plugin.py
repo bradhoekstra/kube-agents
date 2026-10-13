@@ -27,12 +27,16 @@ logger = logging.getLogger("hermes.plugin.chat_metrics")
 
 REGISTRY = metrics.ChatMetrics()
 _listener = None
-# The module Hermes' gateway process imports before it discovers plugins, and
-# which no other hermes process in the container (a CLI call, a worker) loads.
-# Every hermes process runs plugin discovery, so each would otherwise try to
-# bind the one port the pod has for this, and only the gateway sees messages:
-# the listener belongs in the gateway process alone, and the rest log nothing.
-GATEWAY_MODULE = "gateway.run"
+# Every hermes process in the container (a CLI call, a worker) runs plugin
+# discovery, so each would otherwise try to bind the one port the pod has for
+# this, and only the gateway sees messages: the listener belongs in the
+# gateway process alone. Which process this is comes from its command line,
+# the way Hermes itself tells a gateway apart (gateway/status.py), not from
+# what has been imported so far: Hermes starts plugin discovery on a
+# background thread before the gateway's own modules are loaded, so an import
+# test races it. The subcommand tokens of `hermes [--profile X] gateway run`.
+GATEWAY_SUBCOMMAND = ("gateway", "run")
+PROFILE_FLAGS = ("--profile", "-p")
 
 
 def _platform_of(event: Any) -> str:
@@ -50,9 +54,33 @@ def count_inbound(event: Any = None, gateway: Any = None, session_store: Any = N
     return None
 
 
-def in_gateway_process() -> bool:
-    """Whether this process is the Hermes gateway, the one that receives messages."""
-    return GATEWAY_MODULE in sys.modules
+def in_gateway_process(argv: Optional[list] = None) -> bool:
+    """Whether this process is the Hermes gateway, the one that receives messages.
+
+    Hermes' own classifier when it is importable, else the same reading of the
+    command line: the `gateway` subcommand followed by `run`, or bare `gateway`,
+    which Hermes defaults to `run`, with `--profile X` / `-p X` skipped.
+    """
+    argv = list(sys.argv if argv is None else argv)
+    try:
+        from gateway.status import looks_like_gateway_command_line  # type: ignore[import-not-found]
+    except Exception:  # noqa: BLE001 -- outside Hermes, read argv the same way
+        looks_like_gateway_command_line = None
+    if looks_like_gateway_command_line is not None:
+        return bool(looks_like_gateway_command_line(" ".join(str(a) for a in argv)))
+    tokens = []
+    skip_next = False
+    for token in argv[1:]:
+        if skip_next:
+            skip_next = False
+        elif token in PROFILE_FLAGS:
+            skip_next = True
+        elif not token.startswith(tuple(f + "=" for f in PROFILE_FLAGS)):
+            tokens.append(token)
+    for i, token in enumerate(tokens):
+        if token == GATEWAY_SUBCOMMAND[0]:
+            return i + 1 >= len(tokens) or tokens[i + 1] == GATEWAY_SUBCOMMAND[1]
+    return False
 
 
 def start_listener() -> None:
@@ -61,7 +89,9 @@ def start_listener() -> None:
     if _listener is not None:
         return
     if not in_gateway_process():
-        logger.debug("not the gateway process; the inbound chat count is served from the gateway alone")
+        # At info, so a gateway that misread its own command line is visible
+        # in the log rather than a silent listener that never bound.
+        logger.info("not the gateway process (%s); the inbound chat count is served from the gateway alone", " ".join(sys.argv[1:]) or "no arguments")
         return
     port = metrics.listener_port_from_env()
     if port is None:

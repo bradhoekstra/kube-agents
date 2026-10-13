@@ -638,6 +638,8 @@ if not isinstance(template, dict) or not isinstance(live, dict):
     raise SystemExit(0)
 
 added = []
+PLUGINS_KEY = "plugins"
+ENABLED_KEY = "enabled"
 
 
 def fill(src, dst, path):
@@ -659,8 +661,6 @@ fill(template, live, [])
 # into every image and never load it. Add the template's names the live list
 # lacks, after the agent's own, and remove none: a name the agent dropped on
 # purpose comes back, which is the price of a plugin that ships enabled.
-PLUGINS_KEY = "plugins"
-ENABLED_KEY = "enabled"
 template_enabled = (template.get(PLUGINS_KEY) or {}).get(ENABLED_KEY) if isinstance(template.get(PLUGINS_KEY), dict) else None
 live_plugins = live.get(PLUGINS_KEY)
 if isinstance(template_enabled, list) and isinstance(live_plugins, dict) and isinstance(live_plugins.get(ENABLED_KEY), list):

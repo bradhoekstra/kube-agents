@@ -44,6 +44,11 @@ const (
 	// usageNewerFieldGauges names the two cluster gauges' shared pruning
 	// record: they arrived in one release and a CRD serves both or neither.
 	usageNewerFieldGauges = "clustersRegistered and clustersMonitored"
+	// gatewayLeaderLabel is the label leader_elect.py stamps on the gateway pod
+	// that holds the lease and runs Hermes, the one the gateway Service selects
+	// (platformagent_manifests.go); the chat listener lives in that process.
+	gatewayLeaderLabel      = "kubeagents.io/is-leader"
+	gatewayLeaderLabelValue = "true"
 	// usageCountersPollInterval is how often the poller reads the listeners
 	// and, when a total moved, writes the status: the interval the controller
 	// already uses for the RBAC re-probe and the pruned-status re-probe, on
@@ -597,18 +602,30 @@ func (p *UsageCounterPoller) reader() client.Reader {
 // terminating nor in a terminal phase, scraped or not, in live. When the CR switches the watcher off the gateway pods stay live, so
 // their entries persist, and are not read: the entrypoint starts no watcher,
 // so nothing listens on the port, and a refused connection there would be the
-// install's choice.
+// install's choice. The chat listener is read on the same terms from a pod
+// that runs no gateway: above one replica the container runs leader_elect.py,
+// which starts Hermes on the lease holder alone and stamps the leader label
+// on that pod, so a standby pod has nothing on the port by design, stays
+// live, keeps its entry, and is not read; at one replica there is no
+// election and no label, and the one pod is read.
 func (p *UsageCounterPoller) targets(ctx context.Context, agent *agentv1alpha1.PlatformAgent) ([]usageTarget, map[string]bool, error) {
+	replicas, _ := resolveDeploymentReplicasAndStrategy(agent.Spec.Deployment)
+	runsGateway := func(pod *corev1.Pod) bool {
+		return replicas <= 1 || pod.Labels[gatewayLeaderLabel] == gatewayLeaderLabelValue
+	}
+	everyPod := func(*corev1.Pod) bool { return true }
 	groups := []struct {
 		selector  map[string]string
 		counters  []string
 		container string
 		port      string
 		read      bool
+		// podRead narrows read to the pods whose container serves the port.
+		podRead func(*corev1.Pod) bool
 	}{
-		{gatewayPodSelector(agent), usageGatewayCounters, agentAPIAuthContainerName, eventWatcherMetricsPortName, eventWatcherEnabled(agent)},
-		{gatewayPodSelector(agent), usageChatCounters, platformAgentContainerName, chatMetricsPortName, true},
-		{credentialProxySelector(agent), usageBrokerCounters, credentialProxyContainerName, credentialProxyMetricsPortName, true},
+		{gatewayPodSelector(agent), usageGatewayCounters, agentAPIAuthContainerName, eventWatcherMetricsPortName, eventWatcherEnabled(agent), everyPod},
+		{gatewayPodSelector(agent), usageChatCounters, platformAgentContainerName, chatMetricsPortName, true, runsGateway},
+		{credentialProxySelector(agent), usageBrokerCounters, credentialProxyContainerName, credentialProxyMetricsPortName, true, everyPod},
 	}
 	live := map[string]bool{}
 	var targets []usageTarget
@@ -633,7 +650,7 @@ func (p *UsageCounterPoller) targets(ctx context.Context, agent *agentv1alpha1.P
 				continue
 			}
 			live[string(pod.UID)] = true
-			if !group.read || pod.Status.Phase != corev1.PodRunning || pod.Status.PodIP == "" {
+			if !group.read || !group.podRead(pod) || pod.Status.Phase != corev1.PodRunning || pod.Status.PodIP == "" {
 				continue
 			}
 			port, ok := usagePodPort(pod, group.container, group.port)

@@ -83,18 +83,40 @@ class HookTest(unittest.TestCase):
         start.assert_called_once()
 
     def test_the_listener_starts_in_the_gateway_process_alone(self):
-        """Every hermes process in the container discovers plugins; only the one that
-        imported the gateway binds the port, so a CLI call beside it logs no bind failure."""
+        """Every hermes process in the container discovers plugins; only the gateway,
+        told apart by its command line, binds the port, so a CLI call beside it logs
+        no bind failure. Hermes starts discovery on a background thread before the
+        gateway's modules load, so the test is of argv, not of imports."""
+        gateway_argv = ["/usr/local/bin/hermes", "--profile", "default", "gateway", "run"]
         with mock.patch.object(plugin, "_listener", None), mock.patch.object(metrics, "start_listener") as start, \
-                mock.patch.dict(os.environ, {metrics.METRICS_PORT_ENV: "9097"}):
-            with mock.patch.dict(sys.modules, {plugin.GATEWAY_MODULE: object()}):
-                plugin.start_listener()
-            start.assert_called_once_with(9097, plugin.REGISTRY)
-        with mock.patch.object(plugin, "_listener", None), mock.patch.object(metrics, "start_listener") as start, \
-                mock.patch.dict(os.environ, {metrics.METRICS_PORT_ENV: "9097"}):
-            sys.modules.pop(plugin.GATEWAY_MODULE, None)
+                mock.patch.dict(os.environ, {metrics.METRICS_PORT_ENV: "9097"}), mock.patch.object(sys, "argv", gateway_argv):
             plugin.start_listener()
-            start.assert_not_called()
+            start.assert_called_once_with(9097, plugin.REGISTRY)
+        for argv in (["/usr/local/bin/hermes", "-p", "default", "chat", "-q", "hi"],
+                     ["/usr/local/bin/hermes", "gateway", "status"],
+                     ["/usr/local/bin/hermes", "--profile", "gateway"],
+                     ["python3", "leader_elect.py"]):
+            with mock.patch.object(plugin, "_listener", None), mock.patch.object(metrics, "start_listener") as start, \
+                    mock.patch.dict(os.environ, {metrics.METRICS_PORT_ENV: "9097"}), mock.patch.object(sys, "argv", argv):
+                plugin.start_listener()
+                start.assert_not_called()
+
+    def test_the_command_line_reading_matches_hermes_own(self):
+        """Without Hermes' classifier on the path the plugin reads argv the same way
+        gateway/status.py does: `gateway run`, bare `gateway`, profile flags skipped."""
+        cases = {
+            ("hermes", "gateway", "run"): True,
+            ("hermes", "gateway"): True,
+            ("hermes", "--profile", "gateway", "gateway", "run"): True,
+            ("hermes", "-p=default", "gateway", "run"): True,
+            ("hermes", "gateway", "restart"): False,
+            ("hermes", "gateway", "status"): False,
+            ("hermes", "chat"): False,
+            ("python3",): False,
+        }
+        with mock.patch.dict(sys.modules, {"gateway": None, "gateway.status": None}):
+            for argv, want in cases.items():
+                self.assertEqual(want, plugin.in_gateway_process(list(argv)), argv)
 
 
 class ListenerTest(unittest.TestCase):

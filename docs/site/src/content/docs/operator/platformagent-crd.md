@@ -480,7 +480,7 @@ Three things change while it is on:
   dispatcher/worker handoff survives — so cards in flight are unaffected by the flip.
 - The entrypoint stops force-syncing `profiles/platform/config.yaml` from the image and back-fills
   it instead, on the same terms as the `default` profile's own file (except the remote MCP server
-  entries, which follow the image), so `/sethome` and `monitoring.install_id` survive a restart — see
+  entries and the `plugins.enabled` list, which follow the image), so `/sethome` and `monitoring.install_id` survive a restart — see
   [How config reaches each profile](#how-config-reaches-each-profile).
 
 Setting the field back to `false` reverses all three. The overlay records what it applied, so the
@@ -825,7 +825,7 @@ The operator writes observed state to the `status` subresource:
 | `usage.remediationsProposedTotal`      | int64    | Proposals the credential broker's version-control route opened, cumulative: `proposal-create` requests the forge accepted, read from the broker's `kubeagents_vcs_requests_total` under that verb and `status="success"` every five minutes, monotonic like `toolExecutionsTotal`. A refused or failed proposal is not counted.                                                                                                                                                                                                                                                                                       |
 | `usage.remediationsAppliedTotal`       | int64    | Declared; nothing writes it yet (approvals are log records, not a metric).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | `usage.remediationsMergedTotal`        | int64    | Proposals this install opened that the forge reported merged, cumulative. The broker counts each once per broker process when one of its own reads shows it merged, only for proposals whose author is its own login and whose merge is not earlier than the process started; read from `kubeagents_vcs_proposals_merged_total` every five minutes, monotonic like `toolExecutionsTotal`. A merge no read shows is not counted, and a credential whose login the broker cannot name counts nothing (the broker logs that once), so this under-counts and stays absent on such an install.                             |
-| `usage.chatMessagesInboundTotal`       | int64    | Chat messages that reached the gateway, from every platform it serves, cumulative, counted at the dispatch hook, before the sender allowlist, so an unlisted user's message counts: read from the `chat_metrics` plugin's `kubeagents_chat_messages_inbound_total` on the `platform-agent` container's port 9097 every five minutes, summed across gateway replicas, monotonic like `toolExecutionsTotal`.                                                                                                                                                                                                            |
+| `usage.chatMessagesInboundTotal`       | int64    | Chat messages that reached the gateway, from every platform it serves, cumulative, counted at the dispatch hook, before the sender allowlist, so an unlisted user's message counts: read from the `chat_metrics` plugin's `kubeagents_chat_messages_inbound_total` on the `platform-agent` container's port 9097 every five minutes, from the pod that runs Hermes (above one replica, the leader alone), summed across the pods that have led, monotonic like `toolExecutionsTotal`.                                                                                                                                 |
 | `usage.clustersRegistered`             | int64    | Clusters the event watcher built a client for: the number of `k8s_event_watcher_cluster_up` series it exports, read every five minutes, the largest reading across gateway replicas. The watcher discovers its fleet once per process, so this is the fleet as of its last start; a cluster that joins or leaves is counted after the gateway pod restarts. A gauge: it falls after such a restart. Absent when the operator has no current reading: before the first poll, while the watcher is off, and after two polls in a row in which no gateway replica could be read, whatever the cause; a `0` is a reading. |
 | `usage.clustersMonitored`              | int64    | How many of those are delivering events: the `k8s_event_watcher_cluster_up` series at `1`. The difference from `clustersRegistered` is the clusters silently unwatched. A `0` is a reading, and the normal one while the watcher starts. Absent on the same terms as `clustersRegistered`: one poll in which no gateway replica can be read leaves both as they were, and a second in a row clears both. The CR's events and the gateway pod's state say whether the watcher is down, not running, or unreachable.                                                                                                    |
 | `usage.lastActiveTime`                 | time     | The last poll in which `toolExecutionsTotal`, `eventsIngestedTotal`, `remediationsProposedTotal`, `remediationsMergedTotal` or `chatMessagesInboundTotal` moved; a scheduled job that runs one does, so it is not a record of human use alone.                                                                                                                                                                                                                                                                                                                                                                        |
@@ -1102,7 +1102,8 @@ overlays. The reverse order would silently erase every overlay on each restart. 
 profile's `config.yaml` is the exception to the force-sync: it is the agent's own file, and a
 force-sync is exactly what would throw the runtime's edits away. It is instead seeded from the image
 on a fresh volume, and thereafter only back-filled — keys the image declares and the live file has
-lost are restored, keys it already holds are left alone. Its overlay is merged after that
+lost are restored, keys it already holds are left alone, and the `plugins.enabled` list gains the
+names the image's list has and it lacks (below). Its overlay is merged after that
 back-fill, so the operator's settings are not undone by it.
 
 The platform profile's `config.yaml` becomes a second exception under
@@ -1131,6 +1132,13 @@ server the template routes through the credential proxy's MCP relay (`gke` and
 become the template's, so a hand edit to either is reverted at the next start; for any other remote
 server the image ships, only the `User-Agent` header value is set. Nothing else in the file is
 changed.
+
+The `plugins.enabled` list follows the image for the same reason: it is a list, so the back-fill
+never enters it. In the `default`, `platform` and every cluster profile it gains the names the
+image template's list has and the live list lacks, appended after the agent's own; nothing is
+removed, so a name the agent dropped on purpose comes back, which is the price of a plugin that
+ships enabled. Without it a volume scaffolded before a plugin existed would carry the plugin into
+every image and never load it.
 
 **Merge semantics.** These differ between the two mechanisms, which is the easiest thing to get
 wrong here. In a startup **overlay** — every profile including `default` — maps merge recursively,

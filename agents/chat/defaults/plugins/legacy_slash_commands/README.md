@@ -80,8 +80,9 @@ The plugin must be enabled on the profile that receives chat ingress — the
 `default` profile. It is listed in `plugins.enabled` in **both**
 `agents/chat/config.yaml` and the operator's `renderConfigYAML`
 (`k8s-operator/internal/controller/platformagent_manifests.go`); the operator's
-copy is authoritative on the deployed default profile, so a change to one
-without the other is a no-op.
+copy writes the deployed default profile, and the entrypoint's back-fill appends
+the names the image's `agents/chat/config.yaml` has and the live list lacks, so
+an addition to either reaches the pod and a removal from one alone is a no-op.
 
 ## Maintenance rules
 
