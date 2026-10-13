@@ -101,6 +101,22 @@ class HookTest(unittest.TestCase):
                 plugin.start_listener()
                 start.assert_not_called()
 
+    def test_a_sibling_process_logs_its_subcommand_and_not_its_arguments(self):
+        """A `hermes send` carries the destination and the message text in argv;
+        the log line names the subcommand alone."""
+        argv = ["/usr/local/bin/hermes", "-p", "default", "send", "--json", "--to", "google_chat:spaces/XYZ", "the secret text"]
+        with mock.patch.object(plugin, "_listener", None), mock.patch.object(metrics, "start_listener") as start, \
+                mock.patch.dict(os.environ, {metrics.METRICS_PORT_ENV: "9097"}), mock.patch.object(sys, "argv", argv), \
+                self.assertLogs("hermes.plugin.chat_metrics", level="INFO") as logs:
+            plugin.start_listener()
+        start.assert_not_called()
+        self.assertEqual(1, len(logs.output))
+        self.assertIn("(hermes send)", logs.output[0])
+        self.assertNotIn("secret", logs.output[0])
+        self.assertNotIn("spaces/XYZ", logs.output[0])
+        self.assertEqual("gateway", plugin.subcommand_of(["hermes", "--profile=default", "gateway", "run"]))
+        self.assertEqual("no subcommand", plugin.subcommand_of(["hermes", "--version"]))
+
     def test_the_command_line_reading_matches_hermes_own(self):
         """Without Hermes' classifier on the path the plugin reads argv the same way
         gateway/status.py does: `gateway run`, bare `gateway`, profile flags skipped."""

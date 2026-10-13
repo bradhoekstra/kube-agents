@@ -54,6 +54,21 @@ def count_inbound(event: Any = None, gateway: Any = None, session_store: Any = N
     return None
 
 
+def subcommand_of(argv: list) -> str:
+    """The first positional token after the profile flags: `gateway`, `send`,
+    `chat`, ... Named in the log instead of the arguments, which for `send`
+    carry the message text and its destination."""
+    skip_next = False
+    for token in argv[1:]:
+        if skip_next:
+            skip_next = False
+        elif token in PROFILE_FLAGS:
+            skip_next = True
+        elif not token.startswith(tuple(f + "=" for f in PROFILE_FLAGS)) and not token.startswith("-"):
+            return token
+    return "no subcommand"
+
+
 def in_gateway_process(argv: Optional[list] = None) -> bool:
     """Whether this process is the Hermes gateway, the one that receives messages.
 
@@ -90,8 +105,9 @@ def start_listener() -> None:
         return
     if not in_gateway_process():
         # At info, so a gateway that misread its own command line is visible
-        # in the log rather than a silent listener that never bound.
-        logger.info("not the gateway process (%s); the inbound chat count is served from the gateway alone", " ".join(sys.argv[1:]) or "no arguments")
+        # in the log rather than a silent listener that never bound. The
+        # subcommand alone: a `send` carries the message in its arguments.
+        logger.info("not the gateway process (hermes %s); the inbound chat count is served from the gateway alone", subcommand_of(sys.argv))
         return
     port = metrics.listener_port_from_env()
     if port is None:
