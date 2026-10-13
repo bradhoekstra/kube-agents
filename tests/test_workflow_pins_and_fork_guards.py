@@ -468,7 +468,8 @@ def _buildx_problems(job: dict) -> list[str]:
         return []
     problems: list[str] = []
     for step in steps:
-        if not isinstance(step, dict) or not str(step.get(_USES_KEY, "")).startswith(_BUILDX_ACTION_PREFIX):
+        # Lower-cased: GitHub resolves an action's owner and repository case-insensitively.
+        if not isinstance(step, dict) or not str(step.get(_USES_KEY, "")).lower().startswith(_BUILDX_ACTION_PREFIX):
             continue
         with_ = step.get(_WITH_KEY) if isinstance(step.get(_WITH_KEY), dict) else {}
         if _BUILDER_IMAGE_OPT not in str(with_.get(_DRIVER_OPTS_KEY, "")):
@@ -485,7 +486,7 @@ def _count_buildx_steps(job: dict) -> int:
     return sum(
         1
         for step in steps
-        if isinstance(step, dict) and str(step.get(_USES_KEY, "")).startswith(_BUILDX_ACTION_PREFIX)
+        if isinstance(step, dict) and str(step.get(_USES_KEY, "")).lower().startswith(_BUILDX_ACTION_PREFIX)
     )
 
 
@@ -853,6 +854,17 @@ jobs:
       - uses: {_PINNED_BUILD_PUSH}
 """
 
+# The action owner capitalised, which GitHub resolves to the same action.
+CAPITALISED_BUILDX_WORKFLOW = f"""
+name: capitalised
+on: pull_request
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: Docker/setup-buildx-action@{"b" * 40} # v4.4.1
+"""
+
 # No build-push step: the config is owed whatever the job goes on to do.
 BUILDX_WITHOUT_CONFIG_WORKFLOW = f"""
 name: no-config
@@ -1110,6 +1122,12 @@ class FixtureTests(unittest.TestCase):
         self.assertEqual(len(violations), 1, violations)
         self.assertIn("nodriver.yml", violations[0])
         self.assertIn(_DRIVER_OPTS_KEY, violations[0])
+
+    def test_capitalised_action_owner_is_still_a_buildx_step(self) -> None:
+        _write_workflows(self.dir, cap=CAPITALISED_BUILDX_WORKFLOW)
+        report = check_mirror(self.dir)
+        self.assertEqual(report.buildx_steps, 1)
+        self.assertEqual(len(report.violations), 2, report.violations)
 
     def test_buildx_step_without_buildkitd_config_is_a_violation(self) -> None:
         _write_workflows(self.dir, noconfig=BUILDX_WITHOUT_CONFIG_WORKFLOW)
