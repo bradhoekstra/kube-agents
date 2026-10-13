@@ -159,9 +159,10 @@ ENDPOINT_BULLETS = (
     "- endpoint: ip\n"
     "- endpoint-address: 203.0.113.10\n"
     "- authorized-networks: 203.0.113.5/32\n"
-    "- endpoint-remedy: Add 10.92.0.0/14 to this cluster's authorized networks and re-run the "
-    "onboarding so the agent reaches it over the private endpoint, or open its DNS endpoint with "
-    "`gcloud container clusters update --enable-dns-access`.\n"
+    "- endpoint-remedy: Add 10.92.0.0/14 to this cluster's authorized networks, then ask the "
+    "Planning Agent to manage this cluster again so the agent reaches it over the private "
+    "endpoint, or open its DNS endpoint with `gcloud container clusters update "
+    "--enable-dns-access`.\n"
 )
 
 
@@ -363,7 +364,7 @@ class ClusterPreflightTest(unittest.TestCase):
         result = self.run_preflight(FAKE_UNREACHABLE="1")
         self.assertEqual("5", result["check"])
         self.assertIn("ip endpoint (203.0.113.10)", result["reason"])
-        self.assertIn("authorized networks: 203.0.113.5/32", result["reason"])
+        self.assertIn("authorized networks as recorded at onboarding: 203.0.113.5/32", result["reason"])
         self.assertTrue(result["remediation"].startswith("Add 10.92.0.0/14 to this cluster's authorized networks"),
                         result["remediation"])
         self.assertIn("--enable-dns-access", result["remediation"])

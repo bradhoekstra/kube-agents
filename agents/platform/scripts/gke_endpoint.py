@@ -101,21 +101,30 @@ REMEDY_OTHER_NETWORK = (
     f"{_ENABLE_DNS_ACCESS}, or, if the cluster has a public endpoint, add the address "
     "the agent leaves its VPC from to the cluster's authorized networks."
 )
+# Two of the remedies end in a step only a re-scaffold performs: the kubeconfig
+# the agent runs against, and the USER.md record check 5 reads, are written at
+# onboarding, and the hourly reconcile leaves a complete profile alone. So the
+# step is worded as the operator's own action, in the words the manage-cluster
+# skill answers to ("manage my cluster <name> in <location>"); the profile
+# create is idempotent and re-pins the kubeconfig every time. A reply on the
+# blocked card alone reruns the preflight against the old kubeconfig and
+# blocks again.
+_MANAGE_AGAIN = "then ask the Planning Agent to manage this cluster again"
 # Same VPC, but the private endpoint answers only from its own region. An
 # address on the list cannot change that; global access or the DNS endpoint can.
 REMEDY_OTHER_REGION = (
     "This cluster's private endpoint answers only from its own region. Enable "
     "control-plane global access with `gcloud container clusters update "
-    "--enable-master-global-access` and re-run the onboarding, or open its DNS "
-    f"endpoint with {_ENABLE_DNS_ACCESS}."
+    f"--enable-master-global-access`, {_MANAGE_AGAIN} so its kubeconfig is "
+    f"refreshed, or open its DNS endpoint with {_ENABLE_DNS_ACCESS}."
 )
 # Same VPC and region, but the list on the private endpoint does not admit the
 # agent's Pod range. The range is spliced in so the operator has nothing to
 # look up; `{pod_cidr}` reads "the agent cluster's Pod range" when unknown.
 REMEDY_ADMIT_POD_RANGE = (
-    "Add {pod_cidr} to this cluster's authorized networks and re-run the "
-    "onboarding so the agent reaches it over the private endpoint, or open its "
-    f"DNS endpoint with {_ENABLE_DNS_ACCESS}."
+    "Add {pod_cidr} to this cluster's authorized networks, "
+    f"{_MANAGE_AGAIN} so the agent reaches it over the private endpoint, or "
+    f"open its DNS endpoint with {_ENABLE_DNS_ACCESS}."
 )
 POD_RANGE_UNKNOWN = "the agent cluster's Pod range"
 

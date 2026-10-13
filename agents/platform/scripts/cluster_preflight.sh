@@ -434,7 +434,10 @@ if [ "$STATUS" = "ok" ]; then
         # older profile has no such bullets and reads exactly as before.
         ENDPOINT_KIND="$(user_md_field endpoint)"
         if [ -n "$ENDPOINT_KIND" ]; then
-            REASON_5="$REASON_5 The kubeconfig names the cluster's $ENDPOINT_KIND endpoint ($(user_md_text endpoint-address)); authorized networks: $(user_md_text authorized-networks)."
+            # "as recorded at onboarding": the list is what the scaffold saw,
+            # not a live read, so an address added since does not show here
+            # until the cluster is managed again.
+            REASON_5="$REASON_5 The kubeconfig names the cluster's $ENDPOINT_KIND endpoint ($(user_md_text endpoint-address)); authorized networks as recorded at onboarding: $(user_md_text authorized-networks)."
             # The remedy is about reaching the server, so it is offered only
             # when kubectl never did (a timeout, no route, a refused dial), not
             # for an answer it got and disliked (401, 403, NotFound), and not
