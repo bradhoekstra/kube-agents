@@ -297,6 +297,48 @@ func TestTaskTerminalLabelsAreClosed(t *testing.T) {
 
 // TestGchatPullsAreCountedByOutcome: events, then empty pulls, then refused
 // ones, each read off the counter where the summary line counts them.
+// metricsInboundCount reads one inbound-messages series.
+func metricsInboundCount(t *testing.T, m *Metrics, platform string) float64 {
+	t.Helper()
+	return counterValue(t, m.messagesInbound.WithLabelValues(platform))
+}
+
+// Every message a chat backend hands the gateway is counted under its
+// platform, before the sender is verified: the rig's backend is discord, and
+// a sender the principal map does not know counts too.
+func TestInboundMessagesAreCountedByPlatform(t *testing.T) {
+	r := startRig(t)
+	m := r.g.Metrics()
+	r.adapter.inbox <- InboundMessage{Conversation: "discord:g1/count-1", Kind: "group", AuthorID: "1001", MessageID: "c-1", Text: "one"}
+	r.adapter.inbox <- InboundMessage{Conversation: "discord:g1/count-1", Kind: "group", AuthorID: "1001", MessageID: "c-2", Text: "two"}
+	r.adapter.inbox <- InboundMessage{Conversation: "discord:g1/count-2", Kind: "group", AuthorID: "9999", MessageID: "c-3", Text: "from nobody the map knows"}
+	waitFor(t, "three discord messages counted", func() bool { return metricsInboundCount(t, m, platformDiscord) == 3 })
+	for _, platform := range []string{platformGoogleChat, platformSlack, platformConsole, metricsLabelOther} {
+		if got := metricsInboundCount(t, m, platform); got != 0 {
+			t.Errorf("%s = %v, want 0", platform, got)
+		}
+	}
+	if got := seriesCount(t, m, "kubeagents_a2a_gateway_messages_inbound_total"); got != len(metricsPlatforms)+1 {
+		t.Errorf("the inbound counter carries %d series, want %d: every platform and other, pre-seeded", got, len(metricsPlatforms)+1)
+	}
+}
+
+// The platform label is a closed list: each chat backend maps to its name,
+// the doors are not counted at all, and an unknown backend lands under other.
+func TestInboundPlatformLabelsAreClosed(t *testing.T) {
+	for backend, want := range map[string]string{gchatBackend: platformGoogleChat, slackBackend: platformSlack, discordBackend: platformDiscord, consoleBackend: platformConsole, "telegram": metricsLabelOther} {
+		got, ok := metricsPlatformLabel(backend)
+		if !ok || got != want {
+			t.Errorf("%s -> %q,%v; want %q,true", backend, got, ok, want)
+		}
+	}
+	for _, door := range []string{injectBackend, a2aBackend, a2aGoogleBackend} {
+		if _, ok := metricsPlatformLabel(door); ok {
+			t.Errorf("the %s door's turns are counted as chat", door)
+		}
+	}
+}
+
 func TestGchatPullsAreCountedByOutcome(t *testing.T) {
 	turn := gchatMsg("spaces/D1", "DIRECT_MESSAGE", "", "", "spaces/D1/messages/M1", "hi", "", "u1@example.com", "HUMAN")
 	f := &gchatLegibilityRelay{

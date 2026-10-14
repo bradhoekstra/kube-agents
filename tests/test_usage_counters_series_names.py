@@ -27,6 +27,7 @@ _WATCHER_METRICS_GO = _REPO_ROOT / "k8s-operator" / "cmd" / "k8s-event-watcher" 
 _BROKER_PY = _REPO_ROOT / "agents" / "platform" / "scripts" / "credential_proxy.py"
 _CHAT_METRICS_PY = _REPO_ROOT / "agents" / "chat" / "defaults" / "plugins" / "chat_metrics" / "metrics.py"
 _MANIFESTS_GO = _REPO_ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_manifests.go"
+_A2A_METRICS_GO = _REPO_ROOT / "a2a" / "gateway" / "metrics.go"
 
 
 def _go_const(path, name):
@@ -69,6 +70,17 @@ class UsageCountersSeriesNamesTest(unittest.TestCase):
 
     def test_the_brokers_merged_counter_is_the_one_the_poller_sums(self):
         self.assertEqual(_py_const("VCS_MERGED_METRIC"), _go_const(_SCRAPE_GO, "vcsMergedSeries"))
+
+    def test_the_a2a_gateways_inbound_counter_is_the_chat_counters_other_family(self):
+        """On a next-mode install the A2A gateway counts the chat messages it accepts;
+        the poller folds that family into chatMessagesInboundTotal beside the plugin's,
+        and the platforms the two share are spelled the same."""
+        name = "_".join(_go_const(_A2A_METRICS_GO, c) for c in ("metricsNamespace", "metricsSubsystem", "messagesInboundName"))
+        self.assertEqual(name, _go_const(_SCRAPE_GO, "a2aMessagesInboundSeries"))
+        self.assertEqual("platform", _go_const(_A2A_METRICS_GO, "labelPlatform"))
+        helpers = _REPO_ROOT / "k8s-operator" / "internal" / "controller" / "manifest_helpers.go"
+        for gateway_const, operator_const in (("platformGoogleChat", "interfaceGoogleChat"), ("platformSlack", "interfaceSlack")):
+            self.assertEqual(_go_const(_A2A_METRICS_GO, gateway_const), _go_const(helpers, operator_const))
 
     def test_the_chat_plugins_counter_is_the_one_the_poller_sums(self):
         plugin = _CHAT_METRICS_PY.read_text()

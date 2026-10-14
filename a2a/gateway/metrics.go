@@ -40,13 +40,28 @@ const (
 	gchatPullsName          = "gchat_pulls_total"
 	chatMessagesName        = "chat_messages_total"
 	notifyMarksDroppedName  = "notify_marks_dropped_total"
+	// messagesInboundName counts the chat messages the gateway accepted as
+	// turns, by platform: the next-mode half of status.usage's
+	// chatMessagesInboundTotal, which the chat_metrics plugin counts for the
+	// Hermes-side ingress (docs/designs/usage-counters-producer.md).
+	messagesInboundName = "messages_inbound_total"
 
 	// The label names. Every value under them comes from a closed list
 	// below, never from a task, a conversation or an executor's text, so
 	// nothing a chat user or an executor sends can grow the series set.
-	labelState   = "state"
-	labelSource  = "source"
-	labelOutcome = "outcome"
+	labelState    = "state"
+	labelSource   = "source"
+	labelOutcome  = "outcome"
+	labelPlatform = "platform"
+	// The platform label's values: the chat backends, under the names the
+	// operator's activeInterfaces vocabulary and the chat_metrics plugin use
+	// for the ones they share, so one series name reads the same on either
+	// ingress. The doors (inject, a2a, a2a-google) carry programs' turns, not
+	// chat, and are not counted.
+	platformGoogleChat = "googlechat"
+	platformSlack      = "slack"
+	platformDiscord    = "discord"
+	platformConsole    = "console"
 
 	// metricsLabelOther is the bucket for a value outside a closed list.
 	// observeTaskTerminal sees only the four final states and the four
@@ -110,6 +125,15 @@ var (
 	metricsTerminalSources = []TerminalSource{TerminalFromExecutor, TerminalFromSupervisor, TerminalFromGateway, TerminalNeverStarted}
 	metricsGchatOutcomes   = []string{gchatPullEvents, gchatPullEmpty, gchatPullFailed}
 	metricsChatOutcomes    = []string{chatRendered, chatTextOnly, chatRefused, chatInvalid}
+	metricsPlatforms       = []string{platformGoogleChat, platformSlack, platformDiscord, platformConsole}
+	// metricsBackendPlatforms maps each chat backend to its platform label; a
+	// backend outside it is a door and is not counted.
+	metricsBackendPlatforms = map[string]string{
+		gchatBackend:   platformGoogleChat,
+		slackBackend:   platformSlack,
+		discordBackend: platformDiscord,
+		consoleBackend: platformConsole,
+	}
 )
 
 // Metrics is the gateway's counters and the private registry that serves
@@ -125,6 +149,7 @@ type Metrics struct {
 	gchatPulls          *prometheus.CounterVec
 	chatMessages        *prometheus.CounterVec
 	notifyMarksDropped  prometheus.Counter
+	messagesInbound     *prometheus.CounterVec
 }
 
 // NewMetrics builds the counters on a fresh registry.
@@ -161,10 +186,19 @@ func NewMetrics() *Metrics {
 			Name:      notifyMarksDroppedName,
 			Help:      "Conversation notify marks dropped because no chain could be named for them (the notify carried no update key bound to one) while a chain was running in the conversation.",
 		}),
+		messagesInbound: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      messagesInboundName,
+			Help:      "Chat messages the gateway accepted as turns, by platform (googlechat, slack, discord, console, other), counted before the sender is verified; a door's turns are not chat and are not counted.",
+		}, []string{labelPlatform}),
 	}
-	m.registry.MustRegister(m.taskTerminals, m.gchatEventsReceived, m.gchatPulls, m.chatMessages, m.notifyMarksDropped)
+	m.registry.MustRegister(m.taskTerminals, m.gchatEventsReceived, m.gchatPulls, m.chatMessages, m.notifyMarksDropped, m.messagesInbound)
 	for _, outcome := range metricsChatOutcomes {
 		m.chatMessages.WithLabelValues(outcome)
+	}
+	for _, platform := range append(append([]string(nil), metricsPlatforms...), metricsLabelOther) {
+		m.messagesInbound.WithLabelValues(platform)
 	}
 	for _, state := range append(append([]lib.TaskState(nil), metricsTerminalStates...), metricsLabelOther) {
 		for _, source := range append(append([]TerminalSource(nil), metricsTerminalSources...), metricsLabelOther) {
@@ -225,6 +259,29 @@ func (m *Metrics) notifyMarkDropped() {
 }
 
 // metricsTerminalStateLabel is state if the closed list has it, else other.
+// messageInbound counts one accepted chat message under its platform.
+func (m *Metrics) messageInbound(platform string) {
+	if m == nil {
+		return
+	}
+	m.messagesInbound.WithLabelValues(platform).Inc()
+}
+
+// metricsPlatformLabel is the platform label for a message that arrived
+// through backend, and false for a door, whose turns are not chat. A chat
+// backend added later without a row lands under other rather than minting
+// a series nobody documented.
+func metricsPlatformLabel(backend string) (string, bool) {
+	if platform, ok := metricsBackendPlatforms[backend]; ok {
+		return platform, true
+	}
+	switch backend {
+	case injectBackend, a2aBackend, a2aGoogleBackend:
+		return "", false
+	}
+	return metricsLabelOther, true
+}
+
 func metricsTerminalStateLabel(state lib.TaskState) string {
 	for _, known := range metricsTerminalStates {
 		if state == known {

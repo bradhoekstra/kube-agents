@@ -1068,9 +1068,12 @@ const (
 // buildA2AGatewayNetworkPolicy; the chart's PodMonitoring scrapes it by
 // number, held to this one by tests/test_chart_platform_agent_monitoring.py.
 const (
-	a2aGatewayMetricsPort       int32 = 9096
-	a2aGatewayMetricsPortName         = "a2a-metrics"
-	a2aGatewayMetricsPortEnvVar       = "A2A_METRICS_PORT"
+	a2aGatewayMetricsPort     int32 = 9096
+	a2aGatewayMetricsPortName       = "a2a-metrics"
+	// a2aGatewayContainerName is the gateway container, the one that serves
+	// the metrics port; the usage poller names it to find the port.
+	a2aGatewayContainerName     = "gateway"
+	a2aGatewayMetricsPortEnvVar = "A2A_METRICS_PORT"
 )
 
 func a2aNATSImage() string {
@@ -4283,6 +4286,28 @@ func buildA2ADoorNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1
 	return np
 }
 
+// a2aGatewayFencePolicyWithOperatorPeer and a2aDoorNetworkPolicyWithOperatorPeer
+// are the two fences as the reconciler applies them: the collector's rule
+// from the builders, and the operator's pods admitted on the metrics port
+// alone, the way credentialProxyNetworkPolicyWithOperatorPeer admits them on
+// the broker's, so the usage poller can read the gateway's chat counter. The
+// builders stay collector-only, which the conformance fixture pins.
+func a2aGatewayFencePolicyWithOperatorPeer(agent *agentv1alpha1.PlatformAgent, operatorNamespace string) *networkingv1.NetworkPolicy {
+	np := buildA2AGatewayFencePolicy(agent)
+	if rule, ok := operatorMetricsIngressRule(operatorNamespace, a2aGatewayMetricsPort); ok {
+		np.Spec.Ingress = append(np.Spec.Ingress, rule)
+	}
+	return np
+}
+
+func a2aDoorNetworkPolicyWithOperatorPeer(agent *agentv1alpha1.PlatformAgent, operatorNamespace string) *networkingv1.NetworkPolicy {
+	np := buildA2ADoorNetworkPolicy(agent)
+	if rule, ok := operatorMetricsIngressRule(operatorNamespace, a2aGatewayMetricsPort); ok {
+		np.Spec.Ingress = append(np.Spec.Ingress, rule)
+	}
+	return np
+}
+
 // buildA2AGatewayNetworkPolicy fences ingress to the gateway pod while the
 // inject backend is armed.
 //
@@ -4719,7 +4744,7 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 						SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 					},
 					Containers: []corev1.Container{{
-						Name:  "gateway",
+						Name:  a2aGatewayContainerName,
 						Image: a2aGatewayImage(),
 						// Same rule as the provision container, caught by the
 						// same pass: the image is distroless nonroot, which
@@ -4913,7 +4938,7 @@ func (r *PlatformAgentReconciler) reconcileA2ANetworkFences(ctx context.Context,
 		fences = append(fences, buildA2AGatewayNetworkPolicy(agent))
 	}
 	if a2aAgentDoorEnabled() {
-		fences = append(fences, buildA2ADoorNetworkPolicy(agent))
+		fences = append(fences, a2aDoorNetworkPolicyWithOperatorPeer(agent, r.OperatorNamespace))
 	}
 	// The gateway's own fence, keyed on the gateway rather than a flag: the
 	// metrics listener binds every interface whenever the pod runs. Here for
@@ -4928,7 +4953,7 @@ func (r *PlatformAgentReconciler) reconcileA2ANetworkFences(ctx context.Context,
 	// pass removes; a stale miss skips it for one pass on the refusal path
 	// only (on the render path reconcileA2A picks it up).
 	if err := r.Get(ctx, types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}, &appsv1.Deployment{}); err == nil {
-		fences = append(fences, buildA2AGatewayFencePolicy(agent))
+		fences = append(fences, a2aGatewayFencePolicyWithOperatorPeer(agent, r.OperatorNamespace))
 		gatewayFenced = true
 	} else if !errors.IsNotFound(err) {
 		return false, err
@@ -5393,7 +5418,7 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 			// missed and the live read above found it, it is applied
 			// here, ahead of the zero apply, as the ordinary path does.
 			if !gatewayFenced {
-				fence := buildA2AGatewayFencePolicy(agent)
+				fence := a2aGatewayFencePolicyWithOperatorPeer(agent, r.OperatorNamespace)
 				if err := ctrl.SetControllerReference(agent, fence, r.Scheme); err != nil {
 					return state, err
 				}
@@ -5479,7 +5504,7 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 	// pass that applies the Deployment and no fence: either that pass wrote
 	// it or this one does, and both run before the Deployment apply below.
 	if !gatewayFenced {
-		fence := buildA2AGatewayFencePolicy(agent)
+		fence := a2aGatewayFencePolicyWithOperatorPeer(agent, r.OperatorNamespace)
 		if err := ctrl.SetControllerReference(agent, fence, r.Scheme); err != nil {
 			return state, err
 		}
