@@ -41,7 +41,9 @@ def _exports_register(init_py: pathlib.Path) -> bool:
             return True
         if isinstance(node, ast.ImportFrom) and any((a.asname or a.name) == _REGISTER for a in node.names):
             return True
-        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+        # An annotation with no value (`register: Callable`) binds nothing at
+        # runtime and does not count.
+        if isinstance(node, ast.Assign) or (isinstance(node, ast.AnnAssign) and node.value is not None):
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
             if any(isinstance(t, ast.Name) and t.id == _REGISTER for t in targets):
                 return True
@@ -69,6 +71,8 @@ class ChatProfilePluginsTest(unittest.TestCase):
             "from .plugin import register as register\n": True,
             "def register(ctx):\n    pass\n": True,
             "from . import plugin\nregister = plugin.register\n": True,
+            "register: object\n": False,
+            "from . import plugin\nregister: object = plugin.register\n": True,
         }
         with tempfile.TemporaryDirectory() as tmp:
             for source, want in cases.items():

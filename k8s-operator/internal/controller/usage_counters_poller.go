@@ -125,7 +125,7 @@ type UsageCounterPoller struct {
 	// the CRs behind it. A seam so a test need not wait a real interval.
 	pollBudget func() time.Duration
 
-	// streaks is the in-memory failure record per pod, for the one log line
+	// streaks is the in-memory failure record per listener (pod and port), for the one log line
 	// when a listener first fails, the one when it recovers, and the Warning
 	// event when a streak reaches usageScrapeFailureEventStreak. It is not
 	// state: a leader change starts it afresh, at the cost of one more log

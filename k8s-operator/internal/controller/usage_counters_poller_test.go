@@ -1125,11 +1125,10 @@ func TestUsagePoller_ChatListenerIsReadFromTheLeaderAlone(t *testing.T) {
 	}
 	// Leadership moves: the old leader's port is no longer read, the new
 	// leader's is. The new leader is a pod older than the document with no
-	// entry for the counter, so its first sample is baselined, as for any
-	// such pod: the fold cannot tell a standby never read from a pod whose
-	// count the status already holds, and the first interval after a
-	// leadership change is lost, as it is at a re-seed. From the next poll
-	// its advances add, and the total keeps both pods' counts.
+	// entry for the counter, but its Hermes started after the document was
+	// first recorded, which its body says, so nothing of its count has been
+	// seen and its first sample adds whole: the messages it took between the
+	// lease and the first poll are counted. The total keeps both pods'.
 	h.stub.set(chatAddr(), 14, ptr.To(1.0))
 	h.poll(20)
 	if got := h.status().ChatMessagesInboundTotal; got != 4 {
@@ -1143,16 +1142,16 @@ func TestUsagePoller_ChatListenerIsReadFromTheLeaderAlone(t *testing.T) {
 	if err := h.cl.Update(context.Background(), b); err != nil {
 		t.Fatal(err)
 	}
-	h.stub.set(bChat, 3, ptr.To(2.0))
+	h.stub.set(bChat, 3, ptr.To(float64(usageClock(22).Unix())))
 	h.stub.fail(chatAddr(), usageScrapeKindRefused)
 	h.poll(25)
-	if got := h.status().ChatMessagesInboundTotal; got != 4 {
-		t.Fatalf("the new leader's first sample was not baselined: %d, want 4", got)
-	}
-	h.stub.set(bChat, 6, ptr.To(2.0))
-	h.poll(30)
 	if got := h.status().ChatMessagesInboundTotal; got != 7 {
-		t.Fatalf("after 3 more messages on the new leader: %d, want 7", got)
+		t.Fatalf("after leadership moved and 3 messages on the new leader, whose process is younger than the document: %d, want 7", got)
+	}
+	h.stub.set(bChat, 6, ptr.To(float64(usageClock(22).Unix())))
+	h.poll(30)
+	if got := h.status().ChatMessagesInboundTotal; got != 10 {
+		t.Fatalf("after 3 more messages on the new leader: %d, want 10", got)
 	}
 	if !h.stub.scraped(chatAddr()) {
 		t.Fatal("the old leader was never read")
@@ -1251,6 +1250,38 @@ func TestUsagePoller_AnUnreadListenersStreakIsClosed(t *testing.T) {
 	case <-h.recorder.Events:
 	default:
 		t.Fatal("two consecutive failed reads of the leader recorded no Warning")
+	}
+}
+
+// The young-process rule needs the body to say so: a never-read pod older
+// than the document whose body carries no start time, or a start before the
+// document, is baselined as before.
+func TestUsagePoller_AnOldProcessOnANeverReadPodIsBaselined(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	agent := usageTestAgent(created)
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Availability: &agentv1alpha1.AvailabilitySpec{Replicas: ptr.To(int32(2))}}
+	a := usageGatewayPod("agent-gateway-aaa", "gw-a", usageTestGatewayIP, created)
+	a.Labels[gatewayLeaderLabel] = gatewayLeaderLabelValue
+	b := usageGatewayPod("agent-gateway-bbb", "gw-b", usageTestGatewayB, created)
+	h := newUsageHarness(t, agent, append([]client.Object{a, b}, usageDefaultObjects(created)[1:]...)...)
+	bChat := usageTestGatewayB + ":9097"
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.stub.set(usageTestGatewayB+":9095", 0, nil)
+	h.stub.set(chatAddr(), 10, ptr.To(1.0))
+	h.stub.set(brokerAddr(), 0, nil)
+	h.poll(5)
+	a.Labels = map[string]string{"app": usageTestAgentName + "-gateway"}
+	b.Labels[gatewayLeaderLabel] = gatewayLeaderLabelValue
+	for _, pod := range []*corev1.Pod{a, b} {
+		if err := h.cl.Update(context.Background(), pod); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h.stub.set(bChat, 3, nil) // no start time in the body
+	h.stub.fail(chatAddr(), usageScrapeKindRefused)
+	h.poll(10)
+	if got := h.status().ChatMessagesInboundTotal; got != 0 {
+		t.Fatalf("a body without a start time added its whole sample: %d, want 0", got)
 	}
 }
 

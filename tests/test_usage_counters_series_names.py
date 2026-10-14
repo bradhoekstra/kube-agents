@@ -35,9 +35,10 @@ def _go_const(path, name):
     return match.group(1)
 
 
-def _py_const(name):
-    match = re.search(rf'^{name}\s*=\s*"([^"]+)"', _BROKER_PY.read_text(), re.M)
-    assert match, f"{name} not found in {_BROKER_PY}"
+def _py_const(name, path=None):
+    source = (path or _BROKER_PY)
+    match = re.search(rf'^{name}\s*=\s*"([^"]+)"', source.read_text(), re.M)
+    assert match, f"{name} not found in {source}"
     return match.group(1)
 
 
@@ -71,8 +72,8 @@ class UsageCountersSeriesNamesTest(unittest.TestCase):
 
     def test_the_chat_plugins_counter_is_the_one_the_poller_sums(self):
         plugin = _CHAT_METRICS_PY.read_text()
-        self.assertEqual(re.search(r'^CHAT_INBOUND_METRIC = "([^"]+)"', plugin, re.M).group(1), _go_const(_SCRAPE_GO, "chatInboundSeries"))
-        self.assertEqual(re.search(r'^METRICS_PORT_ENV = "([^"]+)"', plugin, re.M).group(1), _go_const(_MANIFESTS_GO, "chatMetricsPortEnv"))
+        self.assertEqual(_py_const("CHAT_INBOUND_METRIC", _CHAT_METRICS_PY), _go_const(_SCRAPE_GO, "chatInboundSeries"))
+        self.assertEqual(_py_const("METRICS_PORT_ENV", _CHAT_METRICS_PY), _go_const(_MANIFESTS_GO, "chatMetricsPortEnv"))
         mapping = re.search(r"^HERMES_PLATFORM_LABELS = \{(.*?)\}", plugin, re.M | re.S).group(1)
         labels = set(re.findall(r':\s*"([a-z]+)"', mapping))
         # The chat platforms are the operator's own interface names (its

@@ -397,7 +397,16 @@ func foldUsage(doc *usageDocument, agentUID string, seed usageSeed, live map[str
 					entry.Marker = doc.FirstRecorded
 				}
 			}
-			if (s.Created.After(doc.FirstRecorded.Time) || unfolded) && s.Sample <= usageDeltaCeiling {
+			// A pod older than the document whose body carries a process
+			// start later than the document was first recorded has, for a
+			// Sum counter, counted nothing any document has seen either: a
+			// pod keeps its entry once read, so only a never-read pod is
+			// here, and its process began after the baseline did. The
+			// standby that takes the lease is that pod, and its first
+			// interval of messages counts. Max counters are read on every
+			// replica from the first poll, so none reaches here that way.
+			youngProcess := usageAggregationFor(s.Counter) == usageAggregateSum && s.StartTime != nil && *s.StartTime > float64(doc.FirstRecorded.Unix())
+			if (s.Created.After(doc.FirstRecorded.Time) || unfolded || youngProcess) && s.Sample <= usageDeltaCeiling {
 				candidates[s.Counter] = append(candidates[s.Counter], usageCandidate{entry: entry, delta: s.Sample, sample: s.Sample, startTime: s.StartTime})
 			}
 			continue

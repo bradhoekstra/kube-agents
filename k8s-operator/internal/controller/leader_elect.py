@@ -1,4 +1,5 @@
 import os, time, subprocess, sys, signal, random
+import urllib.request, urllib.error
 from datetime import datetime, timezone
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
@@ -7,10 +8,21 @@ lease_name = os.environ.get("LEADER_ELECTION_LEASE_NAME")
 namespace = os.environ.get("LEADER_ELECTION_NAMESPACE")
 pod_name = os.environ.get("HOSTNAME")
 process = None
-# labeled is whether this pod carries the leader label as far as the API server
-# has confirmed; cleared with the lease, so a refused patch is retried next loop.
-labeled = False
+# label_state is whether this pod carries the leader label as far as the API
+# server has confirmed: True, False, or None before the first patch of this
+# process. Every loop reconciles it to what the label should say, so a refused
+# patch is retried, and a wrapper that restarts on a pod still labelled from
+# the term its Hermes died in clears the label before anything selects on it.
+label_state = None
 is_shutting_down = False
+# The label means "this pod holds the lease and its Hermes answers": the
+# Service routes on it, and the operator's usage poller and the chart's chat
+# PodMonitoring read the chat listener from the pod that carries it. Hermes
+# binds its API port only once the entrypoint has scaffolded the profiles,
+# minutes after the lease is taken, so the label follows the first answer on
+# that port rather than the lease alone.
+HERMES_API_URL = "http://127.0.0.1:8642/api/sessions?limit=1"
+HERMES_PROBE_TIMEOUT_SECONDS = 3
 
 # The gateway command this wrapper supervises.
 #
@@ -36,11 +48,7 @@ HERMES_COMMAND = ["hermes"] + (["--profile", _gateway_profile] if _gateway_profi
 # This introduces a single point of failure during failovers, rather than request-continuous HA.
 
 def update_pod_label(v1, is_leader):
-    """Stamp or clear the leader label on this pod; True when the API accepted it.
-
-    The label is what the Service and the operator's usage poller select the
-    leader by, so a patch the API server refused is retried on the next loop
-    rather than left for the whole term."""
+    """Stamp or clear the leader label on this pod; True when the API accepted it."""
     try:
         body = {"metadata": {"labels": {"kubeagents.io/is-leader": "true" if is_leader else None}}}
         v1.patch_namespaced_pod(name=pod_name, namespace=namespace, body=body)
@@ -48,6 +56,37 @@ def update_pod_label(v1, is_leader):
     except ApiException as e:
         print(f"[LeaderElect] Error patching pod label: {e}", file=sys.stderr, flush=True)
         return False
+
+
+def hermes_answers(opener=None):
+    """Whether this pod's Hermes answers on its API port: any HTTP answer counts,
+    a 401 included, since the probe carries no key; a refused connection or a
+    timeout does not."""
+    request = urllib.request.Request(HERMES_API_URL, headers={"Authorization": "Bearer " + (os.environ.get("API_SERVER_KEY") or "")})
+    try:
+        (opener or urllib.request.urlopen)(request, timeout=HERMES_PROBE_TIMEOUT_SECONDS)
+        return True
+    except urllib.error.HTTPError:
+        return True
+    except Exception:  # noqa: BLE001 -- refused, timed out, not resolvable: not answering
+        return False
+
+
+def desired_label(holder, running, answers):
+    """What the leader label should say: this pod holds the lease, its Hermes
+    process is running, and that process answers on its API port."""
+    return holder == pod_name and running and answers
+
+
+def reconcile_label(v1, desired, state):
+    """Bring the pod's label to `desired` when the confirmed state differs or is
+    unknown, and return the confirmed state: unchanged when the API refused,
+    so the next loop tries again."""
+    if state is desired:
+        return state
+    if update_pod_label(v1, desired):
+        return desired
+    return state
 
 def release_lease_and_exit(signum, frame):
     global is_shutting_down, process
@@ -82,7 +121,7 @@ def release_lease_and_exit(signum, frame):
     sys.exit(0)
 
 def main():
-    global process, is_shutting_down, labeled
+    global process, is_shutting_down, label_state
 
     # Every replica > 1 deployment reaches Hermes through this file instead of
     # agent-entrypoint: the operator sets a container `command`, which overrides
@@ -168,19 +207,17 @@ def main():
                 print(f"[LeaderElect] Error reading lease: {e}", file=sys.stderr, flush=True)
 
         if holder == pod_name:
-            if not labeled:
-                labeled = update_pod_label(v1, True)
             if process is None:
                 print(f"[{pod_name}] Acquired leadership! Starting Hermes...", flush=True)
                 process = subprocess.Popen(HERMES_COMMAND)
             elif process.poll() is not None:
                 print(f"[{pod_name}] Hermes process crashed with code {process.returncode}. Exiting to trigger pod restart...", flush=True)
+                # The label stays for the restarted wrapper to clear: it starts
+                # with label_state None and reconciles before it leads again.
                 sys.exit(process.returncode)
         else:
             if process is not None:
                 print(f"[{pod_name}] Lost leadership! Stopping Hermes...", flush=True)
-                update_pod_label(v1, False)
-                labeled = False
                 process.terminate()
                 try:
                     process.wait(timeout=10)
@@ -189,7 +226,12 @@ def main():
                     process.kill()
                     process.wait()
                 process = None
-                
+
+        # The label, every loop: set once this pod leads and its Hermes answers,
+        # cleared otherwise, a refused patch retried next time round.
+        running = process is not None and process.poll() is None
+        label_state = reconcile_label(v1, desired_label(holder, running, running and hermes_answers()), label_state)
+
         # Jitter to avoid flapping: sleep for base + 0 to 2 seconds
         time.sleep(base_poll_interval + random.uniform(0, 2))
 

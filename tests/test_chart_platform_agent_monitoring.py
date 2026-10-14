@@ -73,10 +73,10 @@ _SCRAPES = (
     # The same PodMonitoring's second endpoint: the chat_metrics plugin's
     # listener on the platform-agent container.
     {
-        # Its own PodMonitoring, selecting the leader label as well: the chat
-        # listener runs on the leader alone above one replica, and the golden
-        # renders one replica, where the operator puts the label on the
-        # template, so the key is read from the golden like the others.
+        # Selects the leader label as well: the chat listener runs on the leader
+        # alone above one replica, and the golden renders one replica, where the
+        # operator puts the label on the template, so the key is read from the
+        # golden like the others.
         "suffix": "-gateway-chat-monitoring",
         "deployment": "platformagent-gateway",
         "container": "platform-agent",
@@ -154,6 +154,16 @@ def _selector(scrape, name):
     return {key: labels[key].replace(_GOLDEN_AGENT, name) for key in scrape["selector_keys"]}
 
 
+def _reads_as_non_string(value):
+    """Whether YAML would read the bare value as something other than a string
+    (true, 1, null), which matchLabels, a map of strings, cannot carry unquoted.
+    A value YAML cannot parse at all (a Go template) is a string."""
+    try:
+        return not isinstance(yaml.safe_load(value), str)
+    except yaml.YAMLError:
+        return False
+
+
 class MonitoringShapeTest(unittest.TestCase):
     """What the template and its value say, readable without helm."""
 
@@ -184,13 +194,13 @@ class MonitoringShapeTest(unittest.TestCase):
         for scrape in _SCRAPES:
             with self.subTest(scrape=scrape["suffix"]):
                 for key, value in _selector(scrape, "{{ .Values.platformAgent.name }}").items():
-                    # A value YAML would read as a boolean is quoted in the
-                    # template (the leader label's "true"); either spelling
-                    # is the golden's label.
-                    self.assertTrue(
-                        f"{key}: {value}" in self.template or f'{key}: "{value}"' in self.template,
-                        f"{key}: {value} is not a selector in the template",
-                    )
+                    # A value YAML would read as anything but a string (the
+                    # leader label's "true") must be quoted in the template:
+                    # matchLabels is map[string]string and the apiserver
+                    # rejects a boolean. A plain value must not be, so the
+                    # check is for the one spelling the value requires.
+                    spelled = f'{key}: "{value}"' if _reads_as_non_string(value) else f"{key}: {value}"
+                    self.assertIn(spelled, self.template)
 
     def test_the_gate_asks_the_helper_and_the_helper_asks_the_cluster(self):
         self.assertIn(_GATE, self.template)
@@ -229,7 +239,7 @@ class MonitoringRenderTest(unittest.TestCase):
         rendered = self._monitorings(*_ON_GKE)
         self.assertEqual(sorted(rendered), sorted({_AGENT + s["suffix"] for s in _SCRAPES}))
         # One PodMonitoring per suffix; its endpoints are the rows that share the
-        # suffix, in _SCRAPES order (the gateway's carries two).
+        # suffix, in _SCRAPES order (one each today).
         for suffix in dict.fromkeys(s["suffix"] for s in _SCRAPES):
             rows = [s for s in _SCRAPES if s["suffix"] == suffix]
             with self.subTest(scrape=suffix):
