@@ -1307,8 +1307,9 @@ func TestUsagePoller_AnOldProcessOnANeverReadPodIsBaselined(t *testing.T) {
 
 // On a next-mode install the A2A gateway owns Chat ingress and counts the
 // messages it accepts; the poller reads its pod as a fourth target into the
-// same chat counter, summed with the plugin's (which sees the API port's
-// turns there), with an entry and a streak of its own.
+// same chat counter, with an entry and a streak of its own, beside the
+// plugin's entry on the gateway pod (which counts nothing there: a turn the
+// bridge hands Hermes' API server never reaches the dispatch hook).
 func TestUsagePoller_ChatMessagesCountFromTheA2AGatewayToo(t *testing.T) {
 	created := usageClock(0).Add(-time.Hour)
 	a2a := usageA2AGatewayPod("agent-a2a-gateway-ccc", "a2a-c", usageTestA2AIP, created)
