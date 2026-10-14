@@ -75,7 +75,11 @@ class UsageCountersSeriesNamesTest(unittest.TestCase):
         self.assertEqual(re.search(r'^METRICS_PORT_ENV = "([^"]+)"', plugin, re.M).group(1), _go_const(_MANIFESTS_GO, "chatMetricsPortEnv"))
         mapping = re.search(r"^HERMES_PLATFORM_LABELS = \{(.*?)\}", plugin, re.M | re.S).group(1)
         labels = set(re.findall(r':\s*"([a-z]+)"', mapping))
-        self.assertEqual({"googlechat", "slack", "teams", "api"}, labels)
+        # The chat platforms are the operator's own interface names (its
+        # activeInterfaces vocabulary); `api` is Hermes' api_server, which the
+        # operator has no name for.
+        helpers = _REPO_ROOT / "k8s-operator" / "internal" / "controller" / "manifest_helpers.go"
+        self.assertEqual({_go_const(helpers, "interfaceGoogleChat"), _go_const(helpers, "interfaceSlack"), _go_const(helpers, "interfaceTeams"), "api"}, labels)
 
     def test_the_watchers_cluster_gauge_is_the_one_the_poller_counts(self):
         self.assertEqual(_watcher_gauge_family("clusterUp"), _go_const(_SCRAPE_GO, "clusterUpSeries"))

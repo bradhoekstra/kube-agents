@@ -529,8 +529,8 @@ One more residual sits in the peer selector. The chart renders the CR into the o
 namespace, and above one replica the agent's Role holds `get` and `patch` on every pod there,
 because RBAC cannot say "only your own pod"; so on an HA chart install anything running as the
 agent's ServiceAccount can put the operator's label on a pod of its choosing, the sandbox
-included, and that pod is then admitted to both metrics ports. What it gains is the two
-listeners' counters: the watcher's, which the agent container already reaches over its own pod's
+included, and that pod is then admitted to the three metrics ports. What it gains is the
+listeners' counters: the watcher's and the chat plugin's, which the agent container already reaches over its own pod's
 loopback, and the broker's, to which it has no route today, integers under closed label
 vocabularies; and the same grant already lets it swap a sibling's image, so the selector argument above holds in
 full on the single-replica default and in substance above it; the pages the implementation

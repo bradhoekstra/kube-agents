@@ -73,11 +73,15 @@ _SCRAPES = (
     # The same PodMonitoring's second endpoint: the chat_metrics plugin's
     # listener on the platform-agent container.
     {
-        "suffix": "-gateway-monitoring",
+        # Its own PodMonitoring, selecting the leader label as well: the chat
+        # listener runs on the leader alone above one replica, and the golden
+        # renders one replica, where the operator puts the label on the
+        # template, so the key is read from the golden like the others.
+        "suffix": "-gateway-chat-monitoring",
         "deployment": "platformagent-gateway",
         "container": "platform-agent",
         "port_name": "chat-metrics",
-        "selector_keys": ("app",),
+        "selector_keys": ("app", "kubeagents.io/is-leader"),
     },
     {
         "suffix": "-credential-proxy-monitoring",
@@ -180,7 +184,13 @@ class MonitoringShapeTest(unittest.TestCase):
         for scrape in _SCRAPES:
             with self.subTest(scrape=scrape["suffix"]):
                 for key, value in _selector(scrape, "{{ .Values.platformAgent.name }}").items():
-                    self.assertIn(f"{key}: {value}", self.template)
+                    # A value YAML would read as a boolean is quoted in the
+                    # template (the leader label's "true"); either spelling
+                    # is the golden's label.
+                    self.assertTrue(
+                        f"{key}: {value}" in self.template or f'{key}: "{value}"' in self.template,
+                        f"{key}: {value} is not a selector in the template",
+                    )
 
     def test_the_gate_asks_the_helper_and_the_helper_asks_the_cluster(self):
         self.assertIn(_GATE, self.template)

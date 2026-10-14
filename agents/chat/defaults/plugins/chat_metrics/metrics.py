@@ -44,7 +44,6 @@ HERMES_PLATFORM_LABELS = {
     "teams": "teams",
     "api_server": "api",
 }
-PLATFORM_LABELS = tuple(dict.fromkeys(HERMES_PLATFORM_LABELS.values())) + (LABEL_OTHER,)
 PROCESS_START_TIME_METRIC = "process_start_time_seconds"
 PROCESS_START_TIME_SECONDS = time.time()
 METRICS_PATH = "/metrics"
@@ -60,7 +59,7 @@ MAX_PORT = 65535
 
 
 def platform_label(hermes_platform: str) -> str:
-    """The label value for a Hermes platform name: one of PLATFORM_LABELS."""
+    """The label value for a Hermes platform name: one of the values of HERMES_PLATFORM_LABELS, or LABEL_OTHER."""
     return HERMES_PLATFORM_LABELS.get(str(hermes_platform or "").strip().lower(), LABEL_OTHER)
 
 

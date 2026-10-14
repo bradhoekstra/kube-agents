@@ -11,7 +11,9 @@ TestFrontDoorPluginsMatchChatConfig in the operator's tests.
 
 from __future__ import annotations
 
+import ast
 import pathlib
+import tempfile
 import unittest
 
 import yaml
@@ -24,6 +26,28 @@ _CHAT_PLUGINS = _REPO_ROOT / "agents" / "chat" / "defaults" / "plugins"
 _PLUGIN_MANIFEST = "plugin.yaml"
 
 
+_REGISTER = "register"
+
+
+def _exports_register(init_py: pathlib.Path) -> bool:
+    """Whether the package's __init__.py binds the name `register` at top level: a
+    def, an import of the name, or an assignment to it. Parsed, not searched, so a
+    comment that mentions register() does not pass for the import it describes."""
+    if not init_py.is_file():
+        return False
+    tree = ast.parse(init_py.read_text(), filename=str(init_py))
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == _REGISTER:
+            return True
+        if isinstance(node, ast.ImportFrom) and any((a.asname or a.name) == _REGISTER for a in node.names):
+            return True
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if any(isinstance(t, ast.Name) and t.id == _REGISTER for t in targets):
+                return True
+    return False
+
+
 class ChatProfilePluginsTest(unittest.TestCase):
     def test_every_shipped_chat_plugin_exposes_register_from_its_package(self):
         """Hermes imports the plugin package and calls register() on it; a register() that
@@ -31,8 +55,27 @@ class ChatProfilePluginsTest(unittest.TestCase):
         never called. Static: the package's __init__.py defines or imports the name."""
         shipped = sorted(p.parent for p in _CHAT_PLUGINS.glob(f"*/{_PLUGIN_MANIFEST}"))
         self.assertTrue(shipped)
-        without = [d.name for d in shipped if "register" not in (d / "__init__.py").read_text()]
+        without = [d.name for d in shipped if not _exports_register(d / "__init__.py")]
         self.assertEqual([], without, f"plugin package __init__.py neither defines nor imports register: {without}")
+
+    def test_the_register_check_reads_the_code_and_not_the_comments(self):
+        """A comment naming register() is the likely thing left behind when the import is
+        forgotten, and it must not satisfy the check; a def, an import or an assignment does."""
+        cases = {
+            "# Hermes calls register() on plugin.py\n": False,
+            "": False,
+            '"""register lives in plugin.py"""\n': False,
+            "from .plugin import register\n": True,
+            "from .plugin import register as register\n": True,
+            "def register(ctx):\n    pass\n": True,
+            "from . import plugin\nregister = plugin.register\n": True,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            for source, want in cases.items():
+                init_py = pathlib.Path(tmp) / "__init__.py"
+                init_py.write_text(source)
+                self.assertEqual(want, _exports_register(init_py), source)
+            self.assertFalse(_exports_register(pathlib.Path(tmp) / "missing" / "__init__.py"))
 
     def test_every_shipped_chat_plugin_is_enabled_on_the_chat_profile(self):
         enabled = (yaml.safe_load(_CHAT_CONFIG.read_text()) or {}).get("plugins", {}).get("enabled") or []

@@ -3364,6 +3364,15 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// immutable once created.
 	podLabels := commonLabels(agent)
 	podLabels["app"] = agent.Name + "-gateway"
+	// At one replica the pod is the gateway: no election runs and nothing
+	// would stamp the leader label, so the template carries it, and the one
+	// pod reads as the leader to everything that selects on the label (the
+	// chart's PodMonitoring for the chat listener, the usage poller). Above
+	// one replica the label is leader_elect.py's to stamp and clear, so the
+	// template leaves it off.
+	if replicas <= 1 {
+		podLabels[gatewayLeaderLabel] = gatewayLeaderLabelValue
+	}
 	// No kubeagents.x-k8s.io/has-credential-proxy label. That is what
 	// github-token-minter's NetworkPolicy admits on 8080, and this Pod has no
 	// caller for the minter: the credential runtime is in a Pod of its own and

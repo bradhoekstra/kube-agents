@@ -606,12 +606,21 @@ func (p *UsageCounterPoller) reader() client.Reader {
 // that runs no gateway: above one replica the container runs leader_elect.py,
 // which starts Hermes on the lease holder alone and stamps the leader label
 // on that pod, so a standby pod has nothing on the port by design, stays
-// live, keeps its entry, and is not read; at one replica there is no
-// election and no label, and the one pod is read.
+// live, keeps its entry, and is not read; at one replica the template
+// carries the label, and the one pod is read. The chat listener is also not
+// read until the platform-agent container is Ready: Hermes binds the plugin's
+// port only once the entrypoint has scaffolded every profile, minutes after
+// the pod is Running, and the readiness probe is on the API port the same
+// process binds, so a pod read earlier would spend the streak on a cold
+// start that is going well. A listener this poll decided not to read has
+// its streak closed, since a count left open behind a leadership change or
+// a restart would meet the next cold start's one failed read and make it a
+// Warning.
 func (p *UsageCounterPoller) targets(ctx context.Context, agent *agentv1alpha1.PlatformAgent) ([]usageTarget, map[string]bool, error) {
 	replicas, _ := resolveDeploymentReplicasAndStrategy(agent.Spec.Deployment)
 	runsGateway := func(pod *corev1.Pod) bool {
-		return replicas <= 1 || pod.Labels[gatewayLeaderLabel] == gatewayLeaderLabelValue
+		leads := replicas <= 1 || pod.Labels[gatewayLeaderLabel] == gatewayLeaderLabelValue
+		return leads && usageContainerReady(pod, platformAgentContainerName)
 	}
 	everyPod := func(*corev1.Pod) bool { return true }
 	groups := []struct {
@@ -650,7 +659,11 @@ func (p *UsageCounterPoller) targets(ctx context.Context, agent *agentv1alpha1.P
 				continue
 			}
 			live[string(pod.UID)] = true
-			if !group.read || !group.podRead(pod) || pod.Status.Phase != corev1.PodRunning || pod.Status.PodIP == "" {
+			if group.read && !group.podRead(pod) {
+				p.closeStreak(usageStreakKey{uid: pod.UID, port: group.port})
+				continue
+			}
+			if !group.read || pod.Status.Phase != corev1.PodRunning || pod.Status.PodIP == "" {
 				continue
 			}
 			port, ok := usagePodPort(pod, group.container, group.port)
@@ -668,6 +681,25 @@ func (p *UsageCounterPoller) targets(ctx context.Context, agent *agentv1alpha1.P
 		}
 	}
 	return targets, live, nil
+}
+
+// usageContainerReady reports whether the named container of pod has passed
+// its readiness probe, as the kubelet last recorded it.
+func usageContainerReady(pod *corev1.Pod, container string) bool {
+	for _, status := range pod.Status.ContainerStatuses {
+		if status.Name == container {
+			return status.Ready
+		}
+	}
+	return false
+}
+
+// closeStreak drops the failure streak of a listener the poll decided not to
+// read, so a count opened while it was read does not outlive the decision.
+func (p *UsageCounterPoller) closeStreak(key usageStreakKey) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.streaks, key)
 }
 
 // gatewayPodSelector selects the gateway pods, the ones the gateway policy
@@ -973,10 +1005,11 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	usage := &agent.Status.Usage
 	wantRegistered, wantMonitored := usageGaugeFields(gauges)
 	// The first three counters are in every served CRD that has status.usage;
-	// the gauges and the merged counter arrived later, each at its own
-	// release, and a CRD at a previous schema prunes one or both, so a
-	// difference in one of them alone waits while that field's record is
-	// fresh rather than re-patching every poll, and the other keeps landing.
+	// the gauges, the merged counter and the chat counter arrived later, each
+	// at its own release, and a CRD at a previous schema prunes some or all of
+	// them, so a difference in one of them alone waits while that field's
+	// record is fresh rather than re-patching every poll, and the others keep
+	// landing.
 	gaugesPruned := p.newerFieldPruned(agent, usageNewerFieldGauges)
 	mergedPruned := p.newerFieldPruned(agent, usageCounterRemediationsMerged)
 	chatPruned := p.newerFieldPruned(agent, usageCounterChatMessagesInbound)

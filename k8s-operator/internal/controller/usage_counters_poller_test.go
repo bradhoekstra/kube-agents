@@ -95,7 +95,12 @@ func usageGatewayPod(name, uid, ip string, created time.Time) *corev1.Pod {
 				{Name: "fluent-bit"},
 			},
 		},
-		Status: corev1.PodStatus{Phase: corev1.PodRunning, PodIP: ip},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning, PodIP: ip,
+			// The agent container has passed its readiness probe: Hermes is
+			// up, and with it the chat listener the poller reads.
+			ContainerStatuses: []corev1.ContainerStatus{{Name: platformAgentContainerName, Ready: true}},
+		},
 	}
 }
 
@@ -302,9 +307,11 @@ type usageHarness struct {
 	// schema: status.usage with its first three counters, without the fields
 	// added later (the cluster gauges, the merged counter, the chat counter). pruningMerged is
 	// the CRD from the release between: the gauges served, the merged counter
-	// not.
+	// not; pruningChat the one from the release before this: the gauges and
+	// the merged counter served, the chat counter not.
 	pruningGauges bool
 	pruningMerged bool
+	pruningChat   bool
 }
 
 func newUsageHarness(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...client.Object) *usageHarness {
@@ -318,10 +325,13 @@ func newUsageHarness(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...c
 			// the echo, so the store is stripped with a second patch the poller
 			// never sees, and the echo the poller reads is stripped the same way.
 			pa, isAgent := obj.(*agentv1alpha1.PlatformAgent)
-			if err == nil && isAgent && (h.pruning || h.pruningGauges || h.pruningMerged) {
+			if err == nil && isAgent && (h.pruning || h.pruningGauges || h.pruningMerged || h.pruningChat) {
 				strip := `{"status":{"usage":{"clustersRegistered":null,"clustersMonitored":null,"remediationsMergedTotal":null,"chatMessagesInboundTotal":null}}}`
 				if h.pruningMerged {
 					strip = `{"status":{"usage":{"remediationsMergedTotal":null}}}`
+				}
+				if h.pruningChat {
+					strip = `{"status":{"usage":{"chatMessagesInboundTotal":null}}}`
 				}
 				if h.pruning {
 					strip = `{"status":{"usage":null}}`
@@ -338,6 +348,8 @@ func newUsageHarness(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...c
 			}
 			if isAgent && (h.pruningGauges || h.pruningMerged) {
 				pa.Status.Usage.RemediationsMergedTotal = 0
+			}
+			if isAgent && (h.pruningGauges || h.pruningChat) {
 				pa.Status.Usage.ChatMessagesInboundTotal = 0
 			}
 			return err
@@ -1152,6 +1164,96 @@ func TestUsagePoller_ChatListenerIsReadFromTheLeaderAlone(t *testing.T) {
 	}
 }
 
+// The chat listener binds minutes after the pod is Running, once the
+// entrypoint has scaffolded the profiles and Hermes is up: until the agent
+// container is Ready the port is not read, so a cold start that is going well
+// spends none of the streak, and no Warning is recorded however long it takes.
+func TestUsagePoller_ChatListenerIsNotReadBeforeTheAgentContainerIsReady(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	a := usageGatewayPod("agent-gateway-aaa", "gw-a", usageTestGatewayIP, created)
+	a.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: platformAgentContainerName, Ready: false}}
+	h := newUsageHarness(t, usageTestAgent(created), append([]client.Object{a}, usageDefaultObjects(created)[1:]...)...)
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.stub.fail(chatAddr(), usageScrapeKindRefused)
+	h.stub.set(brokerAddr(), 0, nil)
+	h.poll(5)
+	h.poll(10)
+	h.poll(15)
+	if h.stub.scraped(chatAddr()) {
+		t.Fatal("the chat port was read before the agent container was ready")
+	}
+	if !h.stub.scraped(gatewayAddr()) {
+		t.Fatal("the watcher was not read")
+	}
+	select {
+	case ev := <-h.recorder.Events:
+		t.Fatalf("a Warning during a cold start: %q", ev)
+	default:
+	}
+	a.Status.ContainerStatuses[0].Ready = true
+	if err := h.cl.Status().Update(context.Background(), a); err != nil {
+		t.Fatal(err)
+	}
+	h.stub.set(chatAddr(), 3, ptr.To(1.0))
+	h.poll(20)
+	h.stub.set(chatAddr(), 5, ptr.To(1.0))
+	h.poll(25)
+	if got := h.status().ChatMessagesInboundTotal; got != 2 {
+		t.Fatalf("after the container became ready and 2 messages: %d, want 2", got)
+	}
+}
+
+// A listener the poll decides not to read has its streak closed: a leader
+// read once during its startup (one failed read), then unlabelled as
+// leadership moved, must not carry that count to the next time it leads, or
+// the next cold start's one failed read would be the second and a Warning.
+func TestUsagePoller_AnUnreadListenersStreakIsClosed(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	agent := usageTestAgent(created)
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Availability: &agentv1alpha1.AvailabilitySpec{Replicas: ptr.To(int32(2))}}
+	a := usageGatewayPod("agent-gateway-aaa", "gw-a", usageTestGatewayIP, created)
+	a.Labels[gatewayLeaderLabel] = gatewayLeaderLabelValue
+	b := usageGatewayPod("agent-gateway-bbb", "gw-b", usageTestGatewayB, created)
+	h := newUsageHarness(t, agent, append([]client.Object{a, b}, usageDefaultObjects(created)[1:]...)...)
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.stub.set(usageTestGatewayB+":9095", 0, nil)
+	h.stub.fail(chatAddr(), usageScrapeKindRefused)
+	h.stub.set(brokerAddr(), 0, nil)
+	h.poll(5) // the leader's one failed read: streak 1
+	// Leadership moves to b before the next poll; a stays live, unread.
+	a.Labels = map[string]string{"app": usageTestAgentName + "-gateway"}
+	b.Labels[gatewayLeaderLabel] = gatewayLeaderLabelValue
+	for _, pod := range []*corev1.Pod{a, b} {
+		if err := h.cl.Update(context.Background(), pod); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h.stub.set(usageTestGatewayB+":9097", 1, ptr.To(2.0))
+	h.poll(10)
+	// Leadership returns to a, whose fresh Hermes is again read once before
+	// it binds: without the close this is the second failure and a Warning.
+	a.Labels[gatewayLeaderLabel] = gatewayLeaderLabelValue
+	b.Labels = map[string]string{"app": usageTestAgentName + "-gateway"}
+	for _, pod := range []*corev1.Pod{a, b} {
+		if err := h.cl.Update(context.Background(), pod); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h.poll(15)
+	select {
+	case ev := <-h.recorder.Events:
+		t.Fatalf("a stale streak made one failed read a Warning: %q", ev)
+	default:
+	}
+	// The same listener failing on the next poll too is a real streak.
+	h.poll(20)
+	select {
+	case <-h.recorder.Events:
+	default:
+		t.Fatal("two consecutive failed reads of the leader recorded no Warning")
+	}
+}
+
 func TestUsagePoller_ChatMessagesCountFromTheGatewaysSecondListener(t *testing.T) {
 	created := usageClock(0).Add(-time.Hour)
 	b := usageGatewayPod("agent-gateway-bbb", "gw-b", usageTestGatewayB, created)
@@ -1171,9 +1273,8 @@ func TestUsagePoller_ChatMessagesCountFromTheGatewaysSecondListener(t *testing.T
 	if doc := h.document(); doc.Pods[usagePodEntryKey("gw-a", usageCounterChatMessagesInbound)] == nil || doc.Pods[usagePodEntryKey("gw-b", usageCounterChatMessagesInbound)] == nil {
 		t.Fatalf("the chat entries were not recorded: %v", doc.Pods)
 	}
-	// At one replica every gateway pod is read (a rollout has two), and
-	// leadership moves between pods above it, so each pod's own count is
-	// summed: the deltas sum.
+	// At one replica every gateway pod is read, and leadership moves between
+	// pods above it, so each pod's own count is summed: the deltas sum.
 	h.stub.set(chatAddr(), 13, ptr.To(1.0))
 	h.stub.set(bChat, 22, ptr.To(1.0))
 	h.poll(10)
@@ -1732,6 +1833,75 @@ func TestUsagePoller_AGaugeServingCRDWithoutTheMergedCounterKeepsTheGaugesFlowin
 	}
 	if named != 1 {
 		t.Fatalf("%d pruning log lines, want 1 naming remediationsMergedTotal", named)
+	}
+}
+
+// A served CRD from the release before this one serves the gauges and the
+// merged counter and prunes the chat counter: the chat counter's absence
+// stamps its own record, the merged counter keeps landing every poll it
+// moves, and the log names the one field that is pruned.
+func TestUsagePoller_AMergedServingCRDWithoutTheChatCounterKeepsTheOthersFlowing(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	agent := usageTestAgent(created)
+	h := newUsageHarness(t, agent, usageDefaultObjects(created)...)
+	h.pruningChat = true
+	var mu sync.Mutex
+	var lines []string
+	ctx := logf.IntoContext(context.Background(), funcr.New(func(_, args string) {
+		mu.Lock()
+		lines = append(lines, args)
+		mu.Unlock()
+	}, funcr.Options{}))
+	pollAt := func(minute int) {
+		h.clock = usageClock(minute)
+		h.p.pollOnce(ctx)
+	}
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.stub.setClusters(gatewayAddr(), 3, 3)
+	h.stub.set(chatAddr(), 1, ptr.To(1.0))
+	h.stub.set(brokerAddr(), 10, nil)
+	h.stub.setSample(brokerAddr(), usageCounterRemediationsMerged, 1)
+	pollAt(5)
+	// A message and a merge are counted: the patch carries both, the CRD
+	// drops the chat counter, and its record alone is stamped.
+	h.stub.set(chatAddr(), 3, ptr.To(1.0))
+	h.stub.setSample(brokerAddr(), usageCounterRemediationsMerged, 2)
+	pollAt(10)
+	if status := h.status(); status.RemediationsMergedTotal != 1 || status.ChatMessagesInboundTotal != 0 || status.ClustersRegistered == nil {
+		t.Fatalf("after a message and a merge: %+v, want 1 merged, no chat counter, the gauges", status)
+	}
+	if h.p.newerFieldPruned(agent, usageNewerFieldGauges) || h.p.newerFieldPruned(agent, usageCounterRemediationsMerged) || !h.p.newerFieldPruned(agent, usageCounterChatMessagesInbound) {
+		t.Fatal("the chat counter's absence was not recorded against the chat counter alone")
+	}
+	// A quiet poll inside the interval: the chat counter alone is behind the
+	// status, and its record holds the patch back.
+	patches := h.patches
+	pollAt(12)
+	if h.patches != patches {
+		t.Fatalf("a poll with the chat counter alone behind re-patched the status while its record was fresh")
+	}
+	// The merged counter moves while the chat record is fresh: it lands.
+	h.stub.setSample(brokerAddr(), usageCounterRemediationsMerged, 3)
+	pollAt(14)
+	if got := h.status().RemediationsMergedTotal; got != 2 {
+		t.Fatalf("a merge waited on the chat counter's record: %d, want 2", got)
+	}
+	if h.r.usageStatusPruned(agent) {
+		t.Fatal("the chat counter's absence was recorded as the counters' pruning")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	named := 0
+	for _, l := range lines {
+		if strings.Contains(l, "does not serve a status.usage field") {
+			named++
+			if !strings.Contains(l, `"field"="chatMessagesInboundTotal"`) {
+				t.Fatalf("the log named the wrong field: %s", l)
+			}
+		}
+	}
+	if named != 1 {
+		t.Fatalf("%d pruning log lines, want 1 naming chatMessagesInboundTotal", named)
 	}
 }
 

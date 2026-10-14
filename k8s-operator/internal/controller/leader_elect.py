@@ -7,6 +7,9 @@ lease_name = os.environ.get("LEADER_ELECTION_LEASE_NAME")
 namespace = os.environ.get("LEADER_ELECTION_NAMESPACE")
 pod_name = os.environ.get("HOSTNAME")
 process = None
+# labeled is whether this pod carries the leader label as far as the API server
+# has confirmed; cleared with the lease, so a refused patch is retried next loop.
+labeled = False
 is_shutting_down = False
 
 # The gateway command this wrapper supervises.
@@ -33,11 +36,18 @@ HERMES_COMMAND = ["hermes"] + (["--profile", _gateway_profile] if _gateway_profi
 # This introduces a single point of failure during failovers, rather than request-continuous HA.
 
 def update_pod_label(v1, is_leader):
+    """Stamp or clear the leader label on this pod; True when the API accepted it.
+
+    The label is what the Service and the operator's usage poller select the
+    leader by, so a patch the API server refused is retried on the next loop
+    rather than left for the whole term."""
     try:
         body = {"metadata": {"labels": {"kubeagents.io/is-leader": "true" if is_leader else None}}}
         v1.patch_namespaced_pod(name=pod_name, namespace=namespace, body=body)
+        return True
     except ApiException as e:
         print(f"[LeaderElect] Error patching pod label: {e}", file=sys.stderr, flush=True)
+        return False
 
 def release_lease_and_exit(signum, frame):
     global is_shutting_down, process
@@ -72,7 +82,7 @@ def release_lease_and_exit(signum, frame):
     sys.exit(0)
 
 def main():
-    global process, is_shutting_down
+    global process, is_shutting_down, labeled
 
     # Every replica > 1 deployment reaches Hermes through this file instead of
     # agent-entrypoint: the operator sets a container `command`, which overrides
@@ -158,9 +168,10 @@ def main():
                 print(f"[LeaderElect] Error reading lease: {e}", file=sys.stderr, flush=True)
 
         if holder == pod_name:
+            if not labeled:
+                labeled = update_pod_label(v1, True)
             if process is None:
                 print(f"[{pod_name}] Acquired leadership! Starting Hermes...", flush=True)
-                update_pod_label(v1, True)
                 process = subprocess.Popen(HERMES_COMMAND)
             elif process.poll() is not None:
                 print(f"[{pod_name}] Hermes process crashed with code {process.returncode}. Exiting to trigger pod restart...", flush=True)
@@ -169,6 +180,7 @@ def main():
             if process is not None:
                 print(f"[{pod_name}] Lost leadership! Stopping Hermes...", flush=True)
                 update_pod_label(v1, False)
+                labeled = False
                 process.terminate()
                 try:
                     process.wait(timeout=10)
