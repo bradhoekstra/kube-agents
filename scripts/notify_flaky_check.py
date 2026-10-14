@@ -252,6 +252,17 @@ LABEL_DESCRIPTION = "A check failed and passed when re-run on the same commit"
 MARKER_PREFIX = "<!-- flaky-check "
 OCCURRENCE_PREFIX = "<!-- flaky-occurrence "
 OCCURRENCE_SUFFIX = " -->"
+# One more hidden line: every (run, failed attempt, green attempt) key the
+# issue has ever held, whichever rows the table still shows. The rows stop at
+# MAX_OCCURRENCES, and the sweep revisits every run in its window on every
+# pass, so a key that left the rows and nothing else would be read in full,
+# added back and announced again four times an hour until it left the window.
+# Keys are a few bytes each; a thousand of them is a fraction of the body
+# limit and more re-runs than any flake has produced.
+SEEN_PREFIX = "<!-- flaky-seen "
+SEEN_KEY_SEPARATOR = ","
+SEEN_FIELD_SEPARATOR = ":"
+MAX_SEEN_KEYS = 1000
 
 WORKFLOW_FILE = ".github/workflows/flaky-check-notify.yml"
 
@@ -511,6 +522,28 @@ def occurrence_key(record):
     return (record["run_id"], record["failed_attempt"])
 
 
+def seen_key(record):
+    """The compact key the hidden `flaky-seen` line keeps for one record."""
+    return (record["run_id"], record["failed_attempt"], record.get("passed_attempt"))
+
+
+def seen_in(body):
+    """Every key the issue's hidden `flaky-seen` line holds, oldest first."""
+    for line in (body or "").splitlines():
+        line = line.strip()
+        if line.startswith(SEEN_PREFIX) and line.endswith(OCCURRENCE_SUFFIX):
+            raw = line[len(SEEN_PREFIX) : -len(OCCURRENCE_SUFFIX)]
+            found = []
+            for item in filter(None, raw.split(SEEN_KEY_SEPARATOR)):
+                fields = item.split(SEEN_FIELD_SEPARATOR)
+                try:
+                    found.append(tuple(int(field) for field in fields))
+                except ValueError:
+                    continue
+            return found
+    return []
+
+
 def occurrences_in(body):
     """The occurrences an issue body already records, oldest first."""
     found = []
@@ -525,14 +558,17 @@ def occurrences_in(body):
     return found
 
 
-def merge_occurrences(existing, new_records):
+def merge_occurrences(existing, new_records, seen=()):
     """`existing` plus whichever of `new_records` are not already there.
 
     Returns the merged list, oldest first and trimmed to the most recent
     MAX_OCCURRENCES, and the records that were in fact new. Identity is the
     run and its failed attempt, so the same event handled twice is one row.
+    `seen` is the issue's hidden key line: a record whose row the trim took
+    is still known, and is not a new row.
     """
     keys = {occurrence_key(record) for record in existing}
+    keys.update((key[0], key[1]) for key in seen)
     added = []
     for record in new_records:
         if occurrence_key(record) not in keys:
@@ -575,7 +611,7 @@ def render_title(workflow_name, lines):
     return f"🎲 flaky check: {workflow_name}: {first}"
 
 
-def render_body(repo, workflow_name, lines, records, marker, previously=None):
+def render_body(repo, workflow_name, lines, records, marker, previously=None, seen=()):
     """The issue body, rebuilt from scratch on every update."""
     count = len(records)
     plural = "" if count == 1 else "s"
@@ -631,6 +667,13 @@ def render_body(repo, workflow_name, lines, records, marker, previously=None):
     out += [
         f"{OCCURRENCE_PREFIX}{json.dumps(record, sort_keys=True, ensure_ascii=False)}{OCCURRENCE_SUFFIX}"
         for record in records
+    ]
+    # Every key ever held, the rows' included, newest last, bounded on its own.
+    keys = list(dict.fromkeys(list(seen) + [seen_key(record) for record in records]))[-MAX_SEEN_KEYS:]
+    out += [
+        SEEN_PREFIX
+        + SEEN_KEY_SEPARATOR.join(SEEN_FIELD_SEPARATOR.join(str(field) for field in key) for key in keys)
+        + OCCURRENCE_SUFFIX
     ]
     return "\n".join(out)
 
@@ -887,7 +930,8 @@ def workflow_listings(api, workflow_id):
 
 def recorded_greens(listings):
     """Every (run id, green attempt) an occurrence on these issues names,
-    open or closed.
+    open or closed, from the occurrence rows and from the hidden key line
+    that outlives them.
 
     The sweep's cheap test for "already handled": a green attempt on any of
     its workflow's issues was read in full once, and `reconcile` would find
@@ -900,9 +944,12 @@ def recorded_greens(listings):
     found = set()
     for issues in listings:
         for issue in issues:
-            for record in occurrences_in(issue.get("body")):
+            body = issue.get("body")
+            for record in occurrences_in(body):
                 if "run_id" in record:
                     found.add((record["run_id"], record.get("passed_attempt")))
+            # The rows stop at MAX_OCCURRENCES; the key line does not.
+            found.update((key[0], key[-1]) for key in seen_in(body) if len(key) > 1)
     return found
 
 
@@ -932,12 +979,13 @@ def reconcile(api, repo, workflow_id, workflow_name, lines, records, listings=No
         created = api.create_issue(render_title(workflow_name, lines), body)
         return f"opened #{created['number']}" + (f" (recurrence of #{previously['number']})" if previously else "")
 
-    merged, added = merge_occurrences(occurrences_in(current.get("body")), records)
+    seen = seen_in(current.get("body"))
+    merged, added = merge_occurrences(occurrences_in(current.get("body")), records, seen)
     if not added:
         return f"#{current['number']} already records run {records[0]['run_id']}"
     # Body only. The title was written when the issue opened, and whoever
     # renamed it since knows more about the cause than this script does.
-    body = render_body(repo, workflow_name, lines, merged, marker, previously)
+    body = render_body(repo, workflow_name, lines, merged, marker, previously, seen)
     api.update_issue(current["number"], body=body)
     api.comment(current["number"], render_comment(repo, added, len(merged)))
     return f"updated #{current['number']} ({len(merged)} occurrences)"
@@ -1097,6 +1145,9 @@ def sweep(api, repo, dry_run):
                             candidates.append(run)
                 if not candidates:
                     continue
+                # Newest first is how the endpoint lists; the rows should land
+                # in the order the runs happened.
+                candidates.sort(key=lambda run: run["id"])
                 # Issues are listed only for a workflow with a candidate: every
                 # sweep sees the same re-runs for the whole window, and the
                 # bodies say which it has already read in full. The listing is

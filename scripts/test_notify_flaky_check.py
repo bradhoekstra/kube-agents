@@ -523,9 +523,9 @@ class FakeAPI:
         return [action[0] for action in self.actions]
 
 
-def existing_issue(number, lines, records, workflow_id=WORKFLOW_ID):
+def existing_issue(number, lines, records, workflow_id=WORKFLOW_ID, seen=()):
     marker = reporter.issue_marker(workflow_id, reporter.digest(workflow_id, lines))
-    return {"number": number, "body": reporter.render_body(REPO, "Python Unit Tests", lines, records, marker)}
+    return {"number": number, "body": reporter.render_body(REPO, "Python Unit Tests", lines, records, marker, seen=seen)}
 
 
 class ReconcileTest(unittest.TestCase):
@@ -569,6 +569,33 @@ class ReconcileTest(unittest.TestCase):
         self.assertEqual(api.kinds(), ["update", "comment"])
         self.assertIn("(3 occurrences)", done)
         self.assertEqual(len(reporter.occurrences_in(api.actions[0][2]["body"])), 3)
+
+    def test_a_record_the_row_cap_trimmed_is_still_known_and_not_re_added(self):
+        """The body keeps the newest MAX_OCCURRENCES rows and every key it has
+        ever held on a hidden line. A record whose row was trimmed is neither
+        a new row nor a comment, or a sweep that revisits every run in its
+        window would add it back and announce it four times an hour."""
+        rows = [dict(self.record, run_id=100 + n, run_number=n, date="2026-09-08") for n in range(reporter.MAX_OCCURRENCES)]
+        trimmed = dict(self.record, run_id=1, run_number=1, date="2026-09-01")
+        issue = existing_issue(700, self.lines, rows, seen=[reporter.seen_key(trimmed)])
+        self.assertEqual(len(reporter.occurrences_in(issue["body"])), reporter.MAX_OCCURRENCES)
+        api = FakeAPI(open_issues=[issue])
+        done = self.reconcile(api, records=[trimmed])
+        self.assertEqual(api.kinds(), [])
+        self.assertIn("already records", done)
+
+    def test_the_hidden_keys_survive_the_row_cap_and_bound_themselves(self):
+        """Round trip: every key the body has held, newest last, at most
+        MAX_SEEN_KEYS of them, whichever rows the table still shows."""
+        older = [reporter.seen_key(dict(self.record, run_id=n, failed_attempt=1, passed_attempt=2)) for n in range(reporter.MAX_SEEN_KEYS + 5)]
+        body = reporter.render_body(REPO, "Python Unit Tests", self.lines, [self.record], "<!-- flaky-check m -->", seen=older)
+        seen = reporter.seen_in(body)
+        self.assertEqual(len(seen), reporter.MAX_SEEN_KEYS)
+        self.assertEqual(seen[-1], (self.record["run_id"], self.record["failed_attempt"], self.record["passed_attempt"]))
+        # 1005 older keys plus the new record is 1006: the oldest six go.
+        self.assertNotIn((5, 1, 2), seen)
+        self.assertIn((6, 1, 2), seen)
+        self.assertEqual(reporter.MAX_SEEN_KEYS, 1000)
 
     def test_a_different_failure_of_the_same_workflow_is_a_separate_issue(self):
         api = FakeAPI(open_issues=[existing_issue(700, ["test_y (m.C.test_y)"], [self.record])])
@@ -1092,6 +1119,8 @@ class _StatefulSweepAPI:
         self.issues = {"open": [], "closed": []}
         self.created = []
         self.updated = []
+        self.comments = []
+        self.reads = 0
         self.next_number = 900
 
     def workflows(self):
@@ -1104,9 +1133,11 @@ class _StatefulSweepAPI:
         return dict(attempt(number, conclusion), id=run_id, workflow_id=100, html_url=f"https://github.com/gke-labs/kube-agents/actions/runs/{run_id}")
 
     def run(self, run_id):
+        self.reads += 1
         return self._attempt(run_id, 2, "success")
 
     def attempt(self, run_id, number):
+        self.reads += 1
         return self._attempt(run_id, number, "failure" if number == 1 else "success")
 
     def attempt_jobs(self, run_id, number):
@@ -1139,7 +1170,7 @@ class _StatefulSweepAPI:
         self.updated.append((number, fields))
 
     def comment(self, number, body):
-        pass
+        self.comments.append((number, body))
 
 
 class SweepTest(unittest.TestCase):
@@ -1227,6 +1258,42 @@ class SweepTest(unittest.TestCase):
         # `record` lists again before it writes rather than reusing the
         # sweep's listing: see the shared-fingerprint test below.
         self.assertEqual(len(record.call_args_list[0].args), 5)
+
+    def test_a_green_the_hidden_keys_name_is_skipped_once_its_row_is_trimmed(self):
+        issue = {"number": 700, "body": f"{reporter.issue_marker(100, 'abc')}\n{reporter.SEEN_PREFIX}2:1:2{reporter.OCCURRENCE_SUFFIX}"}
+        status, _, record = self._sweep(self._workflows(self._ids()), {100: [listed_run(2, 2)]}, issues={(100, "open"): [issue]})
+        self.assertEqual(status, 0)
+        self.assertEqual(record.call_args_list, [])
+
+    def test_candidates_are_recorded_oldest_first(self):
+        """The list comes newest first; the rows should land in the order the
+        runs happened."""
+        status, _, record = self._sweep(self._workflows(self._ids()), {100: [listed_run(9, 2), listed_run(4, 2), listed_run(6, 3)]})
+        self.assertEqual(status, 0)
+        self.assertEqual([call.args[2] for call in record.call_args_list], [4, 6, 9])
+
+    def test_a_re_run_storm_past_the_row_cap_settles_after_one_sweep(self):
+        """More runs than the table keeps, all one flake, re-run green in one
+        window. The first sweep records them; the second finds every one on
+        the issue's hidden keys and writes nothing, comments nothing."""
+        count = reporter.MAX_OCCURRENCES + 4
+        api = _StatefulSweepAPI(self._ids(), {100: [listed_run(1000 + n, 2) for n in range(count)]})
+        patches = (
+            mock.patch.object(reporter, "GitHubAPI", return_value=api),
+            mock.patch.object(reporter, "log", lambda message: None),
+            mock.patch.object(reporter, "_utcnow", return_value=self.NOW),
+            mock.patch.dict("os.environ", {"GITHUB_TOKEN": "t"}, clear=True),
+        )
+        with patches[0], patches[1], patches[2], patches[3]:
+            self.assertEqual(reporter.main(["--sweep"]), 0)
+            after_first = (len(api.created), len(api.updated), len(api.comments), api.reads)
+            self.assertEqual(reporter.main(["--sweep"]), 0)
+        self.assertEqual(len(api.created), 2)
+        for issue in api.issues["open"]:
+            self.assertEqual(len(reporter.occurrences_in(issue["body"])), reporter.MAX_OCCURRENCES)
+            self.assertEqual(len(reporter.seen_in(issue["body"])), count)
+        self.assertEqual((len(api.created), len(api.updated), len(api.comments)), after_first[:3])
+        self.assertEqual(api.reads, after_first[3], "the second sweep read no run")
 
     def test_a_closed_issue_counts_as_a_record_too(self):
         runs = {100: [listed_run(2, 2)]}
@@ -1400,8 +1467,15 @@ class WorkflowShapeTest(unittest.TestCase):
         self.assertIn("run_id", inputs)
         self.assertFalse(inputs["run_id"].get("required", False))
 
-    def test_one_sweep_at_a_time_and_none_cancelled(self):
-        self.assertEqual(self.document["concurrency"], {"group": "${{ github.workflow }}", "cancel-in-progress": False})
+    def test_one_sweep_at_a_time_and_a_dispatched_run_in_a_group_of_its_own(self):
+        """GitHub holds one pending run per group and cancels it when another
+        arrives. Two sweeps read the same window, so that costs nothing; a
+        `run_id` dispatch is the one record no sweep will redo, so it must not
+        wait in the sweeps' group."""
+        self.assertEqual(
+            self.document["concurrency"],
+            {"group": "${{ github.workflow }}-${{ inputs.run_id || 'sweep' }}", "cancel-in-progress": False},
+        )
 
     def test_the_job_is_guarded_and_each_entry_point_has_its_step(self):
         job = self.document["jobs"]["notify"]
@@ -1421,8 +1495,9 @@ class WorkflowShapeTest(unittest.TestCase):
             ["python3 scripts/notify_flaky_check.py --sweep --dry-run", "python3 scripts/notify_flaky_check.py --sweep"],
             "a dry-run branch and a writing branch, in that order",
         )
-        for step in (one, sweep):
-            self.assertEqual(step["env"]["FLAKY_CHECK_ANNOTATE"], "true")
+        # Only the sweep warns; the one-run path has nothing to annotate.
+        self.assertEqual(sweep["env"]["FLAKY_CHECK_ANNOTATE"], "true")
+        self.assertNotIn("FLAKY_CHECK_ANNOTATE", one["env"])
 
     def test_the_token_can_read_runs_and_write_issues_and_nothing_else(self):
         job = self.document["jobs"]["notify"]

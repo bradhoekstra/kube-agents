@@ -52,8 +52,12 @@ on:
 # re-run together would both find no issue for its fingerprint and both open
 # one. A sweep that arrives while one runs waits; a third cancels the one
 # waiting, which costs nothing, since the one that runs reads the same window.
+# A dispatch with a `run_id` is the one record no sweep will redo, so it
+# gets a group of its own rather than a place in the sweeps' queue, where the
+# next sweep would cancel it. It writes through the same path, which lists
+# the issue before writing, so it needs no serialising against a sweep.
 concurrency:
-  group: ${{ github.workflow }}
+  group: ${{ github.workflow }}-${{ inputs.run_id || 'sweep' }}
   cancel-in-progress: false
 
 permissions: {}
@@ -112,7 +116,6 @@ jobs:
         if: github.event_name == 'workflow_dispatch' && inputs.run_id != ''
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          FLAKY_CHECK_ANNOTATE: "true"
           DRY_RUN: ${{ inputs.dry_run }}
           RUN_ID: ${{ inputs.run_id }}
         run: |
