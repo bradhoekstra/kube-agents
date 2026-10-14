@@ -1758,16 +1758,18 @@ fi
 #     0400/0755 on root-owned files against RunAsUser 10000 besides (the volume's
 #     DefaultMode in platformagent_manifests.go), so it failed the ownership test too.
 #
-# Step 2d has since made that an ordinary writable file on the PVC, which only makes
-# restoring this worse rather than newly safe: the guard would now pass, and the step would
-# rewrite — non-atomically, over a file step 2d has just staged-and-renamed into place — a
-# config it has nothing to add to. Where the guard did pass before (compose, `docker run`)
-# that is exactly what it did, and yaml.safe_dump round-trips the file: it sorted the keys
-# and dropped every comment in a config people read.
+# Step 2d has since made that an ordinary writable file on the PVC, and step 2d's
+# back-fill is now the one writer that appends the template's plugins.enabled names the
+# live list lacks: a plugin the image ships enabled reaches a volume scaffolded before it
+# existed through that step, on the path that works. What this step was faulted for does
+# not hold there: the back-fill stages the file and renames it into place, so a reader
+# sees all of the old file or all of the new one, and it dumps with sort_keys=False, so
+# the keys keep their order. Comments are still dropped, the price every back-fill in
+# step 2d already pays.
 #
-# Do not restore it as a "belt and braces" measure. If a profile ever needs a plugin the
-# image does not ship enabled, the operator overlay in step 2.7 is the mechanism, and it is
-# one that works on the path this ran on.
+# Do not restore this step beside it: two writers of one list, one of them a plain
+# rewrite over the other's rename. A profile that needs a plugin the image does not ship
+# enabled is the operator overlay in step 2.7.
 
 # 4. Point the hermes_otel plugin at the resolved collector and stamp the service name.
 #

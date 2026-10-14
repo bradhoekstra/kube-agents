@@ -126,9 +126,10 @@ type usageDocument struct {
 	// and a name is not ownership.
 	AgentUID string `json:"agentUID"`
 	// FirstRecorded is the poll at which every pod was last re-baselined: the
-	// first poll, and each re-seed after a mismatch or a failed bound. Only a
-	// pod created after it starts from zero with none of its count seen,
-	// which is the one case in which a whole sample is added.
+	// first poll, and each re-seed after a mismatch or a failed bound. A pod
+	// created after it, or a never-read pod whose Sum-counter process started
+	// after it, starts from zero with none of its count seen, the cases in
+	// which a whole sample is added.
 	FirstRecorded metav1.Time      `json:"firstRecorded"`
 	Totals        map[string]int64 `json:"totals"`
 	// LastMoved is the poll in which a total last advanced, projected to

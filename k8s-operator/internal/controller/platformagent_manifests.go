@@ -163,10 +163,13 @@ const (
 	// value the plugin binds, the container port declared beside the API port,
 	// and the port the gateway policy admits the collector and the operator on,
 	// from one constant for the same reason as the watcher's.
-	chatMetricsPort            int32 = 9097
-	chatMetricsPortName              = "chat-metrics"
-	chatMetricsPortEnv               = "CHAT_METRICS_PORT"
-	platformAgentContainerName       = "platform-agent"
+	chatMetricsPort     int32 = 9097
+	chatMetricsPortName       = "chat-metrics"
+	chatMetricsPortEnv        = "CHAT_METRICS_PORT"
+	// platformAgentContainerName is the agent container's name in the gateway
+	// and dashboard pods, the one the poller's Ready gate and the bridge name:
+	// the same word as the app label, under the name for what it is here.
+	platformAgentContainerName = appNamePlatformAgent
 
 	// OperatorNamespaceEnv is the variable both install paths set on the
 	// manager container from the Downward API (the chart's operator

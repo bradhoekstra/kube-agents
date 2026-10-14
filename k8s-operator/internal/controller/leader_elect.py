@@ -11,8 +11,9 @@ process = None
 # label_state is whether this pod carries the leader label as far as the API
 # server has confirmed: True, False, or None before the first patch of this
 # process. Every loop reconciles it to what the label should say, so a refused
-# patch is retried, and a wrapper that restarts on a pod still labelled from
-# the term its Hermes died in clears the label before anything selects on it.
+# patch is retried; a crash clears the label before the wrapper exits, and a
+# wrapper that restarts on a pod still labelled, because that clear was refused,
+# clears it before anything selects on it.
 label_state = None
 is_shutting_down = False
 # The label means "this pod holds the lease and its Hermes answers": the
@@ -23,6 +24,11 @@ is_shutting_down = False
 # that port rather than the lease alone.
 HERMES_API_URL = "http://127.0.0.1:8642/api/sessions?limit=1"
 HERMES_PROBE_TIMEOUT_SECONDS = 3
+# ProxyHandler({}) rather than urlopen's default opener, which reads http_proxy
+# from the environment: a proxy set on the container (an AgentPlugin's env, a
+# base image) would carry a loopback probe off the pod, and its answer would
+# then say nothing about this pod's Hermes.
+HERMES_PROBE_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 # The gateway command this wrapper supervises.
 #
@@ -62,9 +68,9 @@ def hermes_answers(opener=None):
     """Whether this pod's Hermes answers on its API port: any HTTP answer counts,
     a 401 included, since the probe carries no key; a refused connection or a
     timeout does not."""
-    request = urllib.request.Request(HERMES_API_URL, headers={"Authorization": "Bearer " + (os.environ.get("API_SERVER_KEY") or "")})
+    request = urllib.request.Request(HERMES_API_URL)
     try:
-        (opener or urllib.request.urlopen)(request, timeout=HERMES_PROBE_TIMEOUT_SECONDS)
+        (opener or HERMES_PROBE_OPENER.open)(request, timeout=HERMES_PROBE_TIMEOUT_SECONDS)
         return True
     except urllib.error.HTTPError:
         return True
@@ -76,6 +82,16 @@ def desired_label(holder, running, answers):
     """What the leader label should say: this pod holds the lease, its Hermes
     process is running, and that process answers on its API port."""
     return holder == pod_name and running and answers
+
+
+def exit_on_crash(v1, state, code):
+    """Clear the label, then exit so the pod restarts: the re-scaffold between
+    this exit and the next wrapper's first loop is minutes, and a pod labelled
+    for that long with no Hermes behind it is read as the leader by the operator
+    and the chat PodMonitoring. A refused clear is left to the restarted wrapper,
+    which starts with label_state None and reconciles before it leads again."""
+    reconcile_label(v1, False, state)
+    sys.exit(code)
 
 
 def reconcile_label(v1, desired, state):
@@ -212,9 +228,7 @@ def main():
                 process = subprocess.Popen(HERMES_COMMAND)
             elif process.poll() is not None:
                 print(f"[{pod_name}] Hermes process crashed with code {process.returncode}. Exiting to trigger pod restart...", flush=True)
-                # The label stays for the restarted wrapper to clear: it starts
-                # with label_state None and reconciles before it leads again.
-                sys.exit(process.returncode)
+                exit_on_crash(v1, label_state, process.returncode)
         else:
             if process is not None:
                 print(f"[{pod_name}] Lost leadership! Stopping Hermes...", flush=True)

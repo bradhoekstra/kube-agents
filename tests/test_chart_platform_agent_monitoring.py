@@ -70,8 +70,8 @@ _SCRAPES = (
         "port_name": "event-metrics",
         "selector_keys": ("app",),
     },
-    # The same PodMonitoring's second endpoint: the chat_metrics plugin's
-    # listener on the platform-agent container.
+    # The chat listener's own PodMonitoring: the chat_metrics plugin on the
+    # platform-agent container, scraped on the leader alone.
     {
         # Selects the leader label as well: the chat listener runs on the leader
         # alone above one replica, and the golden renders one replica, where the

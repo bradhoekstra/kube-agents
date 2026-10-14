@@ -3,7 +3,7 @@
 The operator sums the credential broker's tool-invocation counter over its
 success and error outcomes (the commands it ran and the requests it rejected or
 failed on before running) and the event watcher's injected-event counter, and
-reads process_start_time_seconds from both, and counts the watcher's per-cluster
+reads process_start_time_seconds from all three, and counts the watcher's per-cluster
 up gauge into the two cluster gauges, and sums the broker's version-control
 counter under one verb and status into remediationsProposedTotal, and its
 merged-proposals counter whole into remediationsMergedTotal, and the chat plugin's inbound-message
@@ -91,10 +91,11 @@ class UsageCountersSeriesNamesTest(unittest.TestCase):
     def test_the_watchers_injected_family_is_the_one_the_poller_sums(self):
         self.assertEqual(_watcher_family("eventsInjected"), _go_const(_SCRAPE_GO, "eventsInjectedSeries"))
 
-    def test_both_listeners_export_the_start_time_gauge_the_poller_reads(self):
+    def test_every_listener_exports_the_start_time_gauge_the_poller_reads(self):
         name = _go_const(_SCRAPE_GO, "processStartTimeSeries")
         self.assertEqual(name, _py_const("PROCESS_START_TIME_METRIC"))
         self.assertEqual(name, _go_const(_WATCHER_METRICS_GO, "processStartTimeMetric"))
+        self.assertEqual(name, _py_const("PROCESS_START_TIME_METRIC", _CHAT_METRICS_PY))
 
     def test_the_counted_outcomes_are_the_brokers_success_and_error(self):
         source = _SCRAPE_GO.read_text()

@@ -1,6 +1,7 @@
 """The gateway leader label as leader_elect.py keeps it: set once this pod holds the
 lease and its Hermes answers, cleared otherwise, reconciled every loop so a refused
-patch is retried and a wrapper restarted on a still-labelled pod clears it.
+patch is retried, cleared before the exit that follows a Hermes crash, and cleared by
+a wrapper restarted on a pod still labelled because that clear was refused.
 
 The script imports the kubernetes client at module level and reads its environment
 there, so it is loaded from its path with that client stubbed; nothing here talks to
@@ -15,6 +16,7 @@ import sys
 import types
 import unittest
 import urllib.error
+import urllib.request
 from unittest import mock
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -99,6 +101,32 @@ class LeaderLabelTest(unittest.TestCase):
         state = self.m.reconcile_label(pods, False, state)
         self.assertIs(state, False)
         self.assertEqual(["true", None], pods.patches)
+
+    def test_a_crash_clears_the_label_before_the_wrapper_exits(self):
+        # Hermes died under a leading wrapper: the label comes off before the
+        # exit that restarts the pod, so the re-scaffold window is not spent
+        # labelled; the exit code is Hermes' own.
+        pods = _FakePods()
+        with self.assertRaises(SystemExit) as raised:
+            self.m.exit_on_crash(pods, True, 137)
+        self.assertEqual(137, raised.exception.code)
+        self.assertEqual([None], pods.patches, "the label was not cleared before the exit")
+        pods = _FakePods(refuse=1)
+        with self.assertRaises(SystemExit):
+            self.m.exit_on_crash(pods, True, 1)
+        self.assertEqual([], pods.patches, "a refused clear must still exit; the restarted wrapper clears it")
+
+    def test_the_probe_ignores_a_proxy_set_on_the_container(self):
+        # urlopen's default opener reads http_proxy from the environment, which
+        # would carry a loopback probe off the pod; the probe's opener is built
+        # with ProxyHandler({}), which build_opener drops as it adds no method,
+        # so a proxy in the environment at import time leaves no handler behind.
+        def proxy_handlers(opener):
+            return [h.proxies for h in opener.handlers if isinstance(h, urllib.request.ProxyHandler)]
+
+        with mock.patch.dict("os.environ", {"http_proxy": "http://127.0.0.1:9"}):
+            self.assertEqual([{"http": "http://127.0.0.1:9"}], proxy_handlers(urllib.request.build_opener()), "the control: the default opener does pick the proxy up")
+            self.assertEqual([], proxy_handlers(_load().HERMES_PROBE_OPENER))
 
     def test_hermes_answers_on_any_http_answer_and_not_on_a_refusal(self):
         def unauthorized(request, timeout):
