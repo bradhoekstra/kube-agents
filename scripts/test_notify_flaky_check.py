@@ -42,9 +42,10 @@ def workflow_document():
     return document, (document.get("on") or document.get(True))
 
 
-def listed_run(run_id, attempt, *, name="Python Unit Tests", workflow_id=WORKFLOW_ID):
-    """A run as the list endpoint returns it: its latest attempt's fields."""
-    return {"id": run_id, "run_attempt": attempt, "conclusion": "success", "status": "completed", "name": name, "workflow_id": workflow_id}
+def listed_run(run_id, attempt):
+    """A run as the list endpoint returns it, with the fields the sweep reads:
+    its id and its latest attempt's number."""
+    return {"id": run_id, "run_attempt": attempt, "conclusion": "success", "status": "completed"}
 
 
 def recording_issue(number, workflow_id, *greens):
@@ -583,6 +584,22 @@ class ReconcileTest(unittest.TestCase):
         done = self.reconcile(api, records=[trimmed])
         self.assertEqual(api.kinds(), [])
         self.assertIn("already records", done)
+
+    def test_a_write_that_trims_a_body_with_no_key_line_keeps_the_trimmed_key(self):
+        """Every issue written before the key line existed shows its rows and
+        nothing else. The first write that trims one of those rows must put its
+        key on the line it creates, or the next sweep reads that run again."""
+        rows = [dict(self.record, run_id=100 + n, run_number=n, date="2026-09-08") for n in range(reporter.MAX_OCCURRENCES)]
+        legacy = existing_issue(700, self.lines, rows)
+        legacy["body"] = "\n".join(line for line in legacy["body"].splitlines() if not line.startswith(reporter.SEEN_PREFIX))
+        self.assertEqual(reporter.seen_in(legacy["body"]), [])
+        api = FakeAPI(open_issues=[legacy])
+        self.reconcile(api, records=[dict(self.record, run_id=999, run_number=99)])
+        self.assertEqual(api.kinds(), ["update", "comment"])
+        body = api.actions[0][2]["body"]
+        self.assertEqual([r["run_id"] for r in reporter.occurrences_in(body)][0], 101, "the oldest row was trimmed")
+        self.assertIn(reporter.seen_key(rows[0]), reporter.seen_in(body), "and its key survived")
+        self.assertEqual(len(reporter.seen_in(body)), reporter.MAX_OCCURRENCES + 1)
 
     def test_the_hidden_keys_survive_the_row_cap_and_bound_themselves(self):
         """Round trip: every key the body has held, newest last, at most
@@ -1304,8 +1321,9 @@ class SweepTest(unittest.TestCase):
 
     def test_a_recorded_run_re_run_again_is_read_for_its_new_attempt(self):
         """Attempt 1 red, 2 green, recorded; then 3 red and 4 green. The run
-        id is on the issue, the green attempt is not, so it is read again and
-        `reconcile` adds attempt 3's row and no other."""
+        id is on the issue, the green attempt is not, so the sweep hands it to
+        `record` again (which then adds attempt 3's row and no other: the
+        merge dedupes per failed attempt, tested with `reconcile` above)."""
         runs = {100: [listed_run(2, 4)]}
         issues = {(100, "open"): [recording_issue(700, 100, (2, 2))]}
         status, _, record = self._sweep(self._workflows(self._ids()), runs, issues=issues)
@@ -1335,8 +1353,9 @@ class SweepTest(unittest.TestCase):
 
     def test_a_defect_on_one_runs_shape_raises_out_of_the_sweep(self):
         """A read that failed is left to the next sweep; a bug in this script
-        is not. It raises and reds the run, where a warning four times an hour
-        on a green job would hide it."""
+        is not. Here the listing raises a `TypeError`, standing in for any
+        defect on the path: it leaves `main` and reds the run, where a warning
+        four times an hour on a green job would hide it."""
         with self.assertRaises(TypeError):
             self._sweep(self._workflows(self._ids()), TypeError("run has no attempt"))
 
@@ -1409,6 +1428,31 @@ class SweepTest(unittest.TestCase):
         self.assertIs(record.call_args_list[0].args[4], True)
 
 
+class HiddenLineParsingTest(unittest.TestCase):
+    """A hand edit can leave either hidden line in a shape the script never
+    writes. The parsers refuse those, because a key of the wrong length or a
+    bare value would otherwise raise inside the sweep and red every pass."""
+
+    def test_a_key_without_three_integer_fields_is_dropped(self):
+        body = f"{reporter.SEEN_PREFIX}5,7:1:2,x:1:2,8:1,9:1:2:3,,10:2:3{reporter.OCCURRENCE_SUFFIX}"
+        self.assertEqual(reporter.seen_in(body), [(7, 1, 2), (10, 2, 3)])
+
+    def test_an_occurrence_that_is_not_an_object_with_its_keys_is_dropped(self):
+        lines = [
+            f"{reporter.OCCURRENCE_PREFIX}5{reporter.OCCURRENCE_SUFFIX}",
+            f'{reporter.OCCURRENCE_PREFIX}{{"foo": 1}}{reporter.OCCURRENCE_SUFFIX}',
+            f"{reporter.OCCURRENCE_PREFIX}[1, 2]{reporter.OCCURRENCE_SUFFIX}",
+            f'{reporter.OCCURRENCE_PREFIX}{{"run_id": 3, "failed_attempt": 1, "passed_attempt": 2}}{reporter.OCCURRENCE_SUFFIX}',
+        ]
+        self.assertEqual(reporter.occurrences_in("\n".join(lines)), [{"run_id": 3, "failed_attempt": 1, "passed_attempt": 2}])
+
+    def test_a_malformed_body_neither_raises_in_the_dedupe_nor_in_the_merge(self):
+        body = f"{reporter.SEEN_PREFIX}5{reporter.OCCURRENCE_SUFFIX}\n{reporter.OCCURRENCE_PREFIX}5{reporter.OCCURRENCE_SUFFIX}"
+        self.assertEqual(reporter.recorded_greens(([{"body": body}], [])), set())
+        merged, added = reporter.merge_occurrences(reporter.occurrences_in(body), [], reporter.seen_in(body))
+        self.assertEqual((merged, added), ([], []))
+
+
 class SuccessfulRunsBetweenTest(unittest.TestCase):
     """The list read behind the sweep: every page of one workflow's successful
     runs created inside one slice, newest first, as the endpoint orders them."""
@@ -1447,6 +1491,17 @@ class SuccessfulRunsBetweenTest(unittest.TestCase):
         self.assertEqual(len(runs), reporter.RUNS_LIST_CAP)
         self.assertEqual(len(calls), reporter.RUNS_LIST_CAP // reporter.PAGE_SIZE)
         self.assertTrue(any("not swept" in line for line in logged))
+
+    def test_exactly_the_cap_is_read_whole_and_warns_about_nothing(self):
+        full = [listed_run(i, 1) for i in range(reporter.PAGE_SIZE)]
+        pages = [full] * (reporter.RUNS_LIST_CAP // reporter.PAGE_SIZE + 1)
+        api, calls = self._api(pages, reporter.RUNS_LIST_CAP)
+        logged = []
+        with mock.patch.object(reporter, "log", logged.append):
+            runs = api.successful_runs_between(WORKFLOW_ID, "2026-10-11T12:00:00Z", "2026-10-12T12:00:00Z")
+        self.assertEqual(len(runs), reporter.RUNS_LIST_CAP)
+        self.assertEqual(len(calls), reporter.RUNS_LIST_CAP // reporter.PAGE_SIZE)
+        self.assertEqual(logged, [])
 
 
 class WorkflowShapeTest(unittest.TestCase):

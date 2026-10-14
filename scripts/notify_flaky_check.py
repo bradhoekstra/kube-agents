@@ -262,6 +262,9 @@ OCCURRENCE_SUFFIX = " -->"
 SEEN_PREFIX = "<!-- flaky-seen "
 SEEN_KEY_SEPARATOR = ","
 SEEN_FIELD_SEPARATOR = ":"
+# run id, failed attempt, green attempt: what `seen_key` writes, and the only
+# shape `seen_in` admits, so a hand-edited line cannot raise inside the sweep.
+SEEN_KEY_FIELDS = 3
 MAX_SEEN_KEYS = 1000
 
 WORKFLOW_FILE = ".github/workflows/flaky-check-notify.yml"
@@ -536,6 +539,8 @@ def seen_in(body):
             found = []
             for item in filter(None, raw.split(SEEN_KEY_SEPARATOR)):
                 fields = item.split(SEEN_FIELD_SEPARATOR)
+                if len(fields) != SEEN_KEY_FIELDS:
+                    continue
                 try:
                     found.append(tuple(int(field) for field in fields))
                 except ValueError:
@@ -545,16 +550,22 @@ def seen_in(body):
 
 
 def occurrences_in(body):
-    """The occurrences an issue body already records, oldest first."""
+    """The occurrences an issue body already records, oldest first.
+
+    Only an object carrying the two fields the merge keys on counts; a hand
+    edit can leave anything else, and the sweep must not raise on it.
+    """
     found = []
     for line in (body or "").splitlines():
         line = line.strip()
         if line.startswith(OCCURRENCE_PREFIX) and line.endswith(OCCURRENCE_SUFFIX):
             raw = line[len(OCCURRENCE_PREFIX) : -len(OCCURRENCE_SUFFIX)]
             try:
-                found.append(json.loads(raw))
+                record = json.loads(raw)
             except json.JSONDecodeError:
                 continue
+            if isinstance(record, dict) and "run_id" in record and "failed_attempt" in record:
+                found.append(record)
     return found
 
 
@@ -746,10 +757,12 @@ class GitHubAPI(BaseGitHubAPI):
             if len(runs) < PAGE_SIZE:
                 return found
             if len(found) >= RUNS_LIST_CAP:
-                warn(
-                    f"workflow {workflow_id}: {batch.get('total_count')} successful runs from {start} to {end}, "
-                    f"more than the {RUNS_LIST_CAP} the endpoint lists; the oldest are not swept"
-                )
+                # Exactly the cap was read whole; only a larger count lost runs.
+                if (batch.get("total_count") or 0) > RUNS_LIST_CAP:
+                    warn(
+                        f"workflow {workflow_id}: {batch.get('total_count')} successful runs from {start} to {end}, "
+                        f"more than the {RUNS_LIST_CAP} the endpoint lists; the oldest are not swept"
+                    )
                 return found
             page += 1
 
@@ -982,8 +995,12 @@ def reconcile(api, repo, workflow_id, workflow_name, lines, records, listings=No
         created = api.create_issue(render_title(workflow_name, lines), body)
         return f"opened #{created['number']}" + (f" (recurrence of #{previously['number']})" if previously else "")
 
-    seen = seen_in(current.get("body"))
-    merged, added = merge_occurrences(occurrences_in(current.get("body")), records, seen)
+    existing = occurrences_in(current.get("body"))
+    # The key line plus the rows: a body written before the line existed, or
+    # hand-edited without it, still knows every row it shows, and the rows
+    # this write trims must leave their keys behind.
+    seen = list(dict.fromkeys(seen_in(current.get("body")) + [seen_key(record) for record in existing]))
+    merged, added = merge_occurrences(existing, records, seen)
     if not added:
         return f"#{current['number']} already records run {records[0]['run_id']}"
     # Body only. The title was written when the issue opened, and whoever
