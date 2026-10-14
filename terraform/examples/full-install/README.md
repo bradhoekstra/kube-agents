@@ -150,8 +150,7 @@ install without the interview.
 ```bash
 cd terraform/examples/full-install
 cp terraform.tfvars.example terraform.tfvars   # then edit it
-terraform init
-terraform apply
+./lifecycle.sh apply -auto-approve             # not bare `terraform apply`; the paragraph below says why
 ```
 
 Even a first apply into an empty project is better driven through
