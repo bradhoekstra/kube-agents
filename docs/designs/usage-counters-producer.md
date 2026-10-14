@@ -67,8 +67,9 @@ interval the controller already uses for the RBAC re-probe and the pruned-status
 the same reasoning: one status write per interval is a cost nobody notices) it lists the
 `PlatformAgent`s from the cache and, for each:
 
-1. lists the pods the two policies select, in the CR's namespace: `app: <name>-gateway` for the
-   gateway, twice, once per listener on that pod, and for the broker the two labels `credentialProxySelector` returns,
+1. lists the pods the policies select, in the CR's namespace: `app: <name>-gateway` for the
+   gateway, twice, once per listener on that pod; `app: <name>-a2a-gateway` for the A2A gateway a `next`
+   install runs, which selects no pod elsewhere; and for the broker the two labels `credentialProxySelector` returns,
    `app: <name>-credential-proxy` and `kubeagents.x-k8s.io/component: credential-proxy`. When
    `eventWatcherEnabled` is false for the CR, the gateway pods' watcher target is left out: the entrypoint
    starts no watcher, so nothing listens on `event-metrics`, and a refused connection there
@@ -174,8 +175,8 @@ rule.
 
 ## Reach: how the operator gets to the endpoints
 
-The scrape is a direct read of the pod IP, and before the poller the two policies admitted the
-metrics ports from the collector's namespace alone. The implementation adds one ingress rule to each policy,
+The scrape is a direct read of the pod IP, and before the poller the policies admitted the
+metrics ports from the collector's namespace alone. The implementation adds one ingress rule to each policy that fences a metrics port (the gateway's, the broker's, and the A2A gateway's three fences on a `next` install),
 the same shape as the collector's rule beside it: the operator's namespace by its
 `kubernetes.io/metadata.name` label, and within it pods with
 `app.kubernetes.io/name: kube-agents-operator`, on the metrics port only. The operator renders
@@ -391,7 +392,7 @@ forward: "a new pod starts from zero and none of it was counted" holds only for 
 processes, started after the last point at which every pod was re-baselined, and a time carried forward would
 make a pod the re-seed could not scrape "new" on its next scrape, with its lifetime counted
 once more on top of totals that already hold it. Absence from the document is not newness: a pod
-the first poll could not scrape, or that one of the two policies kept out while the other
+the first poll could not scrape, or that one of the policies kept out while another
 already admitted the operator, is recorded on its next scrape and adds nothing. `lastActiveTime`
 is first stamped by a poll in which something ran. What a fresh install loses is the count
 between each pod's start and the first poll after it, the under-count this document prefers
@@ -505,18 +506,18 @@ and the CRD description changed from "nothing writes it yet". None needs a secon
 
 ## Security and privacy
 
-Zero external egress: the operator reads three in-cluster listeners over the pod network and
+Zero external egress: the operator reads three in-cluster listeners over the pod network, four on a `next` install, and
 writes two objects in the cluster. Zero PII or secret exposure: the status receives integer
 totals, two integer gauges and one timestamp; label values are summed away and never written anywhere, and the
 baseline ConfigMap holds pod UIDs, pod names and integers. The new NetworkPolicy rules admit
-the operator's pods on the three metrics ports and nothing else; the collector's rule is
+the operator's pods on the metrics ports, three on a `today` install and the A2A gateway's fourth on `next`, and nothing else; the collector's rule is
 unchanged. No new RBAC: pods are listed and ConfigMaps managed with verbs the ClusterRole
 already grants, and the status subresource is already the operator's to write. No credential
-of any kind is involved; the three listeners are unauthenticated by design, as they are for the
+of any kind is involved; the listeners are unauthenticated by design, as they are for the
 collector, and for the same reason the operator treats what it reads as untrusted. The gateway
 pod shares its network namespace across the agent container, the sidecar and any container
 `spec.deployment.sidecars` adds, and the watcher's port is free whenever its process is down, so
-a body on any of the ports can come from something other than the three listeners. Folding each line as
+a body on any of the ports can come from something other than the listeners. Folding each line as
 it is read keeps the operator's memory per poll at one line, under its 128Mi limit whatever the
 fleet's exposition grows to, and the per-poll ceiling bounds what one body can do to a total; neither makes the body more trusted. What is left is stated
 rather than hidden: a workload in the pod can refuse the operator a count, can raise one by at
@@ -633,7 +634,7 @@ scrapes two replicas at different samples, taking the larger delta on the next a
 the furthest replica's pre-seed backlog once; the baseline-absent-with-counters-present case; a ConfigMap whose recorded CR UID is not the CR's
 or whose values fail the read-back bounds, including a total above the `int64` headroom, one
 below the status, and a first-recorded time in the future (treated as absent); a quiet poll writing no ConfigMap; the disabled-watcher
-case (no gateway scrape, no log line); one broker body folded into three counters, each with its own baseline entry, through a restart; the gateway pod's two listeners read as two targets, the chat counter summed across replicas, a failing chat listener with a streak and a Warning of its own and no effect on the gauges; a current-layout document that predates a counter gaining its total rather than being re-seeded; a version-1 document migrated in place under a pruning CRD with its totals kept, the interval's deltas added and the new counter's first sample added whole, one whose migrating poll could not read the broker, so the unfolded counter is written with the document and the broker's first sample adds whole on the poll that reads it, and one migrated under a status that already carries the new counter, which starts at that floor and is not re-seeded; the Warning from a failing broker naming each of its fields; the Warning naming each status field a pod's counters project to; the series selection (the `status` values summed and the
+case (no gateway scrape, no log line); one broker body folded into three counters, each with its own baseline entry, through a restart; the gateway pod's two listeners read as two targets, the chat counter summed across replicas, a failing chat listener with a streak and a Warning of its own and no effect on the gauges, the A2A gateway pod read as a fourth target into the chat counter with an entry, a streak and a Warning of its own; a current-layout document that predates a counter gaining its total rather than being re-seeded; a version-1 document migrated in place under a pruning CRD with its totals kept, the interval's deltas added and the new counter's first sample added whole, one whose migrating poll could not read the broker, so the unfolded counter is written with the document and the broker's first sample adds whole on the poll that reads it, and one migrated under a status that already carries the new counter, which starts at that floor and is not re-seeded; the Warning from a failing broker naming each of its fields; the Warning naming each status field a pod's counters project to; the series selection (the `status` values summed and the
 three excluded; the injected series and not the observed one); and the port-by-name lookup when
 the port sits on a native sidecar among several containers. The accumulator takes samples and
 the ConfigMap's document and returns the next document, so none of these needs a socket.
@@ -654,7 +655,7 @@ events the watcher accepts arrive and `chatMessagesInboundTotal` after a chat me
 watcher process alone (the supervisor's), and an operator restart each leave the counters
 where they were and they keep rising afterwards, the watcher's restart in particular adding nothing for
 the replay of the retained Events; a quarter of an hour with no command, no accepted event and no chat message
-produces no status write; and the two policies show the new rule with the operator pod as the
+produces no status write; and the policies show the new rule with the operator pod as the
 only peer added.
 
 ## Documents the implementation changes

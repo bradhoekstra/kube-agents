@@ -4286,26 +4286,30 @@ func buildA2ADoorNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1
 	return np
 }
 
-// a2aGatewayFencePolicyWithOperatorPeer and a2aDoorNetworkPolicyWithOperatorPeer
-// are the two fences as the reconciler applies them: the collector's rule
-// from the builders, and the operator's pods admitted on the metrics port
-// alone, the way credentialProxyNetworkPolicyWithOperatorPeer admits them on
-// the broker's, so the usage poller can read the gateway's chat counter. The
-// builders stay collector-only, which the conformance fixture pins.
-func a2aGatewayFencePolicyWithOperatorPeer(agent *agentv1alpha1.PlatformAgent, operatorNamespace string) *networkingv1.NetworkPolicy {
-	np := buildA2AGatewayFencePolicy(agent)
+// a2aFenceWithOperatorPeer is a gateway fence as the reconciler applies it:
+// the collector's rule from the builder, and the operator's pods admitted on
+// the metrics port alone, the way credentialProxyNetworkPolicyWithOperatorPeer
+// admits them on the broker's, so the usage poller can read the gateway's
+// chat counter. Every fence on the gateway pod gets the same second rule, so
+// each reads as the complete statement of what reaches the pod. The builders
+// stay collector-only; the conformance fixture is rendered through this.
+func a2aFenceWithOperatorPeer(np *networkingv1.NetworkPolicy, operatorNamespace string) *networkingv1.NetworkPolicy {
 	if rule, ok := operatorMetricsIngressRule(operatorNamespace, a2aGatewayMetricsPort); ok {
 		np.Spec.Ingress = append(np.Spec.Ingress, rule)
 	}
 	return np
 }
 
+func a2aGatewayFencePolicyWithOperatorPeer(agent *agentv1alpha1.PlatformAgent, operatorNamespace string) *networkingv1.NetworkPolicy {
+	return a2aFenceWithOperatorPeer(buildA2AGatewayFencePolicy(agent), operatorNamespace)
+}
+
 func a2aDoorNetworkPolicyWithOperatorPeer(agent *agentv1alpha1.PlatformAgent, operatorNamespace string) *networkingv1.NetworkPolicy {
-	np := buildA2ADoorNetworkPolicy(agent)
-	if rule, ok := operatorMetricsIngressRule(operatorNamespace, a2aGatewayMetricsPort); ok {
-		np.Spec.Ingress = append(np.Spec.Ingress, rule)
-	}
-	return np
+	return a2aFenceWithOperatorPeer(buildA2ADoorNetworkPolicy(agent), operatorNamespace)
+}
+
+func a2aInjectNetworkPolicyWithOperatorPeer(agent *agentv1alpha1.PlatformAgent, operatorNamespace string) *networkingv1.NetworkPolicy {
+	return a2aFenceWithOperatorPeer(buildA2AGatewayNetworkPolicy(agent), operatorNamespace)
 }
 
 // buildA2AGatewayNetworkPolicy fences ingress to the gateway pod while the
@@ -4935,7 +4939,7 @@ func (r *PlatformAgentReconciler) reconcileA2ANetworkFences(ctx context.Context,
 	// over a Service that is gone denies nothing and costs nothing, so the
 	// ordering hazard runs the safe way.
 	if a2aInjectBackendEnabled() {
-		fences = append(fences, buildA2AGatewayNetworkPolicy(agent))
+		fences = append(fences, a2aInjectNetworkPolicyWithOperatorPeer(agent, r.OperatorNamespace))
 	}
 	if a2aAgentDoorEnabled() {
 		fences = append(fences, a2aDoorNetworkPolicyWithOperatorPeer(agent, r.OperatorNamespace))
