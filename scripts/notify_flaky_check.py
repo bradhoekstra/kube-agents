@@ -939,7 +939,10 @@ def recorded_greens(listings):
     re-run a second time -- red again, then green on a later attempt -- is
     read again for its new failure. A run recorded under one key and refused
     under another reads as handled too; the event path had the same gap, and
-    the refusal was a red run at the time.
+    the refusal is a red run both ways. What completes it is a dispatch with
+    that run's id: `record` reconciles every key of the run, and `reconcile`
+    dedupes per issue, so the written key adds nothing and the refused one is
+    written.
     """
     found = set()
     for issues in listings:
