@@ -156,8 +156,8 @@ sweep-probe:
 """
 
 #: Markers for the run-order cases, in the same shape as the two above.
-ORDER_MARKER = "RUN_ORDER="
-HEAVY_MARKER = "HEAVY="
+ORDER_MARKER = "SWEEP-ORDER:"
+HEAVY_MARKER = "SWEEP-HEAVY:"
 
 #: Prints both lists as make expands them, for the derivation case.
 LISTS_MAKEFILE = f"""\
@@ -298,6 +298,14 @@ class RunOrderTest(unittest.TestCase):
         with fixture_files() as (green, _red):
             _, _, order = _order_lists([f"PYTHON_TEST_FILES={green} {heavy[0]}"])
         self.assertEqual(order, [heavy[0], green])
+
+    def test_a_percent_in_the_override_is_a_word_to_run_not_a_pattern_to_match(self):
+        # make reads `%` in a $(filter) pattern as a wildcard. The caller's
+        # list must only ever be the text, or a typed `tests/%` would pull
+        # every heavy file under tests/ into the feed while the output loop,
+        # which walks PYTHON_TEST_FILES, printed none of their blocks.
+        _, _, order = _order_lists(["PYTHON_TEST_FILES=tests/%"])
+        self.assertEqual(order, ["tests/%"])
 
     def test_the_workers_take_files_in_run_order_and_the_blocks_stay_in_list_order(self):
         # One worker, so the `ok` lines come out in feed order. The listed

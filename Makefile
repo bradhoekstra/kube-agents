@@ -286,10 +286,17 @@ PYTHON_TEST_HEAVY_FILES := \
 # PYTHON_TEST_FILES, in that order, then every other file in PYTHON_TEST_FILES
 # order. Filtered both ways so it is a permutation of PYTHON_TEST_FILES and
 # nothing more -- a run narrowed with PYTHON_TEST_FILES="..." runs the files
-# it names, not those plus the heavy list. Only the feed to xargs reads this;
-# the captured output is still printed in PYTHON_TEST_FILES order, so the
-# blocks read in path order whatever order the files ran in.
-PYTHON_TEST_RUN_ORDER = $(filter $(PYTHON_TEST_FILES),$(PYTHON_TEST_HEAVY_FILES)) $(filter-out $(PYTHON_TEST_HEAVY_FILES),$(PYTHON_TEST_FILES))
+# it names, not those plus the heavy list. The heavy names are the patterns in
+# both filters and PYTHON_TEST_FILES is only ever the text, because make reads
+# `%` in a pattern word as a wildcard: with the caller's list as the pattern, a
+# typed PYTHON_TEST_FILES='tests/%' pulled every heavy file under tests/ into
+# the feed, where the output loop below, which walks PYTHON_TEST_FILES, would
+# print none of their blocks and read none of their verdicts. This way that
+# word reaches the worker as the literal it is and fails its regular-file
+# check, the same as on any other path that is not a file. Only the feed to
+# xargs reads this; the captured output is still printed in PYTHON_TEST_FILES
+# order, so the blocks read in path order whatever order the files ran in.
+PYTHON_TEST_RUN_ORDER = $(foreach heavy,$(PYTHON_TEST_HEAVY_FILES),$(filter $(heavy),$(PYTHON_TEST_FILES))) $(filter-out $(PYTHON_TEST_HEAVY_FILES),$(PYTHON_TEST_FILES))
 
 # How many of those files `test-python` and `coverage` run at once. They are
 # separate `python3` processes that share nothing -- each cd's into its own
