@@ -1583,7 +1583,7 @@ Mutation(
          "      ports:\n        - port: 9096\n          protocol: TCP\n    - from:\n        - podSelector: {}\n"
          "      ports:\n        - port: 8098\n          protocol: TCP\n  podSelector:"),
         "test_C1_the_a2a_gateway_admits_the_collector_and_the_operator_to_the_metrics_port_and_nobody_else",
-        "add a second rule beside the collector's, admitting every pod in the "
+        "add a rule beside the collector's and the operator's, admitting every pod in the "
         "namespace to the A2A door's port: the 'an in-cluster caller needs the "
         "door' edit made without the decision the fence's comment asks for",
     ),

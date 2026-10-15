@@ -1141,8 +1141,8 @@ that treated the three alike is what this value exists to stop.
    it exists so that `kubectl port-forward svc/<cr>-a2a-inject` resolves to the pod and the
    port.
 5. **While it is armed, a NetworkPolicy fences the gateway pod against every pod on the cluster
-   network**: one ingress rule, which admits the managed-Prometheus collector's namespace to
-   the metrics-only port and nothing to the door (see "Metrics" below). The gateway's own fence, which renders on every next gateway whether or not a door is armed, admits the same, so this copy is the door's record of the intent rather than the pod's only fence. It is a second control over the edge the bind already
+   network**: two ingress rules, which admit the managed-Prometheus collector's namespace and the
+   operator's pods to the metrics-only port and nothing to the door (see "Metrics" below). The gateway's own fence, which renders on every next gateway whether or not a door is armed, admits the same, so this copy is the door's record of the intent rather than the pod's only fence. It is a second control over the edge the bind already
    closes, kept so that a reader of the rendered objects sees the intent and so that a later
    change to the bind address does not open the pod network by itself. Neither it nor the bind
    governs the port-forward, which the kubelet serves from inside the pod's network namespace;

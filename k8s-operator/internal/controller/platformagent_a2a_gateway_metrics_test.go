@@ -44,8 +44,8 @@ import (
 // with both doors armed: its three NetworkPolicies (the two doors' and the
 // gateway's own), the gateway pod's labels and the gateway container's declared
 // ports, nothing else. The conformance suite reads it
-// (tests/conformance, C1) to hold the policies to "the collector, on the
-// metrics port, and nobody else": the suite cannot run Go, and no golden
+// (tests/conformance, C1) to hold the policies to "the collector and the
+// operator, on the metrics port, and nobody else": the suite cannot run Go, and no golden
 // renders mode next, so this file is the contract between the two.
 //
 // Compared as parsed YAML, as the goldens are, because the file is kept in
@@ -80,7 +80,8 @@ func a2aGatewayDoorPorts(ports []corev1.ContainerPort) []corev1.ContainerPort {
 }
 
 // assertA2AGatewayFenceAdmitsOnlyTheCollector holds one gateway fence to
-// exactly one ingress rule: from the gke-gmp-system namespace by its
+// exactly one ingress rule, the builders' shape and the applied one while the
+// reconciler has no operator namespace, which the envtests here leave unset: from the gke-gmp-system namespace by its
 // metadata.name label, no pod selector and no ipBlock beside it, to TCP
 // a2aGatewayMetricsPort and no other port.
 func assertA2AGatewayFenceAdmitsOnlyTheCollector(t *testing.T, np *networkingv1.NetworkPolicy) {
@@ -287,7 +288,9 @@ func a2aGatewayFixtureDocs(t *testing.T, data string) []any {
 // TestTheA2AGatewayMetricsSurfaceOnTheAPIServerEnvtest applies the gateway
 // Deployment and the fences the way reconcileA2A does, against a real API
 // server, and reads back what it accepted: the metrics port and env on the
-// container, and on each fence the collector rule alone. The gateway's own
+// container, and on each fence the collector rule alone, the reconciler's
+// operator namespace being unset here (a2aFenceWithOperatorPeer appends the
+// operator's rule when it is set). The gateway's own
 // fence is applied by the second fences pass, the refusal path's, which is
 // the one that reads whether the Deployment exists.
 func TestTheA2AGatewayMetricsSurfaceOnTheAPIServerEnvtest(t *testing.T) {
@@ -352,7 +355,8 @@ func a2aGatewayFenceKey(agent *agentv1alpha1.PlatformAgent) types.NamespacedName
 // assertA2AGatewayFence reads the gateway's fence and holds it to selecting
 // the gateway pod, governing ingress alone (no egress rule set on a pod that
 // dials the bus out), and admitting the collector to the metrics port and
-// nobody else.
+// nobody else, the operator's rule absent because this suite sets no operator
+// namespace.
 func assertA2AGatewayFence(t *testing.T, ctx context.Context, cl client.Client, agent *agentv1alpha1.PlatformAgent) {
 	t.Helper()
 	np := &networkingv1.NetworkPolicy{}
@@ -370,7 +374,8 @@ func assertA2AGatewayFence(t *testing.T, ctx context.Context, cl client.Client, 
 
 // TestTheA2AGatewayFenceComesAndGoesWithTheGateway: the gateway's metrics
 // listener binds every interface on every next install, so the fence that
-// admits only the collector to it renders wherever the gateway Deployment
+// admits the collector, and the operator where the reconciler knows its
+// namespace, to it renders wherever the gateway Deployment
 // does, door or no door (bnaylor's call on #2473, 2026-10-06), and not where
 // the gateway is withheld.
 func TestTheA2AGatewayFenceComesAndGoesWithTheGateway(t *testing.T) {
@@ -543,7 +548,7 @@ func TestTheA2AGatewayFenceComesAndGoesWithTheGateway(t *testing.T) {
 		gatewayRendered(t, cl, agent)
 		assertA2AGatewayFence(t, ctx, cl, agent)
 		// The fence edited by hand to admit everyone: only an apply on this
-		// pass puts the collector-only rule back, so the assertion below
+		// pass puts the collector's rule back, so the assertion below
 		// tells a pass that applied the fence from one that merely left it.
 		tampered := &networkingv1.NetworkPolicy{}
 		if err := cl.Get(ctx, a2aGatewayFenceKey(agent), tampered); err != nil {

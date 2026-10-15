@@ -4315,8 +4315,9 @@ func a2aInjectNetworkPolicyWithOperatorPeer(agent *agentv1alpha1.PlatformAgent, 
 // buildA2AGatewayNetworkPolicy fences ingress to the gateway pod while the
 // inject backend is armed.
 //
-// PolicyTypes carries Ingress with one rule, and every pod but the one it
-// names is denied. That is the intent rather than an omission: the chat
+// PolicyTypes carries Ingress with one rule from this builder (the applied
+// copy gains the operator's, a2aFenceWithOperatorPeer), and every pod but the
+// ones they name is denied. That is the intent rather than an omission: the chat
 // backends dial out and listen for nothing, so until this door existed no
 // pod had any business reaching the gateway at all, and the inject port must
 // not become the one that does. The one rule is the credential broker's
@@ -4349,8 +4350,9 @@ func a2aInjectNetworkPolicyWithOperatorPeer(agent *agentv1alpha1.PlatformAgent, 
 // leave that open. The door fences stay as they are, identical in what they
 // admit; two identical policies on one pod admit exactly what one does, and
 // each door's objects still come and go with its own flag. When an in-cluster
-// caller legitimately needs the gateway, it becomes a peer in this rule, and
-// in every copy of it.
+// caller legitimately needs the gateway, it becomes a rule on every copy, the
+// way a2aFenceWithOperatorPeer admits the operator's poller on the metrics
+// port.
 func buildA2AGatewayNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1.NetworkPolicy {
 	return &networkingv1.NetworkPolicy{
 		TypeMeta: metav1.TypeMeta{APIVersion: "networking.k8s.io/v1", Kind: "NetworkPolicy"},

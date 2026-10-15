@@ -19,7 +19,8 @@ import (
 // The gateway's Prometheus surface: a metrics-only TCP listener of its own,
 // copied from the credential broker's (CREDENTIAL_PROXY_METRICS_PORT in
 // agents/platform/scripts/credential_proxy.py), so that the collector
-// scraping it is admitted to a port that serves counters and nothing else.
+// scraping it, and the operator's usage poller, are admitted to a port that
+// serves counters and nothing else.
 // The doors keep their own loopback listeners and never serve these series.
 // The operator renders A2A_METRICS_PORT from the constant that also declares
 // the container port and the collector's ingress rule
@@ -318,7 +319,7 @@ func metricsTerminalSourceLabel(source TerminalSource) string {
 
 // MetricsServer is the metrics-only listener: MetricsPath and nothing else,
 // on its own port, so the NetworkPolicy rule that admits the collector to it
-// admits the collector to counters and nothing else.
+// admits the collector and the operator to counters and nothing else.
 type MetricsServer struct {
 	listen  string
 	metrics *Metrics
@@ -330,8 +331,9 @@ type MetricsServer struct {
 }
 
 // NewMetricsServer builds the listener for a port. It binds every interface,
-// unlike the doors' loopback binds, because its caller is the collector on
-// the pod network; what keeps anyone else off it is the NetworkPolicy, and
+// unlike the doors' loopback binds, because its callers, the collector and
+// the operator's poller, are on the pod network; what keeps anyone else off
+// it is the NetworkPolicy, and
 // what it serves is counters.
 func NewMetricsServer(port int, metrics *Metrics, log *slog.Logger) (*MetricsServer, error) {
 	if port < metricsPortMin || port > metricsPortMax {
