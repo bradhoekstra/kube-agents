@@ -4669,6 +4669,238 @@ class ScopeContainerPreflightTest(unittest.TestCase):
         self.assertNotIn("ERROR", proc.stdout)
 
 
+class ScopeExportSinkPreflightTest(unittest.TestCase):
+    """check_scope_export_sink_access: silent while the apply creates no drift
+    audit-log sink beyond the host (the detector off, no SCOPE_PROJECTS entry
+    past the host and the exclusions); otherwise the applying identity must
+    hold logging.sinks.create in every project the composition will list,
+    asked through testIamPermissions on the project. Every project that lacks
+    it is named before the refusal; a probe that cannot decide warns and lets
+    the apply speak; "warn" turns the refusal into a warning."""
+
+    def _run(self, keys=None, mode="", probe=None, token=True, curl_present=True, strict=False, env_extra=None, cwd=None):
+        """probe: a dict from project ID to what curl answers for
+        projects/<id>:testIamPermissions: "granted", "denied", "forbidden",
+        "service-disabled", "scope-insufficient", "missing", "garbage",
+        "down". cwd: where the check runs (the repository root unless a case
+        plants files to be globbed). The stubs record
+        what they saw in a log the test folds into proc.stderr: the bearer
+        curl read from its stdin, every permission it was asked
+        (PROBED:<permission>) and every resource (RESOURCE:<path>)."""
+        probe = probe or {}
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            (bin_dir / "gcloud").write_text(
+                "#!/usr/bin/env bash\n"
+                'case "$*" in\n'
+                + ('  *"application-default print-access-token"*) echo "tok"; exit 0 ;;\n' if token else
+                   '  *"application-default print-access-token"*) exit 1 ;;\n')
+                + '  *"config get-value account"*) echo "tester@example.com"; exit 0 ;;\n'
+                + '  *"config get-value auth/impersonate_service_account"*) echo ""; exit 0 ;;\n'
+                + '  *"config get-value auth/access_token_file"*) echo ""; exit 0 ;;\n'
+                "esac\nexit 1\n"
+            )
+            if curl_present:
+                cases = []
+                for project, answer in probe.items():
+                    body, status = {
+                        "granted": ('{"permissions":["logging.sinks.create"]}', 200),
+                        "denied": ("{}", 200),
+                        "forbidden": ('{"error":{"code":403,"status":"PERMISSION_DENIED"}}', 403),
+                        "service-disabled": ('{"error":{"code":403,"status":"PERMISSION_DENIED","details":[{"reason":"SERVICE_DISABLED"}]}}', 403),
+                        "scope-insufficient": ('{"error":{"code":403,"message":"Request had insufficient authentication scopes.","status":"PERMISSION_DENIED","details":[{"reason":"ACCESS_TOKEN_SCOPE_INSUFFICIENT"}]}}', 403),
+                        "missing": ('{"error":{"code":404}}', 404),
+                        "garbage": ("<html>", 200),
+                        "down": ("", None),
+                    }[answer]
+                    if status is None:
+                        cases.append(f'  *"/projects/{project}:testIamPermissions"*) exit 7 ;;')
+                    else:
+                        cases.append(f"  *\"/projects/{project}:testIamPermissions\"*) printf '%s\\n%s' '{body}' '{status}'; exit 0 ;;")
+                (bin_dir / "curl").write_text(
+                    "#!/usr/bin/env bash\n"
+                    'case "$*" in *"Bearer "*) echo "TOKEN-ON-ARGV" >>"$SCOPE_PROBE_LOG"; exit 99 ;; esac\n'
+                    'for a in "$@"; do case "$a" in @-) echo "BEARER:$(sed -n \'s/^Authorization: Bearer //p\')" >>"$SCOPE_PROBE_LOG" ;; "{\\"permissions\\""*) echo "PROBED:$(printf \'%s\' "$a" | sed \'s/.*\\["\\(.*\\)"\\].*/\\1/\')" >>"$SCOPE_PROBE_LOG" ;; https://*:testIamPermissions) echo "RESOURCE:${a#*/v3/}" >>"$SCOPE_PROBE_LOG" ;; esac; done\n'
+                    "case \"$*\" in\n" + "\n".join(cases) + "\nesac\nexit 22\n")
+            for stub in ("gcloud",) + (("curl",) if curl_present else ()):
+                path = bin_dir / stub
+                path.chmod(path.stat().st_mode | stat.S_IEXEC)
+            probe_log = pathlib.Path(tmp) / "probe.log"
+            probe_log.write_text("")
+            env = {"PROJECT_ID": "test-project", "SCOPE_PROJECTS": "", "SCOPE_EXCLUDE_PROJECTS": "",
+                   "ENABLE_DRIFT_DETECTOR": "", "TF_VAR_enable_drift_pubsub": "",
+                   "TF_VAR_drift_pubsub_source_exclude_projects": "", "SCOPE_PROBE_LOG": str(probe_log)}
+            env.update({name: "" for name in _GOOGLE_CREDENTIAL_VARIABLES})
+            env.update(keys or {})
+            env.update(env_extra or {})
+            # The strict call also reports a `set -f` the check left on, which
+            # would reach install.sh's main after the (Y/n/g) prompt.
+            call = (f'trap \'echo TRAP-FIRED\' ERR; set -eEo pipefail; check_scope_export_sink_access {mode}; echo "rc=$?"; case "$-" in *f*) echo noglob-left-on ;; esac\n'
+                    if strict else f'check_scope_export_sink_access {mode}; echo "rc=$?"\n')
+            body = (
+                "set -u\n"
+                'print_error() { echo "ERROR: $*"; }; print_info() { echo "INFO: $*"; }\n'
+                'print_warning() { echo "WARN: $*"; }; print_success() { :; }\n'
+                f'source "{_INSTALLER_COMMON}"\n'
+                + call
+            )
+            isolated = get_isolated_test_env(overrides=env, bin_dir=str(bin_dir))
+            if not curl_present:
+                tools = create_minimal_tools_bin(pathlib.Path(tmp) / "tools")
+                (tools / "python3").symlink_to(shutil.which("python3"))
+                isolated["PATH"] = f"{bin_dir}:{tools}"
+            proc = subprocess.run(["bash", "-c", body], capture_output=True, text=True,
+                                  env=isolated, cwd=str(cwd or _REPO_ROOT))
+            proc.stderr += probe_log.read_text()
+            return proc
+
+    def _assert_rc(self, proc, rc):
+        self.assertIn(f"rc={rc}", proc.stdout, proc.stdout + proc.stderr)
+
+    def _probed(self, proc):
+        return [line for line in proc.stderr.splitlines() if line.startswith("RESOURCE:")]
+
+    def test_no_sink_beyond_the_host_is_silent_and_touches_nothing(self):
+        for label, keys in (
+            ("no scope", {}),
+            ("the host alone", {"SCOPE_PROJECTS": "test-project"}),
+            ("the detector off", {"SCOPE_PROJECTS": "a-prod", "ENABLE_DRIFT_DETECTOR": "false"}),
+            ("every project excluded exactly", {"SCOPE_PROJECTS": "a-prod, b-prod", "SCOPE_EXCLUDE_PROJECTS": "a-prod b-prod"}),
+            ("every project excluded by the composition's lever",
+             {"SCOPE_PROJECTS": "a-prod", "TF_VAR_drift_pubsub_source_exclude_projects": "a-prod"}),
+        ):
+            with self.subTest(label=label):
+                proc = self._run(keys=keys, token=False, probe={"a-prod": "denied", "b-prod": "denied"})
+                self._assert_rc(proc, 0)
+                self.assertEqual("rc=0\n", proc.stdout)
+                self.assertEqual([], self._probed(proc))
+
+    def test_the_set_probed_is_the_one_the_composition_lists(self):
+        # SCOPE_PROJECTS less the host, less an exact or glob
+        # SCOPE_EXCLUDE_PROJECTS match (the reconcile's fnmatch: * ? [seq]
+        # [!seq]), less TF_VAR_drift_pubsub_source_exclude_projects, once each.
+        proc = self._run(keys={"SCOPE_PROJECTS": "test-project a-prod b-sandbox c-stage d-stage a-prod e-dev1 e-dev2",
+                               "SCOPE_EXCLUDE_PROJECTS": "*-sandbox c-stage e-dev[!1]",
+                               "TF_VAR_drift_pubsub_source_exclude_projects": "d-stage"},
+                         probe={"a-prod": "granted", "e-dev1": "granted"})
+        self._assert_rc(proc, 0)
+        self.assertEqual(["RESOURCE:projects/a-prod:testIamPermissions", "RESOURCE:projects/e-dev1:testIamPermissions"],
+                         self._probed(proc))
+        self.assertEqual(["PROBED:logging.sinks.create"] * 2,
+                         [line for line in proc.stderr.splitlines() if line.startswith("PROBED:")])
+        self.assertIn("BEARER:tok\n", proc.stderr)
+        self.assertNotIn("TOKEN-ON-ARGV", proc.stderr)
+        self.assertEqual("rc=0\n", proc.stdout)
+        # The detector off in install.env but the ingress on through its own
+        # TF_VAR_ line, which write_tfvars_from_state leaves in force: probed.
+        proc = self._run(keys={"SCOPE_PROJECTS": "a-prod", "ENABLE_DRIFT_DETECTOR": "false", "TF_VAR_enable_drift_pubsub": "true"},
+                         probe={"a-prod": "granted"})
+        self.assertEqual(["RESOURCE:projects/a-prod:testIamPermissions"], self._probed(proc))
+
+    def test_every_project_without_the_grant_is_named_before_the_refusal(self):
+        proc = self._run(keys={"SCOPE_PROJECTS": "a-prod, b-prod c-prod"},
+                         probe={"a-prod": "denied", "b-prod": "granted", "c-prod": "missing"})
+        self._assert_rc(proc, 1)
+        self.assertIn("ERROR: Refusing to apply: the Application Default Credentials (the identity Terraform applies with) cannot create a Log Router sink in project 'a-prod' (logging.sinks.create), or the project is not visible to it; an apply that creates the project's drift audit-log sink would fail there", proc.stdout)
+        self.assertIn("Ask for roles/logging.configWriter in project 'a-prod' for that identity. A project that is to have no sink is added to TF_VAR_drift_pubsub_source_exclude_projects in install.env (it stays in the scope) or dropped from SCOPE_PROJECTS; removing a sink it already has needs the same role.", proc.stdout)
+        self.assertIn("cannot create a Log Router sink in project 'c-prod' (logging.sinks.create)", proc.stdout)
+        self.assertNotIn("'b-prod'", proc.stdout)
+        self.assertIn("INFO: Nothing was changed. Fix what is named above, or edit SCOPE_PROJECTS, SCOPE_EXCLUDE_PROJECTS or TF_VAR_drift_pubsub_source_exclude_projects in install.env, and re-run.", proc.stdout)
+        # A 403 that is a permission answer refuses too.
+        proc = self._run(keys={"SCOPE_PROJECTS": "a-prod"}, probe={"a-prod": "forbidden"})
+        self._assert_rc(proc, 1)
+        self.assertIn("cannot create a Log Router sink in project 'a-prod'", proc.stdout)
+
+    def test_warn_mode_names_the_failures_and_passes(self):
+        proc = self._run(keys={"SCOPE_PROJECTS": "a-prod"}, mode="warn", probe={"a-prod": "denied"})
+        self._assert_rc(proc, 0)
+        self.assertIn("WARN: An applying run would be refused: the Application Default Credentials (the identity Terraform applies with) cannot create a Log Router sink in project 'a-prod' (logging.sinks.create)", proc.stdout)
+        self.assertNotIn("ERROR", proc.stdout)
+
+    def test_an_undecided_probe_warns_and_lets_the_apply_speak(self):
+        proc = self._run(keys={"SCOPE_PROJECTS": "a-prod b-prod"}, probe={"a-prod": "garbage", "b-prod": "down"})
+        self._assert_rc(proc, 0)
+        self.assertNotIn("ERROR", proc.stdout)
+        self.assertIn("WARN: The scope export preflight could not decide whether the Application Default Credentials (the identity Terraform applies with) can create a Log Router sink in project 'a-prod' (Resource Manager answered 200 with a body that is not the JSON it documents); the apply will report it if it fails.", proc.stdout)
+        self.assertIn("in project 'b-prod' (the request to Resource Manager did not complete)", proc.stdout)
+        proc = self._run(keys={"SCOPE_PROJECTS": "a-prod"}, probe={"a-prod": "service-disabled"})
+        self._assert_rc(proc, 0)
+        self.assertIn("in project 'a-prod' (Resource Manager answered 403 for its API being off in the credentials' quota project", proc.stdout)
+        # No token, no curl: one warning for the set, naming the remedy.
+        proc = self._run(keys={"SCOPE_PROJECTS": "a-prod"}, token=False)
+        self._assert_rc(proc, 0)
+        self.assertIn("WARN: The scope export preflight could not decide whether the Application Default Credentials (the identity Terraform applies with) can create a Log Router sink in the scope's projects (gcloud could not mint an access token for them; run: gcloud auth application-default login)", proc.stdout)
+        proc = self._run(keys={"SCOPE_PROJECTS": "a-prod"}, curl_present=False)
+        self._assert_rc(proc, 0)
+        self.assertIn("can create a Log Router sink in the scope's projects (curl is not installed)", proc.stdout)
+        # The identity named is the one the provider would apply with.
+        proc = self._run(keys={"SCOPE_PROJECTS": "a-prod"}, probe={"a-prod": "denied"},
+                         env_extra={"GOOGLE_OAUTH_ACCESS_TOKEN": "from-env"})
+        self._assert_rc(proc, 1)
+        self.assertIn("the identity behind GOOGLE_OAUTH_ACCESS_TOKEN (the identity Terraform applies with) cannot create a Log Router sink in project 'a-prod'", proc.stdout)
+        self.assertIn("BEARER:from-env\n", proc.stderr)
+
+    def test_a_request_that_did_not_complete_stops_the_probing_and_names_the_rest(self):
+        # One endpoint answers for every project and each request that does
+        # not complete waits the full timeout, so a scope of many projects
+        # must not wait once per project: the rest are undecided unasked, in
+        # one warning, and a project among them that would have been denied
+        # is not a refusal (the apply speaks).
+        proc = self._run(keys={"SCOPE_PROJECTS": "a-prod b-prod c-prod d-prod"},
+                         probe={"a-prod": "granted", "b-prod": "down", "c-prod": "denied", "d-prod": "granted"})
+        self._assert_rc(proc, 0)
+        self.assertNotIn("ERROR", proc.stdout)
+        self.assertEqual(["RESOURCE:projects/a-prod:testIamPermissions", "RESOURCE:projects/b-prod:testIamPermissions"],
+                         self._probed(proc))
+        self.assertIn("in project 'b-prod' (the request to Resource Manager did not complete)", proc.stdout)
+        self.assertIn("WARN: The scope export preflight could not decide whether the Application Default Credentials (the identity Terraform applies with) can create a Log Router sink in c-prod d-prod (not asked: the answer above holds for every project); the apply will report it if it fails.", proc.stdout)
+        # The two 403s that are about the credentials, not the project, stop
+        # the probing the same way; a body that is not JSON is about that
+        # answer alone and does not.
+        for answer in ("scope-insufficient", "service-disabled"):
+            with self.subTest(answer=answer):
+                proc = self._run(keys={"SCOPE_PROJECTS": "a-prod b-prod"}, probe={"a-prod": answer, "b-prod": "denied"},
+                                 env_extra={"GOOGLE_OAUTH_ACCESS_TOKEN": "narrow"})
+                self._assert_rc(proc, 0)
+                self.assertEqual(1, len(self._probed(proc)))
+                self.assertIn("in b-prod (not asked: the answer above holds for every project)", proc.stdout)
+        proc = self._run(keys={"SCOPE_PROJECTS": "a-prod b-prod"}, probe={"a-prod": "garbage", "b-prod": "denied"})
+        self._assert_rc(proc, 1)
+        self.assertEqual(2, len(self._probed(proc)))
+
+    def test_an_entry_with_a_glob_character_is_probed_verbatim_not_as_the_files_it_matches(self):
+        # The plan refuses such an entry; the preflight must not turn it into
+        # a filename from the working directory first.
+        with tempfile.TemporaryDirectory() as cwd:
+            (pathlib.Path(cwd) / "a-prodzz").write_text("")
+            proc = self._run(keys={"SCOPE_PROJECTS": "a-prod* b-prod"}, probe={"a-prod*": "granted", "b-prod": "granted"}, cwd=cwd)
+        self._assert_rc(proc, 0)
+        self.assertEqual(["RESOURCE:projects/a-prod*:testIamPermissions", "RESOURCE:projects/b-prod:testIamPermissions"],
+                         self._probed(proc))
+
+    def test_a_denied_probe_is_an_answer_under_the_front_doors_strict_shell(self):
+        # upgrade.sh --plan calls the check bare under set -eE with an ERR
+        # trap; a denied or undecided answer must reach the warning rather
+        # than abort the run, and a clean run is silent.
+        proc = self._run(keys={"SCOPE_PROJECTS": "a-prod b-prod"}, mode="warn", strict=True,
+                         probe={"a-prod": "denied", "b-prod": "down"})
+        self._assert_rc(proc, 0)
+        self.assertNotIn("TRAP-FIRED", proc.stdout + proc.stderr)
+        self.assertIn("WARN: An applying run would be refused: the Application Default Credentials (the identity Terraform applies with) cannot create a Log Router sink in project 'a-prod'", proc.stdout)
+        self.assertIn("can create a Log Router sink in project 'b-prod'", proc.stdout)
+        proc = self._run(keys={"SCOPE_PROJECTS": "a-prod"}, strict=True, probe={"a-prod": "granted"})
+        self._assert_rc(proc, 0)
+        self.assertEqual("rc=0\n", proc.stdout)
+        # And no `set -f` leaks out of the probe loop or the set's derivation,
+        # on a clean run or one that stopped early.
+        for probe in ({"a-prod": "granted", "b-prod": "granted"}, {"a-prod": "down", "b-prod": "granted"}):
+            with self.subTest(probe=probe):
+                proc = self._run(keys={"SCOPE_PROJECTS": "a-prod b-prod", "SCOPE_EXCLUDE_PROJECTS": "*-sandbox"}, strict=True, probe=probe)
+                self._assert_rc(proc, 0)
+                self.assertNotIn("noglob-left-on", proc.stdout)
+
+
 class NextSlackGatewaySettingsRefusalTest(unittest.TestCase):
     """refuse_next_slack_gateway_settings (#2812). Under spec.mode next with
     Slack on and Google Chat off, the A2A gateway takes Slack

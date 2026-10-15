@@ -222,6 +222,11 @@ readonly SCOPE_FOLDER_SET_IAM_PERMISSION="resourcemanager.folders.setIamPolicy"
 readonly SCOPE_ORGANIZATION_SET_IAM_PERMISSION="resourcemanager.organizations.setIamPolicy"
 readonly SCOPE_CONTAINER_ASSET_SEARCH_PERMISSION="cloudasset.assets.searchAllResources"
 readonly SCOPE_CONTAINER_ASSET_SEARCH_ROLE="roles/cloudasset.viewer"
+# What check_scope_export_sink_access verifies before an apply that creates
+# a drift audit-log sink in each project the scope lists: the permission the
+# applying identity needs there, and the role that carries it.
+readonly SCOPE_SINK_CREATE_PERMISSION="logging.sinks.create"
+readonly SCOPE_SINK_CREATE_ROLE="roles/logging.configWriter"
 readonly SCOPE_SERVICE_USAGE_CONSTRAINTS="gcp.restrictServiceUsage serviceuser.services"
 readonly RESOURCE_MANAGER_API_URL="https://cloudresourcemanager.googleapis.com/v3"
 readonly SCOPE_PREFLIGHT_HTTP_TIMEOUT_SECONDS=20
@@ -245,6 +250,14 @@ readonly SCOPE_PROBE_NOT_A_PERMISSION_ANSWER_PATTERN="SERVICE_DISABLED|has not b
 # may well be held, so it is not a permission answer either, and the remedy
 # is the token's scope, not a grant.
 readonly SCOPE_PROBE_TOKEN_SCOPE_PATTERN="insufficient authentication scopes|ACCESS_TOKEN_SCOPE_INSUFFICIENT"
+# The undecided reasons a probe prints that hold for every resource it could
+# be asked about, not the one it was: the request never completed (one
+# endpoint answers every probe), the token lacks the scope, the API is off in
+# the credentials' quota project. A caller with many probes to make stops at
+# the first of these rather than repeat it once per resource.
+readonly SCOPE_PROBE_TRANSPORT_FAILURE_REASON="the request to Resource Manager did not complete"
+readonly SCOPE_PROBE_TOKEN_SCOPE_REASON="the token lacks the cloud-platform scope; mint it with that scope, as gcloud does"
+readonly SCOPE_PROBE_API_OFF_REASON="Resource Manager answered 403 for its API being off in the credentials' quota project, which the apply enables before it binds"
 # The APIs the plan-time resolution of a selector reads
 # (terraform/modules/kube-agents-scope-resolver), per selector kind, billed to
 # the management project, which the resolver sends as the quota project: a
@@ -2139,6 +2152,120 @@ scope_pool_lists_containers() {
   [[ "${SCOPE_FOLDERS:-}${SCOPE_ORGANIZATIONS:-}" == *[![:space:],]* ]]
 }
 
+# The projects beyond the host the apply creates a drift audit-log sink in,
+# one per line, sorted, once each, as the composition lists them at plan time
+# from the same keys (terraform/examples/full-install/main.tf,
+# drift_pubsub_source_projects): SCOPE_PROJECTS less PROJECT_ID, less a
+# project an exact SCOPE_EXCLUDE_PROJECTS entry names or a glob there matches
+# (the reconcile's fnmatch, whose * ? [seq] and [!seq] a bash case pattern
+# shares), less TF_VAR_drift_pubsub_source_exclude_projects. Nothing while the
+# drift ingress is off: ENABLE_DRIFT_DETECTOR, or, with that off,
+# TF_VAR_enable_drift_pubsub on its own, the two ways write_tfvars_from_state
+# lets it reach the apply. A Shared VPC host's or Metrics Scope's members are
+# resolved in the plan and are not here. Each list is read through
+# csv_list_items, the grammar the tfvars carry.
+scope_export_projects() {
+  is_truthy "${ENABLE_DRIFT_DETECTOR:-$DEFAULT_ENABLE_DRIFT_DETECTOR}" || is_truthy "${TF_VAR_enable_drift_pubsub:-}" || return 0
+  local project pattern excluded kept=() exclude_patterns=() lever_projects=()
+  while IFS= read -r pattern; do exclude_patterns+=("$pattern"); done < <(csv_list_items "${SCOPE_EXCLUDE_PROJECTS:-}")
+  while IFS= read -r pattern; do lever_projects+=("$pattern"); done < <(csv_list_items "${TF_VAR_drift_pubsub_source_exclude_projects:-}")
+  while IFS= read -r project; do
+    [ "$project" != "${PROJECT_ID:-}" ] || continue
+    excluded=false
+    for pattern in ${exclude_patterns[@]+"${exclude_patterns[@]}"}; do
+      # The entry is the pattern: an exact ID matches itself. A case pattern
+      # is never pathname-expanded, so no set -f is needed around it.
+      # shellcheck disable=SC2254
+      case "$project" in $pattern) excluded=true; break ;; esac
+    done
+    $excluded && continue
+    for pattern in ${lever_projects[@]+"${lever_projects[@]}"}; do
+      [ "$project" != "$pattern" ] || { excluded=true; break; }
+    done
+    $excluded && continue
+    kept+=("$project")
+  done < <(csv_list_items "${SCOPE_PROJECTS:-}")
+  [ "${#kept[@]}" -gt 0 ] || return 0
+  printf '%s\n' "${kept[@]}" | sort -u
+}
+
+# Preflight for the drift audit-log sinks the apply creates in the scope's
+# other projects (the drift-pubsub module's source_projects), before the apply
+# that would create them. For each project scope_export_projects lists, this
+# asks Resource Manager whether the identity Terraform applies with holds
+# logging.sinks.create there, through the same probe and the same credentials
+# check_scope_container_access uses for a container's setIamPolicy, and
+# refuses the apply with every project that lacks it named: a sink that
+# cannot be created fails the apply at that project, after the host's
+# resources and the other projects' sinks have changed (the module's README,
+# "Exporting the scope's other projects"). It asks whether or not the sink
+# exists already, as the container preflight asks for setIamPolicy over
+# bindings already made: an upgrade by an identity narrower than the one
+# that installed is refused, and the role is the way through, since that
+# identity could not change or remove the sink either. The project's number
+# read and its Logging service agent's mint are left to the apply, as the
+# container preflight leaves serviceusage.services.enable. A probe that
+# cannot decide warns and lets the apply speak; one whose answer holds for
+# every project (the request did not complete, the token lacks the scope,
+# the API is off in the quota project) stops the probing, since each further
+# request would repeat it, or wait the full timeout to, and the projects not
+# asked are named in one warning. An install that lists no such
+# project returns silently and asks nothing. $1 "warn" turns the refusal into
+# a warning, on the routes the container preflight warns on.
+# Caller defines print_error / print_info / print_warning.
+check_scope_export_sink_access() {
+  local mode="${1:-$SCOPE_CHECK_MODE_REFUSE}"
+  local projects entry token="" failures=() undecided=() unasked=() stop=false rc identity properties reason had_noglob=false
+  projects="$(scope_export_projects)"
+  [ -n "$projects" ] || return 0
+  identity="$(_scope_terraform_identity_label)"
+  if ! command -v curl >/dev/null 2>&1; then
+    undecided+=("whether ${identity} can create a Log Router sink in the scope's projects (curl is not installed)")
+  elif properties="$(_scope_gcloud_auth_properties_in_the_way)" && [ -n "$properties" ]; then
+    undecided+=("whether ${identity} can create a Log Router sink in the scope's projects (gcloud's active configuration sets ${properties}, which its token mint honours and Terraform does not; run: gcloud config unset <property>, or set GOOGLE_IMPERSONATE_SERVICE_ACCOUNT to apply as that account)")
+  elif ! token="$(_scope_terraform_access_token)" || [ -z "$token" ]; then
+    undecided+=("whether ${identity} can create a Log Router sink in the scope's projects ($(_scope_terraform_token_remedy))")
+  else
+    # Each probe is called in a `||` list: a denied answer is an answer, not
+    # an error, under the front doors' ERR trap. Globbing off around the
+    # unquoted split, as the container preflight has it: an entry carrying a
+    # glob character would otherwise be replaced by the files it matches.
+    case "$-" in *f*) had_noglob=true ;; esac
+    set -f
+    for entry in $projects; do
+      if $stop; then
+        unasked+=("$entry")
+        continue
+      fi
+      rc=0
+      reason="$(_scope_container_can_set_iam "projects/${entry}" "$SCOPE_SINK_CREATE_PERMISSION" "$token")" || rc=$?
+      if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
+        failures+=("${identity} cannot create a Log Router sink in project '${entry}' (${SCOPE_SINK_CREATE_PERMISSION}), or the project is not visible to it; an apply that creates the project's drift audit-log sink would fail there, after the host's resources and the other projects' sinks have changed. Ask for ${SCOPE_SINK_CREATE_ROLE} in project '${entry}' for that identity. A project that is to have no sink is added to TF_VAR_drift_pubsub_source_exclude_projects in install.env (it stays in the scope) or dropped from SCOPE_PROJECTS; removing a sink it already has needs the same role.")
+      elif [ "$rc" -ne "$SCOPE_PROBE_GRANTED" ]; then
+        undecided+=("whether ${identity} can create a Log Router sink in project '${entry}'${reason:+ ($reason)}")
+        case "$reason" in
+          "$SCOPE_PROBE_TRANSPORT_FAILURE_REASON" | "$SCOPE_PROBE_TOKEN_SCOPE_REASON" | "$SCOPE_PROBE_API_OFF_REASON") stop=true ;;
+        esac
+      fi
+    done
+    $had_noglob || set +f
+    if [ "${#unasked[@]}" -gt 0 ]; then
+      undecided+=("whether ${identity} can create a Log Router sink in ${unasked[*]} (not asked: the answer above holds for every project)")
+    fi
+  fi
+  for entry in ${undecided[@]+"${undecided[@]}"}; do
+    print_warning "The scope export preflight could not decide ${entry}; the apply will report it if it fails."
+  done
+  [ "${#failures[@]}" -eq 0 ] && return 0
+  if [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ]; then
+    for entry in "${failures[@]}"; do print_warning "An applying run would be refused: ${entry}"; done
+    return 0
+  fi
+  for entry in "${failures[@]}"; do print_error "Refusing to apply: ${entry}"; done
+  print_info "Nothing was changed. Fix what is named above, or edit SCOPE_PROJECTS, SCOPE_EXCLUDE_PROJECTS or TF_VAR_drift_pubsub_source_exclude_projects in install.env, and re-run."
+  return 1
+}
+
 # Prints, space-separated, the APIs the plan reads for the selectors the
 # environment declares (SCOPE_METRICS_SCOPE_APIS for SCOPE_METRICS_SCOPES,
 # SCOPE_SHARED_VPC_HOST_APIS for SCOPE_SHARED_VPC_HOSTS, SCOPE_ASSET_API for
@@ -2456,11 +2583,13 @@ sys.exit(not_denied)
 }
 
 # Asks Resource Manager whether the token's identity holds one permission on a
-# container, through testIamPermissions, which never mutates and answers for
-# the caller alone. $1 folders/<id> or organizations/<id>; $2 the permission;
-# $3 the access token. Returns SCOPE_PROBE_GRANTED, _DENIED (a 200 without the
-# permission, a 404, or a 403 that is a permission answer: a container the
-# caller cannot see cannot be bound) or _UNDECIDED (transport failure, a 403
+# resource, through testIamPermissions, which never mutates and answers for
+# the caller alone. $1 folders/<id>, organizations/<id> or projects/<id>; $2
+# the permission (any the resource carries, not only an IAM one: the sink
+# preflight asks a project for logging.sinks.create); $3 the access token.
+# Returns SCOPE_PROBE_GRANTED, _DENIED (a 200 without the permission, a 404,
+# or a 403 that is a permission answer: a resource the caller cannot see
+# cannot be bound or written to) or _UNDECIDED (transport failure, a 403
 # for the API being off in the quota project or for a token minted without
 # the cloud-platform scope, any other status, an unreadable body), printing
 # for an undecided answer the reason, which the caller's warning carries so
@@ -2470,11 +2599,14 @@ _scope_container_can_set_iam() {
   # The bearer token goes to curl on its stdin (-H @-), never argv, where any
   # local user could read it from the process table for the request's
   # duration, and never a file, which an interrupted run would leave behind.
-  if ! response="$(trap - ERR; printf 'Authorization: Bearer %s\n' "$token" | curl -sS --max-time "$SCOPE_PREFLIGHT_HTTP_TIMEOUT_SECONDS" -X POST \
+  # -g: curl's own URL globbing off, so a resource name carrying [ or { (a
+  # mistyped project ID) is sent as is and answered, rather than refused by
+  # curl before any request, which would read as the endpoint being down.
+  if ! response="$(trap - ERR; printf 'Authorization: Bearer %s\n' "$token" | curl -sSg --max-time "$SCOPE_PREFLIGHT_HTTP_TIMEOUT_SECONDS" -X POST \
     -H @- -H "Content-Type: application/json" \
     -d "{\"permissions\":[\"${permission}\"]}" \
     -w $'\n%{http_code}' "${RESOURCE_MANAGER_API_URL}/${resource}:testIamPermissions" 2>/dev/null)"; then
-    printf 'the request to Resource Manager did not complete'
+    printf '%s' "$SCOPE_PROBE_TRANSPORT_FAILURE_REASON"
     return "$SCOPE_PROBE_UNDECIDED"
   fi
   status="${response##*$'\n'}"
@@ -2500,11 +2632,11 @@ sys.exit(granted if sys.argv[1] in held else denied)
       # and the Resource Manager API being off in the credential's quota
       # project (the apply enables that API before it binds).
       if printf '%s' "$body" | grep -qE "$SCOPE_PROBE_TOKEN_SCOPE_PATTERN"; then
-        printf 'the token lacks the cloud-platform scope; mint it with that scope, as gcloud does'
+        printf '%s' "$SCOPE_PROBE_TOKEN_SCOPE_REASON"
         return "$SCOPE_PROBE_UNDECIDED"
       fi
       if printf '%s' "$body" | grep -qE "$SCOPE_PROBE_NOT_A_PERMISSION_ANSWER_PATTERN"; then
-        printf 'Resource Manager answered 403 for its API being off in the credentials'"'"' quota project, which the apply enables before it binds'
+        printf '%s' "$SCOPE_PROBE_API_OFF_REASON"
         return "$SCOPE_PROBE_UNDECIDED"
       fi
       return "$SCOPE_PROBE_DENIED" ;;

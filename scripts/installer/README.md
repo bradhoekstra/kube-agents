@@ -407,7 +407,21 @@ with nothing changed, `upgrade.sh --plan` included. The pool's listing of a cont
 the exception that check probes too, while the pool is armed, because `install.sh` enables the
 Asset API before that plan and a listing refused there would leave it enabled. The bindings themselves are the explicit
 projects' case: a resolved project the applying identity cannot set IAM policy in fails inside the
-apply, as a `SCOPE_PROJECTS` entry does, and no preflight probes either. What the selectors do not have is a container's
+apply, as a `SCOPE_PROJECTS` entry does, and no preflight probes either. The drift audit-log sink the
+same apply creates in each `SCOPE_PROJECTS` entry is probed, by `check_scope_export_sink_access`
+beside the container preflight and as the same identity: for each entry less the host, less an
+exact or glob `SCOPE_EXCLUDE_PROJECTS` match and less `TF_VAR_drift_pubsub_source_exclude_projects`,
+while the drift ingress is on (`ENABLE_DRIFT_DETECTOR`, or `TF_VAR_enable_drift_pubsub` on its own), it
+asks the project whether the identity holds `logging.sinks.create`, and
+refuses the apply naming every project that lacks it, the role that grants it
+(`roles/logging.configWriter`) and the exclusion lever, because a sink that cannot be created fails
+the apply at that project after the host's resources and the other projects' sinks have changed. It
+warns on the routes the container preflight warns on. It asks whether or not the sink exists, as
+the container preflight asks for `setIamPolicy` over bindings already made, so an upgrade by an
+identity narrower than the one that installed is refused and the role is the way through. A
+selector's members are resolved in the
+plan and are not probed; the project's number read and its Logging service agent's mint are left
+to the apply. What the selectors do not have is a container's
 zero-touch onboarding: a service project attached, or a project added to the scope, after the last
 full upgrade reads `denied` in the reconcile's snapshot until the next one binds it. An exclude
 entry that names a Shared VPC service project by ID, or a monitored project by its project number,
