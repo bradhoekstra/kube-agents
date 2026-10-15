@@ -178,8 +178,6 @@ func TestTheA2AGatewayFenceMirrorsTheBrokersCollectorRule(t *testing.T) {
 	}
 }
 
-// TestRenderedA2AGatewayIngressMatchesTheConformanceFixture keeps the fixture
-// the conformance suite reads equal to what the operator renders.
 // a2aFixtureOperatorNamespace is the operator namespace the conformance
 // fixture is rendered with: the install's default, so the fixture reads as a
 // real render, and the string the conformance suite pins the second peer to.
@@ -215,6 +213,8 @@ func TestTheA2AFencesAdmitTheOperatorOnTheMetricsPortAlone(t *testing.T) {
 	}
 }
 
+// TestRenderedA2AGatewayIngressMatchesTheConformanceFixture keeps the fixture
+// the conformance suite reads equal to what the operator renders.
 func TestRenderedA2AGatewayIngressMatchesTheConformanceFixture(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "true")
 	t.Setenv(a2aAgentDoorEnvVar, "true")

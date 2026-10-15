@@ -295,8 +295,6 @@ func TestTaskTerminalLabelsAreClosed(t *testing.T) {
 	none.gchatPull(gchatPullEvents)
 }
 
-// TestGchatPullsAreCountedByOutcome: events, then empty pulls, then refused
-// ones, each read off the counter where the summary line counts them.
 // metricsInboundCount reads one inbound-messages series.
 func metricsInboundCount(t *testing.T, m *Metrics, platform string) float64 {
 	t.Helper()
@@ -323,6 +321,33 @@ func TestInboundMessagesAreCountedByPlatform(t *testing.T) {
 	}
 }
 
+// The body carries the process start time the operator's poller reads to tell
+// an in-place restart from a counter that fell: one series, the process's own
+// clock at construction, never re-derived.
+func TestTheBodyCarriesTheProcessStartTime(t *testing.T) {
+	before := float64(time.Now().UnixNano()) / float64(time.Second)
+	m := NewMetrics()
+	after := float64(time.Now().UnixNano()) / float64(time.Second)
+	var out dto.Metric
+	if err := m.processStart.Write(&out); err != nil {
+		t.Fatal(err)
+	}
+	got := out.GetGauge().GetValue()
+	if got < before || got > after {
+		t.Fatalf("process_start_time_seconds = %v, want within [%v, %v]", got, before, after)
+	}
+	if n := seriesCount(t, m, "process_start_time_seconds"); n != 1 {
+		t.Fatalf("the registry serves %d process_start_time_seconds series, want 1", n)
+	}
+	time.Sleep(10 * time.Millisecond)
+	if err := m.processStart.Write(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out.GetGauge().GetValue() != got {
+		t.Fatal("the start time moved under an unchanged process")
+	}
+}
+
 // The platform label is a closed list: each chat backend maps to its name,
 // the doors are not counted at all, and an unknown backend lands under other.
 func TestInboundPlatformLabelsAreClosed(t *testing.T) {
@@ -339,6 +364,8 @@ func TestInboundPlatformLabelsAreClosed(t *testing.T) {
 	}
 }
 
+// TestGchatPullsAreCountedByOutcome: events, then empty pulls, then refused
+// ones, each read off the counter where the summary line counts them.
 func TestGchatPullsAreCountedByOutcome(t *testing.T) {
 	turn := gchatMsg("spaces/D1", "DIRECT_MESSAGE", "", "", "spaces/D1/messages/M1", "hi", "", "u1@example.com", "HUMAN")
 	f := &gchatLegibilityRelay{

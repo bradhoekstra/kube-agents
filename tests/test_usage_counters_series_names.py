@@ -1,9 +1,9 @@
-"""The series the usage counters poller reads are the ones the three listeners export.
+"""The series the usage counters poller reads are the ones the four listeners export.
 
 The operator sums the credential broker's tool-invocation counter over its
 success and error outcomes (the commands it ran and the requests it rejected or
 failed on before running) and the event watcher's injected-event counter, and
-reads process_start_time_seconds from all three, and counts the watcher's per-cluster
+reads process_start_time_seconds from all four, and counts the watcher's per-cluster
 up gauge into the two cluster gauges, and sums the broker's version-control
 counter under one verb and status into remediationsProposedTotal, and its
 merged-proposals counter whole into remediationsMergedTotal, and the chat plugin's inbound-message
@@ -108,6 +108,7 @@ class UsageCountersSeriesNamesTest(unittest.TestCase):
         self.assertEqual(name, _py_const("PROCESS_START_TIME_METRIC"))
         self.assertEqual(name, _go_const(_WATCHER_METRICS_GO, "processStartTimeMetric"))
         self.assertEqual(name, _py_const("PROCESS_START_TIME_METRIC", _CHAT_METRICS_PY))
+        self.assertEqual(name, _go_const(_A2A_METRICS_GO, "processStartTimeName"))
 
     def test_the_counted_outcomes_are_the_brokers_success_and_error(self):
         source = _SCRAPE_GO.read_text()

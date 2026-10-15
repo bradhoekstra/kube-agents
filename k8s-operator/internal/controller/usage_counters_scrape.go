@@ -158,10 +158,6 @@ func usageSeriesFor(counter string) (family string, filter usageLabelFilter) {
 	}
 }
 
-// usageReading is what one scrape yields: each wanted counter summed over its
-// label sets, the start time the body carried, nil when it carried none, and,
-// for the watcher's body alone, its cluster gauges; nil for any other body, so
-// that a poll can tell a watcher reporting no clusters from no watcher read.
 // usageSiblingFamiliesFor is the other families a counter is read from, on
 // pods whose body carries one of them in place of the family usageSeriesFor
 // names: the chat counter comes from the chat_metrics plugin on a gateway pod
@@ -173,6 +169,10 @@ func usageSiblingFamiliesFor(counter string) []string {
 	return nil
 }
 
+// usageReading is what one scrape yields: each wanted counter summed over its
+// label sets, the start time the body carried, nil when it carried none, and,
+// for the watcher's body alone, its cluster gauges; nil for any other body, so
+// that a poll can tell a watcher reporting no clusters from no watcher read.
 type usageReading struct {
 	Samples   map[string]int64
 	StartTime *float64

@@ -45,6 +45,13 @@ const (
 	// chatMessagesInboundTotal, which the chat_metrics plugin counts for the
 	// Hermes-side ingress (docs/designs/usage-counters-producer.md).
 	messagesInboundName = "messages_inbound_total"
+	// processStartTimeName is the gauge the operator's usage poller reads to
+	// tell a gateway that restarted in place from a counter that fell for
+	// another reason: the Go process collector's name, but captured once at
+	// start and never re-derived, as the broker, the event watcher and the
+	// chat_metrics plugin serve it (docs/designs/usage-counters-producer.md,
+	// "Resets"). Unprefixed: it is the process's, not the gateway's.
+	processStartTimeName = "process_start_time_seconds"
 
 	// The label names. Every value under them comes from a closed list
 	// below, never from a task, a conversation or an executor's text, so
@@ -150,6 +157,9 @@ type Metrics struct {
 	chatMessages        *prometheus.CounterVec
 	notifyMarksDropped  prometheus.Counter
 	messagesInbound     *prometheus.CounterVec
+	// processStart is processStartTimeName, set once in NewMetrics and constant
+	// for the life of the process by construction.
+	processStart prometheus.Gauge
 }
 
 // NewMetrics builds the counters on a fresh registry.
@@ -192,8 +202,13 @@ func NewMetrics() *Metrics {
 			Name:      messagesInboundName,
 			Help:      "Chat messages the gateway accepted as turns, by platform (googlechat, slack, discord, console, other), counted before the sender is verified; a door's turns are not chat and are not counted.",
 		}, []string{labelPlatform}),
+		processStart: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: processStartTimeName,
+			Help: "Start time of the process since unix epoch in seconds, captured once at start.",
+		}),
 	}
-	m.registry.MustRegister(m.taskTerminals, m.gchatEventsReceived, m.gchatPulls, m.chatMessages, m.notifyMarksDropped, m.messagesInbound)
+	m.processStart.Set(float64(time.Now().UnixNano()) / float64(time.Second))
+	m.registry.MustRegister(m.taskTerminals, m.gchatEventsReceived, m.gchatPulls, m.chatMessages, m.notifyMarksDropped, m.messagesInbound, m.processStart)
 	for _, outcome := range metricsChatOutcomes {
 		m.chatMessages.WithLabelValues(outcome)
 	}
@@ -258,7 +273,6 @@ func (m *Metrics) notifyMarkDropped() {
 	m.notifyMarksDropped.Inc()
 }
 
-// metricsTerminalStateLabel is state if the closed list has it, else other.
 // messageInbound counts one accepted chat message under its platform.
 func (m *Metrics) messageInbound(platform string) {
 	if m == nil {
@@ -282,6 +296,7 @@ func metricsPlatformLabel(backend string) (string, bool) {
 	return metricsLabelOther, true
 }
 
+// metricsTerminalStateLabel is state if the closed list has it, else other.
 func metricsTerminalStateLabel(state lib.TaskState) string {
 	for _, known := range metricsTerminalStates {
 		if state == known {

@@ -260,9 +260,6 @@ func TestPodUsageSource_CountsTheBrokersProposals(t *testing.T) {
 	}
 }
 
-// The gateway's chat listener serves one family, summed over its platform
-// label, and no cluster gauge: the chat body is the platform-agent container's,
-// not the watcher's.
 // The A2A gateway's body carries the chat counter under its own family name:
 // the fold names it as the chat counter's sibling and sums it the same way,
 // and a body carrying neither family yields zero, not a failure.
@@ -296,6 +293,9 @@ func TestPodUsageSource_ReadsTheA2AGatewaysInboundFamilyAsTheChatCounter(t *test
 	}
 }
 
+// The gateway's chat listener serves one family, summed over its platform
+// label, and no cluster gauge: the chat body is the platform-agent container's,
+// not the watcher's.
 func TestPodUsageSource_SumsTheChatListenerOverPlatforms(t *testing.T) {
 	body := strings.Join([]string{
 		"# TYPE kubeagents_chat_messages_inbound_total counter",
