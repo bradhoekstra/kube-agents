@@ -111,6 +111,9 @@ def run_collect(*then: str, **stub_env: str) -> tuple[subprocess.CompletedProces
         TARGET_NAMESPACE="test-ns",
         **stub_env,
     )
+    if "AGENT_CLUSTER_CONTEXT" not in stub_env:
+        # A pin in the caller's environment would leak into every case.
+        env.pop("AGENT_CLUSTER_CONTEXT", None)
     proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=False, env=env)
     return proc, artifacts
 
