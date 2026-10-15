@@ -231,6 +231,10 @@ readonly SCOPE_CONTAINER_ASSET_SEARCH_ROLE="roles/cloudasset.viewer"
 # applying identity needs there, and the role that carries it.
 readonly SCOPE_SINK_CREATE_PERMISSION="logging.sinks.create"
 readonly SCOPE_SINK_CREATE_ROLE="roles/logging.configWriter"
+# And, for a sink the state already holds, what the plan's read of it needs
+# and the role that carries that alone.
+readonly SCOPE_SINK_GET_PERMISSION="logging.sinks.get"
+readonly SCOPE_SINK_READ_ROLE="roles/logging.viewer"
 readonly SCOPE_SERVICE_USAGE_CONSTRAINTS="gcp.restrictServiceUsage serviceuser.services"
 readonly RESOURCE_MANAGER_API_URL="https://cloudresourcemanager.googleapis.com/v3"
 readonly SCOPE_PREFLIGHT_HTTP_TIMEOUT_SECONDS=20
@@ -2207,15 +2211,19 @@ scope_export_projects() {
 # "Exporting the scope's other projects"). A project the identity is denied
 # in whose sink this install's Terraform state already holds
 # (tf_state_has_source_sink, read once and only on a denial) is warned
-# about, not refused: an apply that leaves the sink as it is refreshes it
-# with logging.sinks.get and goes ahead, which is how an install made by an
-# owner is upgraded by a narrower Day-2 identity; one that changes the sink
-# (its filter, which a release can move), recreates or removes it would fail
-# there, since the roles that lack create lack update and delete too, and
-# the warning says so and names upgrade.sh --plan as the way to tell which
-# this apply is. A state that cannot be read, or holds no such sink, or
-# holds it tainted or deposed (the next apply replaces or deletes it),
-# refuses as for a first apply. The
+# about, not refused, when the identity can read it (logging.sinks.get,
+# asked second): an apply that leaves the sink as it is refreshes it with
+# that read and goes ahead, which is how an install made by an owner is
+# upgraded by a narrower Day-2 identity; one that changes the sink (its
+# filter, which a release can move), recreates or removes it would fail
+# there, since the roles that lack create lack update and delete too. The
+# warning says so per route: under "warn" the plan that follows shows which
+# this apply is; on an applying route the run goes ahead without a further
+# prompt, and the way to see first is to stop and run upgrade.sh --plan. An
+# identity that cannot read the sink either, or cannot see the project, is
+# refused, since the plan's read of the sink fails. A state that cannot be
+# read, or holds no such sink, or holds it tainted or deposed (the next
+# apply replaces or deletes it), refuses as for a first apply. The
 # project's number read and its Logging service agent's mint are left to
 # the apply, as the container preflight leaves serviceusage.services.enable.
 # A probe that cannot decide warns and lets the apply speak; one whose
@@ -2262,7 +2270,21 @@ check_scope_export_sink_access() {
           state_read=true
         fi
         if tf_state_has_source_sink "$state" "$entry"; then
-          existing+=("${identity} cannot create a Log Router sink in project '${entry}' (${SCOPE_SINK_CREATE_PERMISSION}), or the project is not visible to it, and this install's drift audit-log sink there is already in its Terraform state: an apply that leaves the sink as it is goes ahead (it reads the sink, which needs logging.sinks.get), and one that changes it, which a release that moves the sink filter does, recreates it or removes it would fail there, after the host's resources and the other projects' sinks have changed. Run upgrade.sh --plan to see which this apply is, and ask for ${SCOPE_SINK_CREATE_ROLE} in project '${entry}' for that identity before one that changes it.")
+          # The sink is there to be left alone only if this identity can read
+          # it: the plan refreshes it, and a 403 or 404 above may mean the
+          # project itself is not visible.
+          rc=0
+          reason="$(_scope_container_can_set_iam "projects/${entry}" "$SCOPE_SINK_GET_PERMISSION" "$token")" || rc=$?
+          if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
+            failures+=("${identity} cannot read this install's drift audit-log sink in project '${entry}' (${SCOPE_SINK_GET_PERMISSION}), or the project is not visible to it, and cannot create one (${SCOPE_SINK_CREATE_PERMISSION}); the plan reads the sink and would fail there, or the apply would at that project's read, after the host's resources and the other projects' sinks have changed. Ask for ${SCOPE_SINK_CREATE_ROLE} in project '${entry}' for that identity, or ${SCOPE_SINK_READ_ROLE} there for an apply that leaves the sink as it is.")
+          else
+            [ "$rc" -eq "$SCOPE_PROBE_GRANTED" ] || undecided+=("whether ${identity} can read this install's drift audit-log sink in project '${entry}'${reason:+ ($reason)}")
+            if [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ]; then
+              existing+=("${identity} cannot create a Log Router sink in project '${entry}' (${SCOPE_SINK_CREATE_PERMISSION}), and this install's drift audit-log sink there is already in its Terraform state: an apply that leaves the sink as it is goes ahead, and one that changes it, which a release that moves the sink filter does, recreates it or removes it would fail there, after the host's resources and the other projects' sinks have changed. The plan below shows which this apply is; ask for ${SCOPE_SINK_CREATE_ROLE} in project '${entry}' for that identity before one that changes it.")
+            else
+              existing+=("${identity} cannot create a Log Router sink in project '${entry}' (${SCOPE_SINK_CREATE_PERMISSION}), and this install's drift audit-log sink there is already in its Terraform state: an apply that leaves the sink as it is goes ahead, and one that changes it, which a release that moves the sink filter does, recreates it or removes it would fail there, after the host's resources and the other projects' sinks have changed. This run applies without a further prompt; to see which this apply is first, stop it and run upgrade.sh --plan, and ask for ${SCOPE_SINK_CREATE_ROLE} in project '${entry}' for that identity before one that changes it.")
+            fi
+          fi
         else
           failures+=("${identity} cannot create a Log Router sink in project '${entry}' (${SCOPE_SINK_CREATE_PERMISSION}), or the project is not visible to it; an apply that creates the project's drift audit-log sink would fail there, after the host's resources and the other projects' sinks have changed. Ask for ${SCOPE_SINK_CREATE_ROLE} in project '${entry}' for that identity. A project that is to have no sink is added to TF_VAR_drift_pubsub_source_exclude_projects in install.env (it stays in the scope) or dropped from SCOPE_PROJECTS; removing a sink it already has needs the same role.")
         fi

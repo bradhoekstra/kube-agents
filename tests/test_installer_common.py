@@ -4679,11 +4679,14 @@ class ScopeExportSinkPreflightTest(unittest.TestCase):
     the apply speak; "warn" turns the refusal into a warning."""
 
     def _run(self, keys=None, mode="", probe=None, token=True, curl_present=True, strict=False, env_extra=None, cwd=None,
-             state=None, state_unreadable=False):
+             state=None, state_unreadable=False, get_probe=None):
         """probe: a dict from project ID to what curl answers for
         projects/<id>:testIamPermissions: "granted", "denied", "forbidden",
         "service-disabled", "scope-insufficient", "unauthenticated",
-        "missing", "garbage", "down". cwd: where the check runs (the
+        "missing", "garbage", "down". get_probe: the same, answered only to a
+        request for logging.sinks.get on that project ("granted" or
+        "denied"); a project absent from it answers from probe, whose granted
+        body holds sinks.create alone. cwd: where the check runs (the
         repository root unless a case plants files to be globbed). state: the
         Terraform state document `gcloud storage cat` answers with; None is
         no state object, and state_unreadable a 5xx. The stubs record
@@ -4691,6 +4694,7 @@ class ScopeExportSinkPreflightTest(unittest.TestCase):
         curl read from its stdin, every permission it was asked
         (PROBED:<permission>) and every resource (RESOURCE:<path>)."""
         probe = probe or {}
+        get_probe = get_probe or {}
         with tempfile.TemporaryDirectory() as tmp:
             bin_dir = pathlib.Path(tmp) / "bin"
             bin_dir.mkdir()
@@ -4713,6 +4717,12 @@ class ScopeExportSinkPreflightTest(unittest.TestCase):
             )
             if curl_present:
                 cases = []
+                # The request body (-d) precedes the URL on curl's argv, so a
+                # get case matches the permission then the project, and sits
+                # before the project-only cases.
+                for project, answer in get_probe.items():
+                    body = {"granted": '{"permissions":["logging.sinks.get"]}', "denied": "{}"}[answer]
+                    cases.append(f"  *\"logging.sinks.get\"*\"/projects/{project}:testIamPermissions\"*) printf '%s\\n%s' '{body}' 200; exit 0 ;;")
                 for project, answer in probe.items():
                     body, status = {
                         "granted": ('{"permissions":["logging.sinks.create"]}', 200),
@@ -4893,10 +4903,22 @@ class ScopeExportSinkPreflightTest(unittest.TestCase):
         host_sink = {"module": "module.drift_pubsub[0]", "mode": "managed", "type": "google_logging_project_sink",
                      "name": "drift_audit", "instances": [{"attributes": {"id": "projects/test-project/sinks/s"}}]}
         proc = self._run(keys={"SCOPE_PROJECTS": "a-prod b-prod"}, probe={"a-prod": "denied", "b-prod": "granted"},
-                         state=_state_doc([host_sink, source_sink]))
+                         get_probe={"a-prod": "granted"}, state=_state_doc([host_sink, source_sink]))
         self._assert_rc(proc, 0)
         self.assertNotIn("ERROR", proc.stdout)
-        self.assertIn("WARN: An apply that changes an existing sink would fail: the Application Default Credentials (the identity Terraform applies with) cannot create a Log Router sink in project 'a-prod' (logging.sinks.create), or the project is not visible to it, and this install's drift audit-log sink there is already in its Terraform state: an apply that leaves the sink as it is goes ahead (it reads the sink, which needs logging.sinks.get), and one that changes it, which a release that moves the sink filter does, recreates it or removes it would fail there, after the host's resources and the other projects' sinks have changed. Run upgrade.sh --plan to see which this apply is, and ask for roles/logging.configWriter in project 'a-prod' for that identity before one that changes it.", proc.stdout)
+        self.assertIn("WARN: An apply that changes an existing sink would fail: the Application Default Credentials (the identity Terraform applies with) cannot create a Log Router sink in project 'a-prod' (logging.sinks.create), and this install's drift audit-log sink there is already in its Terraform state: an apply that leaves the sink as it is goes ahead, and one that changes it, which a release that moves the sink filter does, recreates it or removes it would fail there, after the host's resources and the other projects' sinks have changed. This run applies without a further prompt; to see which this apply is first, stop it and run upgrade.sh --plan, and ask for roles/logging.configWriter in project 'a-prod' for that identity before one that changes it.", proc.stdout)
+        # The sink's read was asked second, once, for the denied project alone.
+        self.assertEqual(["PROBED:logging.sinks.create", "PROBED:logging.sinks.get", "PROBED:logging.sinks.create"],
+                         [line for line in proc.stderr.splitlines() if line.startswith("PROBED:")])
+        # An identity that cannot read the sink either, or cannot see the
+        # project, is refused: the plan's read of the sink fails.
+        for answer in ("denied", "forbidden", "missing"):
+            with self.subTest(answer=answer):
+                proc = self._run(keys={"SCOPE_PROJECTS": "a-prod"}, probe={"a-prod": answer},
+                                 get_probe={} if answer != "denied" else {"a-prod": "denied"}, state=_state_doc([source_sink]))
+                self._assert_rc(proc, 1)
+                self.assertIn("ERROR: Refusing to apply: the Application Default Credentials (the identity Terraform applies with) cannot read this install's drift audit-log sink in project 'a-prod' (logging.sinks.get), or the project is not visible to it, and cannot create one (logging.sinks.create); the plan reads the sink and would fail there", proc.stdout)
+                self.assertIn("or roles/logging.viewer there for an apply that leaves the sink as it is.", proc.stdout)
         # Without that project's live instance the refusal stands: the host's
         # sink alone, another project's instance, no instance, a tainted
         # instance (the next apply replaces it), a deposed one (the next
@@ -4915,9 +4937,10 @@ class ScopeExportSinkPreflightTest(unittest.TestCase):
                               ("no state", {}),
                               ("unreadable state", {"state_unreadable": True})):
             with self.subTest(label=label):
-                proc = self._run(keys={"SCOPE_PROJECTS": "a-prod"}, probe={"a-prod": "denied"}, **kwargs)
+                proc = self._run(keys={"SCOPE_PROJECTS": "a-prod"}, probe={"a-prod": "denied"}, get_probe={"a-prod": "granted"}, **kwargs)
                 self._assert_rc(proc, 1)
                 self.assertIn("ERROR: Refusing to apply: the Application Default Credentials (the identity Terraform applies with) cannot create a Log Router sink in project 'a-prod'", proc.stdout)
+                self.assertNotIn("PROBED:logging.sinks.get", proc.stderr)
         # The state is read once, and only on a denial.
         proc = self._run(keys={"SCOPE_PROJECTS": "a-prod b-prod"}, probe={"a-prod": "granted", "b-prod": "granted"},
                          state_unreadable=True)
@@ -4927,11 +4950,14 @@ class ScopeExportSinkPreflightTest(unittest.TestCase):
         proc = self._run(keys={"SCOPE_PROJECTS": "a-prod b-prod"}, probe={"a-prod": "denied", "b-prod": "denied"},
                          state_unreadable=True)
         self.assertEqual(1, proc.stderr.count("Could not read the Terraform state"), proc.stderr)
-        # Warn mode: the existing-sink warning reads the same.
+        # Warn mode (upgrade.sh --plan): the plan that follows is the answer,
+        # so the warning points at it rather than at running --plan.
         proc = self._run(keys={"SCOPE_PROJECTS": "a-prod"}, mode="warn", probe={"a-prod": "denied"},
-                         state=_state_doc([source_sink]))
+                         get_probe={"a-prod": "granted"}, state=_state_doc([source_sink]))
         self._assert_rc(proc, 0)
         self.assertIn("WARN: An apply that changes an existing sink would fail:", proc.stdout)
+        self.assertIn("The plan below shows which this apply is; ask for roles/logging.configWriter in project 'a-prod'", proc.stdout)
+        self.assertNotIn("run upgrade.sh --plan", proc.stdout)
         self.assertNotIn("would be refused", proc.stdout)
 
     def test_an_entry_with_a_glob_character_is_probed_verbatim_not_as_the_files_it_matches(self):

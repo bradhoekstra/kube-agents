@@ -418,12 +418,14 @@ refuses the apply naming every project that lacks it, the role that grants it
 the apply at that project after the host's resources and the other projects' sinks have changed. It
 warns on the routes the container preflight warns on. A denied project whose sink the install's
 Terraform state already holds, live rather than tainted or deposed, is warned about rather than
-refused, because an apply that leaves the sink as it is needs only `logging.sinks.get`: that is how
-an install made by an owner is upgraded by a narrower Day-2 identity. An apply that changes the
-sink (a release that moves its filter), recreates it or removes it fails there all the same, since
-the roles that lack `logging.sinks.create` lack update and delete too, so the warning names
-`upgrade.sh --plan` as the way to tell which this apply is and the role to ask for before one that
-changes it. The state is read once, and only on a denial. A
+refused when the identity can read it (`logging.sinks.get`, asked second), because an apply that
+leaves the sink as it is needs only that read: that is how an install made by an owner is upgraded
+by a narrower Day-2 identity; one that cannot read it either is refused, since the plan's read
+fails. An apply that changes the sink (a release that moves its filter), recreates it or removes
+it fails there all the same, since the roles that lack `logging.sinks.create` lack update and
+delete too, so the warning says so per route: on `--plan` the plan that follows shows which this
+apply is, and on an applying route, which goes ahead without a further prompt, the way to see first
+is to stop and run `upgrade.sh --plan`. The state is read once, and only on a denial. A
 selector's members are resolved in the
 plan and are not probed; the project's number read and its Logging service agent's mint are left
 to the apply. What the selectors do not have is a container's
