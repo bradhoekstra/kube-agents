@@ -661,9 +661,10 @@ its own every merge to `main` would invalidate every other pull request's green
 changed (#1179, #1202); the header of `hack/ci-revalidate.sh` keeps the record of what that cost
 over the three weeks before it was answered. Two things answer it.
 [`smoke-test-sticky.yml`](../.github/workflows/smoke-test-sticky.yml) re-pins that suffix to the
-new head of `main` — for every open pull request against `main` on each push to `main`, and for
-one commit when its green arrives after `main` has already moved — with a note in the description
-saying so, and Tide reads the result as current. It is a race against Tide's roughly once-a-minute
+new head of `main` — for every open pull request against `main` on each push to `main`, and every
+five minutes for the pull requests in Tide's pool, where a green that arrived after `main` had
+already moved would otherwise cost a retest — with a note in the description saying so, and Tide
+reads the result as current. It is a race against Tide's roughly once-a-minute
 sync, and the sweep sometimes loses it; when it does, Tide starts the retest as before (a
 batch, when two or more qualify), crier's `pending` is then the newer status, and the sweep leaves
 it alone. That retest is what [`hack/ci-revalidate.sh`](../hack/ci-revalidate.sh), the job's step 0,

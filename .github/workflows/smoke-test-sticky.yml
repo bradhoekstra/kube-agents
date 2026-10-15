@@ -9,9 +9,10 @@ name: Smoke Test Sticky Status
 # #1202) -- a retest step 0 (`hack/ci-revalidate.sh`) answers in minutes from
 # the head's own green, where it once cost the 1.5-3.5h matrix; the re-pin is
 # what spares even that. `scripts/pin_smoke_status.py` re-pins that suffix to the new
-# head of `main` -- for every open pull request on each push to `main`, and for
-# one commit when its green arrives after `main` has already moved (or with no
-# base at all, as the override plugin's own status does) -- so a pull
+# head of `main` -- for every open pull request on each push to `main`, and
+# every five minutes for the pull requests in Tide's pool, where a green that
+# arrived after `main` had already moved (or with no base at all, as the
+# override plugin's own status does) would otherwise cost a retest -- so a pull
 # request green at its own head merges without a fresh-base retest. What that
 # gives up is testing the combination with the `main` it lands on before the
 # merge; the nightly eval on `main` is what finds a bad combination, as is
@@ -38,19 +39,27 @@ name: Smoke Test Sticky Status
 # So the job carries nothing it does not need -- the runner's own python3 runs
 # a stdlib-only script -- and has no concurrency group: GitHub keeps one
 # pending run per group and cancels the older one, which would drop a pin,
-# while two runs pinning the same commit to the same head are harmless. The
-# price is the Actions tab: every status event on the repository -- Tide's own
-# `tide` context on each sync, every CI context on every push -- starts a run
-# here that the `if:` skips, hundreds a day, free in minutes.
+# while two runs pinning the same commit to the same head are harmless.
 #
-# A status created with GITHUB_TOKEN does not fire `status` again, so the
-# re-post cannot loop; a push to `main` is only ever Tide's merge.
+# The late-green case used to be a `status` trigger, one run per status event
+# on the repository -- Tide's own `tide` context on each sync, every CI
+# context on every push -- about a thousand a day, of which the `if:` kept
+# all but sixty off a runner, and each one a run GitHub had to queue (#2943).
+# A schedule covers the same case at most five minutes later: a green that
+# lands between two sweeps costs at most the retest step 0 answers in a
+# minute, and only for a pull request in the pool, which is the only kind a
+# stale base costs anything. The scheduled sweep reads the pool alone, because
+# one status read per open pull request every five minutes is most of
+# GITHUB_TOKEN's hourly budget for the repository; the push sweep still
+# reads every open pull request. A push to `main` is only ever Tide's merge.
 
 on:
-  status:
   push:
     branches:
       - main
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
 
 permissions: {}
 
@@ -58,16 +67,9 @@ jobs:
   pin:
     name: Pin green smoke-test statuses to the head of main
     # The repository guard is required of any credentialed workflow that starts
-    # on its own (AGENTS.md, Pull Request Hygiene). A push to main always
-    # sweeps; a status event qualifies only when it is the smoke test and green
-    # -- an admin override included -- the script checks the same things again
-    # and is the reference, this expression is what keeps the other statuses
-    # off a runner.
-    if: >-
-      github.repository == 'gke-labs/kube-agents' &&
-      (github.event_name == 'push' ||
-        (github.event.context == 'pull-kube-agents-smoke-test' &&
-          github.event.state == 'success'))
+    # on its own (AGENTS.md, Pull Request Hygiene). Every event this starts on
+    # does the same work, a sweep, so nothing else gates the job.
+    if: github.repository == 'gke-labs/kube-agents'
     runs-on: ubuntu-latest
     permissions:
       contents: read # check out the default branch: the script
@@ -94,10 +96,8 @@ jobs:
       # text: the description is free text written by another app. The script
       # resolves the head of main itself and re-posts only if this status is
       # still the latest on its context.
-      - name: Re-pin this commit's green if main has already moved
-        if: github.event_name == 'status'
+      - name: Re-pin the pool's greens that arrived after main moved
+        if: github.event_name != 'push'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          STATUS_ID: ${{ github.event.id }}
-          SHA: ${{ github.event.sha }}
-        run: python3 scripts/pin_smoke_status.py status --sha "$SHA" --status-id "$STATUS_ID"
+        run: python3 scripts/pin_smoke_status.py sweep --pool-only

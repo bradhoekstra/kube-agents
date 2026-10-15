@@ -20,7 +20,6 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _WORKFLOW = _REPO_ROOT / ".github" / "workflows" / "smoke-test-sticky.yml"
 
 _JOB = "pin"
-_CONTEXT = "pull-kube-agents-smoke-test"
 _FORK_GUARD = "github.repository == 'gke-labs/kube-agents'"
 _SCRIPT = "scripts/pin_smoke_status.py"
 _SCRIPTS = _REPO_ROOT / "scripts"
@@ -46,20 +45,20 @@ class SmokeTestStickyWorkflowTest(unittest.TestCase):
         self.condition = self.job["if"]
         self.steps = {step["name"]: step for step in self.job["steps"]}
 
-    def test_it_starts_on_status_events_and_pushes_to_main_only(self):
-        self.assertEqual(sorted(self.triggers), ["push", "status"])
+    def test_it_starts_on_pushes_to_main_a_five_minute_schedule_and_dispatch(self):
+        # Not on `status`: that fired for every status event on the repository,
+        # about a thousand runs a day that skipped at the job gate (#2943).
+        self.assertEqual(sorted(self.triggers), ["push", "schedule", "workflow_dispatch"])
         self.assertEqual(self.triggers["push"], {"branches": ["main"]})
+        self.assertEqual(self.triggers["schedule"], [{"cron": "*/5 * * * *"}])
 
     def test_the_job_carries_the_fork_guard(self):
         self.assertIn(_FORK_GUARD, self.condition)
 
-    def test_a_status_event_must_be_a_green_smoke_test_an_admin_override_included(self):
-        self.assertIn(f"github.event.context == '{_CONTEXT}'", self.condition)
-        self.assertIn("github.event.state == 'success'", self.condition)
-        self.assertIn("github.event_name == 'push' ||", self.condition)
-        # An override is re-pinned like a green, so nothing may keep it off the runner.
-        self.assertNotIn("Overridden", self.condition)
-        self.assertNotIn("description", self.condition)
+    def test_nothing_but_the_fork_guard_gates_the_job(self):
+        # Every event the workflow starts on sweeps, so no event-shaped clause
+        # belongs here; one would keep a sweep off the runner.
+        self.assertEqual(self.condition.strip(), _FORK_GUARD)
 
     def test_the_token_can_write_statuses_and_read_the_checkout_and_nothing_else(self):
         self.assertEqual(self.workflow["permissions"], {})
@@ -73,15 +72,13 @@ class SmokeTestStickyWorkflowTest(unittest.TestCase):
             if "uses" in step:
                 self.assertRegex(step["uses"], _PINNED_ACTION)
 
-    def test_a_push_sweeps_and_a_status_pins_one_commit(self):
+    def test_a_push_sweeps_everything_and_the_schedule_sweeps_the_pool(self):
         sweep = self.steps["Re-pin every open pull request after the merge"]
         self.assertEqual(sweep["if"], "github.event_name == 'push'")
         self.assertEqual(sweep["run"].strip(), f"python3 {_SCRIPT} sweep")
-        one = self.steps["Re-pin this commit's green if main has already moved"]
-        self.assertEqual(one["if"], "github.event_name == 'status'")
-        self.assertIn(f"{_SCRIPT} status --sha \"$SHA\" --status-id \"$STATUS_ID\"", one["run"])
-        self.assertEqual(one["env"]["STATUS_ID"], "${{ github.event.id }}")
-        self.assertEqual(one["env"]["SHA"], "${{ github.event.sha }}")
+        pool = self.steps["Re-pin the pool's greens that arrived after main moved"]
+        self.assertEqual(pool["if"], "github.event_name != 'push'")
+        self.assertEqual(pool["run"].strip(), f"python3 {_SCRIPT} sweep --pool-only")
 
     def test_each_step_s_command_line_parses_as_the_script_expects(self):
         """argparse rejects a parent option after the subcommand; the order in `run:` is the contract."""
@@ -91,7 +88,7 @@ class SmokeTestStickyWorkflowTest(unittest.TestCase):
             argv = shlex.split(step["run"])
             self.assertEqual(argv[:2], ["python3", _SCRIPT])
             args = pin_smoke_status._parse_args([re.sub(r"^\$\w+$", "0" * 40, token) for token in argv[2:]])
-            self.assertIn(args.mode, ("sweep", "status"))
+            self.assertEqual(args.mode, "sweep")
 
     def test_nothing_queues_behind_a_concurrency_group(self):
         """One pending run per group and the older is cancelled: a dropped pin."""

@@ -246,6 +246,16 @@ class SweepTest(unittest.TestCase):
         pin.sweep(api, MAIN)
         self.assertEqual([path.rsplit("/", 1)[1] for path, _ in api.posts], [first, second, held])
 
+    def test_a_pool_only_sweep_touches_only_the_pool(self):
+        pool, plain, held = "6" * 40, "7" * 40, "8" * 40
+        api = FakeAPI(
+            statuses={sha: [status()] for sha in (pool, plain, held)},
+            pulls=[pull(plain), pull(held, labels=("lgtm", "approved", "do-not-merge/hold")), pull(pool, labels=("lgtm", "approved"))],
+        )
+        outcomes, failures = pin.sweep(api, MAIN, pool_only=True)
+        self.assertEqual((len(outcomes), failures), (1, 0))
+        self.assertEqual([path.rsplit("/", 1)[1] for path, _ in api.posts], [pool])
+
     def test_main_is_read_once_for_the_sweep_and_once_more_per_write(self):
         stale, current = "1" * 40, "2" * 40
         api = FakeAPI(
@@ -283,6 +293,11 @@ class SweepTest(unittest.TestCase):
 
 class ArgumentsTest(unittest.TestCase):
     """The workflow writes the options after the subcommand; argparse must take them there."""
+
+    def test_sweep_takes_pool_only(self):
+        args = pin._parse_args(["sweep", "--pool-only"])
+        self.assertTrue(args.pool_only)
+        self.assertFalse(pin._parse_args(["sweep"]).pool_only)
 
     def test_sweep_takes_main_sha_after_the_subcommand(self):
         args = pin._parse_args(["sweep", "--main-sha", MAIN])

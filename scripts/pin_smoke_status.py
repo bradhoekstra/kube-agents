@@ -12,10 +12,12 @@ where it once cost the 1.5-3.5h matrix; the re-pin spares even that.
 
 This re-pins the suffix. On every push to `main` it sweeps the open pull
 requests and re-posts each green smoke status with `BaseSHA:` set to the new
-head; when a green arrives after `main` has already moved past the base it
-ran on, the `status` event does the same for that one commit. The description
-says what happened, so a reader is not told the run was against a base it was
-not. Tide's newer form of this -- a `[prow:skip-retest]` sentinel that
+head; every five minutes it sweeps the pull requests in Tide's pool again, for
+a green that arrived after `main` had already moved past the base it ran on.
+The `status` event used to do that for the one commit, but it fires for every
+status on the repository, about a thousand runs a day that skipped at the job
+gate, and the pool is where a late green costs a retest. The description says
+what happened, so a reader is not told the run was against a base it was not. Tide's newer form of this -- a `[prow:skip-retest]` sentinel that
 `/override-sticky` writes -- is upstream since July 2026 but not in the Prow
 build this repository merges through (its plugin help does not list
 `/override-sticky`); when it is, append the sentinel here and stop pinning.
@@ -209,8 +211,13 @@ def in_tide_pool(pull_request):
     return POOL_LABELS <= labels and not any(str(name).startswith(HOLD_LABEL_PREFIX) for name in labels)
 
 
-def sweep(api, main_sha, dry_run=False):
+def sweep(api, main_sha, dry_run=False, pool_only=False):
     """Every open pull request's head, after a push to main; the pool first.
+
+    With `pool_only`, only the pull requests Tide is waiting on: the scheduled
+    sweep runs every five minutes, and one status read per open pull request
+    at that cadence would spend most of GITHUB_TOKEN's hourly budget on pull
+    requests a stale base costs nothing.
 
     Returns (outcomes, failures). One pull request's failure does not end the
     sweep -- every pull request after it would otherwise wait for the next
@@ -223,6 +230,8 @@ def sweep(api, main_sha, dry_run=False):
     expected = _resolve(main_sha)  # once, for the comparisons; each write re-reads it
     outcomes, failures = [], 0
     pulls = sorted(open_pulls_against_main(api), key=lambda p: not in_tide_pool(p))
+    if pool_only:
+        pulls = [p for p in pulls if in_tide_pool(p)]
     for pull_request in pulls:
         sha = pull_request["head"]["sha"]
         try:
@@ -247,6 +256,7 @@ def _parse_args(argv):
     status.add_argument("--sha", required=True)
     status.add_argument("--status-id", required=True, help="the event's status id; a newer one wins")
     sweep_ = sub.add_parser("sweep", help="every open pull request against main, after a push to main")
+    sweep_.add_argument("--pool-only", action="store_true", help="only the pull requests carrying lgtm and approved with no hold: the scheduled sweep")
     # On the subcommands, not the parser: argparse rejects a parent option
     # given after the subcommand, and the workflow writes them after it.
     for command in (status, sweep_):
@@ -266,7 +276,7 @@ def main(argv=None):
     if args.mode == "status":
         log(pin_head(api, args.sha, main_sha, status_id=args.status_id, dry_run=args.dry_run))
         return 0
-    _, failures = sweep(api, main_sha, dry_run=args.dry_run)
+    _, failures = sweep(api, main_sha, dry_run=args.dry_run, pool_only=args.pool_only)
     return 1 if failures else 0
 
 
