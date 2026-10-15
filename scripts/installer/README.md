@@ -416,9 +416,14 @@ asks the project whether the identity holds `logging.sinks.create`, and
 refuses the apply naming every project that lacks it, the role that grants it
 (`roles/logging.configWriter`) and the exclusion lever, because a sink that cannot be created fails
 the apply at that project after the host's resources and the other projects' sinks have changed. It
-warns on the routes the container preflight warns on. It asks whether or not the sink exists, as
-the container preflight asks for `setIamPolicy` over bindings already made, so an upgrade by an
-identity narrower than the one that installed is refused and the role is the way through. A
+warns on the routes the container preflight warns on. A denied project whose sink the install's
+Terraform state already holds, live rather than tainted or deposed, is warned about rather than
+refused, because an apply that leaves the sink as it is needs only `logging.sinks.get`: that is how
+an install made by an owner is upgraded by a narrower Day-2 identity. An apply that changes the
+sink (a release that moves its filter), recreates it or removes it fails there all the same, since
+the roles that lack `logging.sinks.create` lack update and delete too, so the warning names
+`upgrade.sh --plan` as the way to tell which this apply is and the role to ask for before one that
+changes it. The state is read once, and only on a denial. A
 selector's members are resolved in the
 plan and are not probed; the project's number read and its Logging service agent's mint are left
 to the apply. What the selectors do not have is a container's

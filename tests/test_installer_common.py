@@ -4678,12 +4678,15 @@ class ScopeExportSinkPreflightTest(unittest.TestCase):
     it is named before the refusal; a probe that cannot decide warns and lets
     the apply speak; "warn" turns the refusal into a warning."""
 
-    def _run(self, keys=None, mode="", probe=None, token=True, curl_present=True, strict=False, env_extra=None, cwd=None):
+    def _run(self, keys=None, mode="", probe=None, token=True, curl_present=True, strict=False, env_extra=None, cwd=None,
+             state=None, state_unreadable=False):
         """probe: a dict from project ID to what curl answers for
         projects/<id>:testIamPermissions: "granted", "denied", "forbidden",
-        "service-disabled", "scope-insufficient", "missing", "garbage",
-        "down". cwd: where the check runs (the repository root unless a case
-        plants files to be globbed). The stubs record
+        "service-disabled", "scope-insufficient", "unauthenticated",
+        "missing", "garbage", "down". cwd: where the check runs (the
+        repository root unless a case plants files to be globbed). state: the
+        Terraform state document `gcloud storage cat` answers with; None is
+        no state object, and state_unreadable a 5xx. The stubs record
         what they saw in a log the test folds into proc.stderr: the bearer
         curl read from its stdin, every permission it was asked
         (PROBED:<permission>) and every resource (RESOURCE:<path>)."""
@@ -4691,9 +4694,16 @@ class ScopeExportSinkPreflightTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             bin_dir = pathlib.Path(tmp) / "bin"
             bin_dir.mkdir()
+            if state_unreadable:
+                state_case = '  *"storage cat"*) echo "ERROR: HTTPError 503: Service Unavailable" >&2; exit 1 ;;\n'
+            elif state is None:
+                state_case = '  *"storage cat"*) echo "ERROR: matched no objects" >&2; exit 1 ;;\n'
+            else:
+                state_case = f"  *\"storage cat\"*) printf '%s' '{state}'; exit 0 ;;\n"
             (bin_dir / "gcloud").write_text(
                 "#!/usr/bin/env bash\n"
                 'case "$*" in\n'
+                + state_case
                 + ('  *"application-default print-access-token"*) echo "tok"; exit 0 ;;\n' if token else
                    '  *"application-default print-access-token"*) exit 1 ;;\n')
                 + '  *"config get-value account"*) echo "tester@example.com"; exit 0 ;;\n'
@@ -4710,6 +4720,7 @@ class ScopeExportSinkPreflightTest(unittest.TestCase):
                         "forbidden": ('{"error":{"code":403,"status":"PERMISSION_DENIED"}}', 403),
                         "service-disabled": ('{"error":{"code":403,"status":"PERMISSION_DENIED","details":[{"reason":"SERVICE_DISABLED"}]}}', 403),
                         "scope-insufficient": ('{"error":{"code":403,"message":"Request had insufficient authentication scopes.","status":"PERMISSION_DENIED","details":[{"reason":"ACCESS_TOKEN_SCOPE_INSUFFICIENT"}]}}', 403),
+                        "unauthenticated": ('{"error":{"code":401,"status":"UNAUTHENTICATED"}}', 401),
                         "missing": ('{"error":{"code":404}}', 404),
                         "garbage": ("<html>", 200),
                         "down": ("", None),
@@ -4728,7 +4739,8 @@ class ScopeExportSinkPreflightTest(unittest.TestCase):
                 path.chmod(path.stat().st_mode | stat.S_IEXEC)
             probe_log = pathlib.Path(tmp) / "probe.log"
             probe_log.write_text("")
-            env = {"PROJECT_ID": "test-project", "SCOPE_PROJECTS": "", "SCOPE_EXCLUDE_PROJECTS": "",
+            env = {"PROJECT_ID": "test-project", "CLUSTER_NAME": "test-cluster", "REGION": "us-central1",
+                   "SCOPE_PROJECTS": "", "SCOPE_EXCLUDE_PROJECTS": "",
                    "ENABLE_DRIFT_DETECTOR": "", "TF_VAR_enable_drift_pubsub": "",
                    "TF_VAR_drift_pubsub_source_exclude_projects": "", "SCOPE_PROBE_LOG": str(probe_log)}
             env.update({name: "" for name in _GOOGLE_CREDENTIAL_VARIABLES})
@@ -4858,7 +4870,7 @@ class ScopeExportSinkPreflightTest(unittest.TestCase):
         # The two 403s that are about the credentials, not the project, stop
         # the probing the same way; a body that is not JSON is about that
         # answer alone and does not.
-        for answer in ("scope-insufficient", "service-disabled"):
+        for answer in ("scope-insufficient", "service-disabled", "unauthenticated"):
             with self.subTest(answer=answer):
                 proc = self._run(keys={"SCOPE_PROJECTS": "a-prod b-prod"}, probe={"a-prod": answer, "b-prod": "denied"},
                                  env_extra={"GOOGLE_OAUTH_ACCESS_TOKEN": "narrow"})
@@ -4868,6 +4880,59 @@ class ScopeExportSinkPreflightTest(unittest.TestCase):
         proc = self._run(keys={"SCOPE_PROJECTS": "a-prod b-prod"}, probe={"a-prod": "garbage", "b-prod": "denied"})
         self._assert_rc(proc, 1)
         self.assertEqual(2, len(self._probed(proc)))
+
+    def test_a_denied_project_whose_sink_is_in_state_warns_instead_of_refusing(self):
+        # An install made by an owner and upgraded by a narrower identity: the
+        # sink exists, an apply that leaves it alone needs only
+        # logging.sinks.get, so the run goes ahead with a warning that names
+        # the role for a change that would recreate or remove the sink. The
+        # host's own sink, an instance for another project, and a resource
+        # with no instance are not that project's sink.
+        source_sink = {"module": "module.drift_pubsub[0]", "mode": "managed", "type": "google_logging_project_sink",
+                       "name": "source_drift_audit", "instances": [{"index_key": "a-prod", "attributes": {"id": "projects/a-prod/sinks/s"}}]}
+        host_sink = {"module": "module.drift_pubsub[0]", "mode": "managed", "type": "google_logging_project_sink",
+                     "name": "drift_audit", "instances": [{"attributes": {"id": "projects/test-project/sinks/s"}}]}
+        proc = self._run(keys={"SCOPE_PROJECTS": "a-prod b-prod"}, probe={"a-prod": "denied", "b-prod": "granted"},
+                         state=_state_doc([host_sink, source_sink]))
+        self._assert_rc(proc, 0)
+        self.assertNotIn("ERROR", proc.stdout)
+        self.assertIn("WARN: An apply that changes an existing sink would fail: the Application Default Credentials (the identity Terraform applies with) cannot create a Log Router sink in project 'a-prod' (logging.sinks.create), or the project is not visible to it, and this install's drift audit-log sink there is already in its Terraform state: an apply that leaves the sink as it is goes ahead (it reads the sink, which needs logging.sinks.get), and one that changes it, which a release that moves the sink filter does, recreates it or removes it would fail there, after the host's resources and the other projects' sinks have changed. Run upgrade.sh --plan to see which this apply is, and ask for roles/logging.configWriter in project 'a-prod' for that identity before one that changes it.", proc.stdout)
+        # Without that project's live instance the refusal stands: the host's
+        # sink alone, another project's instance, no instance, a tainted
+        # instance (the next apply replaces it), a deposed one (the next
+        # apply deletes it), no state, and a state that cannot be read (the
+        # apply would be refused by the lifecycle script in that case, so
+        # this is the safe side).
+        other = dict(source_sink, instances=[{"index_key": "c-prod", "attributes": {}}])
+        empty = dict(source_sink, instances=[])
+        tainted = dict(source_sink, instances=[dict(source_sink["instances"][0], status="tainted")])
+        deposed = dict(source_sink, instances=[dict(source_sink["instances"][0], deposed="00000001")])
+        for label, kwargs in (("host sink only", {"state": _state_doc([host_sink])}),
+                              ("another project", {"state": _state_doc([other])}),
+                              ("no instance", {"state": _state_doc([empty])}),
+                              ("tainted instance", {"state": _state_doc([tainted])}),
+                              ("deposed instance", {"state": _state_doc([deposed])}),
+                              ("no state", {}),
+                              ("unreadable state", {"state_unreadable": True})):
+            with self.subTest(label=label):
+                proc = self._run(keys={"SCOPE_PROJECTS": "a-prod"}, probe={"a-prod": "denied"}, **kwargs)
+                self._assert_rc(proc, 1)
+                self.assertIn("ERROR: Refusing to apply: the Application Default Credentials (the identity Terraform applies with) cannot create a Log Router sink in project 'a-prod'", proc.stdout)
+        # The state is read once, and only on a denial.
+        proc = self._run(keys={"SCOPE_PROJECTS": "a-prod b-prod"}, probe={"a-prod": "granted", "b-prod": "granted"},
+                         state_unreadable=True)
+        self._assert_rc(proc, 0)
+        self.assertEqual("rc=0\n", proc.stdout)
+        self.assertNotIn("Could not read the Terraform state", proc.stderr)
+        proc = self._run(keys={"SCOPE_PROJECTS": "a-prod b-prod"}, probe={"a-prod": "denied", "b-prod": "denied"},
+                         state_unreadable=True)
+        self.assertEqual(1, proc.stderr.count("Could not read the Terraform state"), proc.stderr)
+        # Warn mode: the existing-sink warning reads the same.
+        proc = self._run(keys={"SCOPE_PROJECTS": "a-prod"}, mode="warn", probe={"a-prod": "denied"},
+                         state=_state_doc([source_sink]))
+        self._assert_rc(proc, 0)
+        self.assertIn("WARN: An apply that changes an existing sink would fail:", proc.stdout)
+        self.assertNotIn("would be refused", proc.stdout)
 
     def test_an_entry_with_a_glob_character_is_probed_verbatim_not_as_the_files_it_matches(self):
         # The plan refuses such an entry; the preflight must not turn it into

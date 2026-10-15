@@ -186,6 +186,10 @@ readonly TF_KUBE_AGENTS_RELEASE_NAME="kube_agents"
 readonly TF_PUBSUB_SUBSCRIPTION_TYPE="google_pubsub_subscription"
 readonly TF_CHAT_EVENTS_SUBSCRIPTION_NAME="chat_events"
 readonly TF_RESOURCE_MODE_MANAGED="managed"
+# The drift-pubsub module's sink in a source project, as the state records
+# it, for the sink preflight's read of which projects already have one.
+readonly TF_LOGGING_SINK_TYPE="google_logging_project_sink"
+readonly TF_SOURCE_SINK_NAME="source_drift_audit"
 # The Helm status of a release whose last operation failed, the one of a first
 # install still in flight or interrupted, and the statuses `helm history`
 # gives a revision that served at some point.
@@ -253,9 +257,11 @@ readonly SCOPE_PROBE_TOKEN_SCOPE_PATTERN="insufficient authentication scopes|ACC
 # The undecided reasons a probe prints that hold for every resource it could
 # be asked about, not the one it was: the request never completed (one
 # endpoint answers every probe), the token lacks the scope, the API is off in
-# the credentials' quota project. A caller with many probes to make stops at
-# the first of these rather than repeat it once per resource.
+# the credentials' quota project, the token rejected outright. A caller with
+# many probes to make stops at the first of these rather than repeat it once
+# per resource.
 readonly SCOPE_PROBE_TRANSPORT_FAILURE_REASON="the request to Resource Manager did not complete"
+readonly SCOPE_PROBE_UNAUTHENTICATED_REASON="Resource Manager rejected the token (HTTP 401): it has expired or been revoked, so mint a fresh one"
 readonly SCOPE_PROBE_TOKEN_SCOPE_REASON="the token lacks the cloud-platform scope; mint it with that scope, as gcloud does"
 readonly SCOPE_PROBE_API_OFF_REASON="Resource Manager answered 403 for its API being off in the credentials' quota project, which the apply enables before it binds"
 # The APIs the plan-time resolution of a selector reads
@@ -2198,24 +2204,33 @@ scope_export_projects() {
 # refuses the apply with every project that lacks it named: a sink that
 # cannot be created fails the apply at that project, after the host's
 # resources and the other projects' sinks have changed (the module's README,
-# "Exporting the scope's other projects"). It asks whether or not the sink
-# exists already, as the container preflight asks for setIamPolicy over
-# bindings already made: an upgrade by an identity narrower than the one
-# that installed is refused, and the role is the way through, since that
-# identity could not change or remove the sink either. The project's number
-# read and its Logging service agent's mint are left to the apply, as the
-# container preflight leaves serviceusage.services.enable. A probe that
-# cannot decide warns and lets the apply speak; one whose answer holds for
-# every project (the request did not complete, the token lacks the scope,
-# the API is off in the quota project) stops the probing, since each further
-# request would repeat it, or wait the full timeout to, and the projects not
-# asked are named in one warning. An install that lists no such
+# "Exporting the scope's other projects"). A project the identity is denied
+# in whose sink this install's Terraform state already holds
+# (tf_state_has_source_sink, read once and only on a denial) is warned
+# about, not refused: an apply that leaves the sink as it is refreshes it
+# with logging.sinks.get and goes ahead, which is how an install made by an
+# owner is upgraded by a narrower Day-2 identity; one that changes the sink
+# (its filter, which a release can move), recreates or removes it would fail
+# there, since the roles that lack create lack update and delete too, and
+# the warning says so and names upgrade.sh --plan as the way to tell which
+# this apply is. A state that cannot be read, or holds no such sink, or
+# holds it tainted or deposed (the next apply replaces or deletes it),
+# refuses as for a first apply. The
+# project's number read and its Logging service agent's mint are left to
+# the apply, as the container preflight leaves serviceusage.services.enable.
+# A probe that cannot decide warns and lets the apply speak; one whose
+# answer holds for every project (the request did not complete, the token
+# lacks the scope or was rejected, the API is off in the quota project)
+# stops the probing, since each further request would repeat it, or wait
+# the full timeout to, and the projects not asked are named in one warning.
+# An install that lists no such
 # project returns silently and asks nothing. $1 "warn" turns the refusal into
 # a warning, on the routes the container preflight warns on.
 # Caller defines print_error / print_info / print_warning.
 check_scope_export_sink_access() {
   local mode="${1:-$SCOPE_CHECK_MODE_REFUSE}"
-  local projects entry token="" failures=() undecided=() unasked=() stop=false rc identity properties reason had_noglob=false
+  local projects entry token="" failures=() undecided=() unasked=() existing=() stop=false rc identity properties reason had_noglob=false
+  local state="" state_read=false
   projects="$(scope_export_projects)"
   [ -n "$projects" ] || return 0
   identity="$(_scope_terraform_identity_label)"
@@ -2240,11 +2255,21 @@ check_scope_export_sink_access() {
       rc=0
       reason="$(_scope_container_can_set_iam "projects/${entry}" "$SCOPE_SINK_CREATE_PERMISSION" "$token")" || rc=$?
       if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
-        failures+=("${identity} cannot create a Log Router sink in project '${entry}' (${SCOPE_SINK_CREATE_PERMISSION}), or the project is not visible to it; an apply that creates the project's drift audit-log sink would fail there, after the host's resources and the other projects' sinks have changed. Ask for ${SCOPE_SINK_CREATE_ROLE} in project '${entry}' for that identity. A project that is to have no sink is added to TF_VAR_drift_pubsub_source_exclude_projects in install.env (it stays in the scope) or dropped from SCOPE_PROJECTS; removing a sink it already has needs the same role.")
+        # The state is read on the first denial alone: a run with every
+        # project granted never reads it.
+        if ! $state_read; then
+          state="$(tf_state_read)" || state=""
+          state_read=true
+        fi
+        if tf_state_has_source_sink "$state" "$entry"; then
+          existing+=("${identity} cannot create a Log Router sink in project '${entry}' (${SCOPE_SINK_CREATE_PERMISSION}), or the project is not visible to it, and this install's drift audit-log sink there is already in its Terraform state: an apply that leaves the sink as it is goes ahead (it reads the sink, which needs logging.sinks.get), and one that changes it, which a release that moves the sink filter does, recreates it or removes it would fail there, after the host's resources and the other projects' sinks have changed. Run upgrade.sh --plan to see which this apply is, and ask for ${SCOPE_SINK_CREATE_ROLE} in project '${entry}' for that identity before one that changes it.")
+        else
+          failures+=("${identity} cannot create a Log Router sink in project '${entry}' (${SCOPE_SINK_CREATE_PERMISSION}), or the project is not visible to it; an apply that creates the project's drift audit-log sink would fail there, after the host's resources and the other projects' sinks have changed. Ask for ${SCOPE_SINK_CREATE_ROLE} in project '${entry}' for that identity. A project that is to have no sink is added to TF_VAR_drift_pubsub_source_exclude_projects in install.env (it stays in the scope) or dropped from SCOPE_PROJECTS; removing a sink it already has needs the same role.")
+        fi
       elif [ "$rc" -ne "$SCOPE_PROBE_GRANTED" ]; then
         undecided+=("whether ${identity} can create a Log Router sink in project '${entry}'${reason:+ ($reason)}")
         case "$reason" in
-          "$SCOPE_PROBE_TRANSPORT_FAILURE_REASON" | "$SCOPE_PROBE_TOKEN_SCOPE_REASON" | "$SCOPE_PROBE_API_OFF_REASON") stop=true ;;
+          "$SCOPE_PROBE_TRANSPORT_FAILURE_REASON" | "$SCOPE_PROBE_UNAUTHENTICATED_REASON" | "$SCOPE_PROBE_TOKEN_SCOPE_REASON" | "$SCOPE_PROBE_API_OFF_REASON") stop=true ;;
         esac
       fi
     done
@@ -2256,6 +2281,9 @@ check_scope_export_sink_access() {
   for entry in ${undecided[@]+"${undecided[@]}"}; do
     print_warning "The scope export preflight could not decide ${entry}; the apply will report it if it fails."
   done
+  for entry in ${existing[@]+"${existing[@]}"}; do
+    print_warning "An apply that changes an existing sink would fail: ${entry}"
+  done
   [ "${#failures[@]}" -eq 0 ] && return 0
   if [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ]; then
     for entry in "${failures[@]}"; do print_warning "An applying run would be refused: ${entry}"; done
@@ -2264,6 +2292,42 @@ check_scope_export_sink_access() {
   for entry in "${failures[@]}"; do print_error "Refusing to apply: ${entry}"; done
   print_info "Nothing was changed. Fix what is named above, or edit SCOPE_PROJECTS, SCOPE_EXCLUDE_PROJECTS or TF_VAR_drift_pubsub_source_exclude_projects in install.env, and re-run."
   return 1
+}
+
+# True when the Terraform state text in $1 holds this install's drift
+# audit-log sink for the source project $2: a managed
+# google_logging_project_sink named source_drift_audit (the drift-pubsub
+# module's resource for a project in source_projects) with an instance keyed
+# by that project, neither tainted nor deposed: the next apply replaces a
+# tainted instance and deletes a deposed one, so neither is a sink an apply
+# can leave as it is. Parsed, not grepped, for the reasons
+# tf_state_has_cluster gives: an entry with no instance manages nothing, and
+# the host's own sink (drift_audit) is not a source sink. An empty or
+# unparseable state, and a state that holds no such instance, read as false,
+# which the caller treats as a sink still to be created.
+tf_state_has_source_sink() {
+  local state="${1:-}" project="${2:-}"
+  [ -n "$state" ] && [ -n "$project" ] || return 1
+  (trap - ERR; printf '%s' "$state" | python3 -c '
+import json, sys
+project, mode, sink_type, sink_name = sys.argv[1:5]
+try:
+    doc = json.load(sys.stdin) or {}
+except Exception:
+    sys.exit(1)
+for resource in (doc.get("resources") or []) if isinstance(doc, dict) else []:
+    if not isinstance(resource, dict):
+        continue
+    if resource.get("mode") != mode or resource.get("type") != sink_type or resource.get("name") != sink_name:
+        continue
+    for instance in resource.get("instances") or []:
+        if not isinstance(instance, dict) or instance.get("index_key") != project:
+            continue
+        if instance.get("status") == "tainted" or instance.get("deposed"):
+            continue
+        sys.exit(0)
+sys.exit(1)
+' "$project" "$TF_RESOURCE_MODE_MANAGED" "$TF_LOGGING_SINK_TYPE" "$TF_SOURCE_SINK_NAME" 2>/dev/null)
 }
 
 # Prints, space-separated, the APIs the plan reads for the selectors the
@@ -2641,6 +2705,12 @@ sys.exit(granted if sys.argv[1] in held else denied)
       fi
       return "$SCOPE_PROBE_DENIED" ;;
     404) return "$SCOPE_PROBE_DENIED" ;;
+    401)
+      # Not a permission answer either: a raw GOOGLE_OAUTH_ACCESS_TOKEN that
+      # has expired reaches here unminted, and the answer is the same for
+      # every resource.
+      printf '%s' "$SCOPE_PROBE_UNAUTHENTICATED_REASON"
+      return "$SCOPE_PROBE_UNDECIDED" ;;
     *)
       printf 'Resource Manager answered HTTP %s' "$status"
       return "$SCOPE_PROBE_UNDECIDED" ;;
