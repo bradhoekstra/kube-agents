@@ -352,13 +352,17 @@ $(ENVTEST): $(LOCALBIN)
 # Makefile's test-bench-deps checks: `test`'s integer grammar admits a sign or
 # trailing whitespace ("5 ", "-0") that `sleep` rejects, and under this file's
 # `-e` a rejected sleep ends the recipe after the first failed attempt, so the
-# retry would not retry.
+# retry would not retry. The delay is then read as decimal (`10#`): a leading
+# zero passes the digits check and `sleep`, but the doubling `$$(( ))` in both
+# loops would read `08` as a bad octal literal and end the recipe after the
+# first sleep, and `010` as 8, the shape deploy/shared/start-services.sh
+# normalises for the same reason.
 define retry-tunables
 attempts="$(ENVTEST_DOWNLOAD_ATTEMPTS)"; \
 delay="$(ENVTEST_RETRY_DELAY_SECONDS)"; \
 bad=0; \
 case "$$attempts" in ''|*[!0-9]*) bad=1;; *) [ "$$attempts" -ge 1 ] || bad=1;; esac; \
-case "$$delay" in ''|*[!0-9]*) bad=1;; esac; \
+case "$$delay" in ''|*[!0-9]*) bad=1;; *) delay=$$((10#$$delay));; esac; \
 if [ "$$bad" -ne 0 ]; then \
 echo "Error: ENVTEST_DOWNLOAD_ATTEMPTS must be a whole number of at least 1 and ENVTEST_RETRY_DELAY_SECONDS one of at least 0, digits only; got '$$attempts' and '$$delay'." >&2; \
 exit 1; \

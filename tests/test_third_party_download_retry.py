@@ -193,6 +193,15 @@ RETRY_TUNABLE_DECLARATION = r"^%s \?= (\d+)$"
 #: zero. The guard must stop on them before the first attempt.
 BAD_DELAYS = ("5 ", "-0")
 
+#: A delay the digits check passes that bash arithmetic reads as octal: `08`
+#: is an error to `$(( ))` and `010` is 8. The guard reads the value as
+#: decimal, so this schedule follows, not an abandoned loop.
+LEADING_ZERO_DELAY = "08"
+LEADING_ZERO_SCHEDULE = ["8", "16"]
+
+#: A `sleep` that records the delay it was handed instead of waiting.
+SLEEP_RECORDER_STUB = '#!/bin/sh\necho "$1" >> "%s"\n'
+
 
 #: What the `go` stub below writes to stderr on a failed install: the shape of
 #: the checksum-database error that failed the operator's job (#3029).
@@ -479,7 +488,7 @@ class RetryLoopBehaviourTest(unittest.TestCase):
         _executable(self.tmp / "go", GO_STUB)
         return "%s%s%s" % (self.tmp, os.pathsep, os.environ["PATH"])
 
-    def _run(self, attempts=STUB_ATTEMPTS, delay=0):
+    def _run(self, attempts=STUB_ATTEMPTS, delay=0, extra_env=None):
         return _make(
             ["-s", "envtest-path"],
             env={
@@ -488,6 +497,7 @@ class RetryLoopBehaviourTest(unittest.TestCase):
                 "ENVTEST_DOWNLOAD_ATTEMPTS": attempts,
                 "ENVTEST_RETRY_DELAY_SECONDS": delay,
             },
+            extra_env=extra_env,
         )
 
     def _call_count(self):
@@ -580,6 +590,28 @@ class RetryLoopBehaviourTest(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(self._call_count(), 0, "the guard runs before the first fetch")
                 self.assertIn("digits only", result.stderr)
+
+    def test_a_leading_zero_delay_is_read_as_decimal(self):
+        # `08` passes the digits check and `sleep`; the doubling arithmetic
+        # would read it as a bad octal literal and end the recipe after the
+        # first sleep. The guard reads it as decimal, so the loop runs its
+        # schedule: 8, then 16, and the third attempt succeeds.
+        self._write_stub(
+            "#!/bin/sh\n"
+            'echo call >> "%s"\n'
+            'if [ "$(wc -l < "%s")" -lt 3 ]; then\n'
+            "  exit 1\n"
+            "fi\n"
+            "echo /the/assets/path\n" % (self.calls, self.calls),
+        )
+        sleeps = self.tmp / "sleeps"
+        sleeps.write_text("")
+        _executable(self.tmp / "sleep", SLEEP_RECORDER_STUB % sleeps)
+        result = self._run(attempts=3, delay=LEADING_ZERO_DELAY,
+                           extra_env={"PATH": "%s%s%s" % (self.tmp, os.pathsep, os.environ["PATH"])})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self._call_count(), 3, "the loop must survive its first doubling")
+        self.assertEqual(sleeps.read_text().split(), LEADING_ZERO_SCHEDULE)
 
     def test_the_test_target_stops_when_the_assets_do_not_resolve(self):
         """`make test` must fail, not skip, when the fetch yields no binaries.
@@ -1102,6 +1134,19 @@ class GoInstallRetryTest(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(self._call_count(), 0, "the guard runs before the first install")
                 self.assertIn("digits only", result.stderr)
+
+    def test_a_leading_zero_delay_is_read_as_decimal(self):
+        # As for the envtest loop: `08` must give the 8 s, 16 s schedule, not
+        # a bad octal literal that ends the recipe after the first sleep.
+        self._write_go(2)
+        sleeps = self.tmp / "sleeps"
+        sleeps.write_text("")
+        _executable(self.toolchain / "sleep", SLEEP_RECORDER_STUB % sleeps)
+        result = self._run(attempts=3, delay=LEADING_ZERO_DELAY)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self._call_count(), 3, "the loop must survive its first doubling")
+        self.assertTrue(self._installed())
+        self.assertEqual(sleeps.read_text().split(), LEADING_ZERO_SCHEDULE)
 
     def test_every_installer_goes_through_the_retry(self):
         # Three targets share the macro; a retry added to one copy of the
