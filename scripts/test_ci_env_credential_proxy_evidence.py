@@ -4,10 +4,11 @@
 script's EXIT trap on green and red exits alike, beside `collect_gateway_log`
 and `collect_litellm_log`. The broker's admission queue is in its log and its
 Prometheus listener alone: the log used to be taken by the failure dump only
-and the listener was never read, so a green run kept no record of the queue it
-built up. These tests run the real function, lifted from the real file with
-the constants it reads, under bash with a `kubectl` stub on PATH, so the bounds
-it applies and the exit status it leaves behind are the ones the script has.
+and nothing in the job read the listener, so a green run kept no record of the
+queue it built up. These tests run the real function, lifted from the real file
+with the constants it reads, under bash with `kubectl` and `timeout` stubs on
+PATH, so the bounds it applies and the exit status it leaves behind are the
+ones the script has.
 """
 
 import os
@@ -33,12 +34,21 @@ HISTOGRAM = "kubeagents_credential_proxy_admission_wait_seconds"
 # when STUB_NO_DEPLOYMENT is set, or fails outright when STUB_FAIL is), answers
 # `logs` with its arguments on one line and then STUB_LINES lines of
 # STUB_LINE_BYTES each, and answers `exec` by printing its arguments and a
-# metrics body, as the container's python would.
+# metrics body, as the container's python would. STUB_FAIL_VERB fails that
+# one verb alone, so the `logs` and `exec` failure paths are reached with the
+# `get` probe intact.
 KUBECTL_STUB = """#!/usr/bin/env bash
 if [ -n "${STUB_FAIL:-}" ]; then
   echo "error: unable to reach the cluster" >&2
   exit 1
 fi
+for arg in "$@"; do
+  if [ "$arg" = "${STUB_FAIL_VERB:-}" ]; then
+    echo "error: $arg refused by the stub" >&2
+    exit 1
+  fi
+  case "$arg" in get|logs|exec) break ;; esac
+done
 verb=""
 for arg in "$@"; do
   case "$arg" in
@@ -61,6 +71,24 @@ if [ "$verb" = "exec" ]; then
 fi
 line=$(head -c "${STUB_LINE_BYTES:-100}" /dev/zero | tr '\\0' 'a')
 for _ in $(seq 1 "${STUB_LINES:-3}"); do echo "$line"; done
+"""
+
+# A timeout(1) that records its arguments to STUB_TIMEOUT_ARGS and then runs
+# the command, or, when STUB_TIMEOUT_EXPIRES is set, exits with timeout's own
+# status without running it, as the real one does after sending TERM.
+TIMEOUT_STUB = """#!/usr/bin/env bash
+echo "$*" >> "${STUB_TIMEOUT_ARGS}"
+if [ -n "${STUB_TIMEOUT_EXPIRES:-}" ]; then
+  exit 124
+fi
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --foreground) shift ;;
+    *) break ;;
+  esac
+done
+shift  # the duration
+exec "$@"
 """
 
 
@@ -94,6 +122,9 @@ def run_collect(*then: str, **stub_env: str) -> tuple[subprocess.CompletedProces
     kubectl = stubs / "kubectl"
     kubectl.write_text(KUBECTL_STUB, encoding="utf-8")
     kubectl.chmod(kubectl.stat().st_mode | stat.S_IXUSR)
+    timeout_stub = stubs / "timeout"
+    timeout_stub.write_text(TIMEOUT_STUB, encoding="utf-8")
+    timeout_stub.chmod(timeout_stub.stat().st_mode | stat.S_IXUSR)
     artifacts = tmp / "artifacts"
     script = "\n".join(
         [
@@ -109,6 +140,7 @@ def run_collect(*then: str, **stub_env: str) -> tuple[subprocess.CompletedProces
         PATH=f"{stubs}:{os.environ['PATH']}",
         ARTIFACTS=str(artifacts),
         TARGET_NAMESPACE="test-ns",
+        STUB_TIMEOUT_ARGS=str(tmp / "timeout-args"),
         **stub_env,
     )
     if "AGENT_CLUSTER_CONTEXT" not in stub_env:
@@ -164,6 +196,42 @@ class CredentialProxyEvidenceTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("STATUS AFTER: 0", proc.stdout)
         self.assertTrue((artifacts / LOG_ARTIFACT).is_file())
+
+    def test_a_failed_log_read_or_scrape_leaves_the_status_alone_and_the_other_artifact_intact(self):
+        """Each of the three commands fails on its own `|| true`: a refused
+        `logs` still scrapes, and a refused `exec` keeps the log and writes
+        the refusal into the metrics file with a note."""
+        proc, artifacts = run_collect(STUB_FAIL_VERB="logs")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("STATUS AFTER: 0", proc.stdout)
+        self.assertIn(HISTOGRAM, (artifacts / METRICS_ARTIFACT).read_text(encoding="utf-8"))
+        proc, artifacts = run_collect(STUB_FAIL_VERB="exec", STUB_LINES="3")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("STATUS AFTER: 0", proc.stdout)
+        self.assertEqual(len((artifacts / LOG_ARTIFACT).read_text(encoding="utf-8").splitlines()), 4)
+        metrics = (artifacts / METRICS_ARTIFACT).read_text(encoding="utf-8")
+        self.assertIn("exec refused by the stub", metrics)
+        self.assertIn("note: the metrics scrape exited 1", metrics)
+
+    def test_the_scrape_runs_under_the_timeout_bound(self):
+        """kubectl's --request-timeout does not bound an exec upgrade, so
+        the bound is timeout(1)'s, with the value the constant declares."""
+        proc, artifacts = run_collect()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        recorded = (artifacts.parent / "timeout-args").read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(recorded), 1, recorded)
+        self.assertTrue(recorded[0].startswith(f"--foreground {constant('CREDENTIAL_PROXY_SCRAPE_BOUND_SECONDS')} kubectl exec {DEPLOYMENT}"), recorded[0])
+
+    def test_a_scrape_the_bound_stopped_writes_a_note_naming_the_bound(self):
+        """timeout prints nothing when it stops a command and kubectl writes
+        nothing on TERM, so without the note the artifact would be an empty
+        file indistinguishable from an empty body."""
+        proc, artifacts = run_collect(STUB_TIMEOUT_EXPIRES="1")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("STATUS AFTER: 0", proc.stdout)
+        metrics = (artifacts / METRICS_ARTIFACT).read_text(encoding="utf-8")
+        self.assertIn(f"timed out after {constant('CREDENTIAL_PROXY_SCRAPE_BOUND_SECONDS')}s", metrics)
+        self.assertNotIn(HISTOGRAM, metrics)
 
     def test_the_reads_are_pinned_to_the_agent_cluster_when_the_pin_is_known(self):
         proc, artifacts = run_collect(AGENT_CLUSTER_CONTEXT="gke_proj_region_host")

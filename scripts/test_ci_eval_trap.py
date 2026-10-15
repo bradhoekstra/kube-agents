@@ -202,6 +202,7 @@ class EvalLifetimeHeartbeatTest(unittest.TestCase):
                 "collect_gateway_log() { :; }",
                 "collect_agent_pod_diagnostics() { :; }",
                 "collect_litellm_log() { :; }",
+                "collect_credential_proxy_evidence() { :; }",
                 "profile_report() { :; }",
                 "dump_prow_artifacts_on_failure() { echo 'called dumper'; }",
                 unguarded,

@@ -80,6 +80,10 @@ readonly CREDENTIAL_PROXY_DEPLOYMENT="deployment/platform-agent-credential-proxy
 readonly CREDENTIAL_PROXY_CONTAINER="envoy-credential-proxy"
 readonly CREDENTIAL_PROXY_REQUEST_TIMEOUT="20s"
 readonly CREDENTIAL_PROXY_SCRAPE_BOUND_SECONDS=30
+# timeout(1)'s own status for a command it had to stop. It prints nothing
+# when it does, and kubectl writes nothing on TERM, so the collector appends
+# the note the artifact would otherwise lack.
+readonly CREDENTIAL_PROXY_SCRAPE_TIMEOUT_STATUS=124
 # The scrape, run by the image's `python3` (the proxy image carries one for
 # the Cloud SDK; the broker's own venv interpreter is not on PATH and is not
 # needed, the program is stdlib only). One line, so a test that lifts the
@@ -354,8 +358,16 @@ collect_credential_proxy_evidence() {
     | tail -c "${CREDENTIAL_PROXY_LOG_MAX_BYTES}" > "${log}" || true
   local bound=(timeout --foreground "${CREDENTIAL_PROXY_SCRAPE_BOUND_SECONDS}")
   command -v timeout >/dev/null 2>&1 || bound=()
+  local scrape_status=0
   ${bound[@]+"${bound[@]}"} "${kctl[@]}" exec "${CREDENTIAL_PROXY_DEPLOYMENT}" -c "${CREDENTIAL_PROXY_CONTAINER}" -n "${ns}" -- \
-    python3 -c "${CREDENTIAL_PROXY_METRICS_SCRAPE}" > "${metrics}" 2>&1 || true
+    python3 -c "${CREDENTIAL_PROXY_METRICS_SCRAPE}" > "${metrics}" 2>&1 || scrape_status=$?
+  # A scrape that did not complete leaves whatever reached the file, often
+  # nothing; the note says so, and names the bound when that is what ended it.
+  if [ "${scrape_status}" -ne 0 ]; then
+    local why="exited ${scrape_status}"
+    [ "${scrape_status}" -eq "${CREDENTIAL_PROXY_SCRAPE_TIMEOUT_STATUS}" ] && why="timed out after ${CREDENTIAL_PROXY_SCRAPE_BOUND_SECONDS}s"
+    echo "note: the metrics scrape ${why}; the series above, if any, are what reached this file before that" >> "${metrics}" || true
+  fi
 }
 
 # ─── Agent Pod Watch (the eval's lifetime) ───────────────────────────────────
