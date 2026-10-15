@@ -348,12 +348,19 @@ $(ENVTEST): $(LOCALBIN)
 # envtest-use, so the two cannot drift. An empty one gets past `?=` -- an
 # exported empty variable, or `make ... ENVTEST_DOWNLOAD_ATTEMPTS=` -- and
 # `[ "$$attempt" -ge "" ]` then errors, which `if` reads as false: the ceiling
-# never fires and the loop retries forever.
+# never fires and the loop retries forever. Digits only, as the root
+# Makefile's test-bench-deps checks: `test`'s integer grammar admits a sign or
+# trailing whitespace ("5 ", "-0") that `sleep` rejects, and under this file's
+# `-e` a rejected sleep ends the recipe after the first failed attempt, so the
+# retry would not retry.
 define retry-tunables
 attempts="$(ENVTEST_DOWNLOAD_ATTEMPTS)"; \
 delay="$(ENVTEST_RETRY_DELAY_SECONDS)"; \
-if ! [ "$$attempts" -ge 1 ] 2>/dev/null || ! [ "$$delay" -ge 0 ] 2>/dev/null; then \
-echo "Error: ENVTEST_DOWNLOAD_ATTEMPTS must be a whole number of at least 1 and ENVTEST_RETRY_DELAY_SECONDS one of at least 0; got '$$attempts' and '$$delay'." >&2; \
+bad=0; \
+case "$$attempts" in ''|*[!0-9]*) bad=1;; *) [ "$$attempts" -ge 1 ] || bad=1;; esac; \
+case "$$delay" in ''|*[!0-9]*) bad=1;; esac; \
+if [ "$$bad" -ne 0 ]; then \
+echo "Error: ENVTEST_DOWNLOAD_ATTEMPTS must be a whole number of at least 1 and ENVTEST_RETRY_DELAY_SECONDS one of at least 0, digits only; got '$$attempts' and '$$delay'." >&2; \
 exit 1; \
 fi;
 endef

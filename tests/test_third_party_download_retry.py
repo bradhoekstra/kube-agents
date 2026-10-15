@@ -182,6 +182,17 @@ GUARD_MESSAGE = "holds no kube-apiserver"
 ENVTEST_VERSION_VAR = "ENVTEST_K8S_VERSION"
 ENVTEST_VERSION_DECLARATION = re.compile(r"^%s \?= (.+)$" % ENVTEST_VERSION_VAR, re.MULTILINE)
 
+#: The two retry tunables as k8s-operator/Makefile declares them. The nats CLI
+#: step in a2a-test.yml copies their values, so the test that runs that step
+#: reads the schedule from here rather than from a second copy of its own.
+RETRY_ATTEMPTS_VAR = "ENVTEST_DOWNLOAD_ATTEMPTS"
+RETRY_DELAY_VAR = "ENVTEST_RETRY_DELAY_SECONDS"
+RETRY_TUNABLE_DECLARATION = r"^%s \?= (\d+)$"
+
+#: Values `test -ge` accepts and `sleep` refuses: a trailing space and a signed
+#: zero. The guard must stop on them before the first attempt.
+BAD_DELAYS = ("5 ", "-0")
+
 
 #: What the `go` stub below writes to stderr on a failed install: the shape of
 #: the checksum-database error that failed the operator's job (#3029).
@@ -354,6 +365,18 @@ def _recipe(target):
     deliberately not memoised, since they run the recipe for its side effects.
     """
     return _make_ok(["-n", target])
+
+
+def _declared_retry_schedule():
+    """(attempts, delay) as k8s-operator/Makefile declares the two retry tunables."""
+    text = OPERATOR_MAKEFILE.read_text()
+    values = []
+    for name in (RETRY_ATTEMPTS_VAR, RETRY_DELAY_VAR):
+        declared = re.search(RETRY_TUNABLE_DECLARATION % name, text, re.MULTILINE)
+        if not declared:
+            raise AssertionError("k8s-operator/Makefile must declare %s as a whole number" % name)
+        values.append(int(declared.group(1)))
+    return tuple(values)
 
 
 def _declared_version():
@@ -545,6 +568,18 @@ class RetryLoopBehaviourTest(unittest.TestCase):
         self.assertEqual(
             self._call_count(), 0, "it must refuse before fetching, not after an attempt"
         )
+
+    def test_a_padded_or_signed_delay_is_refused_before_the_first_fetch(self):
+        # `test -ge` takes "5 " and "-0"; `sleep` does not, and under `-e` the
+        # refused sleep would end the recipe after the first failed attempt.
+        for delay in BAD_DELAYS:
+            with self.subTest(delay=delay):
+                self._write_stub('#!/bin/sh\necho call >> "%s"\nexit 1\n' % self.calls)
+                self.calls.write_text("")
+                result = self._run(delay=delay)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self._call_count(), 0, "the guard runs before the first fetch")
+                self.assertIn("digits only", result.stderr)
 
     def test_the_test_target_stops_when_the_assets_do_not_resolve(self):
         """`make test` must fail, not skip, when the fetch yields no binaries.
@@ -1058,6 +1093,16 @@ class GoInstallRetryTest(unittest.TestCase):
         self.assertEqual(self._call_count(), 2)
         self.assertGreaterEqual(elapsed, 1.0, "two attempts with a 1s delay should take at least a second")
 
+    def test_a_padded_or_signed_delay_is_refused_before_the_first_install(self):
+        for delay in BAD_DELAYS:
+            with self.subTest(delay=delay):
+                self._write_go(1)
+                self.calls.write_text("")
+                result = self._run(delay=delay)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self._call_count(), 0, "the guard runs before the first install")
+                self.assertIn("digits only", result.stderr)
+
     def test_every_installer_goes_through_the_retry(self):
         # Three targets share the macro; a retry added to one copy of the
         # recipe and not the macro would leave the other two as they were.
@@ -1107,18 +1152,23 @@ class NatsCliInstallRetryTest(unittest.TestCase):
     def _delays(self):
         return [int(line) for line in self.sleeps.read_text().split()]
 
-    def test_a_failing_install_stops_at_four_attempts_with_a_doubling_delay(self):
+    def test_a_failing_install_stops_at_the_makefile_ceiling_with_its_doubling_delay(self):
+        # The schedule is read from k8s-operator/Makefile, not from a copy
+        # here: a change to either tunable there reads red until the step
+        # follows it.
+        attempts, delay = _declared_retry_schedule()
         result = self._run(NEVER_SUCCEEDS)
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(self._calls(), 4, result.stdout + result.stderr)
-        self.assertEqual(self._delays(), [5, 10, 20], "the delays should double from the Makefile's 5s")
+        self.assertEqual(self._calls(), attempts, result.stdout + result.stderr)
+        self.assertEqual(self._delays(), [delay * 2**i for i in range(attempts - 1)], "the step's delays should follow the Makefile's")
         self.assertIn("::error::", result.stdout)
 
     def test_it_stops_at_the_first_success(self):
+        _, delay = _declared_retry_schedule()
         result = self._run(2)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self._calls(), 3)
-        self.assertEqual(self._delays(), [5, 10])
+        self.assertEqual(self._delays(), [delay, delay * 2])
 
 
 if __name__ == "__main__":
