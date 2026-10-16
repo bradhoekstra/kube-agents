@@ -19,8 +19,10 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 
+	"github.com/go-logr/logr/funcr"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -29,7 +31,14 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
+
+// loggingContext returns a context whose logger appends every message to lines.
+func loggingContext(lines *[]string) context.Context {
+	logger := funcr.New(func(prefix, args string) { *lines = append(*lines, args) }, funcr.Options{})
+	return logf.IntoContext(context.Background(), logger)
+}
 
 // existingClaim is a bound claim from a previous install, at `size`.
 func existingClaim(name, namespace, size string) *corev1.PersistentVolumeClaim {
@@ -147,5 +156,73 @@ func TestReconcilePVCSurvivesARefusedExpansion(t *testing.T) {
 	}
 	if got := claimSize(t, cl, dataClaim.Name, agent.Namespace); got != "10Gi" {
 		t.Errorf("data claim is %s after a refused patch, want 10Gi", got)
+	}
+}
+
+// TestReconcilePVCDoesNotRepatchAClaimWhoseResizeHasNotLanded pins the state a
+// post-admission resize failure leaves behind: the spec already says the wanted
+// size, the capacity still says the old one. Nothing to patch; the reconcile
+// succeeds and leaves the claim for the resizer, the claim's events and whoever
+// reads them.
+func TestReconcilePVCDoesNotRepatchAClaimWhoseResizeHasNotLanded(t *testing.T) {
+	agent := brokerPodAgent()
+	dataClaim := buildPVC(agent)
+	patches := 0
+	count := interceptor.Funcs{
+		Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			if _, isPVC := obj.(*corev1.PersistentVolumeClaim); isPVC {
+				patches++
+			}
+			return cl.Patch(ctx, obj, patch, opts...)
+		},
+	}
+	stuck := existingClaim(dataClaim.Name, agent.Namespace, agentDataStorageSize)
+	stuck.Status.Phase = corev1.ClaimBound
+	stuck.Status.Capacity = corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("10Gi")}
+	scheme := setupScheme()
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, stuck).
+		WithStatusSubresource(stuck).
+		WithInterceptorFuncs(count).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+
+	var lines []string
+	if err := r.reconcilePVC(loggingContext(&lines), agent); err != nil {
+		t.Fatalf("a resize that has not landed must not fail the reconcile: %v", err)
+	}
+	if patches != 0 {
+		t.Errorf("the claim's spec already asks for %s; %d patch(es) were issued for nothing", agentDataStorageSize, patches)
+	}
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, "has not landed") {
+		t.Errorf("a spec at %s over a capacity of 10Gi must be reported every reconcile; logged:\n%s", agentDataStorageSize, joined)
+	}
+}
+
+// TestReconcilePVCReportsAnAcceptedPatchAsARequest pins the wording: the API
+// server accepting the patch is not the volume having grown, and the log must
+// not say it is.
+func TestReconcilePVCReportsAnAcceptedPatchAsARequest(t *testing.T) {
+	agent := brokerPodAgent()
+	dataClaim := buildPVC(agent)
+	scheme := setupScheme()
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, existingClaim(dataClaim.Name, agent.Namespace, "10Gi")).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+
+	var lines []string
+	if err := r.reconcilePVC(loggingContext(&lines), agent); err != nil {
+		t.Fatalf("reconcilePVC: %v", err)
+	}
+	joined := strings.Join(lines, "\n")
+	if strings.Contains(joined, "grew the data claim") {
+		t.Errorf("an accepted patch was logged as growth:\n%s", joined)
+	}
+	if !strings.Contains(joined, "requested growth of the data claim") {
+		t.Errorf("an accepted patch must be logged as a request; logged:\n%s", joined)
 	}
 }
