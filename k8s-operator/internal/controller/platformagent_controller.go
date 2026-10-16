@@ -2494,6 +2494,15 @@ func (r *PlatformAgentReconciler) growDataClaim(ctx context.Context, key client.
 
 	have := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
 	if have.Cmp(want) >= 0 {
+		// The spec asks for enough. Whether the volume has it is a different
+		// question: the API server admits a resize on the StorageClass alone, and
+		// a failure after that (the project's disk quota, say) leaves the spec at
+		// the new size and status.capacity at the old one, with the reason on the
+		// claim's events rather than on any error this function would see.
+		if capacity, ok := pvc.Status.Capacity[corev1.ResourceStorage]; ok && capacity.Cmp(want) < 0 {
+			log.Info("the data claim's resize has not landed; the claim's events and status.capacity say why",
+				"claim", key.Name, "spec", have.String(), "capacity", capacity.String())
+		}
 		return
 	}
 
@@ -2504,7 +2513,9 @@ func (r *PlatformAgentReconciler) growDataClaim(ctx context.Context, key client.
 			"claim", key.Name, "have", have.String(), "want", want.String())
 		return
 	}
-	log.Info("grew the data claim", "claim", key.Name, "from", have.String(), "to", want.String())
+	// Acceptance, not growth: the resize itself is the CSI driver's, and it lands
+	// when status.capacity follows the spec.
+	log.Info("requested growth of the data claim", "claim", key.Name, "from", have.String(), "to", want.String())
 }
 
 // applyShellSandboxStatefulSet applies the StatefulSet, recreating it when the
