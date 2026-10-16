@@ -22,12 +22,14 @@ import (
 	"strings"
 	"testing"
 
+	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 	"github.com/go-logr/logr/funcr"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -40,8 +42,24 @@ func loggingContext(lines *[]string) context.Context {
 	return logf.IntoContext(context.Background(), logger)
 }
 
-// existingClaim is a bound claim from a previous install, at `size`.
-func existingClaim(name, namespace, size string) *corev1.PersistentVolumeClaim {
+// existingClaim is a claim the operator created on a previous install, at
+// `size`: it carries the controller reference reconcilePersistentVolumeClaim
+// sets before Create.
+func existingClaim(agent *agentv1alpha1.PlatformAgent, name, size string) *corev1.PersistentVolumeClaim {
+	pvc := unownedClaim(name, agent.Namespace, size)
+	pvc.OwnerReferences = []metav1.OwnerReference{{
+		APIVersion: agentv1alpha1.GroupVersion.String(),
+		Kind:       "PlatformAgent",
+		Name:       agent.Name,
+		UID:        agent.UID,
+		Controller: ptr.To(true),
+	}}
+	return pvc
+}
+
+// unownedClaim is a claim nobody's controller reference points at: one an
+// administrator made by hand, or one a StatefulSet template created.
+func unownedClaim(name, namespace, size string) *corev1.PersistentVolumeClaim {
 	return &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
 		Spec: corev1.PersistentVolumeClaimSpec{
@@ -86,8 +104,8 @@ func TestReconcilePVCGrowsAnExistingDataClaim(t *testing.T) {
 			cl := fake.NewClientBuilder().
 				WithScheme(scheme).
 				WithObjects(agent,
-					existingClaim(dataClaim.Name, agent.Namespace, tc.have),
-					existingClaim(systemClaim.Name, agent.Namespace, "1Gi")).
+					existingClaim(agent, dataClaim.Name, tc.have),
+					existingClaim(agent, systemClaim.Name, "1Gi")).
 				Build()
 			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 
@@ -143,12 +161,13 @@ func TestReconcilePVCSurvivesARefusedExpansion(t *testing.T) {
 	scheme := setupScheme()
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(agent, existingClaim(dataClaim.Name, agent.Namespace, "10Gi")).
+		WithObjects(agent, existingClaim(agent, dataClaim.Name, "10Gi")).
 		WithInterceptorFuncs(refuse).
 		Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 
-	if err := r.reconcilePVC(context.Background(), agent); err != nil {
+	var lines []string
+	if err := r.reconcilePVC(loggingContext(&lines), agent); err != nil {
 		t.Fatalf("a refused expansion must not fail the reconcile: %v", err)
 	}
 	if refusals == 0 {
@@ -156,6 +175,35 @@ func TestReconcilePVCSurvivesARefusedExpansion(t *testing.T) {
 	}
 	if got := claimSize(t, cl, dataClaim.Name, agent.Namespace); got != "10Gi" {
 		t.Errorf("data claim is %s after a refused patch, want 10Gi", got)
+	}
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, "refused the data claim's growth") {
+		t.Errorf("an admission refusal must be reported as one, with its reason; logged:\n%s", joined)
+	}
+	if strings.Contains(joined, "could not grow the data claim") {
+		t.Errorf("an admission refusal that repeats identically every reconcile was logged as an error:\n%s", joined)
+	}
+}
+
+// TestReconcilePVCLeavesAClaimItDoesNotOwnAlone pins the ownership gate: a
+// `<name>-data` claim an administrator made by hand, smaller on purpose, is
+// adopted by reconcilePersistentVolumeClaim and must not be resized by the
+// grow that follows it.
+func TestReconcilePVCLeavesAClaimItDoesNotOwnAlone(t *testing.T) {
+	agent := brokerPodAgent()
+	dataClaim := buildPVC(agent)
+	scheme := setupScheme()
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, unownedClaim(dataClaim.Name, agent.Namespace, "20Gi")).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+
+	if err := r.reconcilePVC(context.Background(), agent); err != nil {
+		t.Fatalf("reconcilePVC: %v", err)
+	}
+	if got := claimSize(t, cl, dataClaim.Name, agent.Namespace); got != "20Gi" {
+		t.Errorf("a claim the operator did not create was resized to %s; it must stay at 20Gi", got)
 	}
 }
 
@@ -176,7 +224,7 @@ func TestReconcilePVCDoesNotRepatchAClaimWhoseResizeHasNotLanded(t *testing.T) {
 			return cl.Patch(ctx, obj, patch, opts...)
 		},
 	}
-	stuck := existingClaim(dataClaim.Name, agent.Namespace, agentDataStorageSize)
+	stuck := existingClaim(agent, dataClaim.Name, agentDataStorageSize)
 	stuck.Status.Phase = corev1.ClaimBound
 	stuck.Status.Capacity = corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("10Gi")}
 	scheme := setupScheme()
@@ -210,7 +258,7 @@ func TestReconcilePVCReportsAnAcceptedPatchAsARequest(t *testing.T) {
 	scheme := setupScheme()
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(agent, existingClaim(dataClaim.Name, agent.Namespace, "10Gi")).
+		WithObjects(agent, existingClaim(agent, dataClaim.Name, "10Gi")).
 		Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 
