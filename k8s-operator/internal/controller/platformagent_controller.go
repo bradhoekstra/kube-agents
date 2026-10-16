@@ -1185,7 +1185,7 @@ func (r *PlatformAgentReconciler) reconcilePVC(ctx context.Context, agent *agent
 	// reconcilePersistentVolumeClaim is create-only, so without this a size
 	// raised to stop the volume filling would reach new installs only, and
 	// every install that already had the problem would keep it.
-	r.growDataClaim(ctx, client.ObjectKeyFromObject(dataClaim), dataClaim.Spec.Resources.Requests[corev1.ResourceStorage])
+	r.growDataClaim(ctx, client.ObjectKeyFromObject(dataClaim), dataClaim.Spec.Resources.Requests[corev1.ResourceStorage], agent)
 	return nil
 }
 
@@ -2350,21 +2350,26 @@ func (r *PlatformAgentReconciler) ungatedDNSClusterIPs(ctx context.Context, agen
 // already refuses to fill the volume it is given, so a claim this could not
 // grow means a bounded migration, not a broken one.
 func (r *PlatformAgentReconciler) growShellSandboxDataClaim(ctx context.Context, agent *agentv1alpha1.PlatformAgent) {
+	// The StatefulSet's template creates this claim, so no controller reference
+	// points at it; nothing else makes a claim of this name.
 	key := client.ObjectKey{Name: shellSandboxDataClaimName(agent), Namespace: agent.Namespace}
-	r.growDataClaim(ctx, key, resource.MustParse(agentDataStorageSize))
+	r.growDataClaim(ctx, key, resource.MustParse(agentDataStorageSize), nil)
 }
 
 // growDataClaim widens an existing claim to `want`. A claim that is absent is
 // a first install, where whatever creates it sizes it; a claim at or above
 // `want` is left alone, so a size an administrator raised by hand is never
-// undone. Expansion is online; the volume stays mounted and its pod keeps
-// running.
+// undone. With a non-nil owner, a claim the owner does not control is left
+// alone too: reconcilePersistentVolumeClaim adopts a claim of the right name
+// whoever made it, and one an administrator made by hand, smaller on purpose,
+// stays theirs to size. Expansion is online; the volume stays mounted and its
+// pod keeps running.
 //
 // Best-effort and logged rather than returned. A StorageClass without
 // allowVolumeExpansion is how an administrator configured the cluster, and
 // failing the reconcile over it would take the whole agent down to fix a volume
 // that is merely smaller than we would like.
-func (r *PlatformAgentReconciler) growDataClaim(ctx context.Context, key client.ObjectKey, want resource.Quantity) {
+func (r *PlatformAgentReconciler) growDataClaim(ctx context.Context, key client.ObjectKey, want resource.Quantity, owner metav1.Object) {
 	log := logf.FromContext(ctx)
 
 	pvc := &corev1.PersistentVolumeClaim{}
@@ -2372,6 +2377,10 @@ func (r *PlatformAgentReconciler) growDataClaim(ctx context.Context, key client.
 		if client.IgnoreNotFound(err) != nil {
 			log.Error(err, "could not read the data claim", "claim", key.Name)
 		}
+		return
+	}
+	if owner != nil && !metav1.IsControlledBy(pvc, owner) {
+		log.Info("the data claim is not the operator's; leaving its size alone", "claim", key.Name)
 		return
 	}
 
@@ -2392,7 +2401,18 @@ func (r *PlatformAgentReconciler) growDataClaim(ctx context.Context, key client.
 	patched := pvc.DeepCopy()
 	patched.Spec.Resources.Requests[corev1.ResourceStorage] = want
 	if err := r.Patch(ctx, patched, client.MergeFrom(pvc)); err != nil {
-		log.Error(err, "could not grow the data claim; expand it by hand where the StorageClass allows it",
+		// An admission refusal repeats identically on every reconcile until
+		// someone changes the cluster: a StorageClass without
+		// allowVolumeExpansion or a namespace quota (Forbidden), or a claim not
+		// yet bound (Invalid), which binds and then takes the next pass. State,
+		// not an error of ours; Info with the API's reason, so the line that
+		// recurs every quarter hour is not an Error with a stack trace.
+		if errors.IsForbidden(err) || errors.IsInvalid(err) {
+			log.Info("the API server refused the data claim's growth; the StorageClass, a namespace storage quota, or a claim not yet bound decides this",
+				"claim", key.Name, "have", have.String(), "want", want.String(), "reason", err.Error())
+			return
+		}
+		log.Error(err, "could not grow the data claim",
 			"claim", key.Name, "have", have.String(), "want", want.String())
 		return
 	}
