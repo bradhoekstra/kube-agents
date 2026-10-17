@@ -4923,9 +4923,12 @@ _CLI_EXTRA_SECRET_FLAGS = frozenset(
 )
 _CLI_NON_SECRET_FLAGS = frozenset({"with-token"})
 _CLI_USERPASS_FLAG_RE = re.compile(
-    r"(?P<prefix>\b(?:curl|wget|mysql|mysqldump|mariadb|mysqladmin|(?:docker|helm(?:\s+registry)?)\s+login)\b"
-    r"[^\r\n;|&]{0,512}?\s(?:-u|--user)[ \t=]*)"
-    r"(?P<quote>[\"']?)(?P<user>[^:\s\"']+:)(?P<val>[^\s\"']+)(?P=quote)"
+    r"\b(?:curl|wget|mysql|mysqldump|mariadb|mysqladmin|(?:docker|helm(?:\s+registry)?)\s+login)\b[^\r\n;|&]*"
+)
+_CLI_USERPASS_ARG_RE = re.compile(
+    r"(?P<prefix>\s(?:-u|--user)[ \t=]*)"
+    r"(?:(?P<quote>[\"'])(?P<quser>[^:\s\"']+:)(?P<qval>(?:(?!(?P=quote))[^\r\n])+)(?P=quote)"
+    r"|(?P<user>[^:\s\"']+:)(?P<val>\"(?:[^\"\\\r\n]|\\.)*\"|'[^'\r\n]*'|[^\s\"']+))"
 )
 _CLI_SHORT_P_RE = re.compile(
     r"(?P<prefix>\b(?:mysql|mysqldump|mariadb|mysqladmin|sshpass|mongosh|mongo|redis-cli|az\s+login|(?:docker|helm(?:\s+registry)?)\s+login)\b"
@@ -5173,6 +5176,14 @@ def _blank_named_values(redactor: Any, text: str) -> str:
             return match.group(0)
         return f"{match.group('prefix')}{_REDACTED_SECRET_MARKER}"
 
+    def _mask_userpass(match: "re.Match[str]") -> str:
+        quote = match.group("quote") or ""
+        user = match.group("quser") if quote else match.group("user")
+        val = match.group("qval") if quote else _unquote_token(match.group("val"))
+        if val.startswith("-") or not redactor._is_credential_value(val):
+            return match.group(0)
+        return f"{match.group('prefix')}{quote}{user}{_REDACTED_SECRET_MARKER}{quote}"
+
     def _mask_auth_scheme(match: "re.Match[str]") -> str:
         val = _unquote_token(match.group("val"))
         if not redactor._is_credential_value(val):
@@ -5183,14 +5194,7 @@ def _blank_named_values(redactor: Any, text: str) -> str:
     text = _SUPPLEMENT_BLOCK_SCALAR_RE.sub(_mask_block, text)
     text = _AUTH_SCHEME_HEADER_RE.sub(_mask_auth_scheme, text)
     text = _CLI_LONG_FLAG_RE.sub(_mask_long_flag, text)
-    text = _CLI_USERPASS_FLAG_RE.sub(
-        lambda m: (
-            f"{m.group('prefix')}{m.group('quote')}{m.group('user')}{_REDACTED_SECRET_MARKER}{m.group('quote')}"
-            if not m.group("val").startswith("-") and redactor._is_credential_value(m.group("val"))
-            else m.group(0)
-        ),
-        text,
-    )
+    text = _CLI_USERPASS_FLAG_RE.sub(lambda seg: _CLI_USERPASS_ARG_RE.sub(_mask_userpass, seg.group(0)), text)
     text = _CLI_SHORT_P_RE.sub(_mask_short_p, text)
     text = _TEXT_COLON_KV_RE.sub(_mask_colon_kv, text)
     text = _QUOTED_COLON_KV_RE.sub(_mask_colon_kv, text)
@@ -5443,7 +5447,8 @@ def _extract_steps_from_conn(
                     if isinstance(raw_args, str)
                     else (json.dumps(raw_args, default=str) if raw_args is not None else "")
                 )
-                tc_id = tc.get("id") if isinstance(tc.get("id"), str) and tc.get("id") else None
+                raw_id = tc.get("id") or tc.get("call_id")
+                tc_id = raw_id if isinstance(raw_id, str) and raw_id else None
                 pending_withhold.append((tc_id, _is_secret_read_tool_call(raw_args)))
                 steps.append(
                     _make_worker_step("tool_call", name, args_str, ts, include_detail=include_detail)
@@ -5458,13 +5463,15 @@ def _extract_steps_from_conn(
             res_text = _decode_hermes_content(m["content"])
             row_tc_id = m["tool_call_id"] if isinstance(m["tool_call_id"], str) and m["tool_call_id"] else None
             withhold_result = False
+            matched_id = False
             if row_tc_id is not None:
                 for idx, (cid, flag) in enumerate(pending_withhold):
                     if cid == row_tc_id:
                         withhold_result = flag
                         pending_withhold.pop(idx)
+                        matched_id = True
                         break
-            elif pending_withhold:
+            if not matched_id and pending_withhold:
                 _, withhold_result = pending_withhold.pop(0)
             steps.append(
                 _make_worker_step(

@@ -6340,7 +6340,7 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
         self.addCleanup(lambda: os.environ.pop("SESSION_KV_API_KEY", None))
         self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
 
-    def _write_profile_store(self, profile: str, rows: list[tuple]):
+    def _write_profile_store(self, profile: str, rows: list[tuple], *, with_tool_call_id: bool = False):
         import sqlite3
 
         if not profile or profile == "default":
@@ -6348,26 +6348,36 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
         else:
             db_path = self.root / "profiles" / profile / "state.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
+        id_col = ", tool_call_id TEXT" if with_tool_call_id else ""
         with sqlite3.connect(db_path) as conn:
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS messages ("
                 "id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, role TEXT, "
                 "content TEXT, tool_name TEXT, tool_calls TEXT, timestamp REAL, "
-                "reasoning TEXT, active INTEGER DEFAULT 1)"
+                f"reasoning TEXT, active INTEGER DEFAULT 1{id_col})"
             )
-            for sid, role, content, tool_name, tool_calls, ts, reasoning in rows:
+            for row in rows:
+                if with_tool_call_id:
+                    *base, tool_call_id = row
+                else:
+                    base, tool_call_id = row, None
+                sid, role, content, tool_name, tool_calls, ts, reasoning = base
+                values = [
+                    sid,
+                    role,
+                    content,
+                    tool_name,
+                    json.dumps(tool_calls) if tool_calls is not None else None,
+                    ts,
+                    reasoning,
+                ]
+                cols = "session_id, role, content, tool_name, tool_calls, timestamp, reasoning"
+                if with_tool_call_id:
+                    cols += ", tool_call_id"
+                    values.append(tool_call_id)
                 conn.execute(
-                    "INSERT INTO messages (session_id, role, content, tool_name, tool_calls, timestamp, reasoning) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        sid,
-                        role,
-                        content,
-                        tool_name,
-                        json.dumps(tool_calls) if tool_calls is not None else None,
-                        ts,
-                        reasoning,
-                    ),
+                    f"INSERT INTO messages ({cols}) VALUES ({', '.join('?' * len(values))})",
+                    values,
                 )
 
     def test_worker_steps_are_matched_by_dispatcher_prompt_and_returned_in_order(self):
@@ -6444,6 +6454,8 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
         api_token_val = "opaque-api-token-flag-val-99"
         cli_pass = "hunter2-cli-pass"
         long_user_pw = "hunter2-long-user-pw"
+        wget_user_pw = "hunter2-wget-user-pw"
+        quoted_spaced_pw = "hunter2 quoted spaced pw"
         attached_mysql_pw = "hunter2-attached-mysql"
         numeric_sshpass_pw = "1234"
         mongosh_pw = "hunter2-mongosh-pw"
@@ -6547,6 +6559,8 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
                                             f"-H 'Authorization: Bearer {bearer_tok}' "
                                             f"-H 'Authorization: Token {token_scheme_val}' "
                                             f"https://admin:{url_pass}@registry.internal/v2/ && "
+                                            f"wget --user admin:{wget_user_pw} https://registry.internal/ && "
+                                            f'curl -u "admin:{quoted_spaced_pw}" https://registry.internal/ && '
                                             f"docker run -u 1000:1000 busybox && "
                                             f"gcloud container clusters create x --no-enable-basic-auth --zone us-central1-a && "
                                             f"gh auth login --with-token && "
@@ -6760,6 +6774,9 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
             api_token_val,
             cli_pass,
             long_user_pw,
+            wget_user_pw,
+            quoted_spaced_pw,
+            "quoted spaced",
             attached_mysql_pw,
             numeric_sshpass_pw,
             mongosh_pw,
@@ -6849,6 +6866,53 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
         elapsed = time.monotonic() - t0
         self.assertLess(elapsed, 1.0, f"regex took {elapsed:.2f}s, expected < 1s")
         self.assertEqual(cleaned, crafted_line)
+
+    def test_secret_read_result_is_withheld_when_store_pairs_by_tool_call_id(self):
+        secret_val = "paired-secret-hunter2-value"
+        read_args = json.dumps({"command": "kubectl get secret db -o jsonpath='{.data.password}' | base64 -d"})
+        list_args = json.dumps({"command": "kubectl get pods"})
+        self._write_profile_store(
+            "platform",
+            [
+                ("sess-ids", "user", "work kanban task t_d1c3323e", None, None, 101.0, None, None),
+                (
+                    "sess-ids",
+                    "assistant",
+                    None,
+                    None,
+                    [
+                        {"id": "c1", "function": {"name": "terminal", "arguments": list_args}},
+                        {"call_id": "c2", "name": "terminal", "arguments": read_args},
+                    ],
+                    102.0,
+                    None,
+                    None,
+                ),
+                ("sess-ids", "tool", f"{secret_val}\n", "terminal", None, 103.0, None, "c2"),
+                ("sess-ids", "tool", "pod-a Running", "terminal", None, 103.5, None, "c1"),
+                (
+                    "sess-ids",
+                    "assistant",
+                    None,
+                    None,
+                    [{"name": "terminal", "arguments": read_args}],
+                    104.0,
+                    None,
+                    None,
+                ),
+                ("sess-ids", "tool", f"{secret_val}\n", "terminal", None, 105.0, None, "id-with-no-call"),
+            ],
+            with_tool_call_id=True,
+        )
+
+        resp = self.client.get("/v1/tasks/t_d1c3323e")
+        self.assertEqual(resp.status_code, 200)
+        steps = resp.json()["steps"]
+        self.assertEqual(
+            [s["preview"] for s in steps if s["kind"] == "tool_result"],
+            [session_kv_server.WORKER_STEP_WITHHELD, "pod-a Running", session_kv_server.WORKER_STEP_WITHHELD],
+        )
+        self.assertNotIn(secret_val, json.dumps(steps))
 
     def test_steps_truncated_is_true_when_sql_row_window_clips_older_rows(self):
         rows: list[tuple] = [
