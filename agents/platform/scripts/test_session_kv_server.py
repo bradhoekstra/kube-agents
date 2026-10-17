@@ -6857,6 +6857,19 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
                 f"expected all listing live_steps withheld without ellipsis, got {sess_fallback}",
             )
 
+    def test_line_start_auth_scheme_pair_masks_the_token_not_only_the_scheme(self):
+        opaque = "3f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c"
+        for line in (
+            f"Authorization: Bearer {opaque}",
+            f"auth: Bearer {opaque}",
+            f"token: Bearer {opaque}",
+            f"AUTH_HEADER=Bearer {opaque}",
+        ):
+            with self.subTest(line=line):
+                cleaned = session_kv_server._scrub_worker_step_text("tool_result", line)
+                self.assertNotIn(opaque, cleaned)
+                self.assertIn("[REDACTED_SECRET]", cleaned)
+
     def test_cli_short_p_re_linear_scan_on_crafted_line(self):
         import time
 

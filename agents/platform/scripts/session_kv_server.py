@@ -5310,7 +5310,7 @@ def _supplement_redact(
 
 
 def _scrub_worker_step_text(kind: str, text: str) -> str:
-    """Scrub worker step text with supplemental key/block rules + `AuditRedactor.redact`;
+    """Scrub worker step text with `AuditRedactor.redact`, then supplemental key/block rules;
     withhold step text across all kinds if the redactor module is unavailable."""
     redactor = _get_audit_redactor()
     if redactor is None:
@@ -5318,12 +5318,10 @@ def _scrub_worker_step_text(kind: str, text: str) -> str:
     try:
         parsed = _as_json_structure(text)
         if parsed is not None:
-            supplemented = _supplement_redact(
-                redactor, parsed, is_tool_result=(kind == "tool_result")
+            return json.dumps(
+                _supplement_redact(redactor, redactor.redact(parsed), is_tool_result=(kind == "tool_result"))
             )
-            return json.dumps(redactor.redact(supplemented))
-        supplemented = _supplement_redact(redactor, text, is_tool_result=(kind == "tool_result"))
-        return str(redactor.redact(supplemented))
+        return str(_supplement_redact(redactor, redactor.redact(text), is_tool_result=(kind == "tool_result")))
     except RecursionError:
         return WORKER_STEP_WITHHELD
 
