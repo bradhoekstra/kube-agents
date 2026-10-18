@@ -298,6 +298,13 @@
               }
             }
           }
+        },
+        "traceLogEnabled": {
+          "type": "boolean"
+        },
+        "traceLogPath": {
+          "type": "string",
+          "pattern": "^/[^\\x00]*$"
         }
       }
     },

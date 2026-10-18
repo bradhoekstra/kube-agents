@@ -456,6 +456,16 @@ litellm:
     #     literal: prod-eu-1
     #     action: pseudonym
     rules: []
+  # Pass-through JSONL trajectory logger callback. When enabled, registers
+  # llm_trace_logger.proxy_handler_instance in LiteLLM's callbacks and mounts
+  # llm_trace_logger.py beside config.yaml. Every upstream model invocation
+  # (messages, tools, responses, reasoning content, token usage, latency) is
+  # appended as one JSONL record to traceLogPath. Pass-through only: does not
+  # alter requests or responses, and I/O failures never break inference.
+  traceLogEnabled: false
+  # Absolute file path where the trajectory log is written. The default
+  # (/tmp/litellm_traces.jsonl) writes into the gateway pod's emptyDir tmp volume.
+  traceLogPath: "/tmp/litellm_traces.jsonl"
 
 # The Hindsight memory store: the API the agents call for long-term memory,
 # the Postgres/pgvector StatefulSet behind it, a NetworkPolicy standing in for

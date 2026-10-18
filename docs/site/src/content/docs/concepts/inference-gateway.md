@@ -174,6 +174,27 @@ A pseudonym is the first twelve hex characters of an HMAC-SHA256 over the value,
 
 What this covers is the request body on its way to the provider. It does not touch responses, so an identifier the model already knows from an earlier, unredacted turn can still come back. It does not touch what the agent writes to disk: conversation logs and the state databases still carry tool output verbatim, and what the image itself redacts on the agent's volume is listed under [Security and IAM](/kube-agents/reference/security-and-iam/#what-leaves-for-the-model-provider). And it does not touch chat egress. A rule that fails to load stops the gateway pod at startup rather than forwarding requests unredacted, and the render fails on a name, action or source it does not accept; an exception inside the hook fails that request. Each redacted request writes one line of substitution counts by rule name to the gateway pod's log, never the payload.
 
+### Pass-through trajectory logging
+
+For offline evaluation, fine-tuning, latency analysis, and audit trails, `litellm.traceLogEnabled=true` enables pass-through JSONL trajectory capture at the gateway.
+
+When enabled, the chart mounts `llm_trace_logger.py` beside `config.yaml`, registers `llm_trace_logger.proxy_handler_instance` under `litellm_settings.callbacks`, and passes `LITELLM_TRACE_LOG_PATH` (default: `/tmp/litellm_traces.jsonl`, inside the pod's `emptyDir` `/tmp` volume) to the container.
+
+Every completed or failed LLM invocation appends one JSON object containing:
+- `timestamp`: UTC ISO 8601 timestamp.
+- `status`: `"success"` or `"failure"`.
+- `model_alias`: The requested model alias (e.g. `model-default`).
+- `custom_llm_provider`: Upstream provider (`vertex_ai`, `hosted_vllm`, `gemini`, etc.).
+- `api_base`: Backend URL (if configured).
+- `reasoning_effort`: Requested reasoning effort (e.g. `high`, `medium`, `low`).
+- `latency_ms`: Round-trip invocation latency in milliseconds.
+- `messages`: Serialized input messages and tool outputs.
+- `tools`: Serialized tool schemas provided to the model.
+- `response`: Complete upstream response payload, including `choices`, `usage`, and `reasoning_content`.
+- `error`: Error message if the call failed.
+
+The logger is strictly pass-through: it never mutates request or response payloads, and write exceptions are silently trapped so logging I/O issues never fail model calls. When `litellm.traceLogEnabled` is `false` (default), the callback is omitted and the default ConfigMap checksum remains byte-identical.
+
 ### Vertex AI and Model Garden
 
 `MODEL_PROVIDER=vertex_ai` routes `model-default` to Vertex AI in your own GCP project — the same first-party Gemini models, plus every Model Garden publisher model your project has access to (Anthropic Claude, Llama, Mistral, and the rest). Requests stay inside your project's billing and data boundary, and no model API key exists anywhere in the cluster. That boundary is a project, not a geography: the default location is the global endpoint, which makes no promise about the region a request is processed in — see the location bullet below.

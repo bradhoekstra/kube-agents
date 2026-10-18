@@ -133,6 +133,15 @@
 {{- if $redactionEnabled }}
 {{- $callbackList = append $callbackList "litellm_redaction_callback.proxy_handler_instance" }}
 {{- end }}
+{{- $traceLogEnabled := default false .Values.litellm.traceLogEnabled }}
+{{- $traceLogSource := "" }}
+{{- if $traceLogEnabled }}
+{{- $traceLogSource = .Files.Get "files/llm_trace_logger.py" }}
+{{- if empty $traceLogSource }}
+{{- fail "the chart's files/llm_trace_logger.py is missing" }}
+{{- end }}
+{{- $callbackList = append $callbackList "llm_trace_logger.proxy_handler_instance" }}
+{{- end }}
 {{- $quotedCallbacks := list }}
 {{- range $callbackList }}
 {{- $quotedCallbacks = append $quotedCallbacks (quote .) }}
@@ -146,14 +155,15 @@
   "model-default", but a caller that names the harness ("hermes-agent") or the
   concrete model gets routed rather than a 404 from the gateway.
 */}}
-{{- $config := include "kube-agents.litellmConfig" (merge (dict "provider" $provider "model" $model "callbacks" $callbacks "maxTokens" .Values.litellm.maxTokens "reasoningEffort" .Values.litellm.reasoningEffort) $configEndpoint) }}
+{{- $config := include "kube-agents.litellmConfig" (merge (dict "provider" $provider "model" $model "callbacks" $callbacks "maxTokens" .Values.litellm.maxTokens "reasoningEffort" .Values.litellm.reasoningEffort "traceLogEnabled" $traceLogEnabled) $configEndpoint) }}
 {{- /*
   Every key the ConfigMap carries feeds the checksum: the thinking-replay
-  hook, the rule file and the two redaction modules are subPath mounts too, so
-  an edit to any of them has to roll the pods the same way an edit to
-  config.yaml does. With redaction off its three extras are empty strings.
+  hook, the rule file, the two redaction modules, and the optional trace logger
+  are subPath mounts too, so an edit to any of them has to roll the pods the
+  same way an edit to config.yaml does. With redaction or trace logging off,
+  their extras are empty strings.
 */}}
-{{- $checksumInput := printf "%s%s%s%s%s" $config $thinkingReplaySource $redactionConfig $redactorSource $redactionCallbackSource }}
+{{- $checksumInput := printf "%s%s%s%s%s%s" $config $thinkingReplaySource $redactionConfig $redactorSource $redactionCallbackSource $traceLogSource }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -174,6 +184,10 @@ data:
     {{- $redactorSource | nindent 4 }}
   litellm_redaction_callback.py: |
     {{- $redactionCallbackSource | nindent 4 }}
+  {{- end }}
+  {{- if $traceLogEnabled }}
+  llm_trace_logger.py: |
+    {{- $traceLogSource | nindent 4 }}
   {{- end }}
 {{- if eq $provider "vertex_ai" }}
 ---
@@ -344,6 +358,10 @@ spec:
             - name: OTEL_SERVICE_NAME
               value: litellm
             {{- end }}
+            {{- if $traceLogEnabled }}
+            - name: LITELLM_TRACE_LOG_PATH
+              value: {{ .Values.litellm.traceLogPath | quote }}
+            {{- end }}
           ports:
             - containerPort: 8080
           # Without these the Service publishes an endpoint the instant the
@@ -399,6 +417,11 @@ spec:
             - name: config-volume
               mountPath: /app/litellm_redaction_callback.py
               subPath: litellm_redaction_callback.py
+            {{- end }}
+            {{- if $traceLogEnabled }}
+            - name: config-volume
+              mountPath: /app/llm_trace_logger.py
+              subPath: llm_trace_logger.py
             {{- end }}
             {{- if and (eq $provider "openai_compatible") $openaiCompatibleCA.name }}
             # The openai_compatible server's CA bundle, read by ssl_verify on its
