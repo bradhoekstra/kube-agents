@@ -29,8 +29,11 @@ After this change, under `next`:
 ## Goals
 
 - The person confirms the exact public text before anything is filed, every time.
-- One report per confirmation. A retry, a second card, or a lost confirmation never files
-  the same text twice (the incident #1415 records: #1345 and #1346).
+- One report per confirmation. A retry or a lost answer never files the same text twice (the
+  incident #1415 records: #1345 and #1346), and a second card for the same text within a day
+  finds the first filing on the tracker. Two confirmations of one text inside the form
+  pipeline's minute of latency can both reach the form: the broker's replicas share no lock,
+  and the one-card-per-yes persona is what makes that rare.
 - A failed filing is never reported as filed, and never leaves the person without a path.
 - The filing works on a stock install, where the sandbox has no egress but the broker.
 - The gateway's own answer is deterministic and needs no model, like `/session`.
@@ -161,7 +164,8 @@ payload below, and:
   refusal, so the two copies of the rules cannot drift: the sandbox script validates nothing
   the broker does not;
 - reads the tracker once for a recent `external-feedback` issue with this exact title and
-  answers `ALREADY_SUBMITTED` if there is one;
+  the same "what happened" text (the tracker is shared by every install, so a title alone
+  is not a report) and answers `ALREADY_SUBMITTED` if there is one;
 - resolves the current form from the short link, maps fields by question label, POSTs once,
   and polls the tracker for the issue by exact title;
 - answers one JSON object: `SUBMITTED` with `issue_url`; `ALREADY_SUBMITTED` with
@@ -189,9 +193,9 @@ calls the broker. `scripts/file_feedback.py` becomes the client:
 - the same payload file as #1415's: `title`, `kind`, `happened`, `expected`, `environment`,
   `user_confirmed`;
 - the state marker, written in the card workspace before the broker call and finalised
-  after it, so a rerun after a lost response asks the broker nothing and reads the tracker
-  through the broker's `ALREADY_SUBMITTED` path instead of filing again (the broker's
-  pre-POST tracker read is the second half of that guard, for a fresh workspace);
+  after it, so a rerun after a lost response asks the broker to recheck only: it reads the
+  tracker and never posts, and answers what the tracker shows instead of filing again (the
+  broker's pre-POST tracker read is the second half of that guard, for a fresh workspace);
 - one `POST` to `$CREDENTIAL_PROXY_URL/v1/feedback/submit` with the Bearer token
   `credential_proxy_client.py` already builds for the forge verbs;
 - the broker's JSON object printed as the script's one output line, unchanged, so the

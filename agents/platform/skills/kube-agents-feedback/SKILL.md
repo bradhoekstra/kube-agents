@@ -78,13 +78,15 @@ description:
   front door that showed it can know. A
   `SUBMITTED` whose `issue_url` is `null` means the form accepted the report
   and the tracker has not shown the issue yet (its `detail` says so): rerun the
-  same command once, which only reads the tracker for the URL; if it is still
-  `null`, report the title and the tracker link as filed-but-not-yet-visible.
-  Never file again.
+  same command once, which only reads the tracker. The rerun answers
+  `ALREADY_SUBMITTED` with the URL once the issue is there, or `SUBMITTED`
+  with `null` again while it is not; in that case report the title and the
+  tracker link as filed and not yet visible. Never file again.
 - `ALREADY_SUBMITTED` — this exact text is already on the tracker (an earlier
   attempt, or another card); it always carries the `issue_url`. Report it.
   This is a success, not an error. Do not retry.
-- `UNCONFIRMED` — a request went out and no issue has appeared yet. Rerunning
+- `UNCONFIRMED` — a request went out and no issue has appeared yet, or the
+  rerun could not reach the broker to look (its `detail` says which). Rerunning
   the same command once is safe: it only asks the broker to read the tracker,
   never to post again. If it stays `UNCONFIRMED`, the report may be lost — say
   so in the card `result`, with the composed text and both `fallback` links,

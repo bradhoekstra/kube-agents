@@ -470,6 +470,10 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          /usr/local/bin/credential-proxy-exec above, as the
 #                          kubectl/gcloud shim; that copy is not importable by
 #                          module name, so it is staged here as well
+#   feedback_broker.py     the constants the kube-agents-feedback client reads (the
+#                          route, the statuses, the fallback links, the payload's
+#                          normalisation); the same module's broker half files the
+#                          form from the broker pod, which is the side with egress
 #   fleet_scope_args.py    the flags (`--scope-projects`, `--scope-unread`,
 #                          `--scope-exclude-clusters`) the
 #                          fleet-audit collectors take the install's declared scope
