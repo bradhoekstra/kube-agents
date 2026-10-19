@@ -117,7 +117,8 @@ that lost Issues: write (422 minting the token), and a GitHub outage.
   `GITHUB_APP_PRIVATE_KEY` script property, then revoke the old key. Nothing else changes.
 - **Retiring it.** Close the form to responses, delete the trigger, revoke the key, remove
   the redirect from `docs/site/astro.config.mjs`, and remove the links from the contributing
-  guide and the root `README.md`. The agents hand the short link out too, and none of that
+  guide, the root `README.md` and the `/feedback` section of
+  `docs/site/src/content/docs/concepts/chatops.md`, which quotes the gateway's notice. The agents hand the short link out too, and none of that
   is reached by editing the site: drop the "Reporting a Problem with kube-agents Itself"
   bullet from `agents/platform/SOUL.md` and `agents/cluster/SOUL.md`, the routing row and
   the `/feedback <text>` bullet from `agents/chat/SOUL.md`, the `kube-agents-feedback` skill

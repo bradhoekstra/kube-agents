@@ -1,6 +1,6 @@
 # `/feedback`: file a kube-agents report from chat
 
-> **STATUS — design; not built.** Written 2026-10-19 for the pull request that builds it.
+> **STATUS — design of record; implemented.** Written 2026-10-19 with the change that built it.
 > The behaviour it designs works under `spec.mode: next`, where a chat message reaches the
 > A2A gateway and the bridge runs it as a Planning Agent turn
 > ([`spec-chatops-gateway.md`](spec-chatops-gateway.md)), and under `today` for a message
@@ -129,7 +129,7 @@ reworded: `/feedback <text>`, and any ask in words to file a kube-agents report,
    `gke-labs/kube-agents`, asks for a yes, and ends the turn. This is the one place the
    front door replies with more than an ack: the text is the person's own words arranged
    for the form, not knowledge, and §1.6 already requires a confirmation before anything
-   irreversible. The person's next message is the answer.
+   destructive. The person's next message is the answer.
 3. On a yes it files one card for `platform` whose body carries the confirmed text verbatim
    and the line `user-confirmed: yes`, and acks as for any card. On a change it shows the new
    text and asks again. On a no it files nothing.
@@ -171,10 +171,14 @@ payload below, and:
 The broker reaches three hosts for this: the short link's, the form host the short link
 names (pinned by the same `docs.google.com/forms/d/e/<id>/viewform` pattern as #1415), and
 `api.github.com` unauthenticated. It holds no state across calls and uses no credential. The
-route is counted in the broker's metrics under its own label, and audit-logged like the
-forge verbs. Unit tests beside `test_credential_proxy.py` drive the route with a fake wire:
-the 19 wire and validation cases #1415 wrote for the sandbox script, moved to the broker,
-plus the 5 `Code.gs` contract tests.
+route is counted in the broker's request metrics under the `/v1/feedback` endpoint label,
+and audit-logged like the forge verbs. A full broker answers `503`, as the exec and forge
+routes do, so the client reads it as nothing sent. The tracker is read before the POST and
+after it; a tracker that cannot be read before the POST is a refusal (a blind duplicate guard
+is no guard), and one that cannot be read after a confirmed POST leaves `SUBMITTED` with a
+null `issue_url` and a `detail`, which the client's recheck resolves. Unit tests beside
+`test_credential_proxy.py` drive the route with a fake wire: the wire and validation cases
+#1415 wrote for the sandbox script, moved to the broker, plus the `Code.gs` contract tests.
 
 ### 4. The skill: `agents/platform/skills/kube-agents-feedback/`
 
@@ -206,8 +210,8 @@ describing a made-up kube-agents defect that names no cluster. It is graded on t
 Agent's reply, which both lanes carry as the answer text: `report_contains` for the composed
 submission (a summary line, the kind, a "what happened" section), the public-issue warning,
 and a closing question; and the safeguards that no card was filed (a `none`-wrapped
-`tool_called` on `kanban_create`), that no issue URL or claim of filing is in the reply, and
-that no command named `file_feedback.py` ran. The run ends on the question, so the case
+`tool_called` on `kanban_create`) and that no issue URL or claim naming a filed issue is in
+the reply. The run ends on the question, so the case
 grades the pause and the text, not the filing. Red on `main` because the Planning Agent
 there either files a card at once and acks in one line, or answers that there is no such
 command; neither reply carries the composed submission. Registered in
@@ -231,34 +235,27 @@ its issue is closed afterwards.
   bullet and the gateway constants join the list of places the link is published.
 - `tests/test_feedback_reference.py`: the platform bullet names the skill; the chat table
   has the `/feedback` row and the chat bullet carries `user-confirmed: yes`, as `SKILL.md`
-  does; the broker's and the skill's short-link constants equal the persona's.
+  does; the broker's and the gateway's link constants equal the persona's.
 - `make docs-generate` refreshes the skills catalog; `make docs-check` passes.
 
-## Left to the builder
+## Calls made in the build
 
-- The exact wording of the gateway's message, the two persona bullets and the row, within
-  the content above and the repository's writing rules.
-- Where in `gateway.go`'s dispatch the bare-`/feedback` branch sits relative to the
-  `/session` branch, keeping both before status, stop and steer.
-- The broker route's place in the handler's dispatch and metrics, following `/v1/vcs/`.
-- The case's prompt text and regexes, and the red run's evidence.
+- The bare-`/feedback` branch is the first case of the gateway's dispatch switch, ahead of
+  `/session`, status, stop and steer, gated on a message with no programmatic intent.
+- The sandbox client keeps one marker per payload hash in the task workspace. A broker that
+  could not be reached, refused the payload, or answered `503` leaves no marker (nothing was
+  sent); a connection that broke after the request went out keeps it and exits 2, and the
+  rerun asks the broker to recheck only.
+- The web console (`a2a/web`) mirrors the bare `/feedback` as a settled turn, as it does the
+  `/session` forms, so the page does not wait on a task the gateway never submits.
+- The sandbox image's script allowlist (`deploy/sandbox/Dockerfile`) stages
+  `feedback_broker.py` beside the client that imports it; `test_sandbox_delivery.py` is the
+  gate that found the omission.
 
-## Live validation plan
+## Live validation
 
-On the `gkedemos` install (`spec.mode: next`, Google Chat through the A2A gateway, no
-NetworkPolicy enforcement), with the branch's gateway, broker and agent images:
-
-1. Bare `/feedback` in a Chat thread: the gateway's message, verbatim, with no task started
-   (no `⏳ submitted…` status line).
-2. `/feedback <text>`: the composed submission and the question; `yes`: one card, the skill
-   runs once, the broker's audit line shows one `POST`, the issue URL comes back, and the
-   issue on the tracker carries the text as shown and the `external-feedback` label. Close
-   the issue.
-3. The same confirmed text dispatched again: `ALREADY_SUBMITTED` with the same URL, no
-   second issue.
-4. The egress claim on an enforcing cluster: from the `gkedemos2` or `gkedemos3` sandbox
-   (Autopilot), the broker verb with a payload that fails validation answers `400 BLOCKED`
-   through the broker, where a direct request to the form host times out. No issue is filed
-   there.
-5. The case, through the harness's api transport (`--agent-type kubeagents`): red against
-   `main`'s build, green three times against the branch's build.
+The pull request that introduced this document records the runs: the bare command and the
+compose-confirm-file flow on an install under `spec.mode: next` with Google Chat on the A2A
+gateway, the same confirmed text dispatched twice, and the case red against `main` and green
+three times against the branch's build through the harness's api transport. The one real
+filing's issue is closed with a comment naming that validation.
