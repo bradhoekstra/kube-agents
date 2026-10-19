@@ -268,16 +268,24 @@ pseudonymised identifier is one the agent cannot act on; the site's
 owns what the image redacts in the files on the agent's volume.
 
 `litellm.traceLogEnabled=true` turns on pass-through trajectory logging across
-the gateway: the ConfigMap gains `llm_trace_logger.py`, mounted at
-`/app/llm_trace_logger.py` beside `config.yaml`, registers
+the gateway: the ConfigMap gains `llm_trace_logger.py` and the shared
+`redactor.py` module, mounted at `/app/llm_trace_logger.py` and
+`/app/redactor.py` beside `config.yaml`, registers
 `llm_trace_logger.proxy_handler_instance` under `litellm_settings.callbacks`, and sets
 `LITELLM_TRACE_LOG_PATH` (`litellm.traceLogPath`, default
-`"/tmp/litellm_traces.jsonl"`). Every raw model request and response (model alias,
-custom LLM provider, messages, tool definitions, assistant responses, reasoning content,
-token usage, and latency) is appended as one JSONL line to the path. Pass-through only:
-the logger never mutates request or response payloads, and I/O failures are caught so
-inference never fails. Off by default, and the rendered default ConfigMap and rollout
-checksum are unchanged while it is off.
+`"/tmp/litellm_traces.jsonl"`, which must be a file path under `/tmp/` because the
+gateway runs with `readOnlyRootFilesystem: true`) plus an optional `SESSION_KV_SALT`
+from the credentials Secret. Every model request and response (model alias, custom
+LLM provider, messages, tool definitions, assistant responses, reasoning content,
+token usage, and latency) is redacted through `AuditRedactor` (credentials, Secret
+data blocks, sensitive keys, emails, and IP literals, plus operator rules when
+`litellm.redaction.enabled` is also set) before being appended as one JSONL line to
+the path. The trace file rotates at `5 MiB` across `3` backups (`.1`–`.3`, `20 MiB`
+total cap on the pod's `/tmp` `emptyDir`) under an `flock` on `<path>.lock`.
+Pass-through only: the logger never mutates live request or response payloads, and
+I/O failures log a once-per-path warning to stderr so inference never fails. Off by
+default, and the rendered default ConfigMap and rollout checksum are unchanged while
+it is off.
 
 #### Vertex AI (`litellm.modelProvider=vertex_ai`)
 

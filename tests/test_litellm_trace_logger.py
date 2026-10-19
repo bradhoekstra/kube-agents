@@ -2,22 +2,24 @@
 
 Verifies:
 1. Chart rendering invariance when traceLogEnabled is false (default):
-   - ConfigMap data does not include llm_trace_logger.py.
+   - ConfigMap data does not include llm_trace_logger.py or redactor.py.
    - litellm_settings.callbacks does not include the logger.
    - Deployment volumeMounts and env vars omit the logger and LITELLM_TRACE_LOG_PATH.
    - Checksum matches clean unset default.
 2. Chart rendering when traceLogEnabled is true:
-   - ConfigMap data includes llm_trace_logger.py identical to the chart source file.
+   - ConfigMap data includes llm_trace_logger.py and redactor.py identical to the chart source files.
    - litellm_settings.callbacks includes llm_trace_logger.proxy_handler_instance.
-   - Deployment volumeMounts mounts /app/llm_trace_logger.py (subPath: llm_trace_logger.py).
-   - Deployment env includes LITELLM_TRACE_LOG_PATH with default "/tmp/litellm_traces.jsonl".
+   - Deployment volumeMounts mounts /app/llm_trace_logger.py and /app/redactor.py without duplicating redactor.py when redaction.enabled is also true.
+   - Deployment env includes LITELLM_TRACE_LOG_PATH with default "/tmp/litellm_traces.jsonl" and SESSION_KV_SALT.
    - Deployment checksum changes.
-3. Custom litellm.traceLogPath sets LITELLM_TRACE_LOG_PATH accordingly.
-4. Schema validation rejects invalid traceLogPath (e.g. relative paths).
+3. Custom litellm.traceLogPath under /tmp/ sets LITELLM_TRACE_LOG_PATH accordingly.
+4. Schema and template validation reject invalid traceLogPath (relative paths, paths outside /tmp/, or bare /tmp/).
 5. Unit tests for PassThroughTrajectoryLogger:
    - async_log_success_event writes valid JSONL record without mutating payload.
    - async_log_failure_event writes valid failure JSONL record with error string.
-   - I/O and serialization errors never raise exceptions or disrupt caller.
+   - AuditRedactor scrubs credentials, emails, Secret data blocks, and IP literals from messages, tools, responses, and errors before writing.
+   - Log rotation shifts .1-.3 backups when incoming bytes exceed max_bytes.
+   - I/O errors emit a once-per-path warning to stderr and never raise exceptions.
 """
 
 from __future__ import annotations
@@ -25,13 +27,14 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import importlib.util
+import io
 import json
+import logging
 import os
 import pathlib
 import shutil
 import subprocess
 import tempfile
-import types
 import unittest
 
 import yaml
@@ -39,10 +42,14 @@ import yaml
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _CHART = _REPO_ROOT / "charts" / "kube-agents"
 _CHART_FILE = _CHART / "files" / "llm_trace_logger.py"
+_REDACTOR_FILE = _CHART / "files" / "redactor.py"
 _CALLBACK = "llm_trace_logger.proxy_handler_instance"
 _KEY = "llm_trace_logger.py"
+_REDACTOR_KEY = "redactor.py"
 _MOUNT = "/app/llm_trace_logger.py"
+_REDACTOR_MOUNT = "/app/redactor.py"
 _DEFAULT_LOG_PATH = "/tmp/litellm_traces.jsonl"
+_OAUTH_TOKEN = "ya29." + "A" * 195
 _HELM_BASE_ARGS = [
     "helm",
     "template",
@@ -108,11 +115,13 @@ class TestTraceLoggerChartRender(unittest.TestCase):
         self.assertEqual(unset_cm, false_cm)
         self.assertEqual(self._checksum(unset_deploy), self._checksum(false_deploy))
         self.assertNotIn(_KEY, unset_cm["data"])
+        self.assertNotIn(_REDACTOR_KEY, unset_cm["data"])
         self.assertNotIn(_CALLBACK, self._callbacks(unset_cm))
 
         container = unset_deploy["spec"]["template"]["spec"]["containers"][0]
         mounts = container.get("volumeMounts", [])
         self.assertFalse(any(m.get("mountPath") == _MOUNT for m in mounts))
+        self.assertFalse(any(m.get("mountPath") == _REDACTOR_MOUNT for m in mounts))
         envs = container.get("env", [])
         self.assertFalse(any(e.get("name") == "LITELLM_TRACE_LOG_PATH" for e in envs))
 
@@ -120,9 +129,11 @@ class TestTraceLoggerChartRender(unittest.TestCase):
         set_cm, set_deploy = self._documents(["--set", "litellm.traceLogEnabled=true"])
         unset_cm, unset_deploy = self._documents()
 
-        # ConfigMap data contains the source file verbatim
+        # ConfigMap data contains the source file and shared redactor verbatim
         self.assertIn(_KEY, set_cm["data"])
         self.assertEqual(set_cm["data"][_KEY], _CHART_FILE.read_text(encoding="utf-8"))
+        self.assertIn(_REDACTOR_KEY, set_cm["data"])
+        self.assertEqual(set_cm["data"][_REDACTOR_KEY], _REDACTOR_FILE.read_text(encoding="utf-8"))
 
         # ConfigMap litellm_settings.callbacks includes the callback
         callbacks = self._callbacks(set_cm)
@@ -132,22 +143,44 @@ class TestTraceLoggerChartRender(unittest.TestCase):
         # Deployment rolls (checksum changes)
         self.assertNotEqual(self._checksum(unset_deploy), self._checksum(set_deploy))
 
-        # Deployment volumeMounts contains the logger mount
+        # Deployment volumeMounts contains the logger and redactor mounts
         container = set_deploy["spec"]["template"]["spec"]["containers"][0]
         mounts = container.get("volumeMounts", [])
         logger_mount = next((m for m in mounts if m.get("mountPath") == _MOUNT), None)
         self.assertIsNotNone(logger_mount)
         self.assertEqual(logger_mount["subPath"], _KEY)
         self.assertEqual(logger_mount["name"], "config-volume")
+        redactor_mounts = [m for m in mounts if m.get("mountPath") == _REDACTOR_MOUNT]
+        self.assertEqual(len(redactor_mounts), 1)
+        self.assertEqual(redactor_mounts[0]["subPath"], _REDACTOR_KEY)
 
-        # Deployment env contains default LITELLM_TRACE_LOG_PATH
+        # Deployment env contains default LITELLM_TRACE_LOG_PATH and SESSION_KV_SALT
         envs = container.get("env", [])
         path_env = next((e for e in envs if e.get("name") == "LITELLM_TRACE_LOG_PATH"), None)
         self.assertIsNotNone(path_env)
         self.assertEqual(path_env["value"], _DEFAULT_LOG_PATH)
+        salt_envs = [e for e in envs if e.get("name") == "SESSION_KV_SALT"]
+        self.assertEqual(len(salt_envs), 1)
+
+    def test_enabled_alongside_redaction_does_not_duplicate_redactor_mount_or_salt(self) -> None:
+        set_cm, set_deploy = self._documents(
+            [
+                "--set",
+                "litellm.traceLogEnabled=true",
+                "--set",
+                "litellm.redaction.enabled=true",
+            ]
+        )
+        container = set_deploy["spec"]["template"]["spec"]["containers"][0]
+        mounts = container.get("volumeMounts", [])
+        redactor_mounts = [m for m in mounts if m.get("mountPath") == _REDACTOR_MOUNT]
+        self.assertEqual(len(redactor_mounts), 1)
+        envs = container.get("env", [])
+        salt_envs = [e for e in envs if e.get("name") == "SESSION_KV_SALT"]
+        self.assertEqual(len(salt_envs), 1)
 
     def test_custom_trace_log_path(self) -> None:
-        custom_path = "/var/log/litellm/audit.jsonl"
+        custom_path = "/tmp/litellm/audit.jsonl"
         set_cm, set_deploy = self._documents(
             [
                 "--set",
@@ -178,7 +211,13 @@ class TestTraceLoggerChartRender(unittest.TestCase):
         self.assertEqual(self._checksum(set_deploy), self._checksum(file_deploy))
 
     def test_schema_validates_trace_log_path(self) -> None:
-        for bad_path in ("relative/path.jsonl", "just_filename.jsonl"):
+        for bad_path in (
+            "relative/path.jsonl",
+            "just_filename.jsonl",
+            "/var/log/litellm/audit.jsonl",
+            "/tmp/",
+            "/tmp",
+        ):
             with self.subTest(path=bad_path):
                 proc = self._render(
                     [
@@ -195,12 +234,15 @@ class TestTraceLoggerChartRender(unittest.TestCase):
 class TestPassThroughTrajectoryLoggerUnit(unittest.TestCase):
     def setUp(self):
         self.mod = _load_logger_module()
+        self.mod._warned_paths.clear()
         self.temp_dir = tempfile.TemporaryDirectory()
         self.log_path = os.path.join(self.temp_dir.name, "test_traces.jsonl")
         os.environ["LITELLM_TRACE_LOG_PATH"] = self.log_path
+        os.environ["SESSION_KV_SALT"] = "unit-test-salt"
 
     def tearDown(self):
         os.environ.pop("LITELLM_TRACE_LOG_PATH", None)
+        os.environ.pop("SESSION_KV_SALT", None)
         self.temp_dir.cleanup()
 
     def test_success_event_logging(self):
@@ -233,7 +275,6 @@ class TestPassThroughTrajectoryLoggerUnit(unittest.TestCase):
             "usage": {"prompt_tokens": 120, "completion_tokens": 45, "total_tokens": 165},
         }
 
-        # Run async log
         asyncio.run(logger.async_log_success_event(kwargs, response_obj, start, end))
 
         self.assertTrue(os.path.exists(self.log_path))
@@ -278,18 +319,91 @@ class TestPassThroughTrajectoryLoggerUnit(unittest.TestCase):
         self.assertEqual(record["response"], {})
         self.assertEqual(record["latency_ms"], 1000.0)
 
-    def test_io_failure_never_raises(self):
+    def test_redaction_strips_secrets_emails_and_ips_without_mutating_caller_payloads(self):
         logger = self.mod.PassThroughTrajectoryLogger()
-        # Set invalid unwritable path
-        os.environ["LITELLM_TRACE_LOG_PATH"] = "/nonexistent/directory/traces.jsonl"
+        raw_user_msg = f"token {_OAUTH_TOKEN} ip 10.0.0.5 email alice@example.com"
+        raw_assistant_msg = f"found secret {_OAUTH_TOKEN} on 10.0.0.5 for bob@example.com"
+        kwargs = {
+            "model": "model-default",
+            "litellm_params": {"custom_llm_provider": "gemini"},
+            "optional_params": {},
+            "messages": [{"role": "user", "content": raw_user_msg}],
+        }
+        response_obj = {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": raw_assistant_msg,
+                    }
+                }
+            ]
+        }
 
-        kwargs = {"model": "model-default"}
-        # Must not raise an exception
+        asyncio.run(logger.async_log_success_event(kwargs, response_obj, None, None))
+
+        # Caller payloads remain untouched in memory
+        self.assertEqual(kwargs["messages"][0]["content"], raw_user_msg)
+        self.assertEqual(response_obj["choices"][0]["message"]["content"], raw_assistant_msg)
+
+        record = json.loads(pathlib.Path(self.log_path).read_text(encoding="utf-8").strip())
+        logged_user = record["messages"][0]["content"]
+        logged_assistant = record["response"]["choices"][0]["message"]["content"]
+        self.assertNotIn(_OAUTH_TOKEN, logged_user)
+        self.assertNotIn("10.0.0.5", logged_user)
+        self.assertNotIn("alice@example.com", logged_user)
+        self.assertIn("[REDACTED_SECRET]", logged_user)
+        self.assertIn("[REDACTED_EMAIL]", logged_user)
+        self.assertRegex(logged_user, r"\[ip:[0-9a-f]{12}\]")
+
+        self.assertNotIn(_OAUTH_TOKEN, logged_assistant)
+        self.assertNotIn("10.0.0.5", logged_assistant)
+        self.assertNotIn("bob@example.com", logged_assistant)
+        self.assertIn("[REDACTED_SECRET]", logged_assistant)
+        self.assertIn("[REDACTED_EMAIL]", logged_assistant)
+        self.assertRegex(logged_assistant, r"\[ip:[0-9a-f]{12}\]")
+
+    def test_rotation_caps_files_at_max_bytes_and_backup_count(self):
+        # Set max_bytes small enough that each record triggers a rotation once non-empty
+        logger = self.mod.PassThroughTrajectoryLogger(max_bytes=200, backup_count=3)
+        for idx in range(6):
+            kwargs = {
+                "model": "model-default",
+                "messages": [{"role": "user", "content": f"turn-{idx}-" + ("x" * 80)}],
+            }
+            asyncio.run(logger.async_log_success_event(kwargs, {}, None, None))
+
+        base = pathlib.Path(self.log_path)
+        self.assertTrue(base.exists())
+        self.assertTrue(base.with_name(f"{base.name}.1").exists())
+        self.assertTrue(base.with_name(f"{base.name}.2").exists())
+        self.assertTrue(base.with_name(f"{base.name}.3").exists())
+        self.assertFalse(base.with_name(f"{base.name}.4").exists())
+
+        # Latest record is in the live file
+        latest = json.loads(base.read_text(encoding="utf-8").strip())
+        self.assertIn("turn-5-", latest["messages"][0]["content"])
+
+    def test_io_failure_logs_warning_once_and_never_raises(self):
+        logger = self.mod.PassThroughTrajectoryLogger()
+        bad_path = "/nonexistent/directory/traces.jsonl"
+        os.environ["LITELLM_TRACE_LOG_PATH"] = bad_path
+
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        self.mod.logger.addHandler(handler)
         try:
+            kwargs = {"model": "model-default"}
             asyncio.run(logger.async_log_success_event(kwargs, {}, None, None))
             asyncio.run(logger.async_log_failure_event(kwargs, {}, None, None))
         except Exception as e:
             self.fail(f"Logger raised exception on I/O error: {e}")
+        finally:
+            self.mod.logger.removeHandler(handler)
+
+        output = stream.getvalue().strip().splitlines()
+        self.assertEqual(len(output), 1)
+        self.assertIn(bad_path, output[0])
 
     def test_safe_serialize_handles_objects_and_pydantic_shapes(self):
         class DummyPydantic:

@@ -178,22 +178,25 @@ What this covers is the request body on its way to the provider. It does not tou
 
 For offline evaluation, fine-tuning, latency analysis, and audit trails, `litellm.traceLogEnabled=true` enables pass-through JSONL trajectory capture at the gateway.
 
-When enabled, the chart mounts `llm_trace_logger.py` beside `config.yaml`, registers `llm_trace_logger.proxy_handler_instance` under `litellm_settings.callbacks`, and passes `LITELLM_TRACE_LOG_PATH` (default: `/tmp/litellm_traces.jsonl`, inside the pod's `emptyDir` `/tmp` volume) to the container.
+When enabled, the chart mounts `llm_trace_logger.py` and the shared `redactor.py` module beside `config.yaml`, registers `llm_trace_logger.proxy_handler_instance` under `litellm_settings.callbacks`, and passes `LITELLM_TRACE_LOG_PATH` (default: `/tmp/litellm_traces.jsonl`, which must reside under `/tmp/` because the gateway container runs with `readOnlyRootFilesystem: true` and only mounts an `emptyDir` at `/tmp`) plus `SESSION_KV_SALT` to the container.
+
+Before any record is written to disk, `AuditRedactor` runs over `api_base`, `messages`, `tools`, `response`, and `error` to mask built-in credential patterns, Kubernetes `Secret` `data:`/`stringData:` payloads, secret-shaped keys, and e-mail addresses, and to pseudonymise IP literals (plus any operator rules from `redaction.yaml` when `litellm.redaction.enabled` is also on). Because `redaction.enabled` only rewrites outbound requests, running `AuditRedactor` inside the trajectory logger ensures assistant responses and reasoning traces are also scrubbed before hitting `/tmp`.
 
 Every completed or failed LLM invocation appends one JSON object containing:
+
 - `timestamp`: UTC ISO 8601 timestamp.
 - `status`: `"success"` or `"failure"`.
 - `model_alias`: The requested model alias (e.g. `model-default`).
 - `custom_llm_provider`: Upstream provider (`vertex_ai`, `hosted_vllm`, `gemini`, etc.).
-- `api_base`: Backend URL (if configured).
+- `api_base`: Backend URL (if configured, with URL userinfo passwords masked).
 - `reasoning_effort`: Requested reasoning effort (e.g. `high`, `medium`, `low`).
 - `latency_ms`: Round-trip invocation latency in milliseconds.
-- `messages`: Serialized input messages and tool outputs.
-- `tools`: Serialized tool schemas provided to the model.
-- `response`: Complete upstream response payload, including `choices`, `usage`, and `reasoning_content`.
-- `error`: Error message if the call failed.
+- `messages`: Redacted input messages and tool outputs.
+- `tools`: Redacted tool schemas provided to the model.
+- `response`: Redacted upstream response payload, including `choices`, `usage`, and `reasoning_content`.
+- `error`: Redacted error message if the call failed.
 
-The logger is strictly pass-through: it never mutates request or response payloads, and write exceptions are silently trapped so logging I/O issues never fail model calls. When `litellm.traceLogEnabled` is `false` (default), the callback is omitted and the default ConfigMap checksum remains byte-identical.
+To bound disk consumption on the gateway pod's `/tmp` `emptyDir`, the logger rotates the trace file at `5 MiB` (`TRACE_FILE_MAX_BYTES`) across `3` numbered backups (`.1`–`.3`, `TRACE_FILE_BACKUP_COUNT`) under an exclusive `flock` on `<path>.lock`, capping the on-pod trail at `20 MiB`. The logger is strictly pass-through: it never mutates live request or response payloads in place, and write exceptions emit a once-per-path `WARNING` to stderr (`kube_agents.llm_trace_logger`) so logging I/O issues are observable in pod logs without failing model calls. When `litellm.traceLogEnabled` is `false` (default), the callback is omitted and the default ConfigMap checksum remains byte-identical.
 
 ### Vertex AI and Model Garden
 

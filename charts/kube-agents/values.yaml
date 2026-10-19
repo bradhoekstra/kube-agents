@@ -458,13 +458,18 @@ litellm:
     rules: []
   # Pass-through JSONL trajectory logger callback. When enabled, registers
   # llm_trace_logger.proxy_handler_instance in LiteLLM's callbacks and mounts
-  # llm_trace_logger.py beside config.yaml. Every upstream model invocation
-  # (messages, tools, responses, reasoning content, token usage, latency) is
-  # appended as one JSONL record to traceLogPath. Pass-through only: does not
-  # alter requests or responses, and I/O failures never break inference.
+  # llm_trace_logger.py plus the shared redactor.py module beside config.yaml.
+  # Every upstream model invocation (messages, tools, responses, reasoning
+  # content, token usage, latency) is redacted through AuditRedactor (built-in
+  # credential patterns, Secret data blocks, sensitive keys, emails, and IP
+  # literals, plus any operator rules when redaction.enabled is also true) and
+  # appended as one JSONL record to traceLogPath. The file rotates at 5 MiB
+  # across 3 backups (.1-.3, 20 MiB max total) under an flock on <path>.lock.
+  # Pass-through only: does not alter live requests or responses, and logs a
+  # once-per-path warning to stderr on I/O failure rather than breaking inference.
   traceLogEnabled: false
-  # Absolute file path where the trajectory log is written. The default
-  # (/tmp/litellm_traces.jsonl) writes into the gateway pod's emptyDir tmp volume.
+  # File path under /tmp/ where the trajectory log is written (the gateway
+  # container runs with readOnlyRootFilesystem: true and only /tmp is writable).
   traceLogPath: "/tmp/litellm_traces.jsonl"
 
 # The Hindsight memory store: the API the agents call for long-term memory,

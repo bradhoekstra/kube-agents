@@ -134,8 +134,18 @@
 {{- $callbackList = append $callbackList "litellm_redaction_callback.proxy_handler_instance" }}
 {{- end }}
 {{- $traceLogEnabled := default false .Values.litellm.traceLogEnabled }}
+{{- $traceLogPath := .Values.litellm.traceLogPath | default "/tmp/litellm_traces.jsonl" }}
 {{- $traceLogSource := "" }}
 {{- if $traceLogEnabled }}
+{{- if or (not (kindIs "string" $traceLogPath)) (not (regexMatch `^/tmp/[^\x00/]+(/[^\x00/]+)*$` $traceLogPath)) }}
+{{- fail (printf "litellm.traceLogPath %q must be a file path under /tmp/ (the gateway container runs with readOnlyRootFilesystem: true and only /tmp is writable)" $traceLogPath) }}
+{{- end }}
+{{- if empty $redactorSource }}
+{{- $redactorSource = .Files.Get "files/redactor.py" }}
+{{- if empty $redactorSource }}
+{{- fail "litellm.traceLogEnabled is enabled but the chart's files/redactor.py is missing" }}
+{{- end }}
+{{- end }}
 {{- $traceLogSource = .Files.Get "files/llm_trace_logger.py" }}
 {{- if empty $traceLogSource }}
 {{- fail "the chart's files/llm_trace_logger.py is missing" }}
@@ -184,6 +194,9 @@ data:
     {{- $redactorSource | nindent 4 }}
   litellm_redaction_callback.py: |
     {{- $redactionCallbackSource | nindent 4 }}
+  {{- else if $traceLogEnabled }}
+  redactor.py: |
+    {{- $redactorSource | nindent 4 }}
   {{- end }}
   {{- if $traceLogEnabled }}
   llm_trace_logger.py: |
@@ -336,6 +349,8 @@ spec:
             {{- if $redactionEnabled }}
             - name: KUBE_AGENTS_REDACTION_CONFIG
               value: /app/redaction.yaml
+            {{- end }}
+            {{- if or $redactionEnabled $traceLogEnabled }}
             # Salts the [rule:<hex>] pseudonyms. Optional: without it the
             # redactor warns and uses a per-pod salt, so tokens still redact
             # but stop matching across replicas and restarts.
@@ -360,7 +375,7 @@ spec:
             {{- end }}
             {{- if $traceLogEnabled }}
             - name: LITELLM_TRACE_LOG_PATH
-              value: {{ .Values.litellm.traceLogPath | quote }}
+              value: {{ $traceLogPath | quote }}
             {{- end }}
           ports:
             - containerPort: 8080
@@ -417,6 +432,10 @@ spec:
             - name: config-volume
               mountPath: /app/litellm_redaction_callback.py
               subPath: litellm_redaction_callback.py
+            {{- else if $traceLogEnabled }}
+            - name: config-volume
+              mountPath: /app/redactor.py
+              subPath: redactor.py
             {{- end }}
             {{- if $traceLogEnabled }}
             - name: config-volume
