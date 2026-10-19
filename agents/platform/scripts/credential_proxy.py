@@ -42,6 +42,7 @@ from typing import Any, Callable, Iterator, Mapping, NamedTuple, TextIO
 
 import api_policy
 import command_policy
+import feedback_broker
 import mcp_policy
 import providers
 import repo_ref
@@ -625,6 +626,12 @@ AUDIT_STATUS_BLOCKED = "blocked"
 AUDIT_STATUS_REJECTED = "rejected"
 AUDIT_STATUS_FAILED = "failed"
 AUDIT_STATUS_ABANDONED = "abandoned"
+# The feedback verb's audit vocabulary: a closed pair, like every tool and
+# subcommand label here, never the route or the report's text.
+FEEDBACK_AUDIT_TOOL = "feedback"
+FEEDBACK_AUDIT_SUBCOMMAND = "submit"
+FEEDBACK_REASON_LOG_LENGTH = 200
+FEEDBACK_REASON_UNREACHABLE = "could not reach the feedback form ({error}); nothing was sent"
 AUDIT_STATUS_BUSY = "busy"
 # Rule ids for the refusals the exec route decides itself rather than by a
 # policy rule. The response body and the audit record name the same constant,
@@ -1007,6 +1014,10 @@ ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("/v1/chat/api", (CALLER_ROLE_CHAT, CALLER_ROLE_A2A_CHAT)),
     ("/v1/chat/", (CALLER_ROLE_CHAT,)),
     ("/v1/exec", (CALLER_ROLE_SHELL, CALLER_ROLE_SESSION)),
+    # The feedback form verb: the sandbox's one way to file a report about
+    # kube-agents itself (feedback_broker.py). The shell alone: a session pod
+    # files nothing on anyone's behalf.
+    ("/v1/feedback/", (CALLER_ROLE_SHELL,)),
     ("/v1/forge/", (CALLER_ROLE_SHELL,)),
     # The constant, not a literal: required_roles() answers () on a miss and
     # _role_permits then admits every role, so a prefix spelled twice is a
@@ -8738,6 +8749,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         if self.path.startswith("/v1/vcs/"):
             self._handle_vcs_post()
             return
+        if self.path == feedback_broker.ROUTE:
+            self._handle_feedback_post()
+            return
         if self.path != "/v1/exec":
             self._json(HTTPStatus.NOT_FOUND, {"status": "not_found"})
             return
@@ -10166,6 +10180,71 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             )
             return
         self._json(HTTPStatus.OK, {"status": "refreshed", "forge": forge.name})
+
+    def _handle_feedback_post(self) -> None:
+        """`POST /v1/feedback/submit`: file a confirmed kube-agents report once.
+
+        feedback_broker owns the payload rules and the wire path; this route
+        reads the body, holds a request slot around the outbound calls as the
+        forge verbs do, and maps the outcome: the broker's status object on
+        200, a `BLOCKED` object on 400 when nothing was sent (a refused
+        payload, a form that cannot be reached), and the audit line carries
+        the title and the status, never the report's text.
+        """
+        request_id = str(uuid.uuid4())
+        principal = getattr(self, "principal", None)
+        principal_label = _sanitize_for_logging(
+            principal.describe() if principal is not None else "", max_length=PRINCIPAL_LOG_LENGTH
+        )
+
+        def audit(status: str) -> dict[str, Any]:
+            return {
+                AUDIT_EXTRA_KEY: _tool_audit(
+                    status, request_id, principal_label, FEEDBACK_AUDIT_TOOL, FEEDBACK_AUDIT_SUBCOMMAND
+                )
+            }
+
+        try:
+            payload = self._read_json_body()
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
+        title = _sanitize_for_logging(str(payload.get("title", "")))
+        LOGGER.info(
+            "feedback submit request_id=%s principal=%s title=%s",
+            request_id, principal_label, title, extra=audit(AUDIT_STATUS_STARTED),
+        )
+        try:
+            with self._request_slot():
+                answer = feedback_broker.submit(payload)
+        except feedback_broker.Blocked as exc:
+            LOGGER.info(
+                "feedback submit blocked request_id=%s: %s",
+                request_id, _sanitize_for_logging(exc.reason, max_length=FEEDBACK_REASON_LOG_LENGTH),
+                extra=audit(AUDIT_STATUS_BLOCKED),
+            )
+            self._json(HTTPStatus.BAD_REQUEST, feedback_broker.blocked_answer(exc.reason))
+            return
+        except CallerHungUp as exc:
+            LOGGER.info("feedback submit abandoned request_id=%s: %s", request_id, exc, extra=audit(AUDIT_STATUS_ABANDONED))
+            return
+        except (urllib.error.URLError, OSError) as exc:
+            # Nothing feedback_broker lets through here has POSTed: the one
+            # request whose fate is unknown is answered as UNCONFIRMED by it.
+            LOGGER.warning(
+                "feedback submit failed request_id=%s type=%s", request_id, type(exc).__name__,
+                extra=audit(AUDIT_STATUS_FAILED),
+            )
+            self._json(
+                HTTPStatus.BAD_REQUEST,
+                feedback_broker.blocked_answer(FEEDBACK_REASON_UNREACHABLE.format(error=type(exc).__name__)),
+            )
+            return
+        LOGGER.info(
+            "feedback submit %s request_id=%s title=%s",
+            answer.get("status"), request_id, title, extra=audit(AUDIT_STATUS_COMPLETED),
+        )
+        self._json(HTTPStatus.OK, answer)
 
     def _handle_vcs_post(self) -> None:
         """The version-control routes: `POST /v1/vcs/<verb>`.
