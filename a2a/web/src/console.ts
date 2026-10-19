@@ -212,8 +212,10 @@ export function turnFate(text: string): TurnFate {
   if (sessionRest !== null) {
     // Pre-flip the argument is the first turn as written; post-flip it is
     // unwrapped into an ordinary turn, which the delegate rule then reads.
-    // Post-flip the gateway strips the prefix before it reads /feedback, so a bare /feedback behind /session is the notice too.
-    if (sessionRest === "" || isSessionOffArg(sessionRest) || isStopTurn(sessionRest) || feedbackCommandRest(sessionRest) === "") return { kind: "settled" };
+    // The one divergence from the gateway: a bare /feedback behind /session is the notice post-flip (the prefix is
+    // stripped before /feedback is read) and a session's first turn pre-flip. The page cannot tell the modes apart, so
+    // it keeps the conservative reading and lets the post-flip turn get the "no task yet" note.
+    if (sessionRest === "" || isSessionOffArg(sessionRest) || isStopTurn(sessionRest)) return { kind: "settled" };
     return { kind: "task", texts: withDelegate(sessionRest) };
   }
   if (isStopTurn(trimmed)) return { kind: "settled" };

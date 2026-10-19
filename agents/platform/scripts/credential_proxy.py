@@ -10212,7 +10212,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         except feedback_broker.Blocked as exc:
             LOGGER.info(
                 "feedback submit blocked request_id=%s: %s",
-                request_id, _sanitize_for_logging(exc.reason, max_length=FEEDBACK_REASON_LOG_LENGTH),
+                request_id, _sanitize_for_logging(redact_credentials(exc.reason), max_length=FEEDBACK_REASON_LOG_LENGTH),
                 extra=audit(AUDIT_STATUS_BLOCKED),
             )
             self._json(HTTPStatus.BAD_REQUEST, feedback_broker.blocked_answer(exc.reason))

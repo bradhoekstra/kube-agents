@@ -109,11 +109,10 @@ PIPELINE_GRACE_SECONDS = 30 * 60
 # "submitted" from "the form served an error page with status 200".
 CONFIRMATION_SUBSTRING = "filed as a public issue"
 
-# Content that must never reach a public issue, whoever typed it. These block;
-# the softer redaction judgment (cluster names, project ids) is the persona's,
-# because no regex recognizes a cluster name. One list for this gate and for
-# the broker's log redaction: credential_shapes.py.
-SECRET_PATTERNS = credential_shapes.CREDENTIAL_SHAPES
+# Content that must never reach a public issue, whoever typed it, is refused by
+# credential_shapes.find_credential_shape (one list for this gate and for the
+# broker's log redaction). The softer redaction judgment (cluster names,
+# project ids) is the persona's, because no regex recognizes a cluster name.
 
 # The viewform page embeds every question as JSON in this variable.
 FB_DATA_PATTERN = re.compile(r"FB_PUBLIC_LOAD_DATA_\s*=\s*(\[.*?\])\s*;", re.DOTALL)
@@ -122,11 +121,11 @@ FORM_URL_PATTERN = re.compile(r"https://docs\.google\.com/forms/d/e/([A-Za-z0-9_
 # dedupe compares it as well as the title, so two reports that share a one-line
 # summary are two reports.
 HAPPENED_HEADING = "## What happened"
-# The headings Code.gs writes after it (BODY_SECTIONS there). The section ends
-# at the first of these, never at a "## " line the person wrote inside the text.
-NEXT_SECTION_RE = re.compile(
-    r"^## (?:What was expected|Version and environment|Logs, links, or anything else)\s*$", re.MULTILINE
-)
+# Code.gs writes the report's text verbatim after the heading, then this
+# separator before the next heading (or nothing, when it is the last section),
+# so the text is compared exactly rather than cut at any heading the person's
+# own text may contain.
+SECTION_SEPARATOR = "\n\n## "
 VIEWFORM_SUFFIX = "/viewform"
 RESPONSE_SUFFIX = "/formResponse"
 ENTRY_PREFIX = "entry."
@@ -136,7 +135,11 @@ USER_AGENT = "kube-agents-feedback-broker"
 # The pipeline says the issue appears "within a minute"; poll a little longer.
 TRACKER_POLL_SECONDS = 90
 TRACKER_POLL_INTERVAL_SECONDS = 10
-TRACKER_PAGE_SIZE = 20
+# One page covers the day: the read asks for issues updated since the window
+# opened (a superset of created-since), newest first, a hundred to the page.
+TRACKER_PAGE_SIZE = 100
+TRACKER_SORT = "created"
+TRACKER_DIRECTION = "desc"
 TRACKER_TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 # Before a first POST, one tracker read looks for this payload's title among
 # recent feedback issues: a match inside this window means an earlier call
@@ -297,7 +300,8 @@ def validate(payload: dict[str, Any]) -> None:
         if not payload[field]:
             raise Blocked(f"required field '{field}' is empty")
     if payload["kind"] not in KIND_CHOICES:
-        raise Blocked(f"kind {payload['kind']!r} is not one of {', '.join(KIND_CHOICES)}")
+        # The value is not echoed: a refusal names the rule, never the text.
+        raise Blocked(f"kind is not one of {', '.join(KIND_CHOICES)}")
     if len(payload["title"]) > TITLE_MAX_CHARS:
         raise Blocked(REASON_TITLE_TOO_LONG.format(length=len(payload["title"])))
     body_length = sum(len(payload[field]) for field in BODY_FIELDS)
@@ -323,13 +327,20 @@ class TrackerLookup:
         self.error = error
 
 
-def _happened_section(body: str | None) -> str | None:
-    """The text under Code.gs's "What happened" heading, stripped, or None without one."""
+def _body_carries_happened(body: str | None, happened: str) -> bool | None:
+    """Whether the issue body's "What happened" section is exactly happened.
+
+    None when the body has no such section (an issue the form's pipeline did
+    not write, or wrote differently), which the caller reads as "match on
+    title alone" so that pipeline drift cannot blind the probe. The text after
+    the heading is compared whole: equal to happened, or happened followed by
+    the separator Code.gs writes before the next heading, whatever headings
+    the person's own text contains.
+    """
     if not body or HAPPENED_HEADING not in body:
         return None
-    after = body.split(HAPPENED_HEADING, 1)[1]
-    next_heading = NEXT_SECTION_RE.search(after)
-    return (after[: next_heading.start()] if next_heading else after).strip()
+    after = body.split(HAPPENED_HEADING, 1)[1].strip()
+    return after == happened or after.startswith(happened + SECTION_SEPARATOR)
 
 
 def find_issue(
@@ -350,9 +361,14 @@ def find_issue(
     heading alone, still matches on title, so the form's own pipeline drift
     cannot make the probe blind).
     """
-    query = urllib.parse.urlencode(
-        {"labels": FEEDBACK_LABEL, "state": "all", "per_page": TRACKER_PAGE_SIZE}
-    )
+    query = urllib.parse.urlencode({
+        "labels": FEEDBACK_LABEL,
+        "state": "all",
+        "per_page": TRACKER_PAGE_SIZE,
+        "sort": TRACKER_SORT,
+        "direction": TRACKER_DIRECTION,
+        "since": time.strftime(TRACKER_TIME_FORMAT, time.gmtime(max(since_epoch, 0))),
+    })
     deadline = now() + deadline_seconds
     read_ok, error = False, ""
     while True:
@@ -362,8 +378,7 @@ def find_issue(
                 created = calendar.timegm(time.strptime(issue["created_at"], TRACKER_TIME_FORMAT))
                 if issue["title"] != title or created < since_epoch:
                     continue
-                section = _happened_section(issue.get("body"))
-                if happened is not None and section and section != happened:
+                if happened is not None and _body_carries_happened(issue.get("body"), happened) is False:
                     continue
                 return TrackerLookup(issue["html_url"], True)
             read_ok = True
@@ -400,12 +415,15 @@ def submit(
             # The form confirmed the earlier POST; the issue is pipeline
             # latency away, not lost -- for as long as latency is a credible
             # reason. Past the grace, the pipeline is the suspect.
+            # A read that failed is not "no issue": a blind recheck stays
+            # SUBMITTED whatever its age, and the grace is judged only on a
+            # tracker that was read.
+            if not prior.read_ok:
+                return _answer(STATUS_SUBMITTED, None, DETAIL_SUBMITTED_TRACKER_UNREADABLE.format(error=prior.error))
             confirmed_at = payload.get(FORM_CONFIRMED_AT_FIELD)
             if isinstance(confirmed_at, (int, float)) and now() - confirmed_at > PIPELINE_GRACE_SECONDS:
                 minutes = int((now() - confirmed_at) // 60)
                 return _answer(STATUS_UNCONFIRMED, None, DETAIL_PIPELINE_FAILED.format(minutes=minutes))
-            if not prior.read_ok:
-                return _answer(STATUS_SUBMITTED, None, DETAIL_SUBMITTED_TRACKER_UNREADABLE.format(error=prior.error))
             return _answer(STATUS_SUBMITTED, None, DETAIL_SUBMITTED_NO_URL)
         if not prior.read_ok:
             return _answer(STATUS_UNCONFIRMED, None, DETAIL_RECHECK_TRACKER_UNREADABLE.format(error=prior.error))

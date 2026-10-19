@@ -48,7 +48,9 @@ class FileFeedbackTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.state_dir = Path(self.tmp.name)
-        env = mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": BROKER})
+        # The token file is pinned empty: the runner's own, if the shell sourced
+        # a pod's environment, must neither be read nor make the tests fail.
+        env = mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": BROKER, "CREDENTIAL_PROXY_TOKEN_FILE": ""})
         env.start()
         self.addCleanup(env.stop)
 
@@ -57,8 +59,8 @@ class FileFeedbackTest(unittest.TestCase):
         path.write_text(json.dumps(payload), encoding="utf-8")
         calls: list[dict] = []
 
-        def post(endpoint, body):
-            calls.append(body)
+        def post(request):
+            calls.append(json.loads(request.data))
             if isinstance(broker, Exception):
                 raise broker
             return broker
@@ -167,7 +169,7 @@ class FileFeedbackTest(unittest.TestCase):
         cut = CutError("http://broker/v1/feedback/submit", 503, "busy", {}, io.BytesIO(b""))
         with mock.patch.object(file_feedback.credential_proxy_client, "open_broker_request", side_effect=cut):
             with self.assertRaises(file_feedback.BrokerAnswerLost):
-                file_feedback._post_to_broker(BROKER, dict(PAYLOAD))
+                file_feedback._post_to_broker(file_feedback._build_request(BROKER, dict(PAYLOAD)))
 
     def test_a_marker_holding_non_object_json_is_an_attempted_marker(self) -> None:
         path = self.state_dir / "payload.json"
@@ -187,7 +189,7 @@ class FileFeedbackTest(unittest.TestCase):
 
         with mock.patch.object(file_feedback.credential_proxy_client, "open_broker_request", return_value=Cut()):
             with self.assertRaises(file_feedback.BrokerAnswerLost):
-                file_feedback._post_to_broker(BROKER, dict(PAYLOAD))
+                file_feedback._post_to_broker(file_feedback._build_request(BROKER, dict(PAYLOAD)))
 
     def test_a_request_that_cannot_be_built_is_blocked_and_leaves_no_marker(self) -> None:
         # A scheme-less endpoint fails inside urllib's Request constructor, a
@@ -207,6 +209,29 @@ class FileFeedbackTest(unittest.TestCase):
         self._run(PAYLOAD, (200, pending))
         _, _, calls = self._run(PAYLOAD, (200, pending))
         self.assertIsInstance(calls[0].get("form_confirmed_at"), float)
+
+    def test_the_payload_file_cannot_set_the_recheck_fields(self) -> None:
+        code, printed, calls = self._run(dict(PAYLOAD, recheck_only=True, form_confirmed=True, form_confirmed_at=1.0),
+                                         (200, SUBMITTED))
+        self.assertEqual((0, "SUBMITTED"), (code, printed["status"]))
+        self.assertEqual(1, len(calls))
+        for control in ("recheck_only", "form_confirmed", "form_confirmed_at"):
+            self.assertNotIn(control, calls[0])
+
+    def test_the_token_is_read_once_and_before_the_marker(self) -> None:
+        reads: list[int] = []
+
+        def headers():
+            reads.append(1)
+            return {"Authorization": "Bearer t"}
+
+        path = self.state_dir / "payload.json"
+        path.write_text(json.dumps(PAYLOAD), encoding="utf-8")
+        with mock.patch.object(file_feedback.credential_proxy_client, "authorization_headers", side_effect=headers):
+            with mock.patch.object(file_feedback, "_send", return_value=(200, SUBMITTED)):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    file_feedback.submit(path, self.state_dir)
+        self.assertEqual(1, len(reads))
 
     def test_missing_endpoint_is_blocked(self) -> None:
         with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": ""}):

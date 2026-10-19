@@ -68,6 +68,7 @@ RECHECK_FIELD = feedback_broker.RECHECK_FIELD
 FORM_CONFIRMED_FIELD = feedback_broker.FORM_CONFIRMED_FIELD
 FORM_CONFIRMED_AT_FIELD = feedback_broker.FORM_CONFIRMED_AT_FIELD
 MARKER_TMP_SUFFIX = ".tmp"
+CONTROL_FIELDS = (RECHECK_FIELD, FORM_CONFIRMED_FIELD, FORM_CONFIRMED_AT_FIELD)
 STATUS_SUBMITTED = feedback_broker.STATUS_SUBMITTED
 STATUS_UNCONFIRMED = feedback_broker.STATUS_UNCONFIRMED
 FALLBACK = feedback_broker.FALLBACK
@@ -165,16 +166,8 @@ def _build_request(endpoint: str, payload: dict[str, Any]) -> urllib.request.Req
     return urllib.request.Request(endpoint.rstrip("/") + ROUTE, data=body, headers=headers, method="POST")
 
 
-def _post_to_broker(endpoint: str, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
-    """One `POST /v1/feedback/submit`: the HTTP status and the JSON body (``{}`` if none).
-
-    Raises ``urllib.error.URLError`` when the broker could not be reached at all
-    (nothing was sent) and ``BrokerAnswerLost`` when the connection broke after
-    the request went out (the broker may have filed). The arm order is
-    credential_proxy_client.vcs_call's: URLError first, then everything else
-    off an open connection, and the refusal's body read in its own try.
-    """
-    request = _build_request(endpoint, payload)
+def _send(request: urllib.request.Request) -> tuple[int, dict[str, Any]]:
+    """Put a built request on the wire: the HTTP status and the JSON body (``{}`` if none)."""
     try:
         with credential_proxy_client.open_broker_request(request) as response:
             status, raw = response.status, response.read()
@@ -194,6 +187,20 @@ def _post_to_broker(endpoint: str, payload: dict[str, Any]) -> tuple[int, dict[s
     return status, _json_or_empty(raw)
 
 
+def _post_to_broker(request: urllib.request.Request) -> tuple[int, dict[str, Any]]:
+    """One `POST /v1/feedback/submit` with a request `_build_request` made.
+
+    Raises ``urllib.error.URLError`` when the broker could not be reached at all
+    (nothing was sent) and ``BrokerAnswerLost`` when the connection broke after
+    the request went out (the broker may have filed). The arm order is
+    credential_proxy_client.vcs_call's: URLError first, then everything else
+    off an open connection, and the refusal's body read in its own try. The
+    request is built once, before the marker is written, so the token file is
+    never read after the marker exists.
+    """
+    return _send(request)
+
+
 def _write_marker(marker: Path, state: dict[str, Any]) -> None:
     """Write the marker whole: a temp name, then one rename, so a reader never sees a partial file."""
     tmp = marker.with_name(marker.name + MARKER_TMP_SUFFIX)
@@ -211,6 +218,11 @@ def _json_or_empty(raw: bytes) -> dict[str, Any]:
 
 def submit(payload_path: Path, state_dir: Path) -> int:
     payload = feedback_broker.normalize(json.loads(payload_path.read_text(encoding="utf-8")))
+    # The recheck fields are this script's to set, from its marker, never the
+    # payload file's: a file that carried them would send a first attempt down
+    # the broker's recheck path and report a request never made as filed.
+    for control in CONTROL_FIELDS:
+        payload.pop(control, None)
     marker = _marker_path(state_dir, payload)
 
     if marker.exists():
@@ -237,7 +249,7 @@ def submit(payload_path: Path, state_dir: Path) -> int:
     # exists: a marker that outlives a request never made would send every
     # rerun down the recheck path for a report nobody filed.
     try:
-        _build_request(endpoint, payload)
+        request = _build_request(endpoint, payload)
     except credential_proxy_client.TokenUnavailable as exc:
         return _blocked(REASON_NO_TOKEN.format(error=exc))
     except ValueError as exc:
@@ -245,7 +257,7 @@ def submit(payload_path: Path, state_dir: Path) -> int:
     if first_attempt:
         _write_marker(marker, {"started_at": time.time(), "title": payload["title"]})
     try:
-        code, answer = _post_to_broker(endpoint, payload)
+        code, answer = _post_to_broker(request)
     except urllib.error.URLError as exc:
         if not first_attempt:
             return _recheck_unreachable(str(exc.reason))

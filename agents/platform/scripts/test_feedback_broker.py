@@ -352,7 +352,9 @@ class SubmitTest(unittest.TestCase):
         happened = "Opened chat.\n## Steps\n1. typed /feedback"
         body = ("Filed from the form.\n\n**Kind:** Bug\n\n## What happened\n\n" + happened
                 + "\n\n## What was expected\n\nonce\n")
-        self.assertEqual(happened, fb._happened_section(body))
+        self.assertTrue(fb._body_carries_happened(body, happened))
+        self.assertFalse(fb._body_carries_happened(body, "Opened chat."))
+        self.assertIsNone(fb._body_carries_happened("no section here", happened))
 
         class SeededWire(FakeWire):
             def tracker_response(self) -> str:
@@ -363,10 +365,54 @@ class SubmitTest(unittest.TestCase):
         out = self._submit(dict(PAYLOAD, happened=happened), wire)
         self.assertEqual(("ALREADY_SUBMITTED", []), (out["status"], wire.posts))
 
+    def test_one_of_the_forms_own_headings_inside_what_happened_does_not_blind_the_dedupe(self) -> None:
+        happened = "Filed once already:\n## What was expected\nan issue link"
+        body = "## What happened\n\n" + happened + "\n\n## What was expected\n\nonce\n"
+        self.assertTrue(fb._body_carries_happened(body, happened))
+        self.assertFalse(fb._body_carries_happened(body, "Filed once already:"))
+        last_section = "## What happened\n\n" + happened + "\n"
+        self.assertTrue(fb._body_carries_happened(last_section, happened))
+
+    def test_a_blind_recheck_past_the_grace_stays_submitted(self) -> None:
+        class RateLimitedWire(FakeWire):
+            def __call__(self, url: str, data: bytes | None = None) -> str:
+                if url.startswith(fb.TRACKER_API):
+                    raise urllib.error.HTTPError(url, 403, "rate limited", {}, None)
+                return super().__call__(url, data)
+
+        now = 1_800_000_000.0
+        out = fb.submit(dict(PAYLOAD, recheck_only=True, form_confirmed=True,
+                             form_confirmed_at=now - fb.PIPELINE_GRACE_SECONDS - 60),
+                        fetch=RateLimitedWire(), now=lambda: now, sleep=lambda _: None)
+        self.assertEqual(("SUBMITTED", None), (out["status"], out["issue_url"]))
+        self.assertIn("tracker", out["detail"])
+
+    def test_a_refused_kind_is_not_echoed(self) -> None:
+        token = "ghp_" + "a" * 36
+        with self.assertRaises(fb.Blocked) as ctx:
+            fb.validate(fb.normalize(dict(PAYLOAD, kind=token)))
+        self.assertNotIn(token, ctx.exception.reason)
+        self.assertIn("Bug", ctx.exception.reason)
+
+    def test_the_tracker_read_covers_the_whole_day(self) -> None:
+        seen: list[str] = []
+
+        class RecordingWire(FakeWire):
+            def __call__(self, url: str, data: bytes | None = None) -> str:
+                if url.startswith(fb.TRACKER_API):
+                    seen.append(url)
+                return super().__call__(url, data)
+
+        self._submit(PAYLOAD, RecordingWire())
+        self.assertTrue(seen)
+        self.assertIn("since=", seen[0])
+        self.assertIn(f"per_page={fb.TRACKER_PAGE_SIZE}", seen[0])
+        self.assertGreaterEqual(fb.TRACKER_PAGE_SIZE, 100)
+
     def test_the_installs_own_provider_and_oauth_tokens_are_refused(self) -> None:
         for leaky in ("auth failed for sk-ant-api03-" + "Ab1" * 12 + " at litellm",
                       "the relay logged ya29.a0AfB_" + "x" * 40 + " and then 401",
-                      "key sk-" + "a" * 24 + " rejected", "header bearer " + "q" * 30):
+                      "key sk-" + "a" * 24 + " rejected", "header bearer " + "q1w2e3r4" * 4):
             wire = FakeWire()
             with self.subTest(leaky=leaky[:30]), self.assertRaises(fb.Blocked):
                 self._submit(dict(PAYLOAD, happened=leaky), wire)

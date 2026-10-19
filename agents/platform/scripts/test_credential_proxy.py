@@ -14225,6 +14225,15 @@ class FeedbackRouteTest(_ExecRouteServer):
         self.assertFalse(any(token in line for line in logs.output), "the token reached the log")
         self.assertTrue(any("feedback submit" in line for line in logs.output))
 
+    def test_a_refusal_reason_is_redacted_before_it_is_logged(self):
+        token = "ghp_" + "b" * 36
+        payload = {**self.GOOD_PAYLOAD, "kind": token}
+        with self.assertLogs("credential-proxy", level="INFO") as logs:
+            status, body = self.post_as(credential_proxy.CALLER_ROLE_SHELL, payload)
+        self.assertEqual((status, body["status"]), (400, "BLOCKED"))
+        self.assertFalse(any(token in line for line in logs.output), "the token reached the log")
+        self.assertNotIn(token, body["reason"])
+
     def test_a_non_json_body_is_400(self):
         status, body = self.post_as(credential_proxy.CALLER_ROLE_SHELL, b"not json", raw=True)
         self.assertEqual(status, 400)

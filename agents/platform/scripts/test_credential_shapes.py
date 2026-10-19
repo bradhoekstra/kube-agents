@@ -17,7 +17,7 @@ TOKENS = {
     "an AWS access key id": "AKIA" + "A" * 16,
     "a provider API key": "sk-" + "a" * 24,
     "a Slack token": "xoxb-1234567890-abcdefghijkl",
-    "an authorization header value": "Bearer abcdefghijklmnopqrstuvwxyz",
+    "an authorization header value": "Bearer abc123def456ghi789jkl0",
     "a signed JWT": "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abcdefghijklmnop",
     "a password in a URL": "https://user:s3cretpass@example.com/repo.git",
     "private key material": "-----BEGIN RSA PRIVATE KEY-----",
@@ -25,6 +25,9 @@ TOKENS = {
 PREFIXED_PROVIDER_KEY = "sk-ant-api03-" + "Ab1" * 12
 BENIGN = (
     "auth failed with 401 and the relay retried",
+    "I followed the basic troubleshooting steps and the agent hung",
+    "Bearer authentication against the relay returns 401",
+    "basic configuration of the installation steps",
     "Basic auth is on for the dashboard",
     "the bearer of bad news",
     "sk-short",
@@ -47,6 +50,12 @@ class CredentialShapesTest(unittest.TestCase):
         for text in BENIGN:
             with self.subTest(text=text):
                 self.assertIsNone(cs.find_credential_shape(text))
+
+    def test_the_redactor_still_masks_a_letters_only_header_value(self) -> None:
+        # Over-masking a word in a log line is cheap; refusing a report for it
+        # is not, so the two forms differ on purpose.
+        self.assertIn(cs.REDACTED, cs.redact("Authorization: Bearer abcdefghijklmnopqrstuvwxyz"))
+        self.assertIsNone(cs.find_credential_shape("Bearer abcdefghijklmnopqrstuvwxyz"))
 
     def test_redact_blanks_every_shape_and_keeps_the_rest(self) -> None:
         line = "relay said " + " and ".join(TOKENS.values()) + " at 12:00"
