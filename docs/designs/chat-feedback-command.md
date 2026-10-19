@@ -159,10 +159,11 @@ The wire path #1415 put in the sandbox script moves into the credential broker
 is in `ROUTE_ROLES` for the `shell` caller role only, beside `/v1/vcs/`. It takes the JSON
 payload below, and:
 
-- validates it (required fields, the kind, the 120-character title cap, the secret-shaped
-  content patterns, `user_confirmed: true`), answering `400` with a `BLOCKED` body on a
-  refusal, so the two copies of the rules cannot drift: the sandbox script validates nothing
-  the broker does not;
+- validates it (required fields, the kind, the 120-character title cap, a 60,000-character
+  cap over the three text fields so the tracker can hold the body, the token shapes in
+  `credential_shapes.py`, which the broker's own log redaction reads too, and
+  `user_confirmed: true`), answering `400` with a `BLOCKED` body on a refusal, so the two
+  copies of the rules cannot drift: the sandbox script validates nothing the broker does not;
 - reads the tracker once for a recent `external-feedback` issue with this exact title and
   the same "what happened" text (the tracker is shared by every install, so a title alone
   is not a report) and answers `ALREADY_SUBMITTED` if there is one;
@@ -180,7 +181,9 @@ and audit-logged like the forge verbs. A full broker answers `503`, as the exec 
 routes do, so the client reads it as nothing sent. The tracker is read before the POST and
 after it; a tracker that cannot be read before the POST is a refusal (a blind duplicate guard
 is no guard), and one that cannot be read after a confirmed POST leaves `SUBMITTED` with a
-null `issue_url` and a `detail`, which the client's recheck resolves. Unit tests beside
+null `issue_url` and a `detail`, which the client's recheck resolves; thirty minutes after
+the form confirmed, a recheck with no issue answers `UNCONFIRMED` naming the pipeline. Unit
+tests beside
 `test_credential_proxy.py` drive the route with a fake wire: the wire and validation cases
 #1415 wrote for the sandbox script, moved to the broker, plus the `Code.gs` contract tests.
 
@@ -199,8 +202,9 @@ calls the broker. `scripts/file_feedback.py` becomes the client:
 - one `POST` to `$CREDENTIAL_PROXY_URL/v1/feedback/submit` with the Bearer token
   `credential_proxy_client.py` already builds for the forge verbs;
 - the broker's JSON object printed as the script's one output line, unchanged, so the
-  persona reads one shape wherever the refusal came from; a broker that cannot be reached
-  or answers something else is `BLOCKED` with the reason and the `fallback` links.
+  persona reads one shape wherever the refusal came from; on a first attempt a broker that
+  cannot be reached or answers something else is `BLOCKED` with the reason and the
+  `fallback` links, and on a rerun it is `UNCONFIRMED`, since the earlier request went out.
 
 Constants at the top of the file per `.agents/rules/core_engineering.md`. Client tests in
 `scripts/test_file_feedback.py` (the marker, the single call, the output shape, the

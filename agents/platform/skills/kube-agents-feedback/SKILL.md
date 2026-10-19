@@ -81,7 +81,9 @@ description:
   same command once, which only reads the tracker. The rerun answers
   `ALREADY_SUBMITTED` with the URL once the issue is there, or `SUBMITTED`
   with `null` again while it is not; in that case report the title and the
-  tracker link as filed and not yet visible. Never file again.
+  tracker link as filed and not yet visible. About thirty minutes after the
+  form confirmed, a rerun answers `UNCONFIRMED` naming the form's pipeline
+  instead: hand it to a human with the composed text. Never file again.
 - `ALREADY_SUBMITTED` — this exact text is already on the tracker (an earlier
   attempt, or another card); it always carries the `issue_url`. Report it.
   This is a success, not an error. Do not retry.
@@ -92,7 +94,9 @@ description:
   so in the card `result`, with the composed text and both `fallback` links,
   so a person can file it themselves. Never treat a persistent `UNCONFIRMED`
   as filed, and never file again yourself.
-- `BLOCKED` (exit 1) — nothing was sent. Put the `reason`, the composed text
+- `BLOCKED` (exit 1) — nothing was sent by this run, and the `reason` says
+  why: a refused payload, a broker that could not be reached on a first
+  attempt, or a token file that could not be read. Put the `reason`, the composed text
   and both `fallback` links (`fallback.tracker`, `fallback.form`) in the card
   `result`: on an install whose broker cannot reach the form, this is the
   answer, and the person files the text themselves at either link. One
