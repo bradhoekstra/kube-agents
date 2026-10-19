@@ -26,6 +26,7 @@ the confirmation in the response, retried, and filed the same report twice
 ``submit`` answers one of::
 
     {"status": "SUBMITTED", "issue_url": "...", "fallback": {...}}
+    {"status": "SUBMITTED", "issue_url": null, "detail": "...", "fallback": {...}}
     {"status": "ALREADY_SUBMITTED", "issue_url": "...", "fallback": {...}}
     {"status": "UNCONFIRMED", "issue_url": null, "detail": "...", "fallback": {...}}
 
@@ -147,6 +148,22 @@ REASON_FORM_RETIRED = (
 )
 REASON_FORM_UNREACHABLE = "could not reach the feedback form ({error}); nothing was sent"
 REASON_NO_FORM_DATA = "the form page carried no FB_PUBLIC_LOAD_DATA_"
+REASON_FORM_PAGE_UNREADABLE = "the form page could not be read ({error}); nothing was sent"
+REASON_TRACKER_UNREADABLE = (
+    "the tracker could not be read to check for an earlier filing of this text "
+    "({error}); nothing was sent -- try again later"
+)
+DETAIL_SUBMITTED_NO_URL = (
+    "the form accepted the report and the tracker has not shown the issue yet; a "
+    "recheck is safe and will only read the tracker for its URL"
+)
+DETAIL_SUBMITTED_TRACKER_UNREADABLE = (
+    "the form accepted the report but the tracker could not be read ({error}); a "
+    "recheck is safe and will only read the tracker for its URL"
+)
+DETAIL_RECHECK_TRACKER_UNREADABLE = (
+    "the tracker could not be read ({error}); nothing was re-sent -- recheck again later"
+)
 REASON_QUESTIONS_DIVERGED = (
     "the form no longer asks: {missing} -- its questions and this module's "
     "QUESTION_LABELS have diverged"
@@ -199,12 +216,16 @@ def entry_ids_by_field(viewform_html: str) -> dict[str, str]:
     match = FB_DATA_PATTERN.search(viewform_html)
     if not match:
         raise Blocked(REASON_NO_FORM_DATA)
-    data = json.loads(match.group(1))
     label_to_entry: dict[str, str] = {}
-    for question in data[1][1]:
+    try:
+        data = json.loads(match.group(1))
+        questions = data[1][1]
+    except (ValueError, TypeError, IndexError, KeyError) as exc:
+        raise Blocked(REASON_FORM_PAGE_UNREADABLE.format(error=type(exc).__name__)) from exc
+    for question in questions:
         try:
             label, entry = question[1], question[4][0][0]
-        except (TypeError, IndexError):
+        except (TypeError, IndexError, KeyError):
             continue
         label_to_entry[label] = str(entry)
     mapped, missing = {}, []
@@ -247,6 +268,20 @@ def validate(payload: dict[str, Any]) -> None:
             raise Blocked(f"the text contains {name}; that must never reach a public issue, so nothing was sent")
 
 
+class TrackerLookup:
+    """What one tracker lookup found: the issue URL, or None, and whether any read succeeded.
+
+    `error` names the last failure when no read succeeded. A lookup that could
+    not read the tracker at all is not "no issue": before a POST it is a blind
+    duplicate guard, and after one it is a URL the caller still has to fetch.
+    """
+
+    def __init__(self, url: str | None, read_ok: bool, error: str = "") -> None:
+        self.url = url
+        self.read_ok = read_ok
+        self.error = error
+
+
 def find_issue(
     title: str,
     since_epoch: float,
@@ -254,8 +289,8 @@ def find_issue(
     fetch: Fetch = _fetch,
     now: Callable[[], float] = time.time,
     sleep: Callable[[float], None] = time.sleep,
-) -> str | None:
-    """The tracker URL of the filed issue, matched by exact title, or None.
+) -> TrackerLookup:
+    """Look the filed issue up on the tracker by exact title.
 
     Unauthenticated read of a public repo. A deadline of 0 means one read.
     """
@@ -263,17 +298,21 @@ def find_issue(
         {"labels": FEEDBACK_LABEL, "state": "all", "per_page": TRACKER_PAGE_SIZE}
     )
     deadline = now() + deadline_seconds
+    read_ok, error = False, ""
     while True:
         try:
             issues = json.loads(fetch(f"{TRACKER_API}?{query}"))
             for issue in issues:
                 created = calendar.timegm(time.strptime(issue["created_at"], TRACKER_TIME_FORMAT))
                 if issue["title"] == title and created >= since_epoch:
-                    return issue["html_url"]
-        except (urllib.error.URLError, OSError, ValueError, KeyError, TypeError):
-            pass  # the tracker being briefly unreachable is not a submit failure
+                    return TrackerLookup(issue["html_url"], True)
+            read_ok = True
+        except (urllib.error.URLError, OSError, ValueError, KeyError, TypeError) as exc:
+            # A brief outage is not a submit failure; a lookup that never
+            # succeeds is reported as such.
+            error = f"{type(exc).__name__}: {exc}"
         if now() >= deadline:
-            return None
+            return TrackerLookup(None, read_ok, error)
         sleep(TRACKER_POLL_INTERVAL_SECONDS)
 
 
@@ -290,13 +329,18 @@ def submit(
 
     # The same confirmed text may already have been filed, from this card or
     # another. One tracker read settles it before anything is sent.
-    prior_url = find_issue(title, now() - DUPLICATE_LOOKBACK_SECONDS, 0, fetch, now, sleep)
-    if prior_url:
-        return _answer(STATUS_ALREADY_SUBMITTED, prior_url, DETAIL_ALREADY_FILED)
+    prior = find_issue(title, now() - DUPLICATE_LOOKBACK_SECONDS, 0, fetch, now, sleep)
+    if prior.url:
+        return _answer(STATUS_ALREADY_SUBMITTED, prior.url, DETAIL_ALREADY_FILED)
     if payload.get(RECHECK_FIELD) is True:
         # The caller lost an earlier answer. The tracker is the arbiter; a
         # POST here would be the duplicate this whole module exists to stop.
+        if not prior.read_ok:
+            return _answer(STATUS_UNCONFIRMED, None, DETAIL_RECHECK_TRACKER_UNREADABLE.format(error=prior.error))
         return _answer(STATUS_UNCONFIRMED, None, DETAIL_RECHECK_LOST)
+    if not prior.read_ok:
+        # Blind, the duplicate guard is no guard: refuse rather than file.
+        raise Blocked(REASON_TRACKER_UNREADABLE.format(error=prior.error))
 
     try:
         form_url = resolve_form_url(fetch(SHORT_LINK))
@@ -315,9 +359,16 @@ def submit(
         return _answer(STATUS_UNCONFIRMED, None, DETAIL_POST_UNCLEAN.format(error=exc))
     confirmed = CONFIRMATION_SUBSTRING in body
 
-    issue_url = find_issue(
+    found = find_issue(
         title, started_at - POST_CLOCK_SLACK_SECONDS, TRACKER_POLL_SECONDS, fetch, now, sleep
     )
-    if not confirmed and not issue_url:
+    if found.url:
+        return _answer(STATUS_SUBMITTED, found.url)
+    if not confirmed:
         return _answer(STATUS_UNCONFIRMED, None, DETAIL_NO_SIGNAL)
-    return _answer(STATUS_SUBMITTED, issue_url)
+    # The form confirmed and the issue is not on the tracker yet (pipeline
+    # latency), or the tracker could not be read: the report went out, the
+    # URL is still to come, and the caller's recheck fetches it.
+    if not found.read_ok:
+        return _answer(STATUS_SUBMITTED, None, DETAIL_SUBMITTED_TRACKER_UNREADABLE.format(error=found.error))
+    return _answer(STATUS_SUBMITTED, None, DETAIL_SUBMITTED_NO_URL)

@@ -233,6 +233,54 @@ class SubmitTest(unittest.TestCase):
         self.assertIn("could not reach", ctx.exception.reason)
         self.assertEqual([], wire.posts, "nothing was sent, as BLOCKED promises")
 
+    def test_a_malformed_form_page_blocks_rather_than_raising(self) -> None:
+        class OddFormWire(FakeWire):
+            def __call__(self, url: str, data: bytes | None = None) -> str:
+                if "viewform" in url:
+                    return "<script>var FB_PUBLIC_LOAD_DATA_ = [1];</script>"
+                return super().__call__(url, data)
+
+        wire = OddFormWire()
+        with self.assertRaises(fb.Blocked) as ctx:
+            self._submit(PAYLOAD, wire)
+        self.assertIn("form page", ctx.exception.reason)
+        self.assertEqual([], wire.posts)
+
+    def test_an_unreadable_tracker_before_the_post_blocks(self) -> None:
+        # The pre-POST duplicate probe is one of the two guards against
+        # #1345/#1346; blind, it must refuse rather than file.
+        class RateLimitedWire(FakeWire):
+            def __call__(self, url: str, data: bytes | None = None) -> str:
+                if url.startswith(fb.TRACKER_API):
+                    raise urllib.error.HTTPError(url, 403, "rate limited", {}, None)
+                return super().__call__(url, data)
+
+        wire = RateLimitedWire()
+        with self.assertRaises(fb.Blocked) as ctx:
+            self._submit(PAYLOAD, wire)
+        self.assertIn("tracker", ctx.exception.reason)
+        self.assertEqual([], wire.posts, "nothing goes out past a blind probe")
+
+    def test_a_confirmed_post_with_no_issue_yet_says_so(self) -> None:
+        class SlowPipelineWire(FakeWire):
+            def tracker_response(self) -> str:
+                return TRACKER_EMPTY
+
+        out = self._submit(PAYLOAD, SlowPipelineWire())
+        self.assertEqual(("SUBMITTED", None), (out["status"], out["issue_url"]))
+        self.assertIn("recheck", out["detail"])
+
+    def test_an_unreadable_tracker_after_a_confirmed_post_is_still_submitted(self) -> None:
+        class TrackerDiesAfterPostWire(FakeWire):
+            def __call__(self, url: str, data: bytes | None = None) -> str:
+                if url.startswith(fb.TRACKER_API) and self.posts:
+                    raise urllib.error.HTTPError(url, 403, "rate limited", {}, None)
+                return super().__call__(url, data)
+
+        out = self._submit(PAYLOAD, TrackerDiesAfterPostWire())
+        self.assertEqual(("SUBMITTED", None), (out["status"], out["issue_url"]))
+        self.assertIn("tracker", out["detail"])
+
     def test_every_answer_carries_the_fallback_links(self) -> None:
         answers = [
             self._submit(PAYLOAD, FakeWire()),

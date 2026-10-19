@@ -73,7 +73,12 @@ description:
 ## Reporting back
 
 - `SUBMITTED` — put the full `issue_url` in the card `result`, plus the note
-  that the issue is public and was opened by the form's bot account.
+  that the issue is public and was opened by the form's bot account. A
+  `SUBMITTED` whose `issue_url` is `null` means the form accepted the report
+  and the tracker has not shown the issue yet (its `detail` says so): rerun the
+  same command once, which only reads the tracker for the URL; if it is still
+  `null`, report the title and the tracker link as filed-but-not-yet-visible.
+  Never file again.
 - `ALREADY_SUBMITTED` — this exact text is already on the tracker (an earlier
   attempt, or another card); it always carries the `issue_url`. Report it.
   This is a success, not an error. Do not retry.

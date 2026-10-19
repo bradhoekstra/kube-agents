@@ -14130,10 +14130,6 @@ class ApiRelayQueryStrippingTest(unittest.TestCase):
         )
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class FeedbackRouteTest(_ExecRouteServer):
     """`POST /v1/feedback/submit`: the sandbox's one way to file a kube-agents report.
 
@@ -14207,7 +14203,25 @@ class FeedbackRouteTest(_ExecRouteServer):
         self.assertEqual((status, body["status"]), (400, "BLOCKED"))
         self.assertIn("could not reach", body["reason"])
 
+    def test_a_full_broker_answers_503_busy_not_a_dropped_connection(self):
+        busy = credential_proxy.CommandSlotUnavailable("every slot is taken")
+        with mock.patch.object(CredentialProxyHandler, "_request_slot", side_effect=busy):
+            status, body = self.post_as(credential_proxy.CALLER_ROLE_SHELL, self.GOOD_PAYLOAD)
+        self.assertEqual(status, 503)
+        self.assertIn("error", body)
+
+    def test_an_unexpected_broker_error_is_400_blocked(self):
+        with mock.patch.object(feedback_broker, "submit", side_effect=IndexError("list index out of range")):
+            status, body = self.post_as(credential_proxy.CALLER_ROLE_SHELL, self.GOOD_PAYLOAD)
+        self.assertEqual((status, body["status"]), (400, "BLOCKED"))
+        self.assertEqual(body["fallback"], feedback_broker.FALLBACK)
+
     def test_a_non_json_body_is_400(self):
         status, body = self.post_as(credential_proxy.CALLER_ROLE_SHELL, b"not json", raw=True)
         self.assertEqual(status, 400)
         self.assertIn("error", body)
+
+
+
+if __name__ == "__main__":
+    unittest.main()

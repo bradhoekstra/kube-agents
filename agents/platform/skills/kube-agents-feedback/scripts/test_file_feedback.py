@@ -114,6 +114,32 @@ class FileFeedbackTest(unittest.TestCase):
         self.assertEqual((1, BLOCKED_400), (code, printed))
         self.assertEqual([], self._markers())
 
+    def test_a_missing_token_is_blocked_and_leaves_no_marker(self) -> None:
+        path = self.state_dir / "payload.json"
+        path.write_text(json.dumps(PAYLOAD), encoding="utf-8")
+        out = io.StringIO()
+        with mock.patch.object(
+            file_feedback.credential_proxy_client, "authorization_headers",
+            side_effect=file_feedback.credential_proxy_client.TokenUnavailable("empty"),
+        ):
+            with contextlib.redirect_stdout(out):
+                code = file_feedback.submit(path, self.state_dir)
+        printed = json.loads(out.getvalue().strip())
+        self.assertEqual((1, "BLOCKED"), (code, printed["status"]))
+        self.assertIn("token", printed["reason"])
+        self.assertEqual(FALLBACK, printed["fallback"])
+        self.assertEqual([], self._markers())
+
+    def test_submitted_without_a_url_is_rechecked_on_the_next_run(self) -> None:
+        pending = {"status": "SUBMITTED", "issue_url": None, "detail": "not on the tracker yet", "fallback": FALLBACK}
+        code, printed, _ = self._run(PAYLOAD, (200, pending))
+        self.assertEqual((0, pending), (code, printed))
+        code, printed, calls = self._run(PAYLOAD, (200, ALREADY))
+        self.assertEqual((0, "ALREADY_SUBMITTED"), (code, printed["status"]))
+        self.assertEqual([True], [c.get("recheck_only") for c in calls])
+        (marker,) = self._markers()
+        self.assertEqual(ISSUE_URL, json.loads(marker.read_text())["issue_url"])
+
     def test_missing_endpoint_is_blocked(self) -> None:
         with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": ""}):
             code, printed, calls = self._run(PAYLOAD, (200, SUBMITTED))

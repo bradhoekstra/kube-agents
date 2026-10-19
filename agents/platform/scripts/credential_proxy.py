@@ -631,7 +631,7 @@ AUDIT_STATUS_ABANDONED = "abandoned"
 FEEDBACK_AUDIT_TOOL = "feedback"
 FEEDBACK_AUDIT_SUBCOMMAND = "submit"
 FEEDBACK_REASON_LOG_LENGTH = 200
-FEEDBACK_REASON_UNREACHABLE = "could not reach the feedback form ({error}); nothing was sent"
+FEEDBACK_REASON_FAULT = "the broker could not complete the filing ({error}); nothing was sent"
 AUDIT_STATUS_BUSY = "busy"
 # Rule ids for the refusals the exec route decides itself rather than by a
 # policy rule. The response body and the audit record name the same constant,
@@ -10228,16 +10228,25 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         except CallerHungUp as exc:
             LOGGER.info("feedback submit abandoned request_id=%s: %s", request_id, exc, extra=audit(AUDIT_STATUS_ABANDONED))
             return
-        except (urllib.error.URLError, OSError) as exc:
-            # Nothing feedback_broker lets through here has POSTed: the one
-            # request whose fate is unknown is answered as UNCONFIRMED by it.
+        except CommandSlotUnavailable as exc:
+            # A full broker is a 503 the client reads as "nothing was sent",
+            # like the exec and forge routes; a dropped connection would read
+            # as a lost answer and strand the caller's marker.
+            LOGGER.warning("feedback submit busy request_id=%s: %s", request_id, exc, extra=audit(AUDIT_STATUS_BLOCKED))
+            self._busy(exc)
+            return
+        except Exception as exc:  # noqa: BLE001 -- every outcome here must be an answer
+            # feedback_broker converts the wire's failures into Blocked or
+            # UNCONFIRMED itself; what reaches this arm is a fault in reading
+            # a page the form served. The POST has not happened before the
+            # page is read, so this is a BLOCKED, not a lost answer.
             LOGGER.warning(
                 "feedback submit failed request_id=%s type=%s", request_id, type(exc).__name__,
                 extra=audit(AUDIT_STATUS_FAILED),
             )
             self._json(
                 HTTPStatus.BAD_REQUEST,
-                feedback_broker.blocked_answer(FEEDBACK_REASON_UNREACHABLE.format(error=type(exc).__name__)),
+                feedback_broker.blocked_answer(FEEDBACK_REASON_FAULT.format(error=type(exc).__name__)),
             )
             return
         LOGGER.info(

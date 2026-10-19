@@ -1727,7 +1727,8 @@ func (g *Gateway) freshIncarnation(ctx context.Context, rec *SessionRecord) bool
 	return true
 }
 
-// sessionCommand resolves the one slash command the gateway owns:
+// sessionCommand resolves the first of the two slash commands the gateway
+// owns (the other, a bare /feedback, is answered inline in routeTurn):
 // "/session" marks the conversation session-routed, "/session <text>" marks
 // it and runs <text> as the first turn, "/session off" releases the
 // incarnation and re-homes to the default addressee. Deterministic, like

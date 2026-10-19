@@ -27,6 +27,7 @@ The broker validates the rest (the kinds, the 120-character title, secret-shaped
 text). Output is one JSON line on stdout, the broker's object as received:
 
     {"status": "SUBMITTED", "issue_url": "...", "fallback": {...}}
+    {"status": "SUBMITTED", "issue_url": null, "detail": "...", "fallback": {...}}  (rerun rechecks)
     {"status": "ALREADY_SUBMITTED", "issue_url": "...", "fallback": {...}}
     {"status": "UNCONFIRMED", "issue_url": null, "detail": "...", "fallback": {...}}
     {"status": "BLOCKED", "reason": "...", "fallback": {...}}   (exit 1; nothing was sent)
@@ -81,6 +82,7 @@ REASON_NO_BROKER = (
     "skill runs in the shell sandbox"
 )
 REASON_BROKER_UNREACHABLE = "the credential broker could not be reached ({error}); nothing was sent"
+REASON_NO_TOKEN = "the broker token could not be read ({error}); nothing was sent"
 REASON_BROKER_ANSWER = (
     "the credential broker answered HTTP {code} without a feedback status; nothing was sent"
 )
@@ -191,6 +193,10 @@ def submit(payload_path: Path, state_dir: Path) -> int:
         if first_attempt:
             marker.unlink(missing_ok=True)
         return _blocked(REASON_BROKER_UNREACHABLE.format(error=exc.reason))
+    except credential_proxy_client.TokenUnavailable as exc:
+        if first_attempt:
+            marker.unlink(missing_ok=True)
+        return _blocked(REASON_NO_TOKEN.format(error=exc))
     except BrokerAnswerLost as exc:
         print(LOST_MESSAGE.format(error=exc), file=sys.stderr)
         raise SystemExit(LOST_EXIT) from exc
