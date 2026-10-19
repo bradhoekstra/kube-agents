@@ -540,6 +540,7 @@ COPY agents/platform/scripts/sandbox_exec.py \
      agents/platform/scripts/gitops_workspace.py \
      agents/platform/scripts/gitops_preflight.py \
      agents/platform/scripts/credential_proxy_client.py \
+     agents/platform/scripts/feedback_broker.py \
      agents/platform/scripts/fleet_scope_args.py \
      agents/platform/scripts/vcs_client.py \
      agents/platform/scripts/workspace_paths.py \
