@@ -140,6 +140,44 @@ class FileFeedbackTest(unittest.TestCase):
         (marker,) = self._markers()
         self.assertEqual(ISSUE_URL, json.loads(marker.read_text())["issue_url"])
 
+    def test_a_transport_failure_on_the_recheck_keeps_the_marker_and_is_not_blocked(self) -> None:
+        with self.assertRaises(SystemExit):
+            self._run(PAYLOAD, file_feedback.BrokerAnswerLost("connection reset"))
+        for broker in (urllib.error.URLError("refused"), (503, {"error": "busy"}), (502, {})):
+            with self.subTest(broker=broker):
+                code, printed, calls = self._run(PAYLOAD, broker)
+                self.assertEqual((0, "UNCONFIRMED"), (code, printed["status"]))
+                self.assertIn("recheck", printed["detail"])
+                self.assertEqual(1, len(self._markers()), "the earlier request went out; the marker stays")
+
+    def test_a_confirmed_marker_tells_the_recheck_the_form_confirmed(self) -> None:
+        pending = {"status": "SUBMITTED", "issue_url": None, "detail": "not yet", "fallback": FALLBACK}
+        self._run(PAYLOAD, (200, pending))
+        _, _, calls = self._run(PAYLOAD, (200, pending))
+        self.assertEqual([(True, True)], [(c.get("recheck_only"), c.get("form_confirmed")) for c in calls])
+
+    def test_a_broken_body_read_of_a_refusal_is_a_lost_answer(self) -> None:
+        import http.client
+        import io
+
+        class CutError(urllib.error.HTTPError):
+            def read(self, *_a, **_k):
+                raise http.client.IncompleteRead(b"{")
+
+        cut = CutError("http://broker/v1/feedback/submit", 503, "busy", {}, io.BytesIO(b""))
+        with mock.patch.object(file_feedback.credential_proxy_client, "open_broker_request", side_effect=cut):
+            with self.assertRaises(file_feedback.BrokerAnswerLost):
+                file_feedback._post_to_broker(BROKER, dict(PAYLOAD))
+
+    def test_a_marker_holding_non_object_json_is_an_attempted_marker(self) -> None:
+        path = self.state_dir / "payload.json"
+        path.write_text(json.dumps(PAYLOAD), encoding="utf-8")
+        marker = file_feedback._marker_path(self.state_dir, file_feedback.feedback_broker.normalize(PAYLOAD))
+        marker.write_text("null", encoding="utf-8")
+        code, printed, calls = self._run(PAYLOAD, (200, ALREADY))
+        self.assertEqual((0, "ALREADY_SUBMITTED"), (code, printed["status"]))
+        self.assertEqual([True], [c.get("recheck_only") for c in calls])
+
     def test_missing_endpoint_is_blocked(self) -> None:
         with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": ""}):
             code, printed, calls = self._run(PAYLOAD, (200, SUBMITTED))

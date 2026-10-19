@@ -13,6 +13,7 @@ Run:
 
 from __future__ import annotations
 
+import http.client
 import json
 import re
 import unittest
@@ -60,8 +61,15 @@ PAYLOAD = {
 }
 
 ISSUE_URL = "https://github.com/gke-labs/kube-agents/issues/9999"
+ISSUE_BODY = (
+    "Filed from the form.\n\n**Kind:** Bug\n\n## What happened\n\n"
+    + PAYLOAD["happened"]
+    + "\n\n## What was expected\n\n"
+    + PAYLOAD["expected"]
+    + "\n"
+)
 TRACKER_MATCH = json.dumps(
-    [{"title": PAYLOAD["title"], "created_at": "2099-01-01T00:00:00Z", "html_url": ISSUE_URL}]
+    [{"title": PAYLOAD["title"], "created_at": "2099-01-01T00:00:00Z", "html_url": ISSUE_URL, "body": ISSUE_BODY}]
 )
 TRACKER_EMPTY = "[]"
 FALLBACK = {"tracker": "https://github.com/gke-labs/kube-agents/issues",
@@ -280,6 +288,65 @@ class SubmitTest(unittest.TestCase):
         out = self._submit(PAYLOAD, TrackerDiesAfterPostWire())
         self.assertEqual(("SUBMITTED", None), (out["status"], out["issue_url"]))
         self.assertIn("tracker", out["detail"])
+
+    def test_a_truncated_response_after_the_post_is_unconfirmed_not_blocked(self) -> None:
+        class CutBodyWire(FakeWire):
+            def __call__(self, url: str, data: bytes | None = None) -> str:
+                if data is not None:
+                    self.posts.append((url, data))
+                    raise http.client.IncompleteRead(b"<html>partial")
+                return super().__call__(url, data)
+
+        wire = CutBodyWire()
+        out = self._submit(PAYLOAD, wire)
+        self.assertEqual("UNCONFIRMED", out["status"], "the POST went out; this is not BLOCKED")
+        self.assertEqual(1, len(wire.posts))
+
+    def test_a_truncated_tracker_read_after_the_post_is_still_submitted(self) -> None:
+        class CutTrackerWire(FakeWire):
+            def __call__(self, url: str, data: bytes | None = None) -> str:
+                if url.startswith(fb.TRACKER_API) and self.posts:
+                    raise http.client.BadStatusLine("garbage")
+                return super().__call__(url, data)
+
+        out = self._submit(PAYLOAD, CutTrackerWire())
+        self.assertEqual(("SUBMITTED", None), (out["status"], out["issue_url"]))
+
+    def test_fine_grained_github_and_slack_tokens_are_refused(self) -> None:
+        for leaky in ("auth failed with github_pat_11ABCDEFG0123456789abcdefGHIJ in the log",
+                      "token xoxb-1234567890-abcdefghijkl was rejected"):
+            wire = FakeWire()
+            with self.subTest(leaky=leaky), self.assertRaises(fb.Blocked):
+                self._submit(dict(PAYLOAD, happened=leaky), wire)
+            self.assertEqual([], wire.posts)
+
+    def test_a_different_report_with_the_same_summary_is_filed(self) -> None:
+        # The dedupe reads the issue's "What happened" as well as its title: a
+        # second person's report under the same one-line summary is not the
+        # same report.
+        wire = FakeWire(tracker_seeded=True)
+        out = self._submit(dict(PAYLOAD, happened="a different thing happened entirely"), wire)
+        self.assertEqual("SUBMITTED", out["status"])
+        self.assertEqual(1, len(wire.posts))
+
+    def test_null_optional_fields_are_absent_not_the_word_none(self) -> None:
+        wire = FakeWire()
+        self._submit(dict(PAYLOAD, expected=None, environment=None), wire)
+        _, body = wire.posts[0]
+        self.assertNotIn(b"None", body)
+        with self.assertRaises(fb.Blocked):
+            fb.validate(fb.normalize(dict(PAYLOAD, title=None)))
+
+    def test_a_confirmed_recheck_with_no_issue_yet_stays_submitted(self) -> None:
+        # The client's marker says the form confirmed; the pipeline is slow.
+        # The recheck must not say the report may be lost.
+        class SlowPipelineWire(FakeWire):
+            def tracker_response(self) -> str:
+                return TRACKER_EMPTY
+
+        out = self._submit(dict(PAYLOAD, recheck_only=True, form_confirmed=True), SlowPipelineWire())
+        self.assertEqual(("SUBMITTED", None), (out["status"], out["issue_url"]))
+        self.assertIn("recheck", out["detail"])
 
     def test_every_answer_carries_the_fallback_links(self) -> None:
         answers = [

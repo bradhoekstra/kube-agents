@@ -10232,7 +10232,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             # A full broker is a 503 the client reads as "nothing was sent",
             # like the exec and forge routes; a dropped connection would read
             # as a lost answer and strand the caller's marker.
-            LOGGER.warning("feedback submit busy request_id=%s: %s", request_id, exc, extra=audit(AUDIT_STATUS_BLOCKED))
+            LOGGER.warning("feedback submit busy request_id=%s: %s", request_id, exc, extra=audit(AUDIT_STATUS_BUSY))
             self._busy(exc)
             return
         except Exception as exc:  # noqa: BLE001 -- every outcome here must be an answer

@@ -65,6 +65,9 @@ import feedback_broker  # noqa: E402
 BROKER_ENDPOINT_VAR = "CREDENTIAL_PROXY_URL"
 ROUTE = feedback_broker.ROUTE
 RECHECK_FIELD = feedback_broker.RECHECK_FIELD
+FORM_CONFIRMED_FIELD = feedback_broker.FORM_CONFIRMED_FIELD
+STATUS_SUBMITTED = feedback_broker.STATUS_SUBMITTED
+STATUS_UNCONFIRMED = feedback_broker.STATUS_UNCONFIRMED
 FALLBACK = feedback_broker.FALLBACK
 STATUS_BLOCKED = feedback_broker.STATUS_BLOCKED
 STATUS_ALREADY_SUBMITTED = feedback_broker.STATUS_ALREADY_SUBMITTED
@@ -89,6 +92,10 @@ REASON_BROKER_ANSWER = (
 DETAIL_MARKER_SUBMITTED = (
     "a submission for this exact text already went out from this workspace; not filing it again"
 )
+DETAIL_RECHECK_UNREACHABLE = (
+    "the recheck could not reach the broker ({error}); an earlier request for this text "
+    "went out, so nothing is resent -- rerun to recheck the tracker"
+)
 LOST_MESSAGE = (
     "the broker's answer was lost after the request went out ({error}); the marker "
     "is kept, and rerunning the same command only asks the broker to read the tracker"
@@ -106,6 +113,16 @@ def _print(answer: dict[str, Any]) -> None:
 def _blocked(reason: str) -> int:
     _print(feedback_broker.blocked_answer(reason))
     return BLOCKED_EXIT
+
+
+def _recheck_unreachable(error: str) -> int:
+    _print({
+        "status": STATUS_UNCONFIRMED,
+        "issue_url": None,
+        "detail": DETAIL_RECHECK_UNREACHABLE.format(error=error),
+        "fallback": FALLBACK,
+    })
+    return 0
 
 
 def _payload_hash(payload: dict[str, Any]) -> str:
@@ -126,9 +143,10 @@ def _read_marker(marker: Path) -> dict[str, Any]:
     treating it as anything less would re-open the door to a second POST.
     """
     try:
-        return json.loads(marker.read_text(encoding="utf-8"))
+        parsed = json.loads(marker.read_text(encoding="utf-8"))
     except (ValueError, OSError):
         return {"started_at": 0.0}
+    return parsed if isinstance(parsed, dict) else {"started_at": 0.0}
 
 
 def _post_to_broker(endpoint: str, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
@@ -146,12 +164,19 @@ def _post_to_broker(endpoint: str, payload: dict[str, Any]) -> tuple[int, dict[s
     )
     try:
         with credential_proxy_client.open_broker_request(request) as response:
-            return response.status, _json_or_empty(response.read())
+            status, raw = response.status, response.read()
     except urllib.error.HTTPError as exc:
-        with exc:
-            return exc.code, _json_or_empty(exc.read())
+        # The body read sits inside this arm on purpose: an exception raised
+        # here is not offered to the sibling arms (credential_proxy_client
+        # documents the same trap), so it is classified in place.
+        try:
+            with exc:
+                status, raw = exc.code, exc.read()
+        except (http.client.HTTPException, OSError) as broke:
+            raise BrokerAnswerLost(f"{type(broke).__name__}: {broke}") from broke
     except (http.client.HTTPException, ConnectionResetError, TimeoutError) as exc:
         raise BrokerAnswerLost(f"{type(exc).__name__}: {exc}") from exc
+    return status, _json_or_empty(raw)
 
 
 def _json_or_empty(raw: bytes) -> dict[str, Any]:
@@ -177,6 +202,8 @@ def submit(payload_path: Path, state_dir: Path) -> int:
             })
             return 0
         payload = {**payload, RECHECK_FIELD: True}
+        if state.get("status") == STATUS_SUBMITTED:
+            payload[FORM_CONFIRMED_FIELD] = True
 
     endpoint = os.environ.get(BROKER_ENDPOINT_VAR, "").strip()
     if not endpoint:
@@ -190,8 +217,9 @@ def submit(payload_path: Path, state_dir: Path) -> int:
     try:
         code, answer = _post_to_broker(endpoint, payload)
     except urllib.error.URLError as exc:
-        if first_attempt:
-            marker.unlink(missing_ok=True)
+        if not first_attempt:
+            return _recheck_unreachable(str(exc.reason))
+        marker.unlink(missing_ok=True)
         return _blocked(REASON_BROKER_UNREACHABLE.format(error=exc.reason))
     except credential_proxy_client.TokenUnavailable as exc:
         if first_attempt:
@@ -208,13 +236,19 @@ def submit(payload_path: Path, state_dir: Path) -> int:
         marker.write_text(json.dumps(state), encoding="utf-8")
         _print(answer)
         return 0
-    # Refused (400 BLOCKED), or an answer that is not the broker's: nothing was
-    # sent, so a first attempt is forgotten and the next one starts fresh.
-    if first_attempt:
-        marker.unlink(missing_ok=True)
     if status == STATUS_BLOCKED:
+        # Refused (400 BLOCKED): nothing was sent by this request, and a
+        # refusal of the payload holds for a rerun too.
+        if first_attempt:
+            marker.unlink(missing_ok=True)
         _print(answer)
         return BLOCKED_EXIT
+    # An answer that is not the broker's (a 503, a 502, a non-JSON body). On a
+    # first attempt nothing was sent and the marker is forgotten; on a recheck
+    # the earlier request went out, so the marker stays and the status says so.
+    if not first_attempt:
+        return _recheck_unreachable(f"HTTP {code}")
+    marker.unlink(missing_ok=True)
     return _blocked(REASON_BROKER_ANSWER.format(code=code))
 
 

@@ -38,6 +38,7 @@ person can use themselves, on every answer, so the agent relays one source.
 from __future__ import annotations
 
 import calendar
+import http.client
 import json
 import re
 import time
@@ -79,6 +80,9 @@ REQUIRED_FIELDS = ("title", "kind", "happened")
 KIND_CHOICES = ("Bug", "Feature request", "Question", "Other")
 CONFIRMED_FIELD = "user_confirmed"
 RECHECK_FIELD = "recheck_only"
+# Set by the client on a recheck when its marker says the form confirmed the
+# POST: an issue not yet on the tracker is then pipeline latency, not loss.
+FORM_CONFIRMED_FIELD = "form_confirmed"
 
 # The pipeline truncates the issue title at this many characters (Code.gs
 # TITLE_MAX_CHARS). A longer summary would file fine but the filed issue's
@@ -100,11 +104,23 @@ SECRET_PATTERNS = (
     ("a Google API key", re.compile(r"\bAIza[0-9A-Za-z_-]{35}")),
     ("a bearer token", re.compile(r"\bBearer [A-Za-z0-9._~+/-]{20,}")),
     ("a signed JWT", re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ")),
+    # The two shapes credential_proxy's own redactor knows that the list above
+    # did not: GitHub's fine-grained token and a Slack token. A fourth copy of
+    # the shapes, kept short because that module cannot be imported from here
+    # without a cycle; consolidating the lists is the separate work its
+    # redact_credentials docstring names.
+    ("a fine-grained GitHub token", re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}")),
+    ("a Slack token", re.compile(r"\bxox[abpr]-[A-Za-z0-9-]{10,}")),
 )
 
 # The viewform page embeds every question as JSON in this variable.
 FB_DATA_PATTERN = re.compile(r"FB_PUBLIC_LOAD_DATA_\s*=\s*(\[.*?\])\s*;", re.DOTALL)
 FORM_URL_PATTERN = re.compile(r"https://docs\.google\.com/forms/d/e/([A-Za-z0-9_-]+)/viewform")
+# The issue body section Code.gs writes the report's "what happened" into; the
+# dedupe compares it as well as the title, so two reports that share a one-line
+# summary are two reports.
+HAPPENED_HEADING = "## What happened"
+BODY_SECTION_RE = re.compile(r"^## ", re.MULTILINE)
 VIEWFORM_SUFFIX = "/viewform"
 RESPONSE_SUFFIX = "/formResponse"
 ENTRY_PREFIX = "entry."
@@ -173,6 +189,11 @@ REASON_TITLE_TOO_LONG = (
     f"titles at {TITLE_MAX_CHARS}, which would leave the filed issue unfindable "
     "by title -- shorten it"
 )
+
+# What a read off the wire can raise: a connection that did not open or was
+# refused (URLError, OSError) and one that opened and then broke or answered
+# nonsense (HTTPException: IncompleteRead, BadStatusLine).
+WIRE_ERRORS = (urllib.error.URLError, OSError, http.client.HTTPException)
 
 Fetch = Callable[..., str]
 
@@ -247,7 +268,9 @@ def normalize(payload: dict[str, Any]) -> dict[str, Any]:
     """
     normalized = dict(payload)
     for field in QUESTION_LABELS:
-        normalized[field] = str(payload.get(field, "")).strip()
+        value = payload.get(field)
+        # JSON's null for an omitted optional is absent, not the word "None".
+        normalized[field] = "" if value is None else str(value).strip()
     return normalized
 
 
@@ -282,6 +305,15 @@ class TrackerLookup:
         self.error = error
 
 
+def _happened_section(body: str | None) -> str | None:
+    """The text under Code.gs's "What happened" heading, stripped, or None without one."""
+    if not body or HAPPENED_HEADING not in body:
+        return None
+    after = body.split(HAPPENED_HEADING, 1)[1]
+    next_heading = BODY_SECTION_RE.search(after)
+    return (after[: next_heading.start()] if next_heading else after).strip()
+
+
 def find_issue(
     title: str,
     since_epoch: float,
@@ -289,10 +321,16 @@ def find_issue(
     fetch: Fetch = _fetch,
     now: Callable[[], float] = time.time,
     sleep: Callable[[float], None] = time.sleep,
+    happened: str | None = None,
 ) -> TrackerLookup:
-    """Look the filed issue up on the tracker by exact title.
+    """Look the filed issue up on the tracker by exact title, and by its "what happened" text.
 
     Unauthenticated read of a public repo. A deadline of 0 means one read.
+    The tracker is shared by every install, so a title alone is not a report:
+    with `happened` given, an issue counts only when the section Code.gs wrote
+    from that field matches it too (an issue without the section, or with the
+    heading alone, still matches on title, so the form's own pipeline drift
+    cannot make the probe blind).
     """
     query = urllib.parse.urlencode(
         {"labels": FEEDBACK_LABEL, "state": "all", "per_page": TRACKER_PAGE_SIZE}
@@ -304,10 +342,14 @@ def find_issue(
             issues = json.loads(fetch(f"{TRACKER_API}?{query}"))
             for issue in issues:
                 created = calendar.timegm(time.strptime(issue["created_at"], TRACKER_TIME_FORMAT))
-                if issue["title"] == title and created >= since_epoch:
-                    return TrackerLookup(issue["html_url"], True)
+                if issue["title"] != title or created < since_epoch:
+                    continue
+                section = _happened_section(issue.get("body"))
+                if happened is not None and section and section != happened:
+                    continue
+                return TrackerLookup(issue["html_url"], True)
             read_ok = True
-        except (urllib.error.URLError, OSError, ValueError, KeyError, TypeError) as exc:
+        except (*WIRE_ERRORS, ValueError, KeyError, TypeError) as exc:
             # A brief outage is not a submit failure; a lookup that never
             # succeeds is reported as such.
             error = f"{type(exc).__name__}: {exc}"
@@ -329,12 +371,19 @@ def submit(
 
     # The same confirmed text may already have been filed, from this card or
     # another. One tracker read settles it before anything is sent.
-    prior = find_issue(title, now() - DUPLICATE_LOOKBACK_SECONDS, 0, fetch, now, sleep)
+    happened = payload["happened"]
+    prior = find_issue(title, now() - DUPLICATE_LOOKBACK_SECONDS, 0, fetch, now, sleep, happened)
     if prior.url:
         return _answer(STATUS_ALREADY_SUBMITTED, prior.url, DETAIL_ALREADY_FILED)
     if payload.get(RECHECK_FIELD) is True:
         # The caller lost an earlier answer. The tracker is the arbiter; a
         # POST here would be the duplicate this whole module exists to stop.
+        if payload.get(FORM_CONFIRMED_FIELD) is True:
+            # The form confirmed the earlier POST; the issue is pipeline
+            # latency away, not lost.
+            if not prior.read_ok:
+                return _answer(STATUS_SUBMITTED, None, DETAIL_SUBMITTED_TRACKER_UNREADABLE.format(error=prior.error))
+            return _answer(STATUS_SUBMITTED, None, DETAIL_SUBMITTED_NO_URL)
         if not prior.read_ok:
             return _answer(STATUS_UNCONFIRMED, None, DETAIL_RECHECK_TRACKER_UNREADABLE.format(error=prior.error))
         return _answer(STATUS_UNCONFIRMED, None, DETAIL_RECHECK_LOST)
@@ -345,7 +394,7 @@ def submit(
     try:
         form_url = resolve_form_url(fetch(SHORT_LINK))
         entries = entry_ids_by_field(fetch(form_url))
-    except (urllib.error.URLError, OSError) as exc:
+    except WIRE_ERRORS as exc:
         raise Blocked(REASON_FORM_UNREACHABLE.format(error=exc)) from exc
     form_data = {entries[field]: payload[field] for field in QUESTION_LABELS if payload[field]}
     response_url = form_url.replace(VIEWFORM_SUFFIX, RESPONSE_SUFFIX)
@@ -353,14 +402,15 @@ def submit(
     started_at = now()
     try:
         body = fetch(response_url, urllib.parse.urlencode(form_data).encode("utf-8"))
-    except (urllib.error.URLError, OSError) as exc:
-        # The POST's fate is unknown: say so rather than retry. The caller's
-        # recheck reads the tracker.
+    except WIRE_ERRORS as exc:
+        # The POST's fate is unknown (it may have landed and the answer broke
+        # on the way back): say so rather than retry. The caller's recheck
+        # reads the tracker.
         return _answer(STATUS_UNCONFIRMED, None, DETAIL_POST_UNCLEAN.format(error=exc))
     confirmed = CONFIRMATION_SUBSTRING in body
 
     found = find_issue(
-        title, started_at - POST_CLOCK_SLACK_SECONDS, TRACKER_POLL_SECONDS, fetch, now, sleep
+        title, started_at - POST_CLOCK_SLACK_SECONDS, TRACKER_POLL_SECONDS, fetch, now, sleep, happened
     )
     if found.url:
         return _answer(STATUS_SUBMITTED, found.url)
