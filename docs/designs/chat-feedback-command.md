@@ -178,7 +178,8 @@ names (pinned by the same `docs.google.com/forms/d/e/<id>/viewform` pattern as #
 `api.github.com` unauthenticated. It holds no state across calls and uses no credential. The
 route is counted in the broker's request metrics under the `/v1/feedback` endpoint label,
 and audit-logged like the forge verbs. A full broker answers `503`, as the exec and forge
-routes do, so the client reads it as nothing sent. The tracker is read before the POST and
+routes do, so the client reads it as nothing sent on a first attempt and as a recheck that
+could not look on a rerun. The tracker is read before the POST and
 after it; a tracker that cannot be read before the POST is a refusal (a blind duplicate guard
 is no guard), and one that cannot be read after a confirmed POST leaves `SUBMITTED` with a
 null `issue_url` and a `detail`, which the client's recheck resolves; thirty minutes after
