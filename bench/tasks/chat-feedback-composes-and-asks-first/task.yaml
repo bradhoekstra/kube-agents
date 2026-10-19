@@ -10,12 +10,32 @@
 # therefore sees, word for word, what will become public, and nothing is
 # filed that they did not see.
 #
-# WHY THIS IS RED ON MAIN. The Planning Agent on main has no bullet for the
-# command: it either files a card at once and acks in one line, routing the
-# text to platform as "when in doubt", or answers that there is no such
-# command. Neither reply carries the composed submission or asks. The
-# measured red and green runs are recorded below once the branch is live
-# tested (the pull request's Live validation cites the run directories).
+# WHY THIS IS RED ON MAIN, measured rather than argued. The Planning Agent on
+# main has no bullet for the command: it files a card at once and acks in one
+# line, routing the text to platform as "when in doubt", or answers that
+# there is no such command. Neither reply carries the composed submission.
+#
+# Run against `main-2471b53f` on 2026-10-19 (`run_20261019_171746_071193`,
+# the api transport on a `spec.mode: next` install) the objective failed and
+# the no-card safeguard failed with it:
+#
+#   the-reply-shows-the-submission-and-asks   fail
+#     required patterns absent: summary, what happened, posted twice,
+#     public issue, "?"
+#   no-card-before-the-yes                    fail
+#     1 call to kanban_create in the router trajectory
+#
+# The reply was "looking into the duplicate weekly cost report." Green on
+# the branch's build (`feedback-0f3242a`) four times:
+# `run_20261019_173116_791687`, `run_20261019_173239_070335`,
+# `run_20261019_174425_814891`, `run_20261019_174528_407945`. Two runs are
+# not in that count: the first after the deploy ended in
+# `KUBE_AGENTS_INFRA_FAILURE` (HTTP 429 from the agent endpoint, too many
+# concurrent runs) with an empty reply, and one composed the submission under
+# the heading "Title:" where the first draft of the objective accepted only
+# "Summary"; the heading pattern now takes either word, since the form calls
+# the line the summary and says it becomes the issue title, and the red's
+# reply carries neither.
 #
 # WHAT IS GRADED. The Planning Agent's own reply, which both transports carry
 # as the answer text: the submission (a summary line, the kind Bug, a "what
@@ -65,7 +85,9 @@ verification_spec:
       type: report_contains
       fold_decoration: true
       required_patterns:
-        - "(?i)summary"
+        # The one-line heading: the form calls it the summary and says it
+        # becomes the issue title, and the agent labels it either way.
+        - '(?i)\b(?:summary|title)\b'
         - '(?i)\bbug\b'
         - "(?i)what happened"
         - "(?i)posted twice"
