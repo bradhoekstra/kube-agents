@@ -31,6 +31,7 @@ _HERE = pathlib.Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
+import github_api
 import rerun_failed_checks as rfc
 
 REPO_ROOT = _HERE.parent
@@ -63,11 +64,13 @@ def check(check_id, name, conclusion, suite, status="completed", app=rfc.ACTIONS
     }
 
 
-class FakeAPI:
-    """Just enough of `GitHubAPI` for `main`: one pull request, paged lists, posts recorded."""
+class FakeAPI(rfc.GitHubAPI):
+    """`GitHubAPI` with `get` and `post` faked, so the real pager runs over one pull request,
+    paged lists and recorded posts."""
 
-    def __init__(self, pull=None, runs=(), checks=(), per_page=rfc.PER_PAGE, refusing=()):
-        self.repo = "gke-labs/kube-agents"
+    def __init__(self, pull=None, runs=(), checks=(), per_page=github_api.PER_PAGE, refusing=(), refusal_body=b""):
+        super().__init__("gke-labs/kube-agents", "x")
+        self.refusal_body = refusal_body
         self.pull = pull or {"number": 3245, "state": "open", "head": {"sha": HEAD}, "title": "ci: bump"}
         self.runs = list(runs)
         self.checks = list(checks)
@@ -91,13 +94,13 @@ class FakeAPI:
         matched = re.search(rf"/commits/{HEAD}/check-runs\?(.*)$", path)
         if matched:
             query = dict(part.split("=") for part in matched.group(1).split("&"))
-            assert query["filter"] == "all", path
+            assert query["filter"] == "latest", path  # the attempt set Tide sees; `all` would hide a red re-run behind a green first attempt
             return self._page(self.checks, "check_runs", query)
         raise AssertionError(f"unexpected call: {path}")
 
     def post(self, path, payload=None, tolerate=()):
         if path in self.refusing:
-            raise urllib.error.HTTPError(path, 403, "This workflow run cannot be re-run", {}, io.BytesIO(b""))
+            raise urllib.error.HTTPError(path, 403, "Forbidden", {}, io.BytesIO(self.refusal_body))
         self.posts.append((path, payload))
         return {}
 
@@ -188,7 +191,7 @@ class PlanTest(unittest.TestCase):
 class ListTest(unittest.TestCase):
     def test_every_page_of_both_object_endpoints_is_read(self):
         api = FakeAPI(runs=[run(index, "success", index) for index in range(5)], checks=[check(index, "T", "success", index) for index in range(3)], per_page=2)
-        with mock.patch.object(rfc, "PER_PAGE", 2):
+        with mock.patch.object(github_api, "PER_PAGE", 2):
             self.assertEqual([0, 1, 2, 3, 4], [entry["id"] for entry in rfc.list_runs(api, api.repo, HEAD)])
             self.assertEqual([0, 1, 2], [entry["id"] for entry in rfc.list_check_runs(api, api.repo, HEAD)])
 
@@ -203,7 +206,7 @@ class ListTest(unittest.TestCase):
             return result
 
         api.get = get
-        with mock.patch.object(rfc, "PER_PAGE", 1):
+        with mock.patch.object(github_api, "PER_PAGE", 1):
             self.assertEqual([0], [entry["id"] for entry in rfc.list_runs(api, api.repo, HEAD)])
 
 
@@ -252,7 +255,7 @@ class MainTest(unittest.TestCase):
             api.posts,
         )
         self.assertIn(rfc.WORKFLOW_WARNING_PREFIX, out)
-        self.assertIn("no red check", out)
+        self.assertIn("no red GitHub Actions check", out)
         self.assertIn("1 still running", out)
 
     def test_a_cancelled_run_that_never_made_a_check_run_is_not_rerun(self):
@@ -287,6 +290,7 @@ class MainTest(unittest.TestCase):
             runs=[run(1, "failure", 10), run(2, "failure", 20, name="A2A Module Tests")],
             checks=[check(1, "Python Unit Tests", "failure", 10), check(2, "A2A", "failure", 20)],
             refusing={"/repos/gke-labs/kube-agents/actions/runs/1/rerun-failed-jobs"},
+            refusal_body=b'{"message": "This workflow is already running"}',
         )
         code, out, err = self.run_main(api)
         self.assertEqual(0, code, err)
@@ -297,18 +301,28 @@ class MainTest(unittest.TestCase):
             ],
             api.posts,
         )
-        self.assertIn("403", err)
-        self.assertIn("refused", out)
+        self.assertIn("403: This workflow is already running", err)
+        self.assertIn("refused to re-run Python Unit Tests", out)
 
-    def test_every_rerun_refused_gets_a_confused_face(self):
+    def test_every_rerun_refused_gets_a_confused_face_and_a_red_run(self):
+        """A token that cannot re-run at all refuses everything: the person sees 😕 and the job fails
+        with GitHub's message, instead of passing for a quiet run."""
         api = FakeAPI(
             runs=[run(1, "failure", 10)],
             checks=[check(1, "Tests", "failure", 10)],
             refusing={"/repos/gke-labs/kube-agents/actions/runs/1/rerun-failed-jobs"},
+            refusal_body=b'{"message": "Resource not accessible by integration"}',
         )
         code, out, err = self.run_main(api)
-        self.assertEqual(0, code, err)
+        self.assertEqual(1, code, err)
         self.assertEqual([("/repos/gke-labs/kube-agents/issues/comments/77/reactions", {"content": rfc.REACTION_DECLINED})], api.posts)
+        self.assertIn("Resource not accessible by integration", out)
+
+    def test_a_refusal_with_no_json_body_still_names_something(self):
+        error = urllib.error.HTTPError("x", 403, "Forbidden", {}, io.BytesIO(b"nope"))
+        self.assertEqual("nope", rfc.refusal_message(error))
+        error = urllib.error.HTTPError("x", 403, "Forbidden", {}, io.BytesIO(b""))
+        self.assertEqual("Forbidden", rfc.refusal_message(error))
 
     def test_dry_run_posts_nothing(self):
         api = FakeAPI(runs=[run(1, "failure", 10)], checks=[check(1, "Tests", "failure", 10)])

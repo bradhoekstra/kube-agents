@@ -13,12 +13,14 @@ comment reaches Prow, which re-runs its own failed jobs, so one word covers
 both kinds of check.
 
 What is re-run is what Tide sees red, read the way Tide reads it. Tide takes
-every check run at the head commit and keeps the best state per check name:
-success (`success`, `neutral`, `skipped`) over pending (not completed) over
-failure (any other completed conclusion). A name whose best state is failure
-blocks the merge; nothing else does. So the script lists the check runs at the
-head, finds the names that stay red, takes the newest red check run of each,
-and re-runs the GitHub Actions workflow run that produced it: through its
+the check runs at the head commit -- the latest attempt of each check suite,
+which is what GitHub's commit rollup lists -- and keeps the best state per
+check name: success (`success`, `neutral`, `skipped`) over pending (not
+completed) over failure (any other completed conclusion). A name whose best
+state is failure blocks the merge, a pending one holds it, and only a success
+clears it. So the script lists the same check runs, finds the names whose
+best state is failure, takes the newest red check run of each, and re-runs
+the GitHub Actions workflow run that produced it: through its
 failed jobs when the run concluded `failure`, whole otherwise (a `cancelled`
 or `timed_out` run has no failed job for that endpoint to find). A red check
 run from another app (the review bot's `AI Review`) is not a workflow run and
@@ -50,14 +52,16 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import json
 import os
 import sys
 import urllib.error
-import urllib.parse
 
-from github_api import PER_PAGE, GitHubAPI, is_refusal, log
+from github_api import GitHubAPI, is_refusal, log
 
 DEFAULT_REPO = "gke-labs/kube-agents"
+# The pull request state the command acts on; a closed or merged one is declined.
+PULL_REQUEST_OPEN = "open"
 
 # How Tide reads a check run (prow `tide`, `checkRunToContext`): not completed
 # is pending; these conclusions are success; every other completed conclusion
@@ -67,6 +71,10 @@ SUCCESS_CONCLUSIONS = frozenset({"success", "neutral", "skipped"})
 # The per-name order Tide keeps (`isStateBetter`): one success clears the name,
 # one pending holds it, failure only when every check run of the name failed.
 STATE_SUCCESS, STATE_PENDING, STATE_FAILURE = "success", "pending", "failure"
+
+# Which check runs the commit endpoint lists: the latest attempt per check
+# suite, as the rollup Tide reads does (`list_check_runs` says why not `all`).
+CHECK_RUNS_FILTER = "latest"
 
 # Check runs GitHub Actions itself posts carry this app slug. Any other app's
 # red check run is not a workflow run and this command cannot re-run it.
@@ -95,6 +103,9 @@ REACTION_DECLINED = "confused"
 # stdout) and the job's step summary, when Actions provides one.
 WORKFLOW_WARNING_PREFIX = "::warning::"
 STEP_SUMMARY_ENV = "GITHUB_STEP_SUMMARY"
+# How the step summary is written and a refusal body is read.
+TEXT_ENCODING = "utf-8"
+DECODE_ERRORS = "replace"
 
 
 @dataclasses.dataclass
@@ -117,33 +128,19 @@ class Plan:
     pending: int  # check names whose best state is pending
 
 
-def _paged_object(api, path: str, key: str, query: dict) -> list:
-    """Every page of an endpoint that wraps its list in `{total_count, <key>}`.
-
-    `get_all` pages a bare list and cannot read these. An empty page ends the
-    loop as well as reaching the total, so a total that overstates the list
-    cannot spin this.
-    """
-    found = []
-    page = 1
-    while True:
-        encoded = urllib.parse.urlencode({**query, "per_page": PER_PAGE, "page": page})
-        batch = api.get(f"{path}?{encoded}")
-        found.extend(batch[key])
-        if not batch[key] or len(found) >= batch["total_count"]:
-            return found
-        page += 1
-
-
 def list_runs(api, repo: str, head_sha: str) -> list:
     """Every workflow run at `head_sha`, each as its latest attempt."""
-    return _paged_object(api, f"/repos/{repo}/actions/runs", "workflow_runs", {"head_sha": head_sha})
+    return api.get_object_pages(f"/repos/{repo}/actions/runs", "workflow_runs", {"head_sha": head_sha})
 
 
 def list_check_runs(api, repo: str, head_sha: str) -> list:
-    """Every check run at `head_sha`, every attempt: `filter=all`, since the
-    default `latest` keeps one per check suite and Tide reads them all."""
-    return _paged_object(api, f"/repos/{repo}/commits/{head_sha}/check-runs", "check_runs", {"filter": "all"})
+    """The check runs at `head_sha` as Tide sees them: the latest attempt of
+    each check suite. `latest` is the endpoint's default, named here because
+    `all` would also return the attempts a re-run replaced, which the commit
+    rollup Tide reads does not list -- so a check that passed once and failed
+    on a later re-run would read green here and red to Tide. A run a newer
+    event superseded is a check suite of its own and is listed either way."""
+    return api.get_object_pages(f"/repos/{repo}/commits/{head_sha}/check-runs", "check_runs", {"filter": CHECK_RUNS_FILTER})
 
 
 def check_state(check_run: dict) -> str:
@@ -216,6 +213,19 @@ def describe(entry: Rerun) -> str:
     return f"{run.get('name')} (run {run.get('id')}, attempt {run.get('run_attempt')}, {run.get('conclusion')}): {', '.join(entry.check_names)}"
 
 
+def refusal_message(error: urllib.error.HTTPError) -> str:
+    """The `message` GitHub puts in a refusal's body, or the raw body, or the status reason."""
+    try:
+        raw = error.read().decode(TEXT_ENCODING, errors=DECODE_ERRORS)
+    except (OSError, ValueError, AttributeError):
+        raw = ""
+    try:
+        parsed = json.loads(raw) if raw else {}
+    except ValueError:
+        parsed = {}
+    return (parsed.get("message") if isinstance(parsed, dict) else None) or raw.strip() or str(error.reason)
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--pr", type=int, required=True, help="pull request number")
@@ -246,7 +256,7 @@ def react(api, args, content):
 def summarize(lines):
     summary_path = os.environ.get(STEP_SUMMARY_ENV)
     if summary_path:
-        with open(summary_path, "a", encoding="utf-8") as handle:
+        with open(summary_path, "a", encoding=TEXT_ENCODING) as handle:
             handle.write("\n".join(lines) + "\n")
 
 
@@ -277,16 +287,16 @@ def main(argv=None):
     pull_request = api.get(f"/repos/{args.repo}/pulls/{args.pr}")
     head_sha = pull_request["head"]["sha"]
     log(f"#{args.pr} at {head_sha[:12]}: {pull_request.get('title')}")
-    if pull_request.get("state") != "open":
+    if pull_request.get("state") != PULL_REQUEST_OPEN:
         decline(api, args, f"#{args.pr} is {pull_request.get('state')}")
         return 0
 
     plan = plan_reruns(list_check_runs(api, args.repo, head_sha), list_runs(api, args.repo, head_sha))
     skipped_lines = [f"Left alone: {entry.name}: {entry.reason}" for entry in plan.skipped]
     if not plan.rerun:
-        reason = "no red check at the head commit"
+        reason = "no red GitHub Actions check at the head commit"
         if plan.skipped:
-            reason = "no red check at the head commit that this command can re-run"
+            reason = "no red GitHub Actions check at the head commit that this command can re-run"
         if plan.pending:
             reason += f"; {plan.pending} still running"
         decline(api, args, reason, skipped_lines)
@@ -303,22 +313,30 @@ def main(argv=None):
         try:
             api.post(path)
         except urllib.error.HTTPError as error:
-            # GitHub refuses a re-run it cannot make (a run older than thirty
-            # days, one already re-running): that one is named and the rest
-            # still go. Anything else is the API failing, and raises.
+            # GitHub refuses a re-run it cannot make -- a run older than thirty
+            # days, one already re-running -- and refuses every re-run when the
+            # token cannot re-run at all. The message tells them apart, so it
+            # is logged; the rest still go; and a run where nothing could be
+            # re-run exits red below, so a broken command cannot pass for a
+            # quiet one. Anything that is not a refusal is the API failing,
+            # and raises.
             if not is_refusal(error):
                 raise
-            log(f"{describe(entry)}: GitHub refused the re-run ({error.code})")
-            refused.append(entry)
+            message = refusal_message(error)
+            log(f"{describe(entry)}: GitHub refused the re-run ({error.code}: {message})")
+            refused.append((entry, message))
             continue
         log(f"Re-ran {describe(entry)} via {entry.action}")
         done.append(entry)
 
     lines = [f"Re-ran {describe(entry)} ({entry.action})" for entry in done]
-    noted = [f"GitHub refused to re-run {describe(entry)}" for entry in refused] + skipped_lines
+    noted = [f"GitHub refused to re-run {describe(entry)}: {message}" for entry, message in refused] + skipped_lines
     warn(noted)
     summarize(lines + noted)
     react(api, args, REACTION_ACKNOWLEDGED if done else REACTION_DECLINED)
+    if refused and not done:
+        log("Every re-run was refused; failing the run so the refusal is seen")
+        return 1
     return 0
 
 
