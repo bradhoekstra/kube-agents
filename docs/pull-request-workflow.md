@@ -729,10 +729,14 @@ gh pr view <number> --repo gke-labs/kube-agents --json labels --jq '[.labels[].n
 ## Re-running a check that failed
 
 A GitHub Actions check that fails on a pull request whose diff cannot have caused it is worth one
-re-run. Comment `/retest` on the pull request: Prow re-runs its failed jobs, and
-[`retest-actions.yml`](../.github/workflows/retest-actions.yml) re-runs the GitHub Actions runs
-behind the red checks at the head commit (a cancelled or timed-out run whole, since Tide blocks on
-it the same way) for any owner, member or collaborator. It reads the checks as Tide does, the best
+re-run. Comment `/retest` on the pull request, as the first thing in the comment: Prow re-runs its
+failed jobs, and [`retest-actions.yml`](../.github/workflows/retest-actions.yml) re-runs the GitHub
+Actions runs behind the red checks at the head commit (a cancelled or timed-out run whole, since
+Tide blocks on it the same way) for any owner, member or collaborator. Prow also reads the command
+at the start of a later line; the Actions re-run, like `/request-review`, reads the start of the
+comment only, so a `/retest` under a line of explanation re-runs the Prow jobs alone. It re-runs
+only the pull request's own runs: a head commit that is also a commit on `main` or a release line
+carries that line's push runs too, and a red one of those is named and left alone. It reads the checks as Tide does, the best
 state per check name, so a run a newer success superseded or one cancelled while still queued is
 not re-run: neither blocks anything. GitHub's own re-run button needs Write access, which most
 collaborators here do not hold. The comment gets 👀 when something was re-run and 😕 when nothing

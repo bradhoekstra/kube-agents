@@ -60,6 +60,7 @@ import urllib.error
 from github_api import GitHubAPI, is_refusal, log
 
 DEFAULT_REPO = "gke-labs/kube-agents"
+USER_AGENT = "kube-agents-rerun-failed-checks"
 # The pull request state the command acts on; a closed or merged one is declined.
 PULL_REQUEST_OPEN = "open"
 
@@ -79,6 +80,22 @@ CHECK_RUNS_FILTER = "latest"
 # Check runs GitHub Actions itself posts carry this app slug. Any other app's
 # red check run is not a workflow run and this command cannot re-run it.
 ACTIONS_APP_SLUG = "github-actions"
+
+# The events whose workflow runs belong to a pull request. The runs list is
+# keyed by commit, not by pull request: at a head commit that is also a
+# commit on `main` or a release line it lists that line's `push`,
+# `workflow_run` and `status` runs too, and a red one of those would be
+# re-run with its own credentials. So a run counts only when its event is
+# one of these and its head branch and repository are the pull request's.
+PULL_REQUEST_EVENTS = frozenset({"pull_request", "pull_request_target"})
+
+# What a non-completed run's `status` means to the person waiting on it.
+# `queued`, `in_progress` and `requested` finish on their own;
+# `action_required` waits for someone with Write access to approve the run
+# (a first-time contributor's fork); `waiting` and `pending` sit on an
+# environment's protection rules or a deployment review.
+STATUS_AWAITING_APPROVAL = "action_required"
+STATUSES_AWAITING_ENVIRONMENT = frozenset({"waiting", "pending"})
 
 # A run that concluded `failure` has failed jobs to re-run; any other red
 # conclusion has none, so those re-run whole.
@@ -177,8 +194,32 @@ def red_check_runs(check_runs) -> tuple:
     return red, pending
 
 
-def plan_reruns(check_runs, runs) -> Plan:
-    """Which workflow runs to re-run and how, and which red names to leave alone and why."""
+def belongs_to(run: dict, head: dict) -> bool:
+    """Whether a workflow run is the pull request's: a pull-request event at its head branch and repository."""
+    repository = (run.get("head_repository") or {}).get("full_name")
+    return (
+        run.get("event") in PULL_REQUEST_EVENTS
+        and run.get("head_branch") == head.get("ref")
+        and repository == ((head.get("repo") or {}).get("full_name"))
+    )
+
+
+def waiting_reason(run: dict) -> str:
+    """Why a non-completed run is not re-run, in terms of what the person can do about it."""
+    status = run.get("status")
+    if status == STATUS_AWAITING_APPROVAL:
+        return f"its workflow run {run['id']} awaits approval from someone with Write access"
+    if status in STATUSES_AWAITING_ENVIRONMENT:
+        return f"its workflow run {run['id']} is waiting on an environment or a deployment review"
+    return f"its workflow run {run['id']} is still running"
+
+
+def plan_reruns(check_runs, runs, head: dict) -> Plan:
+    """Which workflow runs to re-run and how, and which red names to leave alone and why.
+
+    `head` is the pull request's `head` object (`ref`, `repo.full_name`); a
+    run at the commit that is not the pull request's is never re-run.
+    """
     red, pending = red_check_runs(check_runs)
     by_suite = {run.get("check_suite_id"): run for run in runs}
     plan = Plan(rerun=[], skipped=[], pending=pending)
@@ -193,8 +234,13 @@ def plan_reruns(check_runs, runs) -> Plan:
         if run is None:
             plan.skipped.append(Skipped(name, "no workflow run at the head commit carries it"))
             continue
+        if not belongs_to(run, head):
+            plan.skipped.append(
+                Skipped(name, f"its workflow run {run['id']} is a {run.get('event')} run on {run.get('head_branch')}, not this pull request's")
+            )
+            continue
         if run.get("status") != COMPLETED_STATUS:
-            plan.skipped.append(Skipped(name, f"its workflow run {run['id']} is still running"))
+            plan.skipped.append(Skipped(name, waiting_reason(run)))
             continue
         attempt = run.get("run_attempt") or 1
         if attempt >= RERUN_ATTEMPT_CEILING:
@@ -282,7 +328,7 @@ def main(argv=None):
         log("GITHUB_TOKEN (or GH_TOKEN) is not set")
         return 1
 
-    api = GitHubAPI(args.repo, token, user_agent="kube-agents-rerun-failed-checks")
+    api = GitHubAPI(args.repo, token, user_agent=USER_AGENT)
 
     pull_request = api.get(f"/repos/{args.repo}/pulls/{args.pr}")
     head_sha = pull_request["head"]["sha"]
@@ -291,7 +337,7 @@ def main(argv=None):
         decline(api, args, f"#{args.pr} is {pull_request.get('state')}")
         return 0
 
-    plan = plan_reruns(list_check_runs(api, args.repo, head_sha), list_runs(api, args.repo, head_sha))
+    plan = plan_reruns(list_check_runs(api, args.repo, head_sha), list_runs(api, args.repo, head_sha), pull_request["head"])
     skipped_lines = [f"Left alone: {entry.name}: {entry.reason}" for entry in plan.skipped]
     if not plan.rerun:
         reason = "no red GitHub Actions check at the head commit"

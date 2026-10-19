@@ -39,8 +39,13 @@ WORKFLOW = REPO_ROOT / ".github" / "workflows" / "retest-actions.yml"
 HEAD = "3170d0726e585fb004209d32aeb330c0dc1d6e6e"
 
 
-def run(run_id, conclusion, suite, status="completed", attempt=1, name="Python Unit Tests"):
-    """A workflow run as the runs list returns it; `suite` ties it to its check runs."""
+# The pull request's head as `GET /pulls/{n}` returns it: the fork branch every PR here comes from.
+PR_HEAD = {"sha": HEAD, "ref": "fix-the-thing", "repo": {"full_name": "someone/kube-agents"}}
+
+
+def run(run_id, conclusion, suite, status="completed", attempt=1, name="Python Unit Tests", event="pull_request", head_branch=PR_HEAD["ref"], head_repo=PR_HEAD["repo"]["full_name"]):
+    """A workflow run as the runs list returns it; `suite` ties it to its check runs.
+    By default it is the pull request's own: a pull-request event at its head branch and repository."""
     return {
         "id": run_id,
         "name": name,
@@ -49,6 +54,9 @@ def run(run_id, conclusion, suite, status="completed", attempt=1, name="Python U
         "conclusion": conclusion,
         "run_attempt": attempt,
         "head_sha": HEAD,
+        "event": event,
+        "head_branch": head_branch,
+        "head_repository": {"full_name": head_repo},
     }
 
 
@@ -71,7 +79,7 @@ class FakeAPI(rfc.GitHubAPI):
     def __init__(self, pull=None, runs=(), checks=(), per_page=github_api.PER_PAGE, refusing=(), refusal_body=b""):
         super().__init__("gke-labs/kube-agents", "x")
         self.refusal_body = refusal_body
-        self.pull = pull or {"number": 3245, "state": "open", "head": {"sha": HEAD}, "title": "ci: bump"}
+        self.pull = pull or {"number": 3245, "state": "open", "head": PR_HEAD, "title": "ci: bump"}
         self.runs = list(runs)
         self.checks = list(checks)
         self.per_page = per_page
@@ -140,7 +148,7 @@ class StateTest(unittest.TestCase):
 
 class PlanTest(unittest.TestCase):
     def test_a_failed_run_reruns_its_failed_jobs(self):
-        plan = rfc.plan_reruns([check(1, "Tests", "failure", 10)], [run(100, "failure", 10)])
+        plan = rfc.plan_reruns([check(1, "Tests", "failure", 10)], [run(100, "failure", 10)], PR_HEAD)
         self.assertEqual([(100, rfc.RERUN_FAILED_JOBS, ["Tests"])], [(e.run["id"], e.action, e.check_names) for e in plan.rerun])
         self.assertEqual([], plan.skipped)
 
@@ -148,41 +156,69 @@ class PlanTest(unittest.TestCase):
         plan = rfc.plan_reruns(
             [check(1, "Tests", "cancelled", 10), check(2, "A2A", "timed_out", 20)],
             [run(100, "cancelled", 10), run(200, "timed_out", 20, name="A2A Module Tests")],
+            PR_HEAD,
         )
         self.assertEqual([rfc.RERUN_WHOLE, rfc.RERUN_WHOLE], [entry.action for entry in plan.rerun])
 
     def test_two_red_jobs_of_one_run_make_one_rerun_naming_both(self):
-        plan = rfc.plan_reruns([check(1, "Lint", "failure", 10), check(2, "Tests", "failure", 10)], [run(100, "failure", 10)])
+        plan = rfc.plan_reruns([check(1, "Lint", "failure", 10), check(2, "Tests", "failure", 10)], [run(100, "failure", 10)], PR_HEAD)
         self.assertEqual(1, len(plan.rerun))
         self.assertEqual(["Lint", "Tests"], plan.rerun[0].check_names)
 
     def test_a_red_check_from_another_app_is_named_and_left_alone(self):
-        plan = rfc.plan_reruns([check(1, "AI Review", "failure", 10, app="kube-agents-bot")], [])
+        plan = rfc.plan_reruns([check(1, "AI Review", "failure", 10, app="kube-agents-bot")], [], PR_HEAD)
         self.assertEqual([], plan.rerun)
         self.assertEqual("AI Review", plan.skipped[0].name)
         self.assertIn("kube-agents-bot", plan.skipped[0].reason)
 
     def test_a_red_check_whose_run_is_not_at_the_head_is_left_alone(self):
-        plan = rfc.plan_reruns([check(1, "Tests", "failure", 10)], [run(100, "failure", 99)])
+        plan = rfc.plan_reruns([check(1, "Tests", "failure", 10)], [run(100, "failure", 99)], PR_HEAD)
         self.assertEqual([], plan.rerun)
         self.assertIn("no workflow run", plan.skipped[0].reason)
 
     def test_a_red_check_whose_run_is_already_rerunning_is_left_alone(self):
-        plan = rfc.plan_reruns([check(1, "Tests", "failure", 10)], [run(100, None, 10, status="in_progress")])
+        plan = rfc.plan_reruns([check(1, "Tests", "failure", 10)], [run(100, None, 10, status="in_progress")], PR_HEAD)
         self.assertEqual([], plan.rerun)
         self.assertIn("still running", plan.skipped[0].reason)
 
+    def test_a_run_awaiting_approval_or_an_environment_says_so(self):
+        for status, phrase in (("action_required", "awaits approval from someone with Write access"), ("waiting", "waiting on an environment"), ("pending", "waiting on an environment"), ("queued", "still running")):
+            with self.subTest(status=status):
+                plan = rfc.plan_reruns([check(1, "Tests", "failure", 10)], [run(100, None, 10, status=status)], PR_HEAD)
+                self.assertEqual([], plan.rerun)
+                self.assertIn(phrase, plan.skipped[0].reason)
+
+    def test_a_run_that_is_not_the_pull_requests_is_named_and_left_alone(self):
+        """A head commit that is also a commit on main lists main's push runs; a red one of those is
+        not this command's to re-run, whatever its name."""
+        others = (
+            run(100, "failure", 10, name="Docker Publish", event="push", head_branch="main", head_repo="gke-labs/kube-agents"),
+            run(100, "failure", 10, name="Autopush: Deploy", event="workflow_run", head_branch="main", head_repo="gke-labs/kube-agents"),
+            run(100, "failure", 10, event="pull_request", head_branch="other-branch"),
+            run(100, "failure", 10, event="pull_request", head_repo="else/kube-agents"),
+        )
+        for other in others:
+            with self.subTest(run=f"{other['event']} {other['head_branch']} {other['head_repository']['full_name']}"):
+                plan = rfc.plan_reruns([check(1, "Publish", "failure", 10)], [other], PR_HEAD)
+                self.assertEqual([], plan.rerun)
+                self.assertIn("not this pull request's", plan.skipped[0].reason)
+                self.assertIn(other["event"], plan.skipped[0].reason)
+
+    def test_a_pull_request_target_run_at_the_head_is_the_pull_requests(self):
+        plan = rfc.plan_reruns([check(1, "Risk", "failure", 10)], [run(100, "failure", 10, event="pull_request_target")], PR_HEAD)
+        self.assertEqual(1, len(plan.rerun))
+
     def test_a_run_at_the_attempt_ceiling_is_reported_not_rerun(self):
-        plan = rfc.plan_reruns([check(1, "Tests", "failure", 10)], [run(100, "failure", 10, attempt=rfc.RERUN_ATTEMPT_CEILING)])
+        plan = rfc.plan_reruns([check(1, "Tests", "failure", 10)], [run(100, "failure", 10, attempt=rfc.RERUN_ATTEMPT_CEILING)], PR_HEAD)
         self.assertEqual([], plan.rerun)
         self.assertIn(f"attempt {rfc.RERUN_ATTEMPT_CEILING}", plan.skipped[0].reason)
 
     def test_a_run_one_below_the_ceiling_is_still_rerun(self):
-        plan = rfc.plan_reruns([check(1, "Tests", "failure", 10)], [run(100, "failure", 10, attempt=rfc.RERUN_ATTEMPT_CEILING - 1)])
+        plan = rfc.plan_reruns([check(1, "Tests", "failure", 10)], [run(100, "failure", 10, attempt=rfc.RERUN_ATTEMPT_CEILING - 1)], PR_HEAD)
         self.assertEqual(1, len(plan.rerun))
 
     def test_a_green_head_plans_nothing(self):
-        plan = rfc.plan_reruns([check(1, "Tests", "success", 10), check(2, "Docs", "skipped", 20)], [run(100, "success", 10), run(200, "success", 20)])
+        plan = rfc.plan_reruns([check(1, "Tests", "success", 10), check(2, "Docs", "skipped", 20)], [run(100, "success", 10), run(200, "success", 20)], PR_HEAD)
         self.assertEqual([], plan.rerun)
         self.assertEqual([], plan.skipped)
         self.assertEqual(0, plan.pending)
@@ -279,7 +315,7 @@ class MainTest(unittest.TestCase):
         self.assertIn("AI Review", out)
 
     def test_a_closed_pull_request_declines(self):
-        api = FakeAPI(pull={"number": 3245, "state": "closed", "head": {"sha": HEAD}, "title": "t"})
+        api = FakeAPI(pull={"number": 3245, "state": "closed", "head": PR_HEAD, "title": "t"})
         code, out, err = self.run_main(api)
         self.assertEqual(0, code, err)
         self.assertEqual(rfc.REACTION_DECLINED, api.posts[-1][1]["content"])
