@@ -141,7 +141,7 @@ describe("gateway text mirrors", () => {
   });
 
   it("settles only the turns no gateway branch makes a task of", () => {
-    for (const t of ["stop", "/session", "/session off", "/session stop", "/feedback", "/FEEDBACK  "]) {
+    for (const t of ["stop", "/session", "/session off", "/session stop", "/feedback", "/FEEDBACK  ", "/session /feedback"]) {
       expect(turnFate(t)).toEqual({ kind: "settled" });
     }
     expect(turnFate("/feedback the report posted twice")).toEqual({ kind: "task", texts: ["/feedback the report posted twice"] });

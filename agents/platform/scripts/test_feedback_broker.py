@@ -348,6 +348,54 @@ class SubmitTest(unittest.TestCase):
         self.assertEqual(("SUBMITTED", None), (out["status"], out["issue_url"]))
         self.assertIn("recheck", out["detail"])
 
+    def test_a_heading_inside_what_happened_does_not_blind_the_dedupe(self) -> None:
+        happened = "Opened chat.\n## Steps\n1. typed /feedback"
+        body = ("Filed from the form.\n\n**Kind:** Bug\n\n## What happened\n\n" + happened
+                + "\n\n## What was expected\n\nonce\n")
+        self.assertEqual(happened, fb._happened_section(body))
+
+        class SeededWire(FakeWire):
+            def tracker_response(self) -> str:
+                return json.dumps([{"title": PAYLOAD["title"], "created_at": "2099-01-01T00:00:00Z",
+                                    "html_url": ISSUE_URL, "body": body}])
+
+        wire = SeededWire()
+        out = self._submit(dict(PAYLOAD, happened=happened), wire)
+        self.assertEqual(("ALREADY_SUBMITTED", []), (out["status"], wire.posts))
+
+    def test_the_installs_own_provider_and_oauth_tokens_are_refused(self) -> None:
+        for leaky in ("auth failed for sk-ant-api03-" + "Ab1" * 12 + " at litellm",
+                      "the relay logged ya29.a0AfB_" + "x" * 40 + " and then 401",
+                      "key sk-" + "a" * 24 + " rejected", "header bearer " + "q" * 30):
+            wire = FakeWire()
+            with self.subTest(leaky=leaky[:30]), self.assertRaises(fb.Blocked):
+                self._submit(dict(PAYLOAD, happened=leaky), wire)
+            self.assertEqual([], wire.posts)
+
+    def test_a_body_the_tracker_cannot_hold_is_refused_before_the_post(self) -> None:
+        wire = FakeWire()
+        with self.assertRaises(fb.Blocked) as ctx:
+            self._submit(dict(PAYLOAD, happened="x" * (fb.BODY_MAX_CHARS + 1)), wire)
+        self.assertIn(str(fb.BODY_MAX_CHARS), ctx.exception.reason)
+        self.assertEqual([], wire.posts)
+        fb.validate(fb.normalize(dict(PAYLOAD, happened="x" * (fb.BODY_MAX_CHARS - len(PAYLOAD["expected"]) - len(PAYLOAD["environment"])))))
+
+    def test_a_confirmed_recheck_past_the_pipelines_grace_is_unconfirmed(self) -> None:
+        class SlowPipelineWire(FakeWire):
+            def tracker_response(self) -> str:
+                return TRACKER_EMPTY
+
+        now = 1_800_000_000.0
+        fresh = fb.submit(dict(PAYLOAD, recheck_only=True, form_confirmed=True,
+                               form_confirmed_at=now - fb.PIPELINE_GRACE_SECONDS + 60),
+                          fetch=SlowPipelineWire(), now=lambda: now, sleep=lambda _: None)
+        self.assertEqual("SUBMITTED", fresh["status"])
+        stale = fb.submit(dict(PAYLOAD, recheck_only=True, form_confirmed=True,
+                               form_confirmed_at=now - fb.PIPELINE_GRACE_SECONDS - 60),
+                          fetch=SlowPipelineWire(), now=lambda: now, sleep=lambda _: None)
+        self.assertEqual("UNCONFIRMED", stale["status"])
+        self.assertIn("pipeline", stale["detail"])
+
     def test_every_answer_carries_the_fallback_links(self) -> None:
         answers = [
             self._submit(PAYLOAD, FakeWire()),

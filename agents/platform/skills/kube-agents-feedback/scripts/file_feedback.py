@@ -66,6 +66,8 @@ BROKER_ENDPOINT_VAR = "CREDENTIAL_PROXY_URL"
 ROUTE = feedback_broker.ROUTE
 RECHECK_FIELD = feedback_broker.RECHECK_FIELD
 FORM_CONFIRMED_FIELD = feedback_broker.FORM_CONFIRMED_FIELD
+FORM_CONFIRMED_AT_FIELD = feedback_broker.FORM_CONFIRMED_AT_FIELD
+MARKER_TMP_SUFFIX = ".tmp"
 STATUS_SUBMITTED = feedback_broker.STATUS_SUBMITTED
 STATUS_UNCONFIRMED = feedback_broker.STATUS_UNCONFIRMED
 FALLBACK = feedback_broker.FALLBACK
@@ -86,6 +88,7 @@ REASON_NO_BROKER = (
 )
 REASON_BROKER_UNREACHABLE = "the credential broker could not be reached ({error}); nothing was sent"
 REASON_NO_TOKEN = "the broker token could not be read ({error}); nothing was sent"
+REASON_BAD_ENDPOINT = "the broker endpoint {endpoint!r} is not a URL ({error}); nothing was sent"
 REASON_BROKER_ANSWER = (
     "the credential broker answered HTTP {code} without a feedback status; nothing was sent"
 )
@@ -149,19 +152,29 @@ def _read_marker(marker: Path) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {"started_at": 0.0}
 
 
+def _build_request(endpoint: str, payload: dict[str, Any]) -> urllib.request.Request:
+    """The broker request, with the token read: everything that can fail before a byte is sent.
+
+    Raises ``TokenUnavailable`` (the token file) and ``ValueError`` (an endpoint
+    that is not a URL). Called before the marker is written, so a marker on
+    disk always means a request was at least attempted on the wire.
+    """
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    headers = {"Content-Type": CONTENT_TYPE_JSON}
+    headers.update(credential_proxy_client.authorization_headers())
+    return urllib.request.Request(endpoint.rstrip("/") + ROUTE, data=body, headers=headers, method="POST")
+
+
 def _post_to_broker(endpoint: str, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
     """One `POST /v1/feedback/submit`: the HTTP status and the JSON body (``{}`` if none).
 
     Raises ``urllib.error.URLError`` when the broker could not be reached at all
     (nothing was sent) and ``BrokerAnswerLost`` when the connection broke after
-    the request went out (the broker may have filed).
+    the request went out (the broker may have filed). The arm order is
+    credential_proxy_client.vcs_call's: URLError first, then everything else
+    off an open connection, and the refusal's body read in its own try.
     """
-    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-    headers = {"Content-Type": CONTENT_TYPE_JSON}
-    headers.update(credential_proxy_client.authorization_headers())
-    request = urllib.request.Request(
-        endpoint.rstrip("/") + ROUTE, data=body, headers=headers, method="POST"
-    )
+    request = _build_request(endpoint, payload)
     try:
         with credential_proxy_client.open_broker_request(request) as response:
             status, raw = response.status, response.read()
@@ -174,9 +187,18 @@ def _post_to_broker(endpoint: str, payload: dict[str, Any]) -> tuple[int, dict[s
                 status, raw = exc.code, exc.read()
         except (http.client.HTTPException, OSError) as broke:
             raise BrokerAnswerLost(f"{type(broke).__name__}: {broke}") from broke
-    except (http.client.HTTPException, ConnectionResetError, TimeoutError) as exc:
+    except urllib.error.URLError:
+        raise
+    except (http.client.HTTPException, OSError) as exc:
         raise BrokerAnswerLost(f"{type(exc).__name__}: {exc}") from exc
     return status, _json_or_empty(raw)
+
+
+def _write_marker(marker: Path, state: dict[str, Any]) -> None:
+    """Write the marker whole: a temp name, then one rename, so a reader never sees a partial file."""
+    tmp = marker.with_name(marker.name + MARKER_TMP_SUFFIX)
+    tmp.write_text(json.dumps(state), encoding="utf-8")
+    os.replace(tmp, marker)
 
 
 def _json_or_empty(raw: bytes) -> dict[str, Any]:
@@ -204,16 +226,24 @@ def submit(payload_path: Path, state_dir: Path) -> int:
         payload = {**payload, RECHECK_FIELD: True}
         if state.get("status") == STATUS_SUBMITTED:
             payload[FORM_CONFIRMED_FIELD] = True
+            payload[FORM_CONFIRMED_AT_FIELD] = float(state.get("started_at") or 0.0)
 
     endpoint = os.environ.get(BROKER_ENDPOINT_VAR, "").strip()
     if not endpoint:
         return _blocked(REASON_NO_BROKER)
 
     first_attempt = not marker.exists()
+    # Everything that can fail before a byte is sent happens before the marker
+    # exists: a marker that outlives a request never made would send every
+    # rerun down the recheck path for a report nobody filed.
+    try:
+        _build_request(endpoint, payload)
+    except credential_proxy_client.TokenUnavailable as exc:
+        return _blocked(REASON_NO_TOKEN.format(error=exc))
+    except ValueError as exc:
+        return _blocked(REASON_BAD_ENDPOINT.format(endpoint=endpoint, error=exc))
     if first_attempt:
-        marker.write_text(
-            json.dumps({"started_at": time.time(), "title": payload["title"]}), encoding="utf-8"
-        )
+        _write_marker(marker, {"started_at": time.time(), "title": payload["title"]})
     try:
         code, answer = _post_to_broker(endpoint, payload)
     except urllib.error.URLError as exc:
@@ -221,10 +251,6 @@ def submit(payload_path: Path, state_dir: Path) -> int:
             return _recheck_unreachable(str(exc.reason))
         marker.unlink(missing_ok=True)
         return _blocked(REASON_BROKER_UNREACHABLE.format(error=exc.reason))
-    except credential_proxy_client.TokenUnavailable as exc:
-        if first_attempt:
-            marker.unlink(missing_ok=True)
-        return _blocked(REASON_NO_TOKEN.format(error=exc))
     except BrokerAnswerLost as exc:
         print(LOST_MESSAGE.format(error=exc), file=sys.stderr)
         raise SystemExit(LOST_EXIT) from exc
@@ -233,7 +259,7 @@ def submit(payload_path: Path, state_dir: Path) -> int:
     if code == 200 and status and status != STATUS_BLOCKED:
         state = _read_marker(marker)
         state.update({"status": status, "issue_url": answer.get("issue_url")})
-        marker.write_text(json.dumps(state), encoding="utf-8")
+        _write_marker(marker, state)
         _print(answer)
         return 0
     if status == STATUS_BLOCKED:

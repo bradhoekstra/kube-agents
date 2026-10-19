@@ -47,6 +47,8 @@ import urllib.parse
 import urllib.request
 from typing import Any, Callable
 
+import credential_shapes
+
 # The one link agents hand out; the docs site serves a meta-refresh page here
 # that names the current form. tests/test_feedback_reference.py ties it to the
 # redirect in docs/site/astro.config.mjs, and a2a/lib/chattext/commands.go
@@ -83,12 +85,24 @@ RECHECK_FIELD = "recheck_only"
 # Set by the client on a recheck when its marker says the form confirmed the
 # POST: an issue not yet on the tracker is then pipeline latency, not loss.
 FORM_CONFIRMED_FIELD = "form_confirmed"
+# The epoch time the client's marker recorded the confirmation, for the grace above.
+FORM_CONFIRMED_AT_FIELD = "form_confirmed_at"
 
 # The pipeline truncates the issue title at this many characters (Code.gs
 # TITLE_MAX_CHARS). A longer summary would file fine but the filed issue's
 # title would no longer equal the payload's, so find_issue could never return
 # its URL; refuse it up front, where the person can shorten it.
 TITLE_MAX_CHARS = 120
+# GitHub caps an issue body at 65,536 characters and Code.gs writes the three
+# text fields into it under fixed headings; a report past this is one the
+# pipeline accepts and then cannot file, which would read as "filed, not yet
+# visible" forever. Refused up front instead, where the person can shorten it.
+BODY_MAX_CHARS = 60000
+BODY_FIELDS = ("happened", "expected", "environment")
+# How long after the form confirmed a missing issue is still pipeline latency
+# ("within a minute", says the form). Past it, a recheck says the pipeline may
+# have failed rather than "not yet visible" without end.
+PIPELINE_GRACE_SECONDS = 30 * 60
 
 # A stable substring of the form's confirmation message (CONFIRMATION_MESSAGE
 # in Code.gs); its presence in the POST response is what distinguishes
@@ -97,21 +111,9 @@ CONFIRMATION_SUBSTRING = "filed as a public issue"
 
 # Content that must never reach a public issue, whoever typed it. These block;
 # the softer redaction judgment (cluster names, project ids) is the persona's,
-# because no regex recognizes a cluster name.
-SECRET_PATTERNS = (
-    ("private key material", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
-    ("a GitHub token", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}")),
-    ("a Google API key", re.compile(r"\bAIza[0-9A-Za-z_-]{35}")),
-    ("a bearer token", re.compile(r"\bBearer [A-Za-z0-9._~+/-]{20,}")),
-    ("a signed JWT", re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ")),
-    # The two shapes credential_proxy's own redactor knows that the list above
-    # did not: GitHub's fine-grained token and a Slack token. A fourth copy of
-    # the shapes, kept short because that module cannot be imported from here
-    # without a cycle; consolidating the lists is the separate work its
-    # redact_credentials docstring names.
-    ("a fine-grained GitHub token", re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}")),
-    ("a Slack token", re.compile(r"\bxox[abpr]-[A-Za-z0-9-]{10,}")),
-)
+# because no regex recognizes a cluster name. One list for this gate and for
+# the broker's log redaction: credential_shapes.py.
+SECRET_PATTERNS = credential_shapes.CREDENTIAL_SHAPES
 
 # The viewform page embeds every question as JSON in this variable.
 FB_DATA_PATTERN = re.compile(r"FB_PUBLIC_LOAD_DATA_\s*=\s*(\[.*?\])\s*;", re.DOTALL)
@@ -120,7 +122,11 @@ FORM_URL_PATTERN = re.compile(r"https://docs\.google\.com/forms/d/e/([A-Za-z0-9_
 # dedupe compares it as well as the title, so two reports that share a one-line
 # summary are two reports.
 HAPPENED_HEADING = "## What happened"
-BODY_SECTION_RE = re.compile(r"^## ", re.MULTILINE)
+# The headings Code.gs writes after it (BODY_SECTIONS there). The section ends
+# at the first of these, never at a "## " line the person wrote inside the text.
+NEXT_SECTION_RE = re.compile(
+    r"^## (?:What was expected|Version and environment|Logs, links, or anything else)\s*$", re.MULTILINE
+)
 VIEWFORM_SUFFIX = "/viewform"
 RESPONSE_SUFFIX = "/formResponse"
 ENTRY_PREFIX = "entry."
@@ -183,6 +189,15 @@ DETAIL_RECHECK_TRACKER_UNREADABLE = (
 REASON_QUESTIONS_DIVERGED = (
     "the form no longer asks: {missing} -- its questions and this module's "
     "QUESTION_LABELS have diverged"
+)
+REASON_BODY_TOO_LONG = (
+    "the report's text is {length} characters; the tracker holds at most "
+    f"{BODY_MAX_CHARS} across what happened, what was expected and the environment, "
+    "and the pipeline would accept and then drop it -- shorten it"
+)
+DETAIL_PIPELINE_FAILED = (
+    "the form confirmed the report {minutes} minutes ago and no issue has appeared; the "
+    "form's pipeline may have failed -- hand it to a human rather than filing again"
 )
 REASON_TITLE_TOO_LONG = (
     "the one-line summary is {length} characters; the pipeline truncates issue "
@@ -285,10 +300,13 @@ def validate(payload: dict[str, Any]) -> None:
         raise Blocked(f"kind {payload['kind']!r} is not one of {', '.join(KIND_CHOICES)}")
     if len(payload["title"]) > TITLE_MAX_CHARS:
         raise Blocked(REASON_TITLE_TOO_LONG.format(length=len(payload["title"])))
+    body_length = sum(len(payload[field]) for field in BODY_FIELDS)
+    if body_length > BODY_MAX_CHARS:
+        raise Blocked(REASON_BODY_TOO_LONG.format(length=body_length))
     text = "\n".join(payload[field] for field in QUESTION_LABELS)
-    for name, pattern in SECRET_PATTERNS:
-        if pattern.search(text):
-            raise Blocked(f"the text contains {name}; that must never reach a public issue, so nothing was sent")
+    name = credential_shapes.find_credential_shape(text)
+    if name:
+        raise Blocked(f"the text contains {name}; that must never reach a public issue, so nothing was sent")
 
 
 class TrackerLookup:
@@ -310,7 +328,7 @@ def _happened_section(body: str | None) -> str | None:
     if not body or HAPPENED_HEADING not in body:
         return None
     after = body.split(HAPPENED_HEADING, 1)[1]
-    next_heading = BODY_SECTION_RE.search(after)
+    next_heading = NEXT_SECTION_RE.search(after)
     return (after[: next_heading.start()] if next_heading else after).strip()
 
 
@@ -380,7 +398,12 @@ def submit(
         # POST here would be the duplicate this whole module exists to stop.
         if payload.get(FORM_CONFIRMED_FIELD) is True:
             # The form confirmed the earlier POST; the issue is pipeline
-            # latency away, not lost.
+            # latency away, not lost -- for as long as latency is a credible
+            # reason. Past the grace, the pipeline is the suspect.
+            confirmed_at = payload.get(FORM_CONFIRMED_AT_FIELD)
+            if isinstance(confirmed_at, (int, float)) and now() - confirmed_at > PIPELINE_GRACE_SECONDS:
+                minutes = int((now() - confirmed_at) // 60)
+                return _answer(STATUS_UNCONFIRMED, None, DETAIL_PIPELINE_FAILED.format(minutes=minutes))
             if not prior.read_ok:
                 return _answer(STATUS_SUBMITTED, None, DETAIL_SUBMITTED_TRACKER_UNREADABLE.format(error=prior.error))
             return _answer(STATUS_SUBMITTED, None, DETAIL_SUBMITTED_NO_URL)

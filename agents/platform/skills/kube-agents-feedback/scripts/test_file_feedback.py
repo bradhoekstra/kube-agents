@@ -178,6 +178,36 @@ class FileFeedbackTest(unittest.TestCase):
         self.assertEqual((0, "ALREADY_SUBMITTED"), (code, printed["status"]))
         self.assertEqual([True], [c.get("recheck_only") for c in calls])
 
+    def test_a_broken_body_read_of_a_success_is_a_lost_answer(self) -> None:
+        class Cut:
+            status = 200
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): raise ConnectionAbortedError("aborted")
+
+        with mock.patch.object(file_feedback.credential_proxy_client, "open_broker_request", return_value=Cut()):
+            with self.assertRaises(file_feedback.BrokerAnswerLost):
+                file_feedback._post_to_broker(BROKER, dict(PAYLOAD))
+
+    def test_a_request_that_cannot_be_built_is_blocked_and_leaves_no_marker(self) -> None:
+        # A scheme-less endpoint fails inside urllib's Request constructor, a
+        # ValueError: nothing was sent, so no marker may stay behind.
+        path = self.state_dir / "payload.json"
+        path.write_text(json.dumps(PAYLOAD), encoding="utf-8")
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": "localhost"}):
+            with contextlib.redirect_stdout(out):
+                code = file_feedback.submit(path, self.state_dir)
+        printed = json.loads(out.getvalue().strip())
+        self.assertEqual((1, "BLOCKED"), (code, printed["status"]))
+        self.assertEqual([], self._markers())
+
+    def test_a_confirmed_recheck_carries_when_the_form_confirmed(self) -> None:
+        pending = {"status": "SUBMITTED", "issue_url": None, "detail": "not yet", "fallback": FALLBACK}
+        self._run(PAYLOAD, (200, pending))
+        _, _, calls = self._run(PAYLOAD, (200, pending))
+        self.assertIsInstance(calls[0].get("form_confirmed_at"), float)
+
     def test_missing_endpoint_is_blocked(self) -> None:
         with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": ""}):
             code, printed, calls = self._run(PAYLOAD, (200, SUBMITTED))

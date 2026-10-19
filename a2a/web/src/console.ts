@@ -212,7 +212,8 @@ export function turnFate(text: string): TurnFate {
   if (sessionRest !== null) {
     // Pre-flip the argument is the first turn as written; post-flip it is
     // unwrapped into an ordinary turn, which the delegate rule then reads.
-    if (sessionRest === "" || isSessionOffArg(sessionRest) || isStopTurn(sessionRest)) return { kind: "settled" };
+    // Post-flip the gateway strips the prefix before it reads /feedback, so a bare /feedback behind /session is the notice too.
+    if (sessionRest === "" || isSessionOffArg(sessionRest) || isStopTurn(sessionRest) || feedbackCommandRest(sessionRest) === "") return { kind: "settled" };
     return { kind: "task", texts: withDelegate(sessionRest) };
   }
   if (isStopTurn(trimmed)) return { kind: "settled" };

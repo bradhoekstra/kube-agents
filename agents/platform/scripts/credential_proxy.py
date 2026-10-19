@@ -42,6 +42,7 @@ from typing import Any, Callable, Iterator, Mapping, NamedTuple, TextIO
 
 import api_policy
 import command_policy
+import credential_shapes
 import feedback_broker
 import mcp_policy
 import providers
@@ -668,16 +669,6 @@ def is_valid_repository(repository: Any) -> bool:
     return repo_ref.is_github_slug(repository)
 
 
-# Two shapes, because two are what the GitHub refresh helper handles: the
-# installation token Minty returns, and the Google OIDC identity token sent to
-# authenticate the request to it.
-_CREDENTIAL_SHAPES = re.compile(
-    r"gh[pousr]_[A-Za-z0-9]{20,}"
-    r"|github_pat_[A-Za-z0-9_]{20,}"
-    r"|\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"
-)
-
-
 def redact_credentials(text: str) -> str:
     """Blank out token-shaped substrings so a subprocess's output can be logged.
 
@@ -692,12 +683,11 @@ def redact_credentials(text: str) -> str:
     header back in a 4xx would put a credential in a string we are about to log.
     Match on shape so that stops being an argument about someone else's service.
 
-    Deliberately not a general-purpose redactor. Two others already exist
-    (`AuditRedactor`, and `redact_secrets` in the fleet-audit skill) and both
-    cover more shapes; neither belongs in this container, which must not import
-    from the Hermes plugin tree. Consolidating the three is separate work.
+    The shapes are credential_shapes.py's, the list the feedback gate refuses
+    to publish: one copy for both, seeded from `AuditRedactor` in the chart,
+    which this container must not import from the Hermes plugin tree.
     """
-    return _CREDENTIAL_SHAPES.sub("[REDACTED]", text)
+    return credential_shapes.redact(text)
 
 
 def _redacted_fields(exc) -> dict:
@@ -10209,7 +10199,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         except (json.JSONDecodeError, TypeError, ValueError) as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             return
-        title = _sanitize_for_logging(str(payload.get("title", "")))
+        # Redacted before it is sanitized: the gate inside feedback_broker has
+        # not run yet, and a person's title can carry a token.
+        title = _sanitize_for_logging(redact_credentials(str(payload.get("title", ""))))
         LOGGER.info(
             "feedback submit request_id=%s principal=%s title=%s",
             request_id, principal_label, title, extra=audit(AUDIT_STATUS_STARTED),
