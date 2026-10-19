@@ -727,7 +727,16 @@ gh pr view <number> --repo gke-labs/kube-agents --json labels --jq '[.labels[].n
 ## Re-running a check that failed
 
 A GitHub Actions check that fails on a pull request whose diff cannot have caused it is worth one
-re-run, from the run's page or with `gh run rerun <run-id> --failed`. That re-run is also a report.
+re-run. Comment `/retest` on the pull request: Prow re-runs its failed jobs, and
+[`retest-actions.yml`](../.github/workflows/retest-actions.yml) re-runs the GitHub Actions runs
+behind the red checks at the head commit (a cancelled or timed-out run whole, since Tide blocks on
+it the same way) for any owner, member or collaborator. It reads the checks as Tide does, the best
+state per check name, so a run a newer one superseded or one cancelled while still queued is not
+re-run: neither blocks anything. GitHub's own re-run button needs Write access, which most
+collaborators here do not hold. The comment gets 👀 when something was re-run and 😕 when nothing
+was, with the reason on the workflow run. A run already on its third attempt is left alone; someone
+with Write access reads its log and decides, re-running from the run's page or with
+`gh run rerun <run-id> --failed`. Either re-run is also a report.
 [`flaky-check-notify.yml`](../.github/workflows/flaky-check-notify.yml) sweeps the recent runs
 of the checks it watches every fifteen minutes, and when a run's latest attempt passed on the same
 commit an earlier attempt failed on, it opens a `ci:flaky` issue per failing test class
