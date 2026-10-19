@@ -776,9 +776,9 @@ def failed_line(report: str) -> str | None:
 
     A report that ends with its ledger link completed (the card is built from
     the ledger), and so did one that names an issue URL on any forge anywhere: it wrote a
-    ledger, and posts as written (a URL with a ``:`` past the port, userinfo or an IPv6
-    host, is not read as one). One with no issue URL that opens a "What's
-    wrong" section is a run that could not write its ledger (no GitOps
+    ledger, and posts as written (a URL with a ``:`` past the port, a userinfo with a
+    password, or an IPv6 host, is not read as one). One with no issue URL that opens a
+    "What's wrong" section is a run that could not write its ledger (no GitOps
     repository registered, say): the line is that section's first sentence, as
     the agent wrote it, markdown and all; the headline cut past ``HEADLINE_MAX``
     does not apply, since the line is the whole notification and its "because"
