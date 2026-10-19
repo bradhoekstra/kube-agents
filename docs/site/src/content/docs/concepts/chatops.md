@@ -148,7 +148,7 @@ A sender the allowlist does not admit gets one notice, once per sender until the
 
 | In default mode                                                                                                   | Under `next`, on the backend the gateway holds                                                                                                                                            |
 | ----------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Slash commands: `/new`, `/sethome`, `/steer`, `/hermes …`                                                         | None of them. The gateway reads one command, [`/session`](#session).                                                                                                                      |
+| Slash commands: `/new`, `/sethome`, `/steer`, `/hermes …`                                                         | None of them. The gateway reads two commands, [`/session`](#session) and [`/feedback`](#feedback).                                                                                        |
 | Reactions, buttons, cards and the plan status message (`KAGE_SLACK_UX`)                                           | On Slack, what the agent sends laid out as in default mode, with reactions, answered buttons and Working… ([Slack](#slack)). On Google Chat, one status line per task, edited in place.   |
 | Slack agent view and suggested prompts                                                                            | The three suggested prompts, in a new assistant thread or on an agent-view app's Messages tab.                                                                                            |
 | The home channel ([Google Chat](#home-channel), [Slack](#home-channel-1)): proactive alerts and scheduled reports | Posted by the gateway to the home channel on the `PlatformAgent`: `spec.integration.googleChat.homeChannel` on Google Chat, `spec.integration.slack.homeChannel` (a channel ID) on Slack. |
@@ -191,6 +191,24 @@ On Slack, start the message with the bot's mention, `@bot /session`, because Sla
 | `/session stop`   | `ℹ️ to leave the session route say /session off; to stop a running task say stop`. Nothing is stopped.                                                                                                                                                                                                                                                                                                                                                                                                                               |
 
 If a task is already running on the `platform` route when you send `/session`, that task finishes there, and the message after it opens the first session pod; `/session <text>` sent then is not run, and the gateway says so. A message that starts with `delegate`, such as `delegate check the node pools`, sends that one task to a fresh session pod and leaves the conversation on the `platform` route.
+
+### `/feedback`
+
+`/feedback` is the gateway's other command: how to report a problem with kube-agents itself (the harness, the agent, the operator, the docs) rather than with your cluster. Sent on its own, the gateway answers in place, starts no task, and whatever the conversation is doing carries on:
+
+```
+📝 To report a problem with kube-agents itself:
+• Open an issue: https://github.com/gke-labs/kube-agents/issues
+• Or use the feedback form, which needs no account: https://gke-labs.github.io/kube-agents/feedback
+A report needs a one-line summary, the kind (Bug, Feature request, Question or Other) and what happened. A submission becomes a public issue, so keep cluster names, project ids and anything read from a Secret out of it.
+To have it written up and filed for you, send `/feedback <what happened>` — I'll show you the exact text and ask before anything is filed.
+```
+
+Sent with text, `/feedback the cost report posted twice this morning`, the message is an ordinary turn and the Planning Agent answers it. It writes the report up as the form would receive it, a one-line summary, the kind and what happened in your words, says that a submission becomes a public issue on `gke-labs/kube-agents`, and asks for a yes. Nothing is filed until you give one. On `yes` it hands the exact text to the platform specialist, which files it through the public feedback form; the reply names the issue the form opened. The form needs no account and the install needs no GitHub credential for it. The same text sent again is not filed twice: the reply names the issue already open.
+
+When the install cannot reach the form, the reply says that nothing was filed and gives the composed text back with the two links above, so you can file it yourself. An air-gapped install, or one whose credential broker has no route to the form's hosts, answers this way every time.
+
+On Slack, start the message with the bot's mention, `@bot /feedback`, as for `/session`.
 
 ### The Slack Home tab
 
