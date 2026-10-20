@@ -135,10 +135,19 @@ describe("spend totals", () => {
       task("b"),
       task("c", { usage: { inputTokens: 50, durationMs: 20 } }),
     );
+    // Two tasks naming different models: the sum names both, in first-seen
+    // order, rather than whichever the fold visited last.
+    const mixed = withTasks(
+      task("a", { usage: { model: "model-default", inputTokens: 1 } }),
+      task("b", { usage: { model: "claude-opus-5-5", inputTokens: 1 } }),
+      task("c", { usage: { model: "model-default", inputTokens: 1 } }),
+    );
+    expect(spendOf(mixed).models).toEqual(["model-default", "claude-opus-5-5"]);
     expect(spendOf(state)).toEqual({
       reported: 2,
       priced: 1,
       counted: 2,
+      models: [],
       total: {
         model: undefined,
         inputTokens: 150,

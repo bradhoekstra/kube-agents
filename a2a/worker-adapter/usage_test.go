@@ -2,11 +2,88 @@ package workeradapter
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
+
+// A result line whose total_cost_usd is null carried no total: the baseline
+// is left alone rather than rebased to zero. A string total is dropped and
+// named; an absent key is neither.
+func TestNullCostTotalIsAbsentNotZero(t *testing.T) {
+	for _, tc := range []struct {
+		raw      string
+		hasTotal bool
+		dropped  bool
+	}{{``, false, false}, {`null`, false, false}, {`"0.01"`, false, true}, {`0.01`, true, false}} {
+		ev := harnessEvent{TotalCostUSD: json.RawMessage(tc.raw)}
+		got := ev.telemetry("m")
+		if got.hasTotal != tc.hasTotal || (len(got.dropped) > 0) != tc.dropped {
+			t.Errorf("total_cost_usd %q: hasTotal=%v dropped=%v, want %v %v", tc.raw, got.hasTotal, got.dropped, tc.hasTotal, tc.dropped)
+		}
+	}
+	a := &adapter{}
+	a.turnCost(0.010)
+	ev := harnessEvent{TotalCostUSD: json.RawMessage(`null`)}
+	if tel := ev.telemetry("m"); tel.hasTotal {
+		t.Fatal("null read as a total")
+	}
+	if got := a.turnCost(0.015); got-0.005 > 1e-9 || got-0.005 < -1e-9 {
+		t.Fatalf("after a null line turnCost = %v, want 0.005 against the untouched baseline", got)
+	}
+}
+
+// costStub is recordingStub's shape with a result line that carries the
+// harness's running total by run number: 0.01, 0.03, 0.06, so the second and
+// third runs' turns cost 0.02 and 0.03 when the baseline is carried across
+// runs, and 0 (unknown) when it is not.
+func costStub(t *testing.T, dir string) []string {
+	t.Helper()
+	return stub(t, fmt.Sprintf(`
+dir=%q
+n=$(( $(cat "$dir/n" 2>/dev/null || echo 0) + 1 ))
+echo "$n" > "$dir/n"
+echo '{"type":"system","subtype":"init","session_id":"sess-'"$n"'","model":"m"}'
+read first || exit 1
+case "$n" in 1) c=0.01;; 2) c=0.03;; *) c=0.06;; esac
+echo '{"type":"result","subtype":"success","result":"answer '"$n"'","duration_ms":10,"total_cost_usd":'"$c"'}'
+`, dir))
+}
+
+// Through the session loop: a reused pod hands the running total its last
+// run read to the next run, so each later task's one result line prices its
+// own turn. Remove the hand-off in session.go or execute and the second and
+// third parts carry no cost.
+func TestAReusedPodCarriesTheCostBaselineAcrossRuns(t *testing.T) {
+	url := startServer(t)
+	c := testClient(t, url)
+	const session = "chat-otter-r1cost"
+	dir := t.TempDir()
+	submit(t, c, session, "task-rc-1", "first question")
+
+	cfg := reuseConfig(url, "task-rc-1", session, costStub(t, dir))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runAdapter(ctx, cfg)
+
+	waitState(t, c, session, "task-rc-1", lib.StateCompleted)
+	submit(t, c, session, "task-rc-2", "second question")
+	waitState(t, c, session, "task-rc-2", lib.StateCompleted)
+	submit(t, c, session, "task-rc-3", "third question")
+	waitState(t, c, session, "task-rc-3", lib.StateCompleted)
+
+	for task, want := range map[string]float64{"task-rc-1": 0.01, "task-rc-2": 0.02, "task-rc-3": 0.03} {
+		got := usageParts(t, foldTask(t, c, session, task))
+		if len(got) != 1 || got[0].CostUsd-want > 1e-9 || got[0].CostUsd-want < -1e-9 {
+			t.Errorf("%s usage = %+v, want one part costing %v", task, got, want)
+		}
+	}
+	cancel()
+	waitOutcome(t, done, 30*time.Second)
+}
 
 // usageParts is the usage artifact's parts read as Usage, in stream order.
 func usageParts(t *testing.T, task *lib.Task) []lib.Usage {

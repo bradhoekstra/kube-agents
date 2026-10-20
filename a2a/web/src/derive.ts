@@ -233,7 +233,13 @@ export interface Spend {
   priced: number;
   /** Of those, the tasks whose turns carried token counts; the token sums cover these alone. */
   counted: number;
-  /** Their usage summed; absent until one reports. */
+  /**
+   * The distinct models the reporting tasks named, in first-seen order. A
+   * task's own fold keeps the last model its turns named; across tasks the
+   * sums cover every model, so the panel names them all rather than one.
+   */
+  models: string[];
+  /** Their usage summed; absent until one reports. `total.model` is one task's, not the sum's: read `models`. */
   total?: Usage;
 }
 
@@ -243,6 +249,7 @@ export function spendOf(state: UiState): Spend {
     reported: usages.length,
     priced: usages.filter((u) => u.costUsd !== undefined).length,
     counted: usages.filter((u) => u.inputTokens !== undefined || u.outputTokens !== undefined).length,
+    models: [...new Set(usages.flatMap((u) => (u.model ? [u.model] : [])))],
     total: usageTotal(usages),
   };
 }

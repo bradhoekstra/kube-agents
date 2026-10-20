@@ -126,18 +126,22 @@ describe("Dashboard", () => {
       ...state,
       tasks: new Map([
         ["t1", { ...t1, usage: { model: "claude-opus-5-5", inputTokens: 1500, outputTokens: 80, durationMs: 4000 } }],
-        ["t2", { ...t1, taskId: "t2", usage: { inputTokens: 500, outputTokens: 20, costUsd: 0.0123, durationMs: 1000 } }],
+        [
+          "t2",
+          { ...t1, taskId: "t2", usage: { model: "model-default", inputTokens: 500, outputTokens: 20, costUsd: 0.0123, durationMs: 1000 } },
+        ],
       ]),
     };
     render(<Dashboard state={withUsage} focus={null} onSession={() => {}} />);
     const tasks = document.querySelector('[data-panel="tasks"]')!.textContent!;
     expect(tasks).toContain("1.5k in / 80 out, 4s, claude-opus-5-5");
-    expect(tasks).toContain("500 in / 20 out, $0.0123, 1s");
+    expect(tasks).toContain("500 in / 20 out, $0.0123, 1s, model-default");
     const spend = document.querySelector('[data-panel="spend"]')!.textContent!;
     expect(spend).toContain("tasks reporting2");
     expect(spend).toContain("tokens2k in / 100 out");
     expect(spend).toContain("cost$0.0123 over 1 of 2 tasks");
-    expect(spend).toContain("modelclaude-opus-5-5");
+    // Two tasks, two models: the row names both, not the one the fold saw last.
+    expect(spend).toContain("modelclaude-opus-5-5, model-default");
     expect(spend).toContain("turn time5s");
   });
 

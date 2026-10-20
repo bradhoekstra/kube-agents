@@ -182,12 +182,15 @@ func (ev harnessEvent) telemetry(model string) resultTelemetry {
 		t.usage.InputTokens = int64(counts.InputTokens + counts.CacheCreationInputTokens + counts.CacheReadInputTokens)
 		t.usage.OutputTokens = int64(counts.OutputTokens)
 	}
+	// A null total is a line that carried none, not a total of zero: a zero
+	// would read as the total going down and rebase the baseline.
+	var total *float64
 	switch {
 	case len(ev.TotalCostUSD) == 0:
-	case json.Unmarshal(ev.TotalCostUSD, &t.total) != nil:
+	case json.Unmarshal(ev.TotalCostUSD, &total) != nil:
 		t.dropped = append(t.dropped, "total_cost_usd")
-	default:
-		t.hasTotal = true
+	case total != nil:
+		t.total, t.hasTotal = *total, true
 	}
 	return t
 }

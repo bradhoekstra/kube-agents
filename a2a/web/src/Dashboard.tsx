@@ -236,7 +236,7 @@ export default function Dashboard({
                 ? "not reported"
                 : `${fmtCost(spend.total.costUsd)}${spendCoverage(spend.priced, spend.reported)}`,
             ],
-            ["model", spend.total.model ?? "not reported"],
+            ["model", spend.models.length === 0 ? "not reported" : spend.models.join(", ")],
             ["turn time", spend.total.durationMs === undefined ? "not reported" : fmtDuration(spend.total.durationMs)],
           ].map(([f, v]) => (
             <div key={f} className="anomaly-row">
