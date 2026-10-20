@@ -3,11 +3,11 @@
 A client that enables thinking replays each earlier assistant turn's thinking
 in the next request: Claude Code sends Anthropic ``thinking`` blocks, and an
 OpenAI-format client may send ``thinking_blocks`` on the assistant message.
-LiteLLM's Gemini transformation turns each one into a part carrying the
-thinking text and its ``thoughtSignature`` but not ``thought: true``, so Gemini
-reads its own earlier thought summaries ("**Formulating the Report** / I will
-now draft...") as text it said aloud, and keeps saying them at the top of its
-answers. No prompt reaches that text.
+LiteLLM's Gemini transformation before v1.106.0 turned each one into a part
+carrying the thinking text and its ``thoughtSignature`` but not
+``thought: true``, so Gemini read its own earlier thought summaries
+("**Formulating the Report** / I will now draft...") as text it said aloud, and
+kept saying them at the top of its answers. No prompt reached that text.
 
 This pre-call hook drops those blocks from assistant messages before LiteLLM
 converts the request, for an alias whose every deployment is a Gemini model.
