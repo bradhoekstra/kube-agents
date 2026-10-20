@@ -293,17 +293,18 @@ func TestPodUsageSource_ReadsTheA2AGatewaysInboundFamilyAsTheChatCounter(t *test
 	}
 }
 
-// The watcher's body feeds two counters: the injected events, and the sessions
-// it opened for triage, which are its session creates under outcome="ok" alone,
-// summed over every cluster; an "error" create opened nothing.
-func TestPodUsageSource_SumsTheWatchersOkSessionCreatesIntoTheTriageSessions(t *testing.T) {
+// The watcher's body feeds two counters: the injected events, and the triage
+// sessions it opened whose event was delivered, summed over every cluster; its
+// session-create attempts by outcome are not read.
+func TestPodUsageSource_SumsTheWatchersTriageSessions(t *testing.T) {
 	body := strings.Join([]string{
 		"# TYPE k8s_event_watcher_events_injected_total counter",
 		`k8s_event_watcher_events_injected_total{cluster="a",location="l",namespace="n",project="p",reason="BackOff"} 7`,
+		"# TYPE k8s_event_watcher_triage_sessions_total counter",
+		`k8s_event_watcher_triage_sessions_total{cluster="a",location="l",project="p"} 2`,
+		`k8s_event_watcher_triage_sessions_total{cluster="b",location="l",project="p"} 1`,
 		"# TYPE k8s_event_watcher_session_creates_total counter",
-		`k8s_event_watcher_session_creates_total{cluster="a",location="l",outcome="ok",project="p"} 2`,
-		`k8s_event_watcher_session_creates_total{cluster="b",location="l",outcome="ok",project="p"} 1`,
-		`k8s_event_watcher_session_creates_total{cluster="b",location="l",outcome="error",project="p"} 4`,
+		`k8s_event_watcher_session_creates_total{cluster="b",location="l",outcome="ok",project="p"} 40`,
 		"# TYPE k8s_event_watcher_cluster_up gauge",
 		`k8s_event_watcher_cluster_up{cluster="a",location="l",project="p"} 1`,
 		"",
@@ -314,7 +315,7 @@ func TestPodUsageSource_SumsTheWatchersOkSessionCreatesIntoTheTriageSessions(t *
 		t.Fatalf("Scrape: %v", err)
 	}
 	if reading.Samples[usageCounterEventsIngested] != 7 || reading.Samples[usageCounterSessionsTriage] != 3 {
-		t.Fatalf("samples = %v, want 7 events and 3 triage sessions (the ok creates alone)", reading.Samples)
+		t.Fatalf("samples = %v, want 7 events and 3 triage sessions (not the 40 create attempts)", reading.Samples)
 	}
 	if reading.Clusters == nil || reading.Clusters.Registered != 1 {
 		t.Fatalf("clusters = %+v, want the gauge read from the same body", reading.Clusters)

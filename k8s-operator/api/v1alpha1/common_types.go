@@ -2070,12 +2070,10 @@ type AgentStatus struct {
 // is absent (omitempty) until a series exists for it.
 type AgentUsageStatus struct {
 	// SessionsTotal is the cumulative count of sessions the agent opened: the
-	// sessions the event watcher created on the gateway for events it was
-	// about to inject (its k8s_event_watcher_session_creates_total under
-	// outcome="ok", counted when the create succeeds, so a create whose
-	// inject the daemon then filtered, suppressed or failed counts too, and a
-	// re-create after a failed inject counts again) plus the chat
-	// conversations the gateway opened a session for (the session_store
+	// triage sessions the event watcher opened for events the daemon
+	// delivered (its k8s_event_watcher_triage_sessions_total; a session
+	// whose inject was filtered, suppressed or failed is not counted) plus
+	// the chat conversations the gateway opened a session for (the session_store
 	// plugin's kubeagents_chat_sessions_total on a today install, the A2A
 	// gateway's kubeagents_a2a_gateway_sessions_total on a next install). A
 	// chat conversation that resumes after the session store's retention

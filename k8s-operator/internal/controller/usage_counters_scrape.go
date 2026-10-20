@@ -89,13 +89,11 @@ const (
 	// the Hermes gateway's (a2a/gateway/metrics.go). A body carries one of the
 	// two families; both fold into chatMessagesInboundTotal.
 	a2aMessagesInboundSeries = "kubeagents_a2a_gateway_messages_inbound_total"
-	// sessionCreatesSeries is the watcher's count of the sessions it asked
-	// the gateway to open for triage, by cluster and outcome; the triage half
-	// of sessionsTotal sums it under sessionCreateOutcomeOK alone, the
-	// creates that opened a session.
-	sessionCreatesSeries   = "k8s_event_watcher_session_creates_total"
-	sessionCreateOutcome   = "outcome"
-	sessionCreateOutcomeOK = "ok"
+	// triageSessionsSeries is the watcher's count of the triage sessions it
+	// opened whose event the daemon delivered, by cluster: one per injected
+	// event in per-incident mode, never a session whose inject was filtered,
+	// suppressed or failed. The triage half of sessionsTotal sums it whole.
+	triageSessionsSeries = "k8s_event_watcher_triage_sessions_total"
 	// chatSessionsSeries is the session_store plugin's count of the
 	// conversations it first saw, by platform, served on the chat_metrics
 	// listener beside the inbound counter; a2aSessionsSeries is the A2A
@@ -169,7 +167,7 @@ func usageSeriesFor(counter string) (family string, filter usageLabelFilter) {
 	case usageCounterChatMessagesInbound:
 		return chatInboundSeries, nil
 	case usageCounterSessionsTriage:
-		return sessionCreatesSeries, usageLabelFilter{sessionCreateOutcome: {sessionCreateOutcomeOK: true}}
+		return triageSessionsSeries, nil
 	case usageCounterSessionsChat:
 		return chatSessionsSeries, nil
 	default:
