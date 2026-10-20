@@ -129,6 +129,39 @@ func TestAPI_UsageOnAFailedTurn(t *testing.T) {
 	}
 }
 
+// A turn the server answered with a 5xx ran and failed with no answer: its
+// usage is the wall time alone, ahead of the failed terminal. A 4xx ran
+// nothing and publishes none.
+func TestAPI_UsageOnA5xxTurnIsDurationAlone(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		parts  int
+	}{{"5xx", http.StatusBadGateway, 1}, {"4xx", http.StatusForbidden, 0}} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, url := startServer(t)
+			stub := newAPIStub(t, func(w http.ResponseWriter, _ *http.Request, _ apiCall) {
+				time.Sleep(stubTurnTime)
+				http.Error(w, `{"error":{"message":"upstream failed"}}`, tc.status)
+			})
+			startAPIBridge(t, url, stub, nil)
+			c := gatewayClient(t, url)
+			origin := submitIn(t, c, "task-usage-"+tc.name, "ctx-usage-"+tc.name, "do the thing")
+			task := waitTerminal(t, c, origin.TaskID)
+			if task.State != lib.StateFailed {
+				t.Fatalf("state %s, want failed", task.State)
+			}
+			got := usageSeen(t, url, origin.TaskID)
+			if len(got) != tc.parts {
+				t.Fatalf("usage parts = %+v, want %d", got, tc.parts)
+			}
+			if tc.parts == 1 && (got[0].DurationMs <= 0 || got[0].InputTokens != 0 || got[0].Model != DefaultAPIModel) {
+				t.Fatalf("usage = %+v, want the alias and the duration alone", got[0])
+			}
+		})
+	}
+}
+
 // A model or usage in a shape the bridge does not read is dropped, never the
 // turn: the answer completes and the part carries what did decode.
 func TestAPI_OffShapeTelemetryDoesNotFailTheTurn(t *testing.T) {

@@ -136,43 +136,60 @@ type harnessUsage struct {
 	CacheReadInputTokens     float64 `json:"cache_read_input_tokens,omitempty"`
 }
 
-// model is the init line's model name, or "" when it is absent or not a
-// string.
-func (ev harnessEvent) model() string {
-	var m string
-	if json.Unmarshal(ev.Model, &m) != nil {
-		return ""
+// model is the init line's model name, and whether the line carried one in
+// a shape the adapter reads; an absent model is "" and not dropped.
+func (ev harnessEvent) model() (name string, dropped bool) {
+	if len(ev.Model) == 0 {
+		return "", false
 	}
-	return m
+	if json.Unmarshal(ev.Model, &name) != nil {
+		return "", true
+	}
+	return name, false
 }
 
-// costTotal is the result line's running total, and whether the line
-// carried one the adapter can read.
-func (ev harnessEvent) costTotal() (float64, bool) {
-	var total float64
-	if len(ev.TotalCostUSD) == 0 || json.Unmarshal(ev.TotalCostUSD, &total) != nil {
-		return 0, false
-	}
-	return total, true
-}
-
-// usage is the result line's per-turn figures as the usage artifact's part:
-// model from the init line, every prompt token as input, the wall time as
-// the harness reported it. Zero where the line had nothing, or had it in a
-// shape that does not decode. The cost is not here: it is the running
+// resultTelemetry is one result line's figures for the usage artifact, read
+// field by field so one off-shape field costs that field alone: the
+// per-turn usage (model from the init line, every prompt token as input, the
+// wall time as the harness reported it; zero where the line had nothing),
+// the running total and whether the line carried one, and the names of the
+// fields that were present but did not decode, for the one warning the
+// adapter logs per line. The cost is not in the usage: it is the running
 // total's difference, which the adapter keeps.
-func (ev harnessEvent) usage(model string) lib.Usage {
-	u := lib.Usage{Model: model}
+type resultTelemetry struct {
+	usage    lib.Usage
+	total    float64
+	hasTotal bool
+	dropped  []string
+}
+
+func (ev harnessEvent) telemetry(model string) resultTelemetry {
+	t := resultTelemetry{usage: lib.Usage{Model: model}}
 	var ms float64
-	if len(ev.DurationMs) > 0 && json.Unmarshal(ev.DurationMs, &ms) == nil {
-		u.DurationMs = int64(ms)
+	switch {
+	case len(ev.DurationMs) == 0:
+	case json.Unmarshal(ev.DurationMs, &ms) != nil:
+		t.dropped = append(t.dropped, "duration_ms")
+	default:
+		t.usage.DurationMs = int64(ms)
 	}
 	var counts harnessUsage
-	if len(ev.Usage) > 0 && json.Unmarshal(ev.Usage, &counts) == nil {
-		u.InputTokens = int64(counts.InputTokens + counts.CacheCreationInputTokens + counts.CacheReadInputTokens)
-		u.OutputTokens = int64(counts.OutputTokens)
+	switch {
+	case len(ev.Usage) == 0:
+	case json.Unmarshal(ev.Usage, &counts) != nil:
+		t.dropped = append(t.dropped, "usage")
+	default:
+		t.usage.InputTokens = int64(counts.InputTokens + counts.CacheCreationInputTokens + counts.CacheReadInputTokens)
+		t.usage.OutputTokens = int64(counts.OutputTokens)
 	}
-	return u
+	switch {
+	case len(ev.TotalCostUSD) == 0:
+	case json.Unmarshal(ev.TotalCostUSD, &t.total) != nil:
+		t.dropped = append(t.dropped, "total_cost_usd")
+	default:
+		t.hasTotal = true
+	}
+	return t
 }
 
 type harnessMessage struct {

@@ -661,12 +661,20 @@ function reduceArtifactUpdate(
     chunks: (existing?.chunks ?? 0) + 1,
   });
   // Each usage chunk is one turn's figures; the task keeps the sum, and the
-  // latest part waits for the turn's answer, which takes it as its footer.
-  // A part that is not usage is skipped, as the library's reader skips it.
+  // parts published since the last answer opened wait, summed, for the next
+  // answer, which takes them as its footer: the worker adapter publishes a
+  // part per harness result line but one answer for the steered turns they
+  // settle, so the footer under that answer is their total. A part that is
+  // not usage is skipped, as the library's reader skips it.
   const turns = name === ARTIFACT_USAGE ? usageParts(artifact.parts) : [];
   const usage = turns.length > 0 ? usageTotal([...(prev?.usage ? [prev.usage] : []), ...turns]) : prev?.usage;
   const answerOpens = (name === ARTIFACT_RESULT || name === ARTIFACT_TURN) && payload.append !== true;
-  const turnUsage = turns.length > 0 ? turns[turns.length - 1] : answerOpens ? undefined : prev?.turnUsage;
+  const turnUsage =
+    turns.length > 0
+      ? usageTotal([...(prev?.turnUsage ? [prev.turnUsage] : []), ...turns])
+      : answerOpens
+        ? undefined
+        : prev?.turnUsage;
   next.tasks = upsertTask(state.tasks, env, subject, {
     artifacts,
     executor: prev?.executor ?? env.from.session,

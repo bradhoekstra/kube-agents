@@ -348,6 +348,19 @@ describe("artifact-update", () => {
     expect(again[2].usage).toBeUndefined();
   });
 
+  it("sums the parts published since the last answer into the next answer's footer", () => {
+    // The worker adapter publishes one part per harness result line and one
+    // answer for the steered turns they settle, so two parts before one
+    // answer are that answer's cost, the same figure the tasks table shows.
+    let state = submission();
+    state = usageChunk(state, { inputTokens: 100, outputTokens: 5, costUsd: 0.01 });
+    state = usageChunk(state, { inputTokens: 50, outputTokens: 2, costUsd: 0.005 }, true);
+    state = artifact(state, "result", "settled");
+    const answer = state.chat.filter((c) => c.kind === "answer")[0];
+    expect(answer.usage).toEqual({ model: undefined, inputTokens: 150, outputTokens: 7, costUsd: 0.015, durationMs: undefined });
+    expect(state.tasks.get("task-1")?.usage?.costUsd).toBe(0.015);
+  });
+
   it("skips a usage part that is not usage, as the library's reader does", () => {
     let state = submission();
     state = usageChunk(state, { model: "m" }); // a name is not a figure

@@ -259,19 +259,45 @@ type apiUsage struct {
 // time as the bridge measured it from the request to the body read. No
 // cost: Hermes behind the gateway prices nothing
 // (docs/site/src/content/docs/deploy/telemetry.md), and the artifact
-// carries no figure the producer invented. A field that does not decode
-// is left out; it never fails the turn.
-func apiTurnUsage(out *apiChatResponse, requested string, took time.Duration) lib.Usage {
-	u := lib.Usage{DurationMs: turnMillis(took)}
-	if json.Unmarshal(out.Model, &u.Model) != nil || u.Model == "" {
+// carries no figure the producer invented. A field that is present but does
+// not decode is left out and named in dropped, for the one warning the
+// caller logs per turn; it never fails the turn.
+func apiTurnUsage(out *apiChatResponse, requested string, took time.Duration) (u lib.Usage, dropped []string) {
+	u = lib.Usage{DurationMs: turnMillis(took)}
+	switch {
+	case len(out.Model) == 0:
+	case json.Unmarshal(out.Model, &u.Model) != nil:
+		dropped = append(dropped, "model")
+	}
+	if u.Model == "" {
 		u.Model = requested
 	}
 	var counts apiUsage
-	if len(out.Usage) > 0 && json.Unmarshal(out.Usage, &counts) == nil {
+	switch {
+	case len(out.Usage) == 0:
+	case json.Unmarshal(out.Usage, &counts) != nil:
+		dropped = append(dropped, "usage")
+	default:
 		u.InputTokens = int64(max(counts.PromptTokens, counts.InputTokens))
 		u.OutputTokens = int64(max(counts.CompletionTokens, counts.OutputTokens))
 	}
-	return u
+	return u, dropped
+}
+
+// publishTurnUsage publishes an answered or failed API turn's usage under
+// run.mu, and logs the fields the response carried in a shape the bridge
+// does not read, once per turn.
+func (b *Bridge) publishTurnUsage(run *taskRun, out *apiChatResponse, took time.Duration) {
+	u, dropped := apiTurnUsage(out, b.cfg.APIModel, took)
+	if len(dropped) > 0 {
+		b.cfg.Logger.Warn("usage telemetry on the API response did not decode; those figures are not on the bus",
+			"task", run.origin.TaskID, "fields", dropped)
+	}
+	run.mu.Lock()
+	if run.state == stateRunning {
+		b.publishUsageLocked(run, u)
+	}
+	run.mu.Unlock()
 }
 
 // turnMillis is a turn's wall time for the usage part: whole milliseconds,
@@ -507,6 +533,13 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 			// turn that ran and failed answers 5xx.
 			reason = "hermes-api-refused"
 		}
+		if resp.StatusCode >= http.StatusInternalServerError {
+			// A turn that ran and failed with no answer: the server's error
+			// envelope carries no counts the bridge reads, so its usage is
+			// the wall time, as the CLI executor's is for a run that failed
+			// on its own. A 4xx ran nothing and publishes nothing.
+			b.publishTurnUsage(run, &apiChatResponse{}, time.Since(started))
+		}
 		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: %s - HTTP %d; session: %s%s; body tail: %s",
 			reason, resp.StatusCode, sessionID, turnNote(turn), tail(string(raw), apiBodyTailBytes)), nil)
 		return "", false
@@ -533,11 +566,7 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 		}
 		// A turn that ran and failed still read tokens: its usage goes out
 		// ahead of the failed terminal, as the worker adapter's does.
-		run.mu.Lock()
-		if run.state == stateRunning {
-			b.publishUsageLocked(run, apiTurnUsage(&out, b.cfg.APIModel, time.Since(started)))
-		}
-		run.mu.Unlock()
+		b.publishTurnUsage(run, &out, time.Since(started))
 		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: %s - HTTP %d, turn failed; session: %s%s; error: %s",
 			reason, resp.StatusCode, sessionID, turnNote(turn), tail(out.Hermes.Error, apiBodyTailBytes)), nil)
 		return "", false
@@ -552,7 +581,12 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 	run.answerHeld = true
 	// What the turn cost, ahead of its answer and under the same lock a
 	// finalizer takes, so the usage part never follows the terminal.
-	b.publishUsageLocked(run, apiTurnUsage(&out, b.cfg.APIModel, time.Since(started)))
+	u, dropped := apiTurnUsage(&out, b.cfg.APIModel, time.Since(started))
+	if len(dropped) > 0 {
+		b.cfg.Logger.Warn("usage telemetry on the API response did not decode; those figures are not on the bus",
+			"task", run.origin.TaskID, "fields", dropped)
+	}
+	b.publishUsageLocked(run, u)
 	return out.Choices[0].Message.Content, true
 }
 

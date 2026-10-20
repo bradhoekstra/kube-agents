@@ -437,13 +437,17 @@ records no price for a turn (`docs/site/src/content/docs/deploy/telemetry.md`), 
 hermes-bridge omits it and a cost reader turns to the gateway's `litellm_spend_metric_total`. The
 worker adapter's harness reports a running total (`total_cost_usd`) across every result line of
 the process, a resumed session's earlier spend included, so the adapter publishes the difference
-between consecutive lines and omits the cost on the first line of a resumed session, where
-nothing says how much of the total is this turn's. A zero is "not known" and is omitted, so a
-reader never mistakes unknown for free, and a part with no figure at all is not published; the
-bridge's CLI executor, which sees no token counts, publishes the wall time alone. A turn that
-ran and failed still publishes what it read: the adapter on an errored result line, the bridge
-on a turn the API server answered as failed or a CLI run that exited on its own; a turn killed
-by a cancel, the deadline or a shutdown has no figure and publishes none. An `activity` entry is one `data` part whose object carries
+between consecutive lines. A reused pod carries the total its previous run last read into the
+next run, so a resumed session's first line prices its own turn; only a resumed session the pod
+holds no baseline for omits the cost on its first line, where nothing says how much of the total
+is this turn's. A zero is "not known" and is omitted, so a reader never mistakes unknown for
+free, and a part with no figure at all is not published; the bridge's CLI executor, which sees
+no token counts, publishes the wall time alone. A turn that ran and failed still publishes what
+it read: the adapter on an errored result line, the bridge on a turn the API server answered as
+failed (a 200 with Hermes's failure verdict, with its counts, or a 5xx, with the wall time alone)
+or a CLI run that exited on its own; a request the server refused before a turn ran (a 4xx), or a
+turn killed by a cancel, the deadline or a shutdown, has no figure and publishes none. Telemetry
+a producer cannot read is dropped field by field with one log line per turn, never the turn. An `activity` entry is one `data` part whose object carries
 `tool`, `input` when the call had one, and may carry `callId`, `status` (`completed`, `error`,
 `interrupted` for a call still open at the terminal, or `truncated` on the one entry an executor
 publishes in place of the calls missing from the trace: past its budget, failed to publish,

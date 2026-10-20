@@ -787,8 +787,12 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 			case "system":
 				if ev.Subtype == "init" {
 					a.harnessSession = ev.SessionID
-					a.harnessModel = ev.model()
+					var dropped bool
+					a.harnessModel, dropped = ev.model()
 					log.Info("harness session started", "harnessSession", ev.SessionID, "model", a.harnessModel)
+					if dropped {
+						log.Warn("the init line's model is not a string; the usage parts carry no model", "task", a.taskID)
+					}
 				}
 			case "assistant":
 				a.publishAssistant(ctx, ev)
@@ -978,9 +982,16 @@ func (a *adapter) completeWith(resultText string) (Result, error) {
 // zeroes. Best-effort, like the other stream telemetry: the deliverable and
 // the terminal are the load-bearing publishes.
 func (a *adapter) publishUsage(ctx context.Context, ev harnessEvent) {
-	u := ev.usage(a.harnessModel)
-	if total, ok := ev.costTotal(); ok {
-		u.CostUsd = a.turnCost(total)
+	t := ev.telemetry(a.harnessModel)
+	if len(t.dropped) > 0 {
+		// One line per result line: a harness that retyped a field would
+		// otherwise zero the figure install-wide with nothing to go on.
+		a.log.Warn("usage telemetry on the result line did not decode; those figures are not on the bus",
+			"task", a.taskID, "fields", t.dropped)
+	}
+	u := t.usage
+	if t.hasTotal {
+		u.CostUsd = a.turnCost(t.total)
 	}
 	part, err := lib.UsagePart(u)
 	if err != nil {
