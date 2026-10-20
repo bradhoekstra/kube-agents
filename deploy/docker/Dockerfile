@@ -1719,6 +1719,7 @@ COPY deploy/docker/patches/kanban_wake_nudge.py \
      deploy/docker/patches/credential_redaction.py \
      deploy/docker/patches/apply_credential_redaction.py \
      deploy/docker/patches/verify_credential_redaction.py \
+     agents/chat/defaults/plugins/common/redactor.py \
      deploy/docker/patches/skill_manage_image_owned.py \
      deploy/docker/patches/apply_skill_manage_image_owned.py \
      deploy/docker/patches/verify_skill_manage_image_owned.py \
@@ -1806,6 +1807,9 @@ RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes
     test "$(grep -c '_kube_agents_register_patterns()' /opt/hermes/agent/redact.py)" = "1" && \
     test "$(grep -c '_kube_agents_redact_tool_argument' /opt/hermes/agent/display.py)" = "2" && \
     test "$(grep -c '_kube_agents_install_transcript_redaction()' /opt/hermes/hermes_cli/main.py)" = "1" && \
+    test "$(grep -c '_kube_agents_install_operator_rules(' /opt/hermes/agent/redact.py)" = "1" && \
+    test "$(grep -c '_kube_agents_redact_message_for_store(' /opt/hermes/hermes_state_messages.py)" = "1" && \
+    test "$(grep -c '_kube_agents_redact_store_text(' /opt/hermes/hermes_cli/kanban_db.py)" = "6" && \
     cp /tmp/latency-patches/skill_manage_image_owned.py /opt/hermes/tools/skill_manage_image_owned.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_skill_manage_image_owned.py /opt/hermes && \
     test "$(grep -c 'from tools.skill_manage_image_owned import image_owned_batch_refusal, image_owned_refusal' /opt/hermes/tools/skill_manager_tool.py)" = "1" && \
@@ -1826,7 +1830,8 @@ RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_priority.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_ended_run.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_self_copy.py && \
-    /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_credential_redaction.py && \
+    KUBE_AGENTS_REDACTOR_MODULE=/tmp/latency-patches/redactor.py \
+      /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_credential_redaction.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_skill_manage_image_owned.py && \
     rm -rf /tmp/latency-patches
 

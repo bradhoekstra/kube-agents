@@ -13,6 +13,8 @@ from __future__ import annotations
 import ast
 import importlib.util
 import io
+import json
+import os
 import re
 import sys
 import tempfile
@@ -239,6 +241,285 @@ class InstallTest(unittest.TestCase):
 
 
 #: The three upstream sites, reduced to the text the applier anchors on.
+
+RULES_YAML = """\
+ip:
+  action: pseudonym
+  allowCidrs: [127.0.0.0/8]
+rules:
+  - name: cluster-name
+    literal: prod-eu-1
+    action: mask
+  - name: project
+    pattern: "acme-[a-z]+-prod"
+    action: pseudonym
+"""
+
+
+class OperatorRulesTest(unittest.TestCase):
+    """The operator's rule file, applied after the upstream redactor (issue #1985)."""
+
+    def setUp(self):
+        cr.reset_operator_rules()
+        self.addCleanup(cr.reset_operator_rules)
+        self.tmp = Path(tempfile.mkdtemp())
+        self.rule_file = self.tmp / "redaction.yaml"
+        self.rule_file.write_text(RULES_YAML)
+        self.env = {
+            cr.RULE_FILE_ENV: str(self.rule_file),
+            cr.REDACTOR_MODULE_ENV: str(GATEWAY_REDACTOR),
+        }
+
+    def switched_off(self):
+        env = {k: v for k, v in os.environ.items() if k != cr.RULE_FILE_ENV}
+        return mock.patch.dict(os.environ, env, clear=True)
+
+    def test_without_the_variable_nothing_changes(self):
+        with self.switched_off():
+            self.assertFalse(cr.disk_redaction_enabled())
+            self.assertIs(cr.install_operator_rules(stub_redact), stub_redact)
+            self.assertEqual(cr.apply_operator_rules("prod-eu-1 at 10.1.2.3"), "prod-eu-1 at 10.1.2.3")
+
+    def test_the_projected_file_at_the_fixed_path_is_the_switch(self):
+        with self.switched_off(), mock.patch.object(cr, "DEFAULT_RULE_FILE", str(self.rule_file)):
+            with mock.patch.dict(os.environ, {cr.REDACTOR_MODULE_ENV: str(GATEWAY_REDACTOR)}):
+                self.assertTrue(cr.disk_redaction_enabled())
+                self.assertEqual(cr.rule_file_path(), str(self.rule_file))
+                redact = cr.install_operator_rules(stub_redact)
+                self.assertIn("[REDACTED_CLUSTER_NAME]", redact("prod-eu-1"))
+
+    def test_the_variable_overrides_the_fixed_path(self):
+        other = self.tmp / "other.yaml"
+        other.write_text("rules:\n  - name: other\n    literal: other-name\n")
+        with mock.patch.dict(os.environ, {**self.env, cr.RULE_FILE_ENV: str(other)}):
+            with mock.patch.object(cr, "DEFAULT_RULE_FILE", str(self.rule_file)):
+                self.assertEqual(cr.rule_file_path(), str(other))
+
+    def test_the_path_is_resolved_once(self):
+        with self.switched_off(), mock.patch.object(cr, "DEFAULT_RULE_FILE", str(self.tmp / "absent.yaml")):
+            self.assertFalse(cr.disk_redaction_enabled())
+            (self.tmp / "absent.yaml").write_text(RULES_YAML)
+            self.assertFalse(cr.disk_redaction_enabled())
+
+    def test_the_rules_apply_after_the_upstream_redactor(self):
+        with mock.patch.dict(os.environ, self.env):
+            self.assertTrue(cr.disk_redaction_enabled())
+            redact = cr.install_operator_rules(stub_redact)
+            out = redact(
+                f"deploy {TOKEN} to prod-eu-1 (acme-web-prod) at 10.1.2.3 and 127.0.0.1"
+            )
+        self.assertNotIn(TOKEN, out)
+        self.assertIn("[REDACTED_CLUSTER_NAME]", out)
+        self.assertNotIn("acme-web-prod", out)
+        self.assertRegex(out, r"\[project:[0-9a-f]{12}\]")
+        self.assertNotIn("10.1.2.3", out)
+        self.assertIn("127.0.0.1", out)
+        self.assertTrue(getattr(redact, cr.RULES_INSTALLED_MARKER))
+        self.assertIs(cr.install_operator_rules(redact), redact)
+
+    def test_keyword_arguments_reach_the_upstream_redactor(self):
+        seen = {}
+
+        def upstream(text, *, force=False, code_file=False):
+            seen.update(force=force, code_file=code_file)
+            return text
+
+        with mock.patch.dict(os.environ, self.env):
+            redact = cr.install_operator_rules(upstream)
+            self.assertEqual(redact("plain", force=True, code_file=True), "plain")
+        self.assertEqual(seen, {"force": True, "code_file": True})
+
+    def test_an_empty_text_passes_through(self):
+        with mock.patch.dict(os.environ, self.env):
+            redact = cr.install_operator_rules(stub_redact)
+            self.assertEqual(redact(""), "")
+
+    def test_a_bad_rule_raises_and_names_the_file(self):
+        self.rule_file.write_text("rules:\n  - name: bad\n    literal: ''\n")
+        with mock.patch.dict(os.environ, self.env):
+            with self.assertRaises(ValueError) as ctx:
+                cr.install_operator_rules(stub_redact)
+        self.assertIn(str(self.rule_file), str(ctx.exception))
+
+    def test_a_file_that_is_not_a_mapping_raises(self):
+        self.rule_file.write_text("- a\n- b\n")
+        with mock.patch.dict(os.environ, self.env):
+            with self.assertRaises(ValueError) as ctx:
+                cr.install_operator_rules(stub_redact)
+        self.assertIn("mapping", str(ctx.exception))
+
+    def test_a_missing_file_raises(self):
+        self.rule_file.unlink()
+        with mock.patch.dict(os.environ, self.env):
+            with self.assertRaises(ValueError) as ctx:
+                cr.install_operator_rules(stub_redact)
+        self.assertIn(str(self.rule_file), str(ctx.exception))
+
+    def test_the_file_is_read_once(self):
+        with mock.patch.dict(os.environ, self.env):
+            cr.install_operator_rules(stub_redact)
+            self.rule_file.write_text("rules:\n  - name: other\n    literal: other-name\n")
+            out = cr.apply_operator_rules("prod-eu-1 other-name")
+        self.assertIn("[REDACTED_CLUSTER_NAME]", out)
+        self.assertIn("other-name", out)
+
+
+class StoreRedactionTest(unittest.TestCase):
+    """What the session store and the kanban board receive when the switch is on."""
+
+    MESSAGE = {
+        "role": "tool",
+        "content": [
+            {"type": "text", "text": f"token {TOKEN}"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        ],
+        "api_content": TOKEN,
+        "reasoning": f"saw {TOKEN}",
+        "reasoning_content": None,
+        "reasoning_details": [{"type": "text", "text": TOKEN}],
+        "tool_call_id": "c1",
+        "tool_name": "terminal",
+        "token_count": 3,
+        "observed": True,
+    }
+    TOOL_CALLS = [
+        {
+            "id": "c1",
+            "type": "function",
+            "function": {
+                "name": "terminal",
+                "arguments": json.dumps({"command": f"curl -H 'Authorization: Bearer {TOKEN}'"}),
+            },
+        }
+    ]
+
+    def setUp(self):
+        cr.reset_operator_rules()
+        self.addCleanup(cr.reset_operator_rules)
+        self.tmp = Path(tempfile.mkdtemp())
+        rule_file = self.tmp / "redaction.yaml"
+        rule_file.write_text(RULES_YAML)
+        self.env = {cr.RULE_FILE_ENV: str(rule_file), cr.REDACTOR_MODULE_ENV: str(GATEWAY_REDACTOR)}
+
+    def switched_off(self):
+        env = {k: v for k, v in os.environ.items() if k != cr.RULE_FILE_ENV}
+        return mock.patch.dict(os.environ, env, clear=True)
+
+    def test_a_message_and_its_tool_calls_are_redacted_in_copies(self):
+        msg = json.loads(json.dumps(self.MESSAGE))
+        calls = json.loads(json.dumps(self.TOOL_CALLS))
+        with mock.patch.dict(os.environ, self.env):
+            out_msg, out_calls = cr.redact_message_for_store(msg, calls, redact=stub_redact)
+        self.assertNotIn(TOKEN, json.dumps(out_msg))
+        self.assertNotIn(TOKEN, json.dumps(out_calls))
+        self.assertIn(TOKEN, json.dumps(msg))
+        self.assertIn(TOKEN, json.dumps(calls))
+        self.assertEqual(out_msg["role"], "tool")
+        self.assertEqual(out_msg["token_count"], 3)
+        self.assertIs(out_msg["observed"], True)
+        self.assertIsNone(out_msg["reasoning_content"])
+        self.assertEqual(out_msg["content"][1], self.MESSAGE["content"][1])
+        self.assertEqual(out_calls[0]["function"]["name"], "terminal")
+        command = json.loads(out_calls[0]["function"]["arguments"])["command"]
+        self.assertTrue(command.startswith("curl -H 'Authorization: Bearer ya29."))
+        self.assertIn("...", command)
+
+    def test_a_string_content_and_a_string_tool_calls_column_are_redacted(self):
+        with mock.patch.dict(os.environ, self.env):
+            out_msg, out_calls = cr.redact_message_for_store(
+                {"role": "user", "content": TOKEN}, json.dumps(self.TOOL_CALLS), redact=stub_redact
+            )
+        self.assertNotIn(TOKEN, out_msg["content"])
+        self.assertIsInstance(out_calls, str)
+        self.assertNotIn(TOKEN, out_calls)
+        self.assertEqual(json.loads(out_calls)[0]["id"], "c1")
+
+    def test_the_operator_rules_reach_the_store_through_the_wrapped_redactor(self):
+        with mock.patch.dict(os.environ, self.env):
+            redact = cr.install_operator_rules(stub_redact)
+            out_msg, _ = cr.redact_message_for_store(
+                {"role": "assistant", "content": "prod-eu-1 is at 10.1.2.3"}, None, redact=redact
+            )
+        self.assertEqual(out_msg["content"].count("[REDACTED_CLUSTER_NAME]"), 1)
+        self.assertNotIn("10.1.2.3", out_msg["content"])
+
+    def test_nothing_is_touched_without_the_switch(self):
+        msg, calls = dict(self.MESSAGE), list(self.TOOL_CALLS)
+        with self.switched_off():
+            out_msg, out_calls = cr.redact_message_for_store(msg, calls, redact=stub_redact)
+            self.assertIs(out_msg, msg)
+            self.assertIs(out_calls, calls)
+            text = f"a {TOKEN}"
+            self.assertIs(cr.redact_store_text(text, redact=stub_redact), text)
+
+    def test_store_text_is_redacted_with_the_switch(self):
+        with mock.patch.dict(os.environ, self.env):
+            self.assertNotIn(TOKEN, cr.redact_store_text(f"a {TOKEN}", redact=stub_redact))
+            self.assertIsNone(cr.redact_store_text(None, redact=stub_redact))
+            self.assertEqual(cr.redact_store_text(7, redact=stub_redact), 7)
+
+    def test_the_default_redactor_is_the_forced_upstream_call(self):
+        calls = []
+        fake_module = mock.Mock()
+        fake_module.redact_sensitive_text = lambda text, **kw: calls.append(kw) or text.replace(TOKEN, "x")
+        with mock.patch.dict(sys.modules, {"agent": mock.Mock(), "agent.redact": fake_module}):
+            with mock.patch.dict(os.environ, self.env):
+                out = cr.redact_store_text(f"a {TOKEN}")
+        self.assertEqual(out, "a x")
+        self.assertEqual(calls, [{"force": True}])
+
+
+UPSTREAM_STATE = '''\
+import json
+
+
+class SessionMessagesMixin:
+    """Message rows."""
+
+    def _message_row_params(self, session_id: str, role: str, msg, tool_calls,
+        message_timestamp: float, *, keep_reasoning: bool) -> tuple:
+        """Bind values for ``_INSERT_MESSAGE_SQL`` from one message dict."""
+        encoded_content = msg.get("content")
+        return (session_id, role, encoded_content, tool_calls, message_timestamp, keep_reasoning)
+
+    def append_message(self, session_id, role, msg):
+        return self._message_row_params(session_id, role, msg, None, 0.0, keep_reasoning=True)
+'''
+
+UPSTREAM_KANBAN = '''\
+import sqlite3
+from typing import Optional
+
+
+def create_task(
+    conn: sqlite3.Connection, *, title: str, body: Optional[str] = None,
+    assignee: Optional[str] = None, priority: int = 0,
+) -> str:
+    """Create a task."""
+    conn.execute("INSERT INTO tasks (title, body) VALUES (?, ?)", (title, body))
+    return "t_1"
+
+
+def complete_task(
+    conn: sqlite3.Connection, task_id: str, *, result: Optional[str] = None,
+    summary: Optional[str] = None, metadata: Optional[dict] = None,
+) -> bool:
+    """``running -> done``; records ``result``."""
+    handoff_summary = summary if summary is not None else result
+    conn.execute("UPDATE tasks SET result = ? WHERE id = ?", (result, task_id))
+    return handoff_summary is not None
+
+
+def edit_completed_task_result(
+    conn: sqlite3.Connection, task_id: str, *, result: str, summary: Optional[str] = None,
+    metadata: Optional[dict] = None,
+) -> bool:
+    """Backfill the user-visible result for an already completed task."""
+    conn.execute("UPDATE tasks SET result = ? WHERE id = ?", (result, task_id))
+    return True
+'''
+
+
 UPSTREAM_REDACT = '''\
 import logging
 
@@ -304,6 +585,8 @@ class ApplierTest(unittest.TestCase):
             (apply_credential_redaction.REDACT_RELATIVE, UPSTREAM_REDACT),
             (apply_credential_redaction.DISPLAY_RELATIVE, UPSTREAM_DISPLAY),
             (apply_credential_redaction.MAIN_RELATIVE, UPSTREAM_MAIN),
+            (apply_credential_redaction.STATE_RELATIVE, UPSTREAM_STATE),
+            (apply_credential_redaction.KANBAN_RELATIVE, UPSTREAM_KANBAN),
         ):
             target = root / relative
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -370,6 +653,79 @@ class ApplierTest(unittest.TestCase):
             with self.assertRaises(SystemExit) as ctx:
                 apply_credential_redaction.apply(root)
         self.assertIn("tool-args display branch", str(ctx.exception))
+        self.assertNotIn("_kube_agents", target.read_text())
+
+    def test_the_operator_rules_trailer_wraps_the_redactor_outside_the_guard(self):
+        root = self.write_tree()
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            apply_credential_redaction.apply(root)
+        patched = self.read(root, apply_credential_redaction.REDACT_RELATIVE)
+        self.assertEqual(patched.count("_kube_agents_install_operator_rules("), 1)
+        self.assertIn(
+            "redact_sensitive_text = _kube_agents_install_operator_rules(redact_sensitive_text)",
+            patched,
+        )
+        # The rule-file error must reach the importer: the install call is not
+        # inside the registration trailer's try block.
+        tree = ast.parse(patched)
+        guarded = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Try)
+            and "_kube_agents_install_operator_rules(" in ast.unparse(node)
+        ]
+        self.assertEqual(guarded, [])
+
+    def test_the_message_binder_gets_a_prologue_before_its_first_statement(self):
+        root = self.write_tree()
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            apply_credential_redaction.apply(root)
+        patched = self.read(root, apply_credential_redaction.STATE_RELATIVE)
+        self.assertEqual(patched.count("_kube_agents_redact_message_for_store("), 1)
+        self.assertIn(
+            '        """Bind values for ``_INSERT_MESSAGE_SQL`` from one message dict."""\n'
+            "        # kube-agents patch:",
+            patched,
+        )
+        self.assertIn(
+            "        msg, tool_calls = _kube_agents_redact_message_for_store(msg, tool_calls)\n"
+            '        encoded_content = msg.get("content")',
+            patched,
+        )
+
+    def test_each_kanban_writer_rebinds_its_text_parameters(self):
+        root = self.write_tree()
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            apply_credential_redaction.apply(root)
+        patched = self.read(root, apply_credential_redaction.KANBAN_RELATIVE)
+        self.assertEqual(patched.count("_kube_agents_redact_store_text("), 6)
+        self.assertIn("    title = _kube_agents_redact_store_text(title)\n", patched)
+        self.assertIn("    body = _kube_agents_redact_store_text(body)\n", patched)
+        self.assertEqual(patched.count("    result = _kube_agents_redact_store_text(result)\n"), 2)
+        self.assertEqual(patched.count("    summary = _kube_agents_redact_store_text(summary)\n"), 2)
+        self.assertEqual(patched.count("from agent.credential_redaction import"), 3)
+
+    def test_a_renamed_binder_parameter_fails_before_writing(self):
+        root = self.write_tree()
+        target = root / apply_credential_redaction.STATE_RELATIVE
+        target.write_text(UPSTREAM_STATE.replace("msg, tool_calls,", "msg, calls,"))
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            with self.assertRaises(SystemExit) as ctx:
+                apply_credential_redaction.apply(root)
+        self.assertIn("tool_calls", str(ctx.exception))
+        self.assertNotIn("_kube_agents", target.read_text())
+
+    def test_a_kanban_writer_without_its_parameter_fails_before_writing(self):
+        root = self.write_tree()
+        target = root / apply_credential_redaction.KANBAN_RELATIVE
+        target.write_text(
+            UPSTREAM_KANBAN.replace("summary: Optional[str] = None, metadata", "metadata", 1)
+        )
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            with self.assertRaises(SystemExit) as ctx:
+                apply_credential_redaction.apply(root)
+        self.assertIn("complete_task", str(ctx.exception))
+        self.assertIn("summary", str(ctx.exception))
         self.assertNotIn("_kube_agents", target.read_text())
 
     def test_the_prologue_indent_follows_the_body(self):

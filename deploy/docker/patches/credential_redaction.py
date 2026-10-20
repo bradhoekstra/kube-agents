@@ -68,10 +68,13 @@ a PVC before this image is rewritten.
 
 from __future__ import annotations
 
+import functools
+import importlib.util
+import json
 import os
 import sys
 import threading
-from typing import Callable, Iterable, TextIO
+from typing import Any, Callable, Iterable, TextIO
 
 #: A GCP OAuth 2.0 access token. The same string as
 #: ``AuditRedactor.GCP_OAUTH_TOKEN_PATTERN`` in
@@ -119,6 +122,33 @@ BINARY_DECODE_ERRORS = "replace"
 #: that point logging is not configured yet; the transcript is the one place
 #: the operator will look.
 INSTALL_FAILURE_PREFIX = "kube-agents: transcript redaction not installed: "
+#: The operator's rule file (issue #1985): the same ``redaction.yaml`` the chart
+#: renders for the gateway's pre-call hook, projected into the agent pod at
+#: DEFAULT_RULE_FILE. The file's presence there is the switch: the operator
+#: admits no path-valued variable through ``spec.deployment.env`` into the
+#: agent container, by design, and the agent cannot write under ``/etc``. The
+#: variable the hook reads overrides the path for the build-time verifier and
+#: the tests. Neither set means the switch is off and every function in the
+#: section below is a no-op.
+RULE_FILE_ENV = "KUBE_AGENTS_REDACTION_CONFIG"
+DEFAULT_RULE_FILE = "/etc/kube-agents/redaction/redaction.yaml"
+#: Where the shared redactor module lives in the image; the gateway's hook
+#: runs the same file. Overridable for the build-time verifier and the tests.
+REDACTOR_MODULE_ENV = "KUBE_AGENTS_REDACTOR_MODULE"
+DEFAULT_REDACTOR_MODULE = "/opt/defaults/plugins/common/redactor.py"
+REDACTOR_MODULE_NAME = "kube_agents_redactor"
+RULES_INSTALLED_MARKER = "_kube_agents_operator_rules"
+#: The message-dict fields the session store persists as text, or as JSON that
+#: carries text: what ``_message_row_params`` binds besides ``tool_calls``.
+MESSAGE_TEXT_FIELDS: tuple[str, ...] = (
+    "content",
+    "api_content",
+    "reasoning",
+    "reasoning_content",
+    "reasoning_details",
+    "codex_reasoning_items",
+    "codex_message_items",
+)
 
 Redactor = Callable[[str], str]
 
@@ -340,3 +370,188 @@ def install_or_report() -> bool:
         except Exception:  # noqa: BLE001
             pass
         return False
+
+
+# --- The operator's rules, on disk (issue #1985) -----------------------------
+#
+# ``litellm.redaction`` masks or pseudonymises IP literals and operator-named
+# identifiers in every request the gateway forwards. The same rule file, named
+# by RULE_FILE_ENV, makes the durable writers in this pod apply those rules
+# too: the trailer on ``agent/redact.py`` wraps ``redact_sensitive_text`` so
+# ``agent.log``, the terminal-output cache, the worker transcript and the
+# ``💻 $`` line all carry them, and prologues on the session store's row
+# binder and the kanban board's writers run the wrapped redactor over what
+# those two databases receive. Without the variable none of this is installed
+# and the image behaves as before.
+
+_RULES_LOCK = threading.Lock()
+_RULES: dict[str, list] = {}
+_REDACTOR_MODULE: list = []
+_RULE_FILE: list = []
+
+
+def rule_file_path() -> str:
+    """The operator's rule file, or "" when the switch is off.
+
+    Resolved once per process, like the rules themselves: the variable when
+    set, else DEFAULT_RULE_FILE when the chart has projected it, else "".
+    """
+    if _RULE_FILE:
+        return _RULE_FILE[0]
+    path = (os.environ.get(RULE_FILE_ENV) or "").strip()
+    if not path and os.path.isfile(DEFAULT_RULE_FILE):
+        path = DEFAULT_RULE_FILE
+    _RULE_FILE.append(path)
+    return path
+
+
+def disk_redaction_enabled() -> bool:
+    return bool(rule_file_path())
+
+
+def reset_operator_rules() -> None:
+    """Forget the loaded rules and module (tests)."""
+    with _RULES_LOCK:
+        _RULES.clear()
+        _REDACTOR_MODULE.clear()
+        _RULE_FILE.clear()
+
+
+def _redactor_module():
+    """The shared ``AuditRedactor`` module, loaded once from its file.
+
+    Loaded by path rather than imported by name: the plugin tree is not on
+    ``sys.path`` in a worker, and the hook's copy in the chart is the same file.
+    """
+    if _REDACTOR_MODULE:
+        return _REDACTOR_MODULE[0]
+    path = (os.environ.get(REDACTOR_MODULE_ENV) or "").strip() or DEFAULT_REDACTOR_MODULE
+    spec = importlib.util.spec_from_file_location(REDACTOR_MODULE_NAME, path)
+    if spec is None or spec.loader is None:
+        raise ValueError(f"{REDACTOR_MODULE_ENV}: cannot load the redactor module from {path}")
+    module = importlib.util.module_from_spec(spec)
+    # Its frozen dataclasses resolve annotations through sys.modules.
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    _REDACTOR_MODULE.append(module)
+    return module
+
+
+def _load_rules(path: str) -> list:
+    """Parse the rule file into ``RedactionRule`` objects; raise ``ValueError`` on anything wrong.
+
+    The file was validated when the chart rendered it, and the gateway stops
+    at startup on the same file, so this fails only for a hand-authored one.
+    """
+    import yaml  # the Hermes venv ships it; not needed when the switch is off
+
+    try:
+        with open(path, encoding="utf-8") as handle:
+            config = yaml.safe_load(handle)
+    except OSError as error:
+        raise ValueError(f"{RULE_FILE_ENV}: cannot read {path}: {error}") from error
+    except yaml.YAMLError as error:
+        raise ValueError(f"{RULE_FILE_ENV}: {path} is not valid YAML: {error}") from error
+    if config is None:
+        config = {}
+    if not isinstance(config, dict):
+        raise ValueError(f"{RULE_FILE_ENV}: {path} must hold a mapping, got {type(config).__name__}")
+    try:
+        return _redactor_module().AuditRedactor.rules_from_config(config)
+    except ValueError as error:
+        raise ValueError(f"{RULE_FILE_ENV}: {path}: {error}") from error
+
+
+def operator_rules() -> list:
+    """The rules for the configured file, read once per process; ``[]`` when off."""
+    path = rule_file_path()
+    if not path:
+        return []
+    with _RULES_LOCK:
+        rules = _RULES.get(path)
+        if rules is None:
+            rules = _load_rules(path)
+            _RULES[path] = rules
+        return rules
+
+
+def apply_operator_rules(text: str) -> str:
+    """Run the operator's rules over ``text``; identity when the switch is off."""
+    rules = operator_rules()
+    if not rules or not text:
+        return text
+    redacted, _counts = _redactor_module().AuditRedactor.apply_rules(text, rules)
+    return redacted
+
+
+def install_operator_rules(upstream: Callable[..., str]) -> Callable[..., str]:
+    """Return ``upstream`` composed with the operator's rules, or ``upstream`` itself.
+
+    Called by the trailer on ``agent/redact.py`` with ``redact_sensitive_text``
+    and rebound to that name, so every caller that imports it afterwards, and
+    every function in the module that reads the global at call time, gets the
+    composed form. The rules run after upstream's masking and whatever
+    ``force`` says: the switch is the operator's, not the profile's. A rule
+    file that cannot be read or parsed raises here, at import, and the process
+    does not start, which is what the gateway does with the same file.
+    """
+    if not disk_redaction_enabled() or getattr(upstream, RULES_INSTALLED_MARKER, False):
+        return upstream
+    operator_rules()  # load now: a bad file fails the import, not the first write
+
+    @functools.wraps(upstream)
+    def redact(text: str, *args, **kwargs) -> str:
+        return apply_operator_rules(upstream(text, *args, **kwargs))
+
+    setattr(redact, RULES_INSTALLED_MARKER, True)
+    return redact
+
+
+def _redact_structure(value: Any, redact: Redactor) -> Any:
+    """``redact`` over every string in a JSON-shaped value; a new structure, the input untouched."""
+    if isinstance(value, str):
+        return redact(value)
+    if isinstance(value, dict):
+        return {key: _redact_structure(item, redact) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_structure(item, redact) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_structure(item, redact) for item in value)
+    return value
+
+
+def redact_store_text(value: Any, redact: Redactor | None = None) -> Any:
+    """A string bound for the kanban board, redacted when the switch is on.
+
+    Anything that is not a string, and every value when the switch is off,
+    comes back as the same object.
+    """
+    if not isinstance(value, str) or not disk_redaction_enabled():
+        return value
+    return (redact if redact is not None else _forced_redactor())(value)
+
+
+def redact_message_for_store(
+    msg: dict, tool_calls: Any, redact: Redactor | None = None
+) -> tuple[dict, Any]:
+    """The message dict and tool calls as the session store should persist them.
+
+    When the switch is off both come back as the same objects. On, the text
+    fields in MESSAGE_TEXT_FIELDS and every string inside ``tool_calls``
+    (parsed, or still the JSON text some callers pass) go through ``redact``,
+    in copies; counters, ids, flags and the rest of the dict are untouched.
+    """
+    if not disk_redaction_enabled() or not isinstance(msg, dict):
+        return msg, tool_calls
+    redactor = redact if redact is not None else _forced_redactor()
+    redacted = dict(msg)
+    for field in MESSAGE_TEXT_FIELDS:
+        if field in redacted:
+            redacted[field] = _redact_structure(redacted[field], redactor)
+    if isinstance(tool_calls, str):
+        try:
+            parsed = json.loads(tool_calls)
+        except ValueError:
+            return redacted, redactor(tool_calls)
+        return redacted, json.dumps(_redact_structure(parsed, redactor))
+    return redacted, _redact_structure(tool_calls, redactor)
