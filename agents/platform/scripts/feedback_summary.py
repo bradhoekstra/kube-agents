@@ -34,6 +34,7 @@ import dataclasses
 import functools
 import datetime as dt
 import json
+import math
 import re
 import subprocess
 import sys
@@ -57,9 +58,18 @@ INFERENCE_GATEWAY_METRICS_URL = "http://inference-gateway/metrics/"
 LITELLM_CONFIG_MAP = "litellm-config"
 LITELLM_CONFIG_MAP_HASHED_PREFIX = LITELLM_CONFIG_MAP + "-"
 LITELLM_CONFIG_KEY = "config.yaml"
+LITELLM_DEPLOYMENT = "litellm"
 KUBECTL = "kubectl"
 KUBECTL_TIMEOUT_SECONDS = 30
 CURL_TIMEOUT_SECONDS = 10
+#: ``-f`` makes an HTTP error an exit code, so an error body is never read as data.
+CURL_FLAGS = "-sSf"
+CURL_FLAGS_FOLLOW = "-sSfL"
+#: Why an optional source is missing, for the one stderr line.
+REASON_NO_POD = "no running gateway pod"
+REASON_EXEC = "the exec or the request failed"
+REASON_SHAPE = "the answer had no tasks list"
+REASON_SKIPPED = "skipped by --no-exec"
 EXIT_OK = 0
 EXIT_COLLECT = 1
 EXIT_LEAK = 3
@@ -75,10 +85,18 @@ TRUNCATED_SUFFIX = "+"
 SECONDS_PER_MINUTE = 60
 SECONDS_PER_HOUR = 3600
 SECONDS_PER_DAY = 86400
-#: The two spec strings the block prints by design; every other string leaf of
-#: the spec is an identifier the block must not carry.
+#: The two spec strings the block prints by design.
 PRINTED_SPEC_PATHS: Tuple[Tuple[str, ...], ...] = (("mode",), ("deployment", "tag"))
+#: Spec subtrees whose string leaves name the install (cluster, project, scope,
+#: repositories, channels) and must not reach the block. ``deployment`` is left
+#: out on purpose: its env values, annotations, selectors and sidecar args are
+#: settings, not identifiers, and a value spelled "true" there would otherwise
+#: collide with the block's own ``ready: true``.
+IDENTIFIER_SPEC_SUBTREES: Tuple[str, ...] = ("harness", "scope", "integration", "security", "chat", "telemetry", "networkPolicy")
 MIN_IDENTIFIER_LENGTH = 3
+#: Spec strings that are settings in any subtree: booleans, numbers, enums the block prints.
+IDENTIFIER_STOPWORDS = frozenset({"true", "false", "yes", "no", "on", "off", "none", "null"})
+NUMERIC_VALUE = re.compile(r"^[0-9][0-9._%:-]*$")
 IDENTIFIER_BOUNDARY = r"[A-Za-z0-9_.-]"
 TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_.-]+")
 #: The instant the template is rendered at to learn its own vocabulary.
@@ -98,6 +116,9 @@ USAGE_COUNTERS: Tuple[str, ...] = (
 STATUS_BUCKETS: Mapping[str, str] = {
     "done": "done",
     "archived": "done",
+    "failed": "failed",
+    "cancelled": "cancelled",
+    "canceled": "cancelled",
     "blocked": "blocked",
     "running": "active",
     "ready": "active",
@@ -106,7 +127,7 @@ STATUS_BUCKETS: Mapping[str, str] = {
     "scheduled": "active",
     "review": "active",
 }
-BUCKET_ORDER: Tuple[str, ...] = ("done", "blocked", "active", OTHER_BUCKET)
+BUCKET_ORDER: Tuple[str, ...] = ("done", "failed", "cancelled", "blocked", "active", OTHER_BUCKET)
 #: Prometheus families the inference gateway may publish, by LiteLLM version.
 TOKEN_FAMILIES: Mapping[str, Tuple[str, ...]] = {
     "in": ("litellm_input_tokens_metric_total", "litellm_input_tokens_metric", "litellm_input_tokens_total", "litellm_input_tokens"),
@@ -119,7 +140,7 @@ LATENCY_QUANTILES: Tuple[float, float] = (0.5, 0.95)
 COMPLETION_QUANTILES: Tuple[float, float] = (0.5, 0.95)
 PROMETHEUS_LINE = re.compile(r'^(?P<name>[a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{(?P<labels>[^}]*)\})?\s+(?P<value>\S+)')
 PROMETHEUS_LABEL = re.compile(r'(?P<key>[a-zA-Z_][a-zA-Z0-9_]*)="(?P<value>(?:[^"\\]|\\.)*)"')
-LITELLM_MODEL_LINE = re.compile(r"^\s*model:\s*['\"]?(?P<model>[A-Za-z0-9_./:-]+)", re.MULTILINE)
+LITELLM_MODEL_LINE = re.compile(r"^\s*model:\s*['\"]?(?P<model>[A-Za-z0-9_./:@+-]+)", re.MULTILINE)
 FEEDBACK_TEMPLATE: Tuple[str, ...] = (
     "feedback:",
     "  Rating: [ 👍 / 👎 / 😐 ]",
@@ -159,6 +180,8 @@ class Snapshot:
     litellm_metrics: Optional[str]
     sources: Mapping[str, bool]
     tasks_truncated: bool = False
+    #: Why a source in ``sources`` is False, by source name.
+    source_reasons: Mapping[str, str] = dataclasses.field(default_factory=dict)
 
     @property
     def identifiers(self) -> List[str]:
@@ -171,11 +194,16 @@ class Snapshot:
         spec = self.cr.get("spec") or {}
         metadata = self.cr.get("metadata") or {}
         printed = {_spec_value(spec, path) for path in PRINTED_SPEC_PATHS}
-        values = [metadata.get("name"), metadata.get("namespace"), *_string_leaves(spec)]
+        values = [metadata.get("name"), metadata.get("namespace")]
+        for subtree in IDENTIFIER_SPEC_SUBTREES:
+            values.extend(_string_leaves(spec.get(subtree)))
         seen: List[str] = []
         for value in values:
-            if isinstance(value, str) and len(value) >= MIN_IDENTIFIER_LENGTH and value not in printed and value not in seen:
-                seen.append(value)
+            if not isinstance(value, str) or len(value) < MIN_IDENTIFIER_LENGTH or value in printed or value in seen:
+                continue
+            if value.lower() in IDENTIFIER_STOPWORDS or NUMERIC_VALUE.match(value):
+                continue
+            seen.append(value)
         return seen
 
 
@@ -209,6 +237,8 @@ def parse_prometheus(text: str) -> List[Sample]:
         try:
             value = float(match.group("value"))
         except ValueError:
+            continue
+        if not math.isfinite(value):
             continue
         labels = {m.group("key"): m.group("value") for m in PROMETHEUS_LABEL.finditer(match.group("labels") or "")}
         samples.append(Sample(match.group("name"), labels, value))
@@ -478,8 +508,25 @@ def _in_pod_curl(options: Options, pod: str, shell: str) -> Optional[str]:
     )
 
 
+def _mounted_config_maps(options: Options) -> List[str]:
+    """The ConfigMaps the gateway Deployment mounts: the live config under a kustomize hash."""
+    raw = _optional(options, "get", "deployment", LITELLM_DEPLOYMENT, "-n", options.namespace, "-o", "json")
+    if raw is None:
+        return []
+    try:
+        volumes = (((json.loads(raw).get("spec") or {}).get("template") or {}).get("spec") or {}).get("volumes") or []
+    except ValueError:
+        return []
+    return [v["configMap"]["name"] for v in volumes if isinstance(v.get("configMap"), dict) and v["configMap"].get("name")]
+
+
 def _litellm_config(options: Options) -> Optional[str]:
-    """The gateway's rendered config, from the ConfigMap under either of its names."""
+    """The gateway's rendered config: the ConfigMap its Deployment mounts, else the newest of its names.
+
+    The chart names it ``litellm-config``; the kustomize base appends a content
+    hash and a re-apply leaves the older hashes behind, so the Deployment's own
+    volume says which one is live, and creation time breaks a tie without it.
+    """
     raw = _optional(options, "get", "configmap", "-n", options.namespace, "-o", "json")
     if raw is None:
         return None
@@ -487,13 +534,20 @@ def _litellm_config(options: Options) -> Optional[str]:
         items = json.loads(raw).get("items") or []
     except ValueError:
         return None
+    candidates = []
     for item in items:
-        name = (item.get("metadata") or {}).get("name") or ""
-        if name == LITELLM_CONFIG_MAP or name.startswith(LITELLM_CONFIG_MAP_HASHED_PREFIX):
-            config = (item.get("data") or {}).get(LITELLM_CONFIG_KEY)
-            if isinstance(config, str):
-                return config
-    return None
+        metadata = item.get("metadata") or {}
+        name = metadata.get("name") or ""
+        config = (item.get("data") or {}).get(LITELLM_CONFIG_KEY)
+        if isinstance(config, str) and (name == LITELLM_CONFIG_MAP or name.startswith(LITELLM_CONFIG_MAP_HASHED_PREFIX)):
+            candidates.append((name, str(metadata.get("creationTimestamp") or ""), config))
+    if not candidates:
+        return None
+    mounted = set(_mounted_config_maps(options)) if len(candidates) > 1 else set()
+    for name, _created, config in candidates:
+        if name in mounted:
+            return config
+    return max(candidates, key=lambda c: c[1])[2]
 
 
 def collect(options: Options) -> Snapshot:
@@ -513,29 +567,40 @@ def collect(options: Options) -> Snapshot:
     tasks: Optional[Sequence[Mapping[str, Any]]] = None
     truncated = False
     metrics: Optional[str] = None
-    if options.in_pod:
+    reasons: Dict[str, str] = {}
+    if not options.in_pod:
+        reasons = {"session-kv": REASON_SKIPPED, "litellm-metrics": REASON_SKIPPED}
+    else:
         pod = _gateway_pod(options)
-        if pod:
+        if not pod:
+            reasons = {"session-kv": REASON_NO_POD, "litellm-metrics": REASON_NO_POD}
+        else:
             since = int(now.timestamp()) - TASK_WINDOW_DAYS * SECONDS_PER_DAY
             feed = _in_pod_curl(
                 options, pod,
-                f'curl -sS -m {CURL_TIMEOUT_SECONDS} -H "X-API-Key: ${SESSION_KV_KEY_ENV}" '
+                f'curl {CURL_FLAGS} -m {CURL_TIMEOUT_SECONDS} -H "X-API-Key: ${SESSION_KV_KEY_ENV}" '
                 f'"{SESSION_KV_URL}?since={since}&limit={TASK_FEED_LIMIT}"',
             )
-            if feed:
+            if feed is None:
+                reasons["session-kv"] = REASON_EXEC
+            else:
                 try:
                     body = json.loads(feed)
-                    tasks = body.get("tasks")
+                    tasks = body.get("tasks") if isinstance(body.get("tasks"), list) else None
                     truncated = bool(body.get("truncated"))
                 except ValueError:
                     tasks = None
-            metrics = _in_pod_curl(options, pod, f"curl -sSL -m {CURL_TIMEOUT_SECONDS} {INFERENCE_GATEWAY_METRICS_URL}")
-            if metrics is not None and not metrics.strip():
+                if tasks is None:
+                    reasons["session-kv"] = REASON_SHAPE
+            metrics = _in_pod_curl(options, pod, f"curl {CURL_FLAGS_FOLLOW} -m {CURL_TIMEOUT_SECONDS} {INFERENCE_GATEWAY_METRICS_URL}")
+            if metrics is None or not metrics.strip():
                 metrics = None
+                reasons["litellm-metrics"] = REASON_EXEC
     return Snapshot(
         generated_at=now, cr=cr, server_version=server_version, litellm_config=litellm_config,
         tasks=tasks, litellm_metrics=metrics, tasks_truncated=truncated,
         sources={"session-kv": tasks is not None, "litellm-metrics": metrics is not None},
+        source_reasons=reasons,
     )
 
 
@@ -556,7 +621,8 @@ def main(argv: Optional[Sequence[str]] = None, stdout: TextIO = sys.stdout, stde
     text = render(snapshot)
     missing = [name for name, present in snapshot.sources.items() if not present]
     if missing and options.in_pod:
-        print(f"feedback-summary: {', '.join(missing)} unavailable; the in-pod sources need pods/exec on the gateway pod", file=stderr)
+        detail = "; ".join(f"{name}: {snapshot.source_reasons.get(name, REASON_EXEC)}" for name in missing)
+        print(f"feedback-summary: could not be read: {detail}", file=stderr)
     leaked = audit(text, snapshot.identifiers)
     if leaked:
         print(f"feedback-summary: refused to print: the block names {', '.join(leaked)}", file=stderr)

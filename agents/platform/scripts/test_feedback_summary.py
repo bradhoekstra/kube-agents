@@ -28,10 +28,12 @@ CR = {
     },
     "spec": {
         "mode": "today",
-        "deployment": {"tag": TAG},
-        "harness": {"clusterName": CLUSTER, "projectId": PROJECT, "location": "us-central1"},
+        "harness": {"clusterName": CLUSTER, "projectId": PROJECT, "location": "us-central1", "memory": {"memoryEnabled": "false", "provider": "multiuser_memory"}},
         "scope": {"projects": ["acme-scope-dev"], "exclude": {"clusters": ["old-cluster"]}},
         "integration": {"gitops": {"repository": "acme/gitops"}},
+        "deployment": {"tag": TAG, "env": [{"name": "OTEL_SDK_DISABLED", "value": "true"}],
+                       "podAnnotations": {"cluster-autoscaler.kubernetes.io/safe-to-evict": "true"},
+                       "sidecars": [{"name": "x", "args": ["false", "12"]}]},
     },
     "status": {
         "conditions": [{"type": "Ready", "status": "True"}],
@@ -85,6 +87,8 @@ TASKS = [
     _task("done", 60, 310),
     _task("blocked", 120, 40),
     _task("blocked", 600, 2000),
+    _task("failed", 90, 12),
+    _task("cancelled", 100),
     _task("running", 2),
     _task("done", 30 * 24 * 60, 50),  # outside the window
 ]
@@ -166,17 +170,28 @@ class RenderTest(unittest.TestCase):
 
     def test_a_truncated_feed_prints_a_plus(self):
         text = fs.render(full_snapshot(tasks_truncated=True))
-        self.assertIn("tasks (14 days): 5+ (", text)
+        self.assertIn("tasks (14 days): 7+ (", text)
+
+    def test_settings_spelled_true_or_numeric_are_not_identifiers(self):
+        ids = full_snapshot().identifiers
+        for setting in ("true", "false", "12", "OTEL_SDK_DISABLED", "cluster-autoscaler.kubernetes.io/safe-to-evict"):
+            self.assertNotIn(setting, ids)
+        text = fs.render(full_snapshot())
+        self.assertIn("ready: true", text)
+        self.assertEqual(fs.audit(text, ids), [])
 
     def test_rendering_is_deterministic(self):
         self.assertEqual(fs.render(full_snapshot()), fs.render(full_snapshot()))
 
     def test_tasks_are_rolled_up_by_status_and_duration_only(self):
         text = fs.render(full_snapshot())
-        self.assertIn("tasks (14 days): 5", text)
+        self.assertIn("tasks (14 days): 7", text)
         self.assertIn("done 2", text)
+        self.assertIn("failed 1", text)
+        self.assertIn("cancelled 1", text)
         self.assertIn("blocked 2", text)
         self.assertNotIn("gave_up", text)
+        self.assertNotIn("other", text.split("tasks (14 days)")[1].splitlines()[0])
         self.assertIn("active 1", text)
         self.assertIn("completed p50 1m35s / p95 5m10s", text)
         # the newest completed tasks, one line each, without titles
@@ -238,6 +253,11 @@ class ParsingTest(unittest.TestCase):
 
     def test_the_model_line_is_read_from_the_gateway_config(self):
         self.assertEqual(fs.model_from_litellm_config(LITELLM_CONFIG_YAML), "vertex_ai/claude-opus-5")
+        self.assertEqual(fs.model_from_litellm_config("  model: vertex_ai/claude-3-5-sonnet@20240620\n"), "vertex_ai/claude-3-5-sonnet@20240620")
+
+    def test_non_finite_samples_are_skipped(self):
+        samples = fs.parse_prometheus("litellm_input_tokens_metric_total{m=\"a\"} NaN\nlitellm_input_tokens_metric_total{m=\"b\"} +Inf\nlitellm_input_tokens_metric_total{m=\"c\"} 5\n")
+        self.assertEqual(fs.family_total(samples, fs.TOKEN_FAMILIES["in"]), 5.0)
         self.assertIsNone(fs.model_from_litellm_config("model_list: []\n"))
         self.assertIsNone(fs.model_from_litellm_config(None))
 
@@ -255,6 +275,8 @@ class CollectTest(unittest.TestCase):
                 if needle in key:
                     if isinstance(result, Exception):
                         raise result
+                    if isinstance(result, subprocess.CompletedProcess):
+                        return result
                     return subprocess.CompletedProcess(args, 0, stdout=result, stderr="")
             return subprocess.CompletedProcess(args, 1, stdout="", stderr="not found")
 
@@ -266,8 +288,10 @@ class CollectTest(unittest.TestCase):
             "version -o json": json.dumps(SERVER_VERSION),
             "get configmap": json.dumps({"items": [
                 {"metadata": {"name": "other"}, "data": {"config.yaml": "model: x/y\n"}},
-                {"metadata": {"name": "litellm-config-k4b9ht22c7"}, "data": {"config.yaml": LITELLM_CONFIG_YAML}},
+                {"metadata": {"name": "litellm-config-a1b2stale", "creationTimestamp": "2026-10-01T00:00:00Z"}, "data": {"config.yaml": "model: vertex_ai/old-model\n"}},
+                {"metadata": {"name": "litellm-config-k4b9ht22c7", "creationTimestamp": "2026-10-10T00:00:00Z"}, "data": {"config.yaml": LITELLM_CONFIG_YAML}},
             ]}),
+            "get deployment litellm": json.dumps({"spec": {"template": {"spec": {"volumes": [{"name": "cfg", "configMap": {"name": "litellm-config-k4b9ht22c7"}}]}}}}),
             "get pods": json.dumps({"items": [
                 {"metadata": {"name": "other-agent-gateway-y"}, "status": {"phase": "Running"}},
                 {"metadata": {"name": "platform-agent-gateway-old", "deletionTimestamp": "2026-10-20T17:00:00Z"}, "status": {"phase": "Running"}},
@@ -280,11 +304,11 @@ class CollectTest(unittest.TestCase):
             snapshot = fs.collect(fs.Options(namespace=NAMESPACE, name="platform-agent", now=NOW))
         self.assertEqual(snapshot.sources, {"session-kv": True, "litellm-metrics": True})
         text = fs.render(snapshot)
-        self.assertIn("tasks (14 days): 5", text)
+        self.assertIn("tasks (14 days): 7", text)
         self.assertIn("model: vertex_ai/claude-opus-5", text)
         self.assertEqual(fs.audit(text, [CLUSTER, PROJECT, NAMESPACE]), [])
         self.assertTrue(snapshot.tasks_truncated)
-        self.assertIn("tasks (14 days): 5+ (", text)
+        self.assertIn("tasks (14 days): 7+ (", text)
         exec_calls = [c for c in calls if "exec" in c]
         self.assertEqual(len(exec_calls), 2)
         for c in exec_calls:
@@ -292,6 +316,8 @@ class CollectTest(unittest.TestCase):
             self.assertEqual(c[4], "platform-agent-gateway-x")
             self.assertEqual(c[5:9], ["-c", "platform-agent", "--", "sh"])
         feed_shell = exec_calls[0][-1]
+        self.assertIn("curl -sSf ", feed_shell)
+        self.assertIn("curl -sSfL ", exec_calls[1][-1])
         self.assertIn('-H "X-API-Key: $SESSION_KV_API_KEY"', feed_shell)
         self.assertIn("http://127.0.0.1:8699/v1/tasks?since=", feed_shell)
         self.assertIn("http://inference-gateway/metrics/", exec_calls[1][-1])
@@ -315,10 +341,49 @@ class CollectTest(unittest.TestCase):
         text = fs.render(snapshot)
         self.assertIn("tasks (14 days): unavailable", text)
         self.assertIn("tokens: unavailable", text)
+        self.assertEqual(snapshot.source_reasons, {"session-kv": fs.REASON_NO_POD, "litellm-metrics": fs.REASON_NO_POD})
         err = io.StringIO()
         with mock.patch.object(fs, "collect", return_value=snapshot):
             self.assertEqual(fs.main(["--namespace", NAMESPACE], stdout=io.StringIO(), stderr=err), 0)
-        self.assertIn("pods/exec", err.getvalue())
+        self.assertIn("could not be read", err.getvalue())
+        self.assertIn(fs.REASON_NO_POD, err.getvalue())
+        self.assertNotIn("pods/exec", err.getvalue())
+
+    def test_an_error_body_from_the_feed_is_not_a_task_list(self):
+        run, _ = self.fake_run({
+            "get platformagent": json.dumps(CR),
+            "get pods": json.dumps({"items": [{"metadata": {"name": "platform-agent-gateway-x"}, "status": {"phase": "Running"}}]}),
+            "/v1/tasks": json.dumps({"detail": "board locked"}),
+            "/metrics": subprocess.CompletedProcess(["kubectl"], 22, stdout="", stderr="curl: (22) 404"),
+        })
+        with mock.patch.object(fs.subprocess, "run", run):
+            snapshot = fs.collect(fs.Options(namespace=NAMESPACE, name="platform-agent", now=NOW))
+        self.assertIsNone(snapshot.tasks)
+        self.assertEqual(snapshot.source_reasons["session-kv"], fs.REASON_SHAPE)
+        self.assertEqual(snapshot.source_reasons["litellm-metrics"], fs.REASON_EXEC)
+
+    def test_a_stale_hashed_config_map_loses_to_the_mounted_one(self):
+        run, _ = self.fake_run({
+            "get platformagent": json.dumps(CR),
+            "get configmap": json.dumps({"items": [
+                {"metadata": {"name": "litellm-config-a1b2stale", "creationTimestamp": "2026-10-11T00:00:00Z"}, "data": {"config.yaml": "model: vertex_ai/old-model\n"}},
+                {"metadata": {"name": "litellm-config-k4b9ht22c7", "creationTimestamp": "2026-10-10T00:00:00Z"}, "data": {"config.yaml": LITELLM_CONFIG_YAML}},
+            ]}),
+            "get deployment litellm": json.dumps({"spec": {"template": {"spec": {"volumes": [{"name": "cfg", "configMap": {"name": "litellm-config-k4b9ht22c7"}}]}}}}),
+        })
+        with mock.patch.object(fs.subprocess, "run", run):
+            snapshot = fs.collect(fs.Options(namespace=NAMESPACE, name="platform-agent", now=NOW, in_pod=False))
+        self.assertEqual(fs.model_from_litellm_config(snapshot.litellm_config), "vertex_ai/claude-opus-5")
+        run, _ = self.fake_run({
+            "get platformagent": json.dumps(CR),
+            "get configmap": json.dumps({"items": [
+                {"metadata": {"name": "litellm-config-a1b2stale", "creationTimestamp": "2026-10-01T00:00:00Z"}, "data": {"config.yaml": "model: vertex_ai/old-model\n"}},
+                {"metadata": {"name": "litellm-config-k4b9ht22c7", "creationTimestamp": "2026-10-10T00:00:00Z"}, "data": {"config.yaml": LITELLM_CONFIG_YAML}},
+            ]}),
+        })
+        with mock.patch.object(fs.subprocess, "run", run):
+            snapshot = fs.collect(fs.Options(namespace=NAMESPACE, name="platform-agent", now=NOW, in_pod=False))
+        self.assertEqual(fs.model_from_litellm_config(snapshot.litellm_config), "vertex_ai/claude-opus-5")
 
     def test_no_exec_skips_the_in_pod_sources(self):
         run, calls = self.fake_run({"get platformagent": json.dumps(CR)})
