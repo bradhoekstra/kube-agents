@@ -138,7 +138,8 @@ LATENCY_FAMILIES: Tuple[str, ...] = ("litellm_request_total_latency_metric", "li
 LATENCY_QUANTILES: Tuple[float, float] = (0.5, 0.95)
 #: Completion-time quantiles over the window's done tasks, nearest rank.
 COMPLETION_QUANTILES: Tuple[float, float] = (0.5, 0.95)
-PROMETHEUS_LINE = re.compile(r'^(?P<name>[a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{(?P<labels>[^}]*)\})?\s+(?P<value>\S+)')
+#: Labels are read as quoted strings, so a ``}`` inside a value does not end them.
+PROMETHEUS_LINE = re.compile(r'^(?P<name>[a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{(?P<labels>(?:[^"}]|"(?:[^"\\]|\\.)*")*)\})?\s+(?P<value>\S+)')
 PROMETHEUS_LABEL = re.compile(r'(?P<key>[a-zA-Z_][a-zA-Z0-9_]*)="(?P<value>(?:[^"\\]|\\.)*)"')
 LITELLM_MODEL_LINE = re.compile(r"^\s*model:\s*['\"]?(?P<model>[A-Za-z0-9_./:@+-]+)", re.MULTILINE)
 FEEDBACK_TEMPLATE: Tuple[str, ...] = (
@@ -187,9 +188,12 @@ class Snapshot:
     def identifiers(self) -> List[str]:
         """Strings read from the resource that must never appear in the block.
 
-        Every string leaf of the spec except the two the block prints by design,
-        plus the resource's name and namespace: cluster, project, location,
-        scope entries, repositories, channels, whatever the install declared.
+        The resource's name and namespace, plus the string leaves of the spec
+        subtrees that name the install (IDENTIFIER_SPEC_SUBTREES: cluster,
+        project, location, scope entries, repositories, channels), skipping
+        booleans, numbers, strings under MIN_IDENTIFIER_LENGTH and the
+        template's own vocabulary. ``deployment`` is a settings block and is
+        not read; nothing the block prints draws from it.
         """
         spec = self.cr.get("spec") or {}
         metadata = self.cr.get("metadata") or {}
@@ -550,6 +554,25 @@ def _litellm_config(options: Options) -> Optional[str]:
     return max(candidates, key=lambda c: c[1])[2]
 
 
+def _task_feed(feed: str) -> Tuple[Optional[Sequence[Mapping[str, Any]]], bool]:
+    """The feed's rows and its truncated flag, or ``(None, False)`` for anything not shaped like the feed.
+
+    An object with a ``tasks`` list whose rows are objects is the feed; a
+    non-object body, a non-list ``tasks`` or a row that is not an object is
+    not, and reads as unavailable rather than as a traceback in ``render``.
+    """
+    try:
+        body = json.loads(feed)
+    except ValueError:
+        return None, False
+    if not isinstance(body, dict) or not isinstance(body.get("tasks"), list):
+        return None, False
+    rows = body["tasks"]
+    if not all(isinstance(row, Mapping) for row in rows):
+        return None, False
+    return rows, bool(body.get("truncated"))
+
+
 def collect(options: Options) -> Snapshot:
     now = options.now or dt.datetime.now(dt.timezone.utc)
     try:
@@ -584,12 +607,7 @@ def collect(options: Options) -> Snapshot:
             if feed is None:
                 reasons["session-kv"] = REASON_EXEC
             else:
-                try:
-                    body = json.loads(feed)
-                    tasks = body.get("tasks") if isinstance(body.get("tasks"), list) else None
-                    truncated = bool(body.get("truncated"))
-                except ValueError:
-                    tasks = None
+                tasks, truncated = _task_feed(feed)
                 if tasks is None:
                     reasons["session-kv"] = REASON_SHAPE
             metrics = _in_pod_curl(options, pod, f"curl {CURL_FLAGS_FOLLOW} -m {CURL_TIMEOUT_SECONDS} {INFERENCE_GATEWAY_METRICS_URL}")

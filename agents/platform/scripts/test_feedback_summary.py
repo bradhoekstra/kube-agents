@@ -154,7 +154,7 @@ class RenderTest(unittest.TestCase):
         self.assertEqual(fs.audit("version: 0.14.0-rc", ["0.14.0"]), [])
         self.assertEqual(fs.audit("cluster prod-eu-1 here", ["prod-eu-1"]), ["prod-eu-1"])
 
-    def test_identifiers_are_every_spec_string_but_the_printed_two(self):
+    def test_identifiers_are_the_naming_subtrees_strings_plus_name_and_namespace(self):
         ids = full_snapshot().identifiers
         for expected in (CLUSTER, PROJECT, NAMESPACE, "us-central1", "acme-scope-dev", "old-cluster", "acme/gitops", "platform-agent"):
             self.assertIn(expected, ids)
@@ -254,6 +254,11 @@ class ParsingTest(unittest.TestCase):
     def test_the_model_line_is_read_from_the_gateway_config(self):
         self.assertEqual(fs.model_from_litellm_config(LITELLM_CONFIG_YAML), "vertex_ai/claude-opus-5")
         self.assertEqual(fs.model_from_litellm_config("  model: vertex_ai/claude-3-5-sonnet@20240620\n"), "vertex_ai/claude-3-5-sonnet@20240620")
+
+    def test_a_label_value_holding_a_brace_keeps_its_sample(self):
+        samples = fs.parse_prometheus('litellm_input_tokens_metric_total{model="a}b",team="x\\"y"} 5\nlitellm_input_tokens_metric_total{model="c"} 2\n')
+        self.assertEqual(fs.family_total(samples, fs.TOKEN_FAMILIES["in"]), 7.0)
+        self.assertEqual(samples[0].labels["model"], "a}b")
 
     def test_non_finite_samples_are_skipped(self):
         samples = fs.parse_prometheus("litellm_input_tokens_metric_total{m=\"a\"} NaN\nlitellm_input_tokens_metric_total{m=\"b\"} +Inf\nlitellm_input_tokens_metric_total{m=\"c\"} 5\n")
@@ -361,6 +366,26 @@ class CollectTest(unittest.TestCase):
         self.assertIsNone(snapshot.tasks)
         self.assertEqual(snapshot.source_reasons["session-kv"], fs.REASON_SHAPE)
         self.assertEqual(snapshot.source_reasons["litellm-metrics"], fs.REASON_EXEC)
+
+    def test_a_feed_that_is_not_the_feed_reads_as_unavailable(self):
+        self.assertEqual(fs._task_feed("[1, 2]"), (None, False))
+        self.assertEqual(fs._task_feed('"text"'), (None, False))
+        self.assertEqual(fs._task_feed("null"), (None, False))
+        self.assertEqual(fs._task_feed('{"tasks": "no"}'), (None, False))
+        self.assertEqual(fs._task_feed('{"tasks": [1, {"id": "t"}]}'), (None, False))
+        rows, truncated = fs._task_feed('{"tasks": [{"id": "t", "status": "done"}], "truncated": true}')
+        self.assertEqual(rows, [{"id": "t", "status": "done"}])
+        self.assertTrue(truncated)
+        run, _ = self.fake_run({
+            "get platformagent": json.dumps(CR),
+            "get pods": json.dumps({"items": [{"metadata": {"name": "platform-agent-gateway-x"}, "status": {"phase": "Running"}}]}),
+            "/v1/tasks": "[1, 2]",
+        })
+        with mock.patch.object(fs.subprocess, "run", run):
+            snapshot = fs.collect(fs.Options(namespace=NAMESPACE, name="platform-agent", now=NOW))
+        self.assertIsNone(snapshot.tasks)
+        self.assertEqual(snapshot.source_reasons["session-kv"], fs.REASON_SHAPE)
+        self.assertIn("tasks (14 days): unavailable", fs.render(snapshot))
 
     def test_a_stale_hashed_config_map_loses_to_the_mounted_one(self):
         run, _ = self.fake_run({
