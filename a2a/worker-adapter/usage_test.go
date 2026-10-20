@@ -132,6 +132,42 @@ func TestTurnCostIsTheRunningTotalsDifference(t *testing.T) {
 	if got := resumed.turnCost(0.52); !near(got, 0.02) {
 		t.Fatalf("resumed second line: turnCost = %v, want 0.02", got)
 	}
+	// The next run in the same pod resumes the session with the baseline the
+	// run before left (session.go hands it on through turnPlan), so its
+	// first line prices its own turn rather than reading as unknown.
+	carried := &adapter{resumedSession: true, costSeen: resumed.costSeen, costKnown: resumed.costKnown}
+	if got := carried.turnCost(0.55); !near(got, 0.03) {
+		t.Fatalf("carried baseline: turnCost = %v, want 0.03", got)
+	}
+}
+
+// Telemetry in a shape the adapter does not expect is dropped, never the
+// result line: a fractional duration, a token count written as a string and
+// a model that is not a string still leave the deliverable and the terminal
+// intact, and the usage part carries what did decode.
+func TestOffShapeTelemetryDoesNotLoseTheResult(t *testing.T) {
+	url := startServer(t)
+	c := testClient(t, url)
+	const session, taskID = "chat-otter-u5", "task-usage-5"
+	submit(t, c, session, taskID, "odd shapes")
+
+	harness := stub(t, `
+echo '{"type":"system","subtype":"init","session_id":"stub-u5","model":7}'
+read first || exit 1
+echo '{"type":"result","subtype":"success","result":"still here","duration_ms":12.5,"total_cost_usd":"0.01","usage":{"input_tokens":"10","output_tokens":2}}'
+`)
+	out := waitOutcome(t, runAdapter(context.Background(), adapterConfig(url, taskID, session, harness)), 30*time.Second)
+	if out.err != nil || out.res.State != lib.StateCompleted {
+		t.Fatalf("run: state=%q err=%v", out.res.State, out.err)
+	}
+	task := foldTask(t, c, session, taskID)
+	if got := artifactText(task, lib.ArtifactResult); got != "still here" {
+		t.Fatalf("result artifact %q", got)
+	}
+	got := usageParts(t, task)
+	if len(got) != 1 || got[0].DurationMs != 12 || got[0].Model != "" || got[0].CostUsd != 0 || got[0].InputTokens != 0 {
+		t.Fatalf("usage = %+v, want the duration alone", got)
+	}
 }
 
 // Two result lines from one process carry the running total; the usage

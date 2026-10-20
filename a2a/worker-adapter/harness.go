@@ -108,38 +108,69 @@ type harnessEvent struct {
 	// TotalCostUSD is cumulative across every result line the process has
 	// emitted, plus what a resumed session had already spent, so the
 	// adapter publishes the difference between consecutive lines
-	// (adapter.turnCost), never the figure itself. Each is optional; the
-	// adapter publishes what is there as the usage artifact (payload spec
-	// "Reserved artifact names") and nothing when none is.
-	Usage        *harnessUsage `json:"usage,omitempty"`
-	TotalCostUSD float64       `json:"total_cost_usd,omitempty"`
-	DurationMs   int64         `json:"duration_ms,omitempty"`
+	// (adapter.turnCost), never the figure itself. Each is optional, and
+	// each is held raw and decoded on its own (usage, costTotal, model):
+	// telemetry in a shape the adapter does not expect is dropped, never
+	// the result line that carries the deliverable. The adapter publishes
+	// what decodes as the usage artifact (payload spec "Reserved artifact
+	// names") and nothing when nothing does.
+	Usage        json.RawMessage `json:"usage,omitempty"`
+	TotalCostUSD json.RawMessage `json:"total_cost_usd,omitempty"`
+	DurationMs   json.RawMessage `json:"duration_ms,omitempty"`
 	// type:"system" subtype:"init".
 	SessionID string `json:"session_id,omitempty"`
 	// Model is the model the harness runs, named once on the init line and
-	// carried onto every turn's usage.
-	Model string `json:"model,omitempty"`
+	// carried onto every turn's usage. Raw for the same reason.
+	Model json.RawMessage `json:"model,omitempty"`
 }
 
 // harnessUsage is a result line's token counts. The three prompt figures
 // are what the model read for the turn, split by cache state; the usage
 // artifact sums them as inputTokens, since a cached read is still a read.
+// float64 so a count written with a fraction still decodes; the part
+// carries whole tokens.
 type harnessUsage struct {
-	InputTokens              int64 `json:"input_tokens,omitempty"`
-	OutputTokens             int64 `json:"output_tokens,omitempty"`
-	CacheCreationInputTokens int64 `json:"cache_creation_input_tokens,omitempty"`
-	CacheReadInputTokens     int64 `json:"cache_read_input_tokens,omitempty"`
+	InputTokens              float64 `json:"input_tokens,omitempty"`
+	OutputTokens             float64 `json:"output_tokens,omitempty"`
+	CacheCreationInputTokens float64 `json:"cache_creation_input_tokens,omitempty"`
+	CacheReadInputTokens     float64 `json:"cache_read_input_tokens,omitempty"`
+}
+
+// model is the init line's model name, or "" when it is absent or not a
+// string.
+func (ev harnessEvent) model() string {
+	var m string
+	if json.Unmarshal(ev.Model, &m) != nil {
+		return ""
+	}
+	return m
+}
+
+// costTotal is the result line's running total, and whether the line
+// carried one the adapter can read.
+func (ev harnessEvent) costTotal() (float64, bool) {
+	var total float64
+	if len(ev.TotalCostUSD) == 0 || json.Unmarshal(ev.TotalCostUSD, &total) != nil {
+		return 0, false
+	}
+	return total, true
 }
 
 // usage is the result line's per-turn figures as the usage artifact's part:
 // model from the init line, every prompt token as input, the wall time as
-// the harness reported it. Zero where the line had nothing. The cost is not
-// here: it is the running total's difference, which the adapter keeps.
+// the harness reported it. Zero where the line had nothing, or had it in a
+// shape that does not decode. The cost is not here: it is the running
+// total's difference, which the adapter keeps.
 func (ev harnessEvent) usage(model string) lib.Usage {
-	u := lib.Usage{Model: model, DurationMs: ev.DurationMs}
-	if ev.Usage != nil {
-		u.InputTokens = ev.Usage.InputTokens + ev.Usage.CacheCreationInputTokens + ev.Usage.CacheReadInputTokens
-		u.OutputTokens = ev.Usage.OutputTokens
+	u := lib.Usage{Model: model}
+	var ms float64
+	if len(ev.DurationMs) > 0 && json.Unmarshal(ev.DurationMs, &ms) == nil {
+		u.DurationMs = int64(ms)
+	}
+	var counts harnessUsage
+	if len(ev.Usage) > 0 && json.Unmarshal(ev.Usage, &counts) == nil {
+		u.InputTokens = int64(counts.InputTokens + counts.CacheCreationInputTokens + counts.CacheReadInputTokens)
+		u.OutputTokens = int64(counts.OutputTokens)
 	}
 	return u
 }

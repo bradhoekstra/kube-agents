@@ -129,6 +129,36 @@ func TestAPI_UsageOnAFailedTurn(t *testing.T) {
 	}
 }
 
+// A model or usage in a shape the bridge does not read is dropped, never the
+// turn: the answer completes and the part carries what did decode.
+func TestAPI_OffShapeTelemetryDoesNotFailTheTurn(t *testing.T) {
+	_, url := startServer(t)
+	stub := newAPIStub(t, func(w http.ResponseWriter, _ *http.Request, c apiCall) {
+		time.Sleep(stubTurnTime)
+		w.Header().Set(apiSessionIDHeader, c.sessionID)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"model":   7,
+			"choices": []any{map[string]any{"message": map[string]any{"role": "assistant", "content": "three pods"}, "finish_reason": "stop"}},
+			"usage":   []any{},
+		})
+	})
+	startAPIBridge(t, url, stub, nil)
+	c := gatewayClient(t, url)
+	origin := submitIn(t, c, "task-usage-odd", "ctx-usage-odd", "how many pods are pending")
+	task := waitTerminal(t, c, origin.TaskID)
+	if task.State != lib.StateCompleted {
+		t.Fatalf("state %s, want completed", task.State)
+	}
+	if got := task.Artifact(lib.ArtifactResult); got == nil || got.Parts[0].Text != "three pods" {
+		t.Fatalf("result = %+v", got)
+	}
+	got := usageSeen(t, url, origin.TaskID)
+	if len(got) != 1 || got[0].Model != DefaultAPIModel || got[0].InputTokens != 0 || got[0].DurationMs <= 0 {
+		t.Fatalf("usage = %+v, want the alias and the duration alone", got)
+	}
+}
+
 // A CLI run that exits non-zero on its own publishes its wall time ahead of
 // the failed terminal.
 func TestCLI_UsageOnAFailedRun(t *testing.T) {

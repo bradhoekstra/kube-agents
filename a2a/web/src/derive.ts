@@ -30,8 +30,10 @@ export const LIVENESS_STALE_MS = LIVENESS_STALE_POLLS * POLL_MS;
 /** What the spend tile and panel say before any task has reported a turn's usage. */
 export const SPEND_EMPTY_REASON =
   "no task has reported usage yet: each executor publishes a usage artifact when a turn finishes (the worker adapter from the harness result line, the hermes-bridge from the API turn's answer); the bridge's CLI executor reports duration alone, and cost is carried only by a harness that prices its own turns";
-/** The tasks table's cost cell for a task whose turns reported nothing. */
+/** The tasks table's cost cell for a task whose turns reported nothing, and its title. */
 export const SPEND_NONE = "—";
+export const SPEND_TASK_NONE_REASON =
+  "this task's turns reported no usage: its executor published no usage artifact, or none of its parts carried a figure";
 export const KV_TBD_REASON =
   "tbd: the only KV size read (STREAM.INFO on the KV_ streams) also lists every key, so the console identity doesn't have it";
 
@@ -198,12 +200,21 @@ export function fmtCost(usd: number): string {
   return `$${usd.toFixed(usd >= 1 ? COST_DECIMALS : COST_SMALL_DECIMALS)}`;
 }
 
+/** The token counts a usage has: "1.2k in / 80 out", "80 out", or "" when it has neither. */
+export function fmtTokenCounts(u: Usage): string {
+  return [
+    u.inputTokens !== undefined ? `${fmtTokens(u.inputTokens)} in` : "",
+    u.outputTokens !== undefined ? `${fmtTokens(u.outputTokens)} out` : "",
+  ]
+    .filter(Boolean)
+    .join(" / ");
+}
+
 /** One line for a usage: the figures it has, in a fixed order, nothing for the ones it lacks. */
 export function fmtUsage(u: Usage): string {
   const parts: string[] = [];
-  if (u.inputTokens !== undefined || u.outputTokens !== undefined) {
-    parts.push(`${fmtTokens(u.inputTokens ?? 0)} in / ${fmtTokens(u.outputTokens ?? 0)} out`);
-  }
+  const counts = fmtTokenCounts(u);
+  if (counts !== "") parts.push(counts);
   if (u.costUsd !== undefined) parts.push(fmtCost(u.costUsd));
   if (u.durationMs !== undefined) parts.push(fmtDuration(u.durationMs));
   if (u.model) parts.push(u.model);

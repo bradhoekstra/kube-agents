@@ -523,6 +523,11 @@ func newTaskAdapter(cfg Config, b *busConns) *adapter {
 type turnPlan struct {
 	primer string
 	resume string
+	// costSeen and costKnown are the harness's running total as the
+	// previous run in this pod last read it, so a resumed session's first
+	// result line prices its own turn rather than the whole session.
+	costSeen  float64
+	costKnown bool
 }
 
 // turnOutcome is one task's run, as the session loop needs it: the terminal
@@ -535,6 +540,10 @@ type turnOutcome struct {
 	// harnessSession is the session id the harness reported at init, or ""
 	// when it reported none (it never started, or died before saying).
 	harnessSession string
+	// costSeen and costKnown are the running total as this run last read
+	// it, handed to the next run's turnPlan.
+	costSeen  float64
+	costKnown bool
 	// task is the task this outcome is for, set by the session loop.
 	task string
 	// podBroken is a turn refused after working and before its harness ran,
@@ -544,8 +553,17 @@ type turnOutcome struct {
 	podBroken bool
 }
 
-// execute runs one task from its submission to its terminal state.
+// execute runs one task from its submission to its terminal state, seeded
+// with the cost baseline the previous run in this pod left and handing its
+// own on.
 func (a *adapter) execute(ctx context.Context, origin *lib.Envelope, originSeq uint64, plan turnPlan) turnOutcome {
+	a.costSeen, a.costKnown = plan.costSeen, plan.costKnown
+	out := a.run(ctx, origin, originSeq, plan)
+	out.costSeen, out.costKnown = a.costSeen, a.costKnown
+	return out
+}
+
+func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint64, plan turnPlan) turnOutcome {
 	cfg, log := a.cfg, a.log
 	done := func(res Result, err error) turnOutcome { return turnOutcome{res: res, err: err} }
 	broken := func(res Result, err error) turnOutcome {
@@ -768,9 +786,9 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 			switch ev.Type {
 			case "system":
 				if ev.Subtype == "init" {
-					log.Info("harness session started", "harnessSession", ev.SessionID, "model", ev.Model)
 					a.harnessSession = ev.SessionID
-					a.harnessModel = ev.Model
+					a.harnessModel = ev.model()
+					log.Info("harness session started", "harnessSession", ev.SessionID, "model", a.harnessModel)
 				}
 			case "assistant":
 				a.publishAssistant(ctx, ev)
@@ -961,7 +979,9 @@ func (a *adapter) completeWith(resultText string) (Result, error) {
 // the terminal are the load-bearing publishes.
 func (a *adapter) publishUsage(ctx context.Context, ev harnessEvent) {
 	u := ev.usage(a.harnessModel)
-	u.CostUsd = a.turnCost(ev.TotalCostUSD)
+	if total, ok := ev.costTotal(); ok {
+		u.CostUsd = a.turnCost(total)
+	}
 	part, err := lib.UsagePart(u)
 	if err != nil {
 		return

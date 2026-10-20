@@ -7,13 +7,14 @@ import { useEffect, useRef } from "react";
 import {
   KV_TBD_REASON,
   SPEND_EMPTY_REASON,
+  SPEND_TASK_NONE_REASON,
   capacities,
   conversationsByBackend,
   currentTaskOf,
   fmtAgo,
   fmtCost,
   fmtDuration,
-  fmtTokens,
+  fmtTokenCounts,
   fmtUsage,
   livenessOf,
   recentTasks,
@@ -145,7 +146,7 @@ export default function Dashboard({
                   <td>{t.addressee}</td>
                   <td>{t.state}</td>
                   <td>{taskTimes(t)}</td>
-                  <td title={t.usage ? fmtUsage(t.usage) : SPEND_EMPTY_REASON}>{taskSpend(t)}</td>
+                  <td title={t.usage ? fmtUsage(t.usage) : SPEND_TASK_NONE_REASON}>{taskSpend(t)}</td>
                   <td>{t.reason ?? ""}</td>
                 </tr>
               ))}
@@ -227,7 +228,7 @@ export default function Dashboard({
               "tokens",
               spend.total.inputTokens === undefined && spend.total.outputTokens === undefined
                 ? "not reported"
-                : `${fmtTokens(spend.total.inputTokens ?? 0)} in / ${fmtTokens(spend.total.outputTokens ?? 0)} out${spendCoverage(spend.counted, spend.reported)}`,
+                : `${fmtTokenCounts(spend.total)}${spendCoverage(spend.counted, spend.reported)}`,
             ],
             [
               "cost",

@@ -115,7 +115,9 @@ describe("spend formatting", () => {
       }),
     ).toBe("1.5k in / 80 out, $0.0500, 4s, m");
     expect(fmtUsage({ durationMs: 250 })).toBe("250ms");
-    expect(fmtUsage({ outputTokens: 3 })).toBe("0 in / 3 out");
+    // A count the producer did not send is not shown as zero.
+    expect(fmtUsage({ outputTokens: 3 })).toBe("3 out");
+    expect(fmtUsage({ inputTokens: 1500, durationMs: 100 })).toBe("1.5k in, 100ms");
   });
 
   it("dashes a task that reported nothing", () => {

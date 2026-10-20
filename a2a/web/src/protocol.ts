@@ -81,6 +81,10 @@ export interface Usage {
 export function usageOf(v: unknown): Usage | undefined {
   if (typeof v !== "object" || v === null || Array.isArray(v)) return undefined;
   const o = v as Record<string, unknown>;
+  // A negative figure is one no producer measured; the whole part is not
+  // usage then, as the library's reader says.
+  const figureKeys = ["inputTokens", "outputTokens", "costUsd", "durationMs"];
+  if (figureKeys.some((k) => typeof o[k] === "number" && (o[k] as number) < 0)) return undefined;
   // A zero is "not known" on the wire (the producer omits it), so an explicit
   // zero reads as absent too rather than as a known nothing.
   const num = (k: string): number | undefined =>

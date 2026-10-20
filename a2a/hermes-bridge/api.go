@@ -233,36 +233,43 @@ type apiChatResponse struct {
 		Failed bool   `json:"failed"`
 		Error  string `json:"error"`
 	} `json:"hermes"`
-	Model string    `json:"model"`
-	Usage *apiUsage `json:"usage"`
+	// Raw, decoded on their own by apiTurnUsage: telemetry must not fail
+	// the decode that carries the answer, so a model or usage in a shape
+	// the bridge does not expect is dropped, never the turn.
+	Model json.RawMessage `json:"model"`
+	Usage json.RawMessage `json:"usage"`
 }
 
 // apiUsage is a response's token counts, in either spelling the server may
 // use: the chat-completions one (prompt_tokens, completion_tokens) or the
 // responses one (input_tokens, output_tokens). Hermes's prompt_tokens is
 // every token the model read, cached reads included, which is what the
-// usage artifact's inputTokens means.
+// usage artifact's inputTokens means. The counts are float64 so a count
+// written as 1200.0 still decodes; the part carries whole tokens.
 type apiUsage struct {
-	PromptTokens     int64 `json:"prompt_tokens"`
-	CompletionTokens int64 `json:"completion_tokens"`
-	InputTokens      int64 `json:"input_tokens"`
-	OutputTokens     int64 `json:"output_tokens"`
+	PromptTokens     float64 `json:"prompt_tokens"`
+	CompletionTokens float64 `json:"completion_tokens"`
+	InputTokens      float64 `json:"input_tokens"`
+	OutputTokens     float64 `json:"output_tokens"`
 }
 
 // apiTurnUsage is one answered turn's usage part: the server's model name
 // when it sent one (the alias the request named otherwise), its token
-// counts when it sent them, and the turn's wall time as the bridge measured
-// it from the request to the body read. No cost: Hermes behind the gateway
-// prices nothing (docs/site/src/content/docs/deploy/telemetry.md), and the
-// artifact carries no figure the producer invented.
+// counts when it sent them in a shape the bridge reads, and the turn's wall
+// time as the bridge measured it from the request to the body read. No
+// cost: Hermes behind the gateway prices nothing
+// (docs/site/src/content/docs/deploy/telemetry.md), and the artifact
+// carries no figure the producer invented. A field that does not decode
+// is left out; it never fails the turn.
 func apiTurnUsage(out *apiChatResponse, requested string, took time.Duration) lib.Usage {
-	u := lib.Usage{Model: out.Model, DurationMs: turnMillis(took)}
-	if u.Model == "" {
+	u := lib.Usage{DurationMs: turnMillis(took)}
+	if json.Unmarshal(out.Model, &u.Model) != nil || u.Model == "" {
 		u.Model = requested
 	}
-	if out.Usage != nil {
-		u.InputTokens = max(out.Usage.PromptTokens, out.Usage.InputTokens)
-		u.OutputTokens = max(out.Usage.CompletionTokens, out.Usage.OutputTokens)
+	var counts apiUsage
+	if len(out.Usage) > 0 && json.Unmarshal(out.Usage, &counts) == nil {
+		u.InputTokens = int64(max(counts.PromptTokens, counts.InputTokens))
+		u.OutputTokens = int64(max(counts.CompletionTokens, counts.OutputTokens))
 	}
 	return u
 }
