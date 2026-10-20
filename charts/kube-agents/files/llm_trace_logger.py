@@ -110,6 +110,13 @@ def _resolve_redaction_rules() -> List[Any]:
     return AuditRedactor.ip_rules()
 
 
+# Resolved once at import, as litellm_redaction_callback does: the rule file is a
+# subPath ConfigMap mount that never changes in a running pod (an edit rolls the
+# pod through checksum/config), so reading it per call only adds file I/O and
+# YAML parsing on the proxy's event loop.
+_redaction_rules = _resolve_redaction_rules()
+
+
 def _safe_serialize(obj: Any) -> Any:
     if obj is None or isinstance(obj, (bool, int, float, str)):
         return obj
@@ -195,6 +202,7 @@ def _append_line(
 ) -> None:
     data = (line + "\n").encode(_ENCODING)
     lock_path = _lock_file_path(path)
+    os.makedirs(lock_path.parent, exist_ok=True)
     lock_fd = os.open(lock_path, _OPEN_FLAGS, TRACE_FILE_MODE)
     try:
         _acquire_lock(lock_fd, lock_path)
@@ -256,7 +264,7 @@ class PassThroughTrajectoryLogger(CustomLogger):
                 except Exception:
                     latency_ms = None
 
-            rules = _resolve_redaction_rules()
+            rules = _redaction_rules
             raw_messages = _safe_serialize(kwargs.get("messages"))
             raw_tools = _safe_serialize(optional_params.get("tools"))
             raw_resp = _safe_serialize(response_obj) if response_obj is not None else {}

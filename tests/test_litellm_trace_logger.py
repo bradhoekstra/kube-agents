@@ -19,6 +19,8 @@ Verifies:
    - async_log_failure_event writes valid failure JSONL record with error string.
    - AuditRedactor scrubs credentials, emails, Secret data blocks, and IP literals from messages, tools, responses, and errors before writing.
    - Log rotation shifts .1-.3 backups when incoming bytes exceed max_bytes.
+   - A nested trace path gets its parent directory created before the first write.
+   - Operator rules from KUBE_AGENTS_REDACTION_CONFIG are read once, at import.
    - I/O errors emit a once-per-path warning to stderr and never raise exceptions.
 """
 
@@ -384,9 +386,51 @@ class TestPassThroughTrajectoryLoggerUnit(unittest.TestCase):
         latest = json.loads(base.read_text(encoding="utf-8").strip())
         self.assertIn("turn-5-", latest["messages"][0]["content"])
 
+    def test_nested_trace_log_path_creates_parent_directory(self):
+        # The chart admits /tmp/<dir>/<file> (test_custom_trace_log_path), and
+        # the gateway's /tmp emptyDir starts empty, so the logger has to create
+        # <dir> itself.
+        nested_path = os.path.join(self.temp_dir.name, "litellm", "audit.jsonl")
+        os.environ["LITELLM_TRACE_LOG_PATH"] = nested_path
+        logger = self.mod.PassThroughTrajectoryLogger()
+
+        asyncio.run(logger.async_log_success_event({"model": "model-default"}, {}, None, None))
+
+        lines = pathlib.Path(nested_path).read_text(encoding="utf-8").strip().splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(json.loads(lines[0])["model_alias"], "model-default")
+        self.assertEqual(self.mod._warned_paths, set())
+
+    def test_redaction_rules_are_read_once_at_import(self):
+        rules_path = pathlib.Path(self.temp_dir.name) / "redaction.yaml"
+        rules_path.write_text(
+            "rules:\n  - name: cluster-name\n    literal: prod-eu-1\n    action: mask\n",
+            encoding="utf-8",
+        )
+        os.environ["KUBE_AGENTS_REDACTION_CONFIG"] = str(rules_path)
+        self.addCleanup(os.environ.pop, "KUBE_AGENTS_REDACTION_CONFIG", None)
+        mod = _load_logger_module()
+        # The pod's rule file never changes after start; a record written after
+        # it is gone still carries the operator rule loaded at import.
+        rules_path.unlink()
+        logger = mod.PassThroughTrajectoryLogger()
+        kwargs = {
+            "model": "model-default",
+            "messages": [{"role": "user", "content": "deploy to prod-eu-1"}],
+        }
+
+        asyncio.run(logger.async_log_success_event(kwargs, {}, None, None))
+
+        record = json.loads(pathlib.Path(self.log_path).read_text(encoding="utf-8").strip())
+        self.assertEqual(record["messages"][0]["content"], "deploy to [REDACTED_CLUSTER_NAME]")
+
     def test_io_failure_logs_warning_once_and_never_raises(self):
         logger = self.mod.PassThroughTrajectoryLogger()
-        bad_path = "/nonexistent/directory/traces.jsonl"
+        # A parent that is a regular file cannot be created as a directory by
+        # any user, root included, so the write fails the same way everywhere.
+        not_a_directory = pathlib.Path(self.temp_dir.name) / "not-a-directory"
+        not_a_directory.write_text("", encoding="utf-8")
+        bad_path = str(not_a_directory / "traces.jsonl")
         os.environ["LITELLM_TRACE_LOG_PATH"] = bad_path
 
         stream = io.StringIO()
