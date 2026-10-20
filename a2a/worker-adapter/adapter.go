@@ -367,24 +367,37 @@ type adapter struct {
 	resumedSession bool
 }
 
-// turnCost is one result line's cost from the harness's running total: the
-// difference from the previous line, or the total itself on the first line
-// of a fresh process. The first line of a resumed session is unknown rather
-// than a figure: the harness restores the resumed session's spend into the
-// total, and nothing on the line says how much of it is this turn's. A
-// total that went down (a harness that reset it) is unknown too.
-func (a *adapter) turnCost(total float64) float64 {
-	prev, known := a.costSeen, a.costKnown
-	a.costSeen, a.costKnown = total, true
+// turnCostFrom is one result line's cost from the harness's running total,
+// and the baseline to keep once the line's part is published: the
+// difference from the baseline, or the total itself on the first line of a
+// fresh process. A resumed session's first line prices against the baseline
+// the previous run in this pod handed on (turnPlan); only a resumed session
+// with no baseline is unknown, since the harness restores the session's
+// spend into the total and nothing on the line says how much is this
+// turn's. A total that went down (a harness that reset it) is unknown and
+// rebases; a total below zero is unknown and leaves the baseline alone.
+func (a *adapter) turnCostFrom(total float64) (cost, seen float64, known bool) {
+	prev, had := a.costSeen, a.costKnown
 	switch {
-	case !known && a.resumedSession:
-		return 0
-	case !known:
-		return total
+	case total < 0:
+		return 0, prev, had
+	case !had && a.resumedSession:
+		return 0, total, true
+	case !had:
+		return total, total, true
 	case total < prev:
-		return 0
+		return 0, total, true
 	}
-	return total - prev
+	return total - prev, total, true
+}
+
+// turnCost is turnCostFrom with the baseline advanced, for a line whose part
+// is published; publishUsage advances it only then, so a refused part does
+// not consume its turn's cost.
+func (a *adapter) turnCost(total float64) float64 {
+	cost, seen, known := a.turnCostFrom(total)
+	a.costSeen, a.costKnown = seen, known
+	return cost
 }
 
 // Run executes the adapter's whole lifecycle and returns the terminal state of
@@ -990,13 +1003,21 @@ func (a *adapter) publishUsage(ctx context.Context, ev harnessEvent) {
 			"task", a.taskID, "fields", t.dropped)
 	}
 	u := t.usage
+	seen, known := a.costSeen, a.costKnown
 	if t.hasTotal {
-		u.CostUsd = a.turnCost(t.total)
+		u.CostUsd, seen, known = a.turnCostFrom(t.total)
 	}
 	part, err := lib.UsagePart(u)
 	if err != nil {
+		if u != (lib.Usage{Model: u.Model}) {
+			// A figure was there and the part was refused: say so, and
+			// leave the baseline where it was, so the turn's cost lands
+			// in the next line's difference rather than nowhere.
+			a.log.Warn("usage part refused; the turn's figures are not on the bus", "task", a.taskID, "err", err)
+		}
 		return
 	}
+	a.costSeen, a.costKnown = seen, known
 	a.publishArtifactChunk(ctx, lib.ArtifactUsage, part, false)
 }
 

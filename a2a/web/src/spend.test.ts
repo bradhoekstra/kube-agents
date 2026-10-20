@@ -92,16 +92,21 @@ describe("usage parts", () => {
 });
 
 describe("spend formatting", () => {
-  it("formats tokens compactly", () => {
+  it("formats tokens compactly, picking the band from the rounded value", () => {
     expect(fmtTokens(999)).toBe("999");
+    expect(fmtTokens(999.6)).toBe("1k");
     expect(fmtTokens(1000)).toBe("1k");
     expect(fmtTokens(1500)).toBe("1.5k");
+    expect(fmtTokens(999_949)).toBe("999.9k");
+    expect(fmtTokens(999_950)).toBe("1M");
     expect(fmtTokens(2_340_000)).toBe("2.3M");
   });
 
-  it("keeps four places under a dollar and two above", () => {
+  it("keeps four places under a dollar and two above, and never prints a present cost as nothing", () => {
     expect(fmtCost(0.0123)).toBe("$0.0123");
     expect(fmtCost(12.5)).toBe("$12.50");
+    expect(fmtCost(0.00004)).toBe("<$0.0001");
+    expect(fmtCost(0.00005)).toBe("$0.0001");
   });
 
   it("writes only the figures a usage has, in a fixed order", () => {
@@ -179,8 +184,12 @@ describe("spend totals", () => {
     });
     expect(spendTile(withTasks(task("a", { usage: { costUsd: 1.5, inputTokens: 1 } }))).text).toBe("$1.50");
     expect(spendTile(withTasks(task("a", { usage: { inputTokens: 900, outputTokens: 100 } }))).text).toBe("1k tok");
-    const timed = spendTile(withTasks(task("a", { usage: { durationMs: 65_000 } })));
+    // Durations alone, each task naming its model: the title sums the time
+    // and names no single model as the sum's.
+    const timed = spendTile(
+      withTasks(task("a", { usage: { durationMs: 60_000, model: "model-default" } }), task("b", { usage: { durationMs: 5_000, model: "claude-opus-5-5" } })),
+    );
     expect(timed.text).toBe("1m 5s");
-    expect(timed.title).toBe("1 task reported usage: 1m 5s");
+    expect(timed.title).toBe("2 tasks reported usage: 1m 5s");
   });
 });

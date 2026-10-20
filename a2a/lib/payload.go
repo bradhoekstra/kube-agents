@@ -3,6 +3,7 @@ package lib
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"strings"
 )
 
@@ -142,6 +143,18 @@ func UsageOf(p Part) (Usage, bool) {
 		return Usage{}, false
 	}
 	return u, true
+}
+
+// UsageFigure is a producer's count or duration, read from a float, as the
+// whole number a Usage part carries, and whether it is one: a figure that is
+// not finite, below zero or at or above 2^63 (which int64 cannot hold and a
+// conversion would wrap) is not, and the producer drops that field and names
+// it rather than refuse the part or publish a wrapped value.
+func UsageFigure(f float64) (int64, bool) {
+	if math.IsNaN(f) || math.IsInf(f, 0) || f < 0 || f >= math.MaxInt64 {
+		return 0, false
+	}
+	return int64(f), true
 }
 
 // UsageTotal folds the turns of one task: the figures sum and Model is the

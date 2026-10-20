@@ -1862,6 +1862,13 @@ func (b *Bridge) publishHandoff(ctx context.Context, run *taskRun, state lib.Tas
 func (b *Bridge) publishUsageLocked(run *taskRun, u lib.Usage) {
 	part, err := lib.UsagePart(u)
 	if err != nil {
+		if u != (lib.Usage{Model: u.Model}) {
+			// A figure was there and the part was refused (a negative
+			// one): say so, since the turn's time and counts are not on
+			// the bus. A usage with no figure at all is the quiet case.
+			b.cfg.Logger.Warn("usage part refused; the turn's figures are not on the bus",
+				"task", run.origin.TaskID, "err", err)
+		}
 		return
 	}
 	if run.act.Load() == nil {

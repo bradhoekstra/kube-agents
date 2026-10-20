@@ -278,8 +278,15 @@ func apiTurnUsage(out *apiChatResponse, requested string, took time.Duration) (u
 	case json.Unmarshal(out.Usage, &counts) != nil:
 		dropped = append(dropped, "usage")
 	default:
-		u.InputTokens = int64(max(counts.PromptTokens, counts.InputTokens))
-		u.OutputTokens = int64(max(counts.CompletionTokens, counts.OutputTokens))
+		// A count that is negative or past what the part carries is that
+		// field dropped, named, so the part keeps its time and model.
+		var ok bool
+		if u.InputTokens, ok = lib.UsageFigure(max(counts.PromptTokens, counts.InputTokens)); !ok {
+			dropped = append(dropped, "usage.prompt_tokens")
+		}
+		if u.OutputTokens, ok = lib.UsageFigure(max(counts.CompletionTokens, counts.OutputTokens)); !ok {
+			dropped = append(dropped, "usage.completion_tokens")
+		}
 	}
 	return u, dropped
 }
@@ -503,8 +510,7 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 		run.mu.Unlock()
 	}
 
-	started := time.Now()
-	resp, err := b.sendAPI(taskCtx, req, body)
+	resp, connectedAt, err := b.sendAPI(taskCtx, req, body)
 	if err != nil {
 		b.finalizeAPIError(run, taskCtx, err, turn)
 		return "", false
@@ -514,6 +520,10 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 	// its headers before the body, and a cancel or shutdown in between must
 	// still end the request.
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, apiResponseCap+1))
+	// The turn's wall time: from the connection the server answered on to
+	// the end of the body, before any lock below adds to it, and without
+	// the refused dials sendAPI retried first.
+	took := time.Since(connectedAt)
 	if err != nil && taskCtx.Err() != nil {
 		b.finalizeAPIError(run, taskCtx, err, turn)
 		return "", false
@@ -538,7 +548,7 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 			// envelope carries no counts the bridge reads, so its usage is
 			// the wall time, as the CLI executor's is for a run that failed
 			// on its own. A 4xx ran nothing and publishes nothing.
-			b.publishTurnUsage(run, &apiChatResponse{}, time.Since(started))
+			b.publishTurnUsage(run, &apiChatResponse{}, took)
 		}
 		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: %s - HTTP %d; session: %s%s; body tail: %s",
 			reason, resp.StatusCode, sessionID, turnNote(turn), tail(string(raw), apiBodyTailBytes)), nil)
@@ -566,7 +576,7 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 		}
 		// A turn that ran and failed still read tokens: its usage goes out
 		// ahead of the failed terminal, as the worker adapter's does.
-		b.publishTurnUsage(run, &out, time.Since(started))
+		b.publishTurnUsage(run, &out, took)
 		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: %s - HTTP %d, turn failed; session: %s%s; error: %s",
 			reason, resp.StatusCode, sessionID, turnNote(turn), tail(out.Hermes.Error, apiBodyTailBytes)), nil)
 		return "", false
@@ -581,7 +591,7 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 	run.answerHeld = true
 	// What the turn cost, ahead of its answer and under the same lock a
 	// finalizer takes, so the usage part never follows the terminal.
-	u, dropped := apiTurnUsage(&out, b.cfg.APIModel, time.Since(started))
+	u, dropped := apiTurnUsage(&out, b.cfg.APIModel, took)
 	if len(dropped) > 0 {
 		b.cfg.Logger.Warn("usage telemetry on the API response did not decode; those figures are not on the bus",
 			"task", run.origin.TaskID, "fields", dropped)
@@ -595,14 +605,17 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 // A response of any status is returned as it is; an error is wrapped in
 // errNeverConnected when no attempt got a connection, so no request was
 // sent.
-func (b *Bridge) sendAPI(ctx context.Context, req *http.Request, body []byte) (*http.Response, error) {
-	var connected atomic.Bool
+func (b *Bridge) sendAPI(ctx context.Context, req *http.Request, body []byte) (*http.Response, time.Time, error) {
+	// connectedAt is when the attempt that got a connection got it, as
+	// UnixNano, so the turn's clock starts at the request the server
+	// received rather than at the first refused dial.
+	var connectedAt atomic.Int64
 	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
-		GotConn: func(httptrace.GotConnInfo) { connected.Store(true) },
+		GotConn: func(httptrace.GotConnInfo) { connectedAt.Store(time.Now().UnixNano()) },
 	})
 	req = req.WithContext(ctx)
 	neverConnected := func(err error) error {
-		if connected.Load() {
+		if connectedAt.Load() != 0 {
 			return err
 		}
 		return fmt.Errorf("%w: %w", errNeverConnected, err)
@@ -611,14 +624,14 @@ func (b *Bridge) sendAPI(ctx context.Context, req *http.Request, body []byte) (*
 	for {
 		resp, err := b.apiClient.Do(req)
 		if err == nil {
-			return resp, nil
+			return resp, time.Unix(0, connectedAt.Load()), nil
 		}
 		if !errors.Is(err, syscall.ECONNREFUSED) || time.Now().After(giveUp) {
-			return nil, neverConnected(err)
+			return nil, time.Time{}, neverConnected(err)
 		}
 		select {
 		case <-ctx.Done():
-			return nil, neverConnected(err)
+			return nil, time.Time{}, neverConnected(err)
 		case <-time.After(apiConnectRetryInterval):
 		}
 		req = req.Clone(ctx)

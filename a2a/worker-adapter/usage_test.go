@@ -36,6 +36,37 @@ func TestNullCostTotalIsAbsentNotZero(t *testing.T) {
 	}
 }
 
+// A negative or overflowing figure is that field dropped, never the part: a
+// result line with a negative duration and a token count past int64 still
+// publishes its other count and its cost, and the baseline advances. A
+// negative total is unknown and leaves the baseline alone.
+func TestOffShapeFiguresDropTheFieldNotThePart(t *testing.T) {
+	url := startServer(t)
+	c := testClient(t, url)
+	const session, taskID = "chat-otter-u6", "task-usage-6"
+	submit(t, c, session, taskID, "odd figures")
+
+	harness := stub(t, `
+echo '{"type":"system","subtype":"init","session_id":"stub-u6","model":"m"}'
+read first || exit 1
+echo '{"type":"result","subtype":"success","result":"still here","duration_ms":-5,"total_cost_usd":0.02,"usage":{"input_tokens":1e19,"output_tokens":4}}'
+`)
+	out := waitOutcome(t, runAdapter(context.Background(), adapterConfig(url, taskID, session, harness)), 30*time.Second)
+	if out.err != nil || out.res.State != lib.StateCompleted {
+		t.Fatalf("run: state=%q err=%v", out.res.State, out.err)
+	}
+	got := usageParts(t, foldTask(t, c, session, taskID))
+	if len(got) != 1 || got[0].DurationMs != 0 || got[0].InputTokens != 0 || got[0].OutputTokens != 4 || got[0].CostUsd != 0.02 {
+		t.Fatalf("usage = %+v, want output tokens 4 and cost 0.02 with the duration and input count dropped", got)
+	}
+
+	a := &adapter{}
+	a.turnCost(0.010)
+	if cost, seen, known := a.turnCostFrom(-1); cost != 0 || seen != 0.010 || !known {
+		t.Fatalf("negative total: cost=%v seen=%v known=%v, want unknown with the baseline untouched", cost, seen, known)
+	}
+}
+
 // costStub is recordingStub's shape with a result line that carries the
 // harness's running total by run number: 0.01, 0.03, 0.06, so the second and
 // third runs' turns cost 0.02 and 0.03 when the baseline is carried across

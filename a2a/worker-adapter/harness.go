@@ -109,11 +109,11 @@ type harnessEvent struct {
 	// emitted, plus what a resumed session had already spent, so the
 	// adapter publishes the difference between consecutive lines
 	// (adapter.turnCost), never the figure itself. Each is optional, and
-	// each is held raw and decoded on its own (usage, costTotal, model):
-	// telemetry in a shape the adapter does not expect is dropped, never
-	// the result line that carries the deliverable. The adapter publishes
-	// what decodes as the usage artifact (payload spec "Reserved artifact
-	// names") and nothing when nothing does.
+	// each is held raw and decoded on its own (telemetry, model): telemetry
+	// in a shape the adapter does not expect is dropped field by field,
+	// never the result line that carries the deliverable. The adapter
+	// publishes what decodes as the usage artifact (payload spec "Reserved
+	// artifact names") and nothing when nothing does.
 	Usage        json.RawMessage `json:"usage,omitempty"`
 	TotalCostUSD json.RawMessage `json:"total_cost_usd,omitempty"`
 	DurationMs   json.RawMessage `json:"duration_ms,omitempty"`
@@ -165,13 +165,19 @@ type resultTelemetry struct {
 
 func (ev harnessEvent) telemetry(model string) resultTelemetry {
 	t := resultTelemetry{usage: lib.Usage{Model: model}}
+	// Each figure passes lib.UsageFigure: a negative or overflowing number
+	// is that field dropped and named, never a refused part or a wrapped
+	// value, so the line's other figures still reach the bus.
 	var ms float64
+	var ok bool
 	switch {
 	case len(ev.DurationMs) == 0:
 	case json.Unmarshal(ev.DurationMs, &ms) != nil:
 		t.dropped = append(t.dropped, "duration_ms")
 	default:
-		t.usage.DurationMs = int64(ms)
+		if t.usage.DurationMs, ok = lib.UsageFigure(ms); !ok {
+			t.dropped = append(t.dropped, "duration_ms")
+		}
 	}
 	var counts harnessUsage
 	switch {
@@ -179,8 +185,12 @@ func (ev harnessEvent) telemetry(model string) resultTelemetry {
 	case json.Unmarshal(ev.Usage, &counts) != nil:
 		t.dropped = append(t.dropped, "usage")
 	default:
-		t.usage.InputTokens = int64(counts.InputTokens + counts.CacheCreationInputTokens + counts.CacheReadInputTokens)
-		t.usage.OutputTokens = int64(counts.OutputTokens)
+		if t.usage.InputTokens, ok = lib.UsageFigure(counts.InputTokens + counts.CacheCreationInputTokens + counts.CacheReadInputTokens); !ok {
+			t.dropped = append(t.dropped, "usage.input_tokens")
+		}
+		if t.usage.OutputTokens, ok = lib.UsageFigure(counts.OutputTokens); !ok {
+			t.dropped = append(t.dropped, "usage.output_tokens")
+		}
 	}
 	// A null total is a line that carried none, not a total of zero: a zero
 	// would read as the total going down and rebase the baseline.

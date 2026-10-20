@@ -666,12 +666,18 @@ function reduceArtifactUpdate(
   // part per harness result line but one answer for the steered turns they
   // settle, so the footer under that answer is their total. A part that is
   // not usage is skipped, as the library's reader skips it.
+  // As the library's fold does for every artifact, a non-append usage chunk
+  // replaces the task's turns and an append chunk extends them, so a
+  // re-published artifact is counted once, as UsageTotal over the folded
+  // task would count it.
   const turns = name === ARTIFACT_USAGE ? usageParts(artifact.parts) : [];
-  const usage = turns.length > 0 ? usageTotal([...(prev?.usage ? [prev.usage] : []), ...turns]) : prev?.usage;
-  const answerOpens = (name === ARTIFACT_RESULT || name === ARTIFACT_TURN) && payload.append !== true;
+  const extends_ = payload.append === true;
+  const usage =
+    name === ARTIFACT_USAGE ? usageTotal([...(extends_ && prev?.usage ? [prev.usage] : []), ...turns]) : prev?.usage;
+  const answerOpens = (name === ARTIFACT_RESULT || name === ARTIFACT_TURN) && !extends_;
   const turnUsage =
-    turns.length > 0
-      ? usageTotal([...(prev?.turnUsage ? [prev.turnUsage] : []), ...turns])
+    name === ARTIFACT_USAGE
+      ? usageTotal([...(extends_ && prev?.turnUsage ? [prev.turnUsage] : []), ...turns])
       : answerOpens
         ? undefined
         : prev?.turnUsage;

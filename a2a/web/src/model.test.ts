@@ -361,6 +361,40 @@ describe("artifact-update", () => {
     expect(state.tasks.get("task-1")?.usage?.costUsd).toBe(0.015);
   });
 
+  it("replaces the task's turns on a non-append usage chunk and extends them on append, as the library fold does", () => {
+    let state = submission();
+    state = usageChunk(state, { inputTokens: 1000 });
+    expect(state.tasks.get("task-1")?.usage?.inputTokens).toBe(1000);
+    // A re-publish of the whole artifact, non-append: counted once, not on top.
+    state = onSubject(
+      state,
+      "a2a.tasks.platform.task-1.events",
+      env({
+        kind: "artifact-update",
+        taskId: "task-1",
+        contextId: "ctx-1",
+        from: bridge,
+        payload: {
+          taskId: "task-1",
+          contextId: "ctx-1",
+          artifact: {
+            artifactId: "art-usage",
+            name: "usage",
+            parts: [
+              { kind: "data", data: { inputTokens: 1000 } },
+              { kind: "data", data: { inputTokens: 200 } },
+            ],
+          },
+          append: false,
+        },
+      }),
+    );
+    expect(state.tasks.get("task-1")?.usage?.inputTokens).toBe(1200);
+    expect(state.tasks.get("task-1")?.turnUsage?.inputTokens).toBe(1200);
+    state = usageChunk(state, { inputTokens: 50 }, true);
+    expect(state.tasks.get("task-1")?.usage?.inputTokens).toBe(1250);
+  });
+
   it("skips a usage part that is not usage, as the library's reader does", () => {
     let state = submission();
     state = usageChunk(state, { model: "m" }); // a name is not a figure

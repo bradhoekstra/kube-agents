@@ -162,6 +162,38 @@ func TestAPI_UsageOnA5xxTurnIsDurationAlone(t *testing.T) {
 	}
 }
 
+// A count that is negative or past what the part carries is that field
+// dropped: the part keeps the other count, the model and the wall time, and
+// the turn completes.
+func TestAPI_OutOfRangeCountsDropTheFieldNotThePart(t *testing.T) {
+	_, url := startServer(t)
+	stub := newAPIStub(t, func(w http.ResponseWriter, _ *http.Request, c apiCall) {
+		time.Sleep(stubTurnTime)
+		w.Header().Set(apiSessionIDHeader, c.sessionID)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"model":   "claude-opus-5-5",
+			"choices": []any{map[string]any{"message": map[string]any{"role": "assistant", "content": "three pods"}, "finish_reason": "stop"}},
+			"usage":   map[string]any{"prompt_tokens": -3, "input_tokens": -2, "completion_tokens": 9},
+		})
+	})
+	startAPIBridge(t, url, stub, nil)
+	c := gatewayClient(t, url)
+	origin := submitIn(t, c, "task-usage-range", "ctx-usage-range", "how many pods are pending")
+	task := waitTerminal(t, c, origin.TaskID)
+	if task.State != lib.StateCompleted {
+		t.Fatalf("state %s, want completed", task.State)
+	}
+	got := usageSeen(t, url, origin.TaskID)
+	if len(got) != 1 || got[0].Model != "claude-opus-5-5" || got[0].InputTokens != 0 || got[0].OutputTokens != 9 || got[0].DurationMs <= 0 {
+		t.Fatalf("usage = %+v, want the model, 9 output tokens and the duration with the input count dropped", got)
+	}
+	u, dropped := apiTurnUsage(&apiChatResponse{Usage: json.RawMessage(`{"prompt_tokens":1e19,"completion_tokens":1}`)}, "alias", time.Second)
+	if u.InputTokens != 0 || u.OutputTokens != 1 || len(dropped) != 1 || dropped[0] != "usage.prompt_tokens" {
+		t.Fatalf("overflowing count: usage=%+v dropped=%v", u, dropped)
+	}
+}
+
 // A model or usage in a shape the bridge does not read is dropped, never the
 // turn: the answer completes and the part carries what did decode.
 func TestAPI_OffShapeTelemetryDoesNotFailTheTurn(t *testing.T) {

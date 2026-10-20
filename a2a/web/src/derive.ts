@@ -190,13 +190,23 @@ const MILLION = 1_000_000;
 const COST_SMALL_DECIMALS = 4;
 const COST_DECIMALS = 2;
 
-export function fmtTokens(n: number): string {
-  if (n < THOUSAND) return `${Math.round(n)}`;
-  if (n < MILLION) return `${(n / THOUSAND).toFixed(1).replace(/\.0$/, "")}k`;
-  return `${(n / MILLION).toFixed(1).replace(/\.0$/, "")}M`;
+/** One decimal, rounded first, so a value that rounds up to the next band is printed in it (999,950 is 1M, not 1000k). */
+function oneDecimal(v: number): string {
+  return (Math.round(v * 10) / 10).toFixed(1).replace(/\.0$/, "");
 }
 
+export function fmtTokens(n: number): string {
+  if (Math.round(n) < THOUSAND) return `${Math.round(n)}`;
+  const k = oneDecimal(n / THOUSAND);
+  if (Number(k) < THOUSAND) return `${k}k`;
+  return `${oneDecimal(n / MILLION)}M`;
+}
+
+/** The smallest cost the four-place form prints; a positive cost below it is shown as under that, never as $0.0000. */
+const COST_FLOOR = 10 ** -COST_SMALL_DECIMALS;
+
 export function fmtCost(usd: number): string {
+  if (usd > 0 && usd < COST_FLOOR / 2) return `<$${COST_FLOOR.toFixed(COST_SMALL_DECIMALS)}`;
   return `$${usd.toFixed(usd >= 1 ? COST_DECIMALS : COST_SMALL_DECIMALS)}`;
 }
 
@@ -239,18 +249,19 @@ export interface Spend {
    * sums cover every model, so the panel names them all rather than one.
    */
   models: string[];
-  /** Their usage summed; absent until one reports. `total.model` is one task's, not the sum's: read `models`. */
+  /** Their figures summed; absent until one reports. It names no model: the sum covers every task, so `models` holds them. */
   total?: Usage;
 }
 
 export function spendOf(state: UiState): Spend {
   const usages = [...state.tasks.values()].flatMap((t) => (t.usage ? [t.usage] : []));
+  const total = usageTotal(usages);
   return {
     reported: usages.length,
     priced: usages.filter((u) => u.costUsd !== undefined).length,
     counted: usages.filter((u) => u.inputTokens !== undefined || u.outputTokens !== undefined).length,
     models: [...new Set(usages.flatMap((u) => (u.model ? [u.model] : [])))],
-    total: usageTotal(usages),
+    total: total === undefined ? undefined : { ...total, model: undefined },
   };
 }
 

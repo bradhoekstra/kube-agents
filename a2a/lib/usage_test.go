@@ -2,6 +2,7 @@ package lib
 
 import (
 	"encoding/json"
+	"math"
 	"testing"
 )
 
@@ -72,6 +73,22 @@ func TestUsagePartOmitsZeroes(t *testing.T) {
 func TestUsagePartRefusesNoFigures(t *testing.T) {
 	if _, err := UsagePart(Usage{Model: "m"}); err == nil {
 		t.Fatal("UsagePart accepted a usage with no figure")
+	}
+}
+
+// UsageFigure takes a finite, non-negative float below 2^63 as a whole
+// figure and refuses the rest, so a producer drops that field rather than
+// publish a wrapped value or lose the part.
+func TestUsageFigure(t *testing.T) {
+	for _, tc := range []struct {
+		in   float64
+		want int64
+		ok   bool
+	}{{0, 0, true}, {12.9, 12, true}, {1200, 1200, true}, {-1, 0, false}, {1e19, 0, false}, {math.NaN(), 0, false}, {math.Inf(1), 0, false}} {
+		got, ok := UsageFigure(tc.in)
+		if got != tc.want || ok != tc.ok {
+			t.Errorf("UsageFigure(%v) = %d, %v; want %d, %v", tc.in, got, ok, tc.want, tc.ok)
+		}
 	}
 }
 
