@@ -37,8 +37,9 @@ def stub_redact(text: str, **_kwargs) -> str:
     return TOKEN_RE.sub(lambda m: m.group(0)[:6] + "..." + m.group(0)[-4:], text)
 
 
-# Built by concatenation: a literal of this shape trips GitHub's secret scanning on push.
-HERMES_ONLY_SHAPE = "xoxb-" + "1234567890" + "-" + "abcdefghij" * 2
+# A shape Hermes' prefix list masks and the shared module does not (``hf_``), built by
+# concatenation so no token-shaped literal sits in the file.
+HERMES_ONLY_SHAPE = "hf_" + "AbCdEfGhIj" * 3
 
 
 def opt_out_aware_redact(text: str, *, force: bool = False, **_kwargs) -> str:
@@ -526,11 +527,21 @@ class StoreRedactionTest(unittest.TestCase):
 
     def test_argument_leaves_are_redacted_forced_despite_the_profile_opt_out(self):
         calls = [{"id": "c1", "type": "function", "function": {"name": "terminal", "arguments": json.dumps(
-            {"command": f"curl -H 'X-Token: {HERMES_ONLY_SHAPE}' https://example.invalid/"})}}]
+            {"command": f"curl -H 'X-Hermes: {HERMES_ONLY_SHAPE}' https://example.invalid/"})}}]
         with mock.patch.dict(os.environ, self.env):
+            module = cr._redactor_module()
+            # The premise: the shared module leaves this shape alone, so only the Hermes layer can mask it.
+            self.assertIn(HERMES_ONLY_SHAPE, module.AuditRedactor.redact_text(f"x {HERMES_ONLY_SHAPE} y"))
             redact = cr.install_operator_rules(opt_out_aware_redact)
             _, out_calls = cr.redact_message_for_store({"role": "assistant"}, calls, redact=redact)
         self.assertNotIn(HERMES_ONLY_SHAPE, out_calls[0]["function"]["arguments"])
+        # And with the leaves unforced the shape would survive: the stub honours the opt-out.
+        cr.reset_operator_rules()
+        with mock.patch.dict(os.environ, self.env):
+            cr.install_operator_rules(opt_out_aware_redact)
+            cr._UPSTREAM_REDACTOR[:] = [opt_out_aware_redact]
+            _, leaked = cr.redact_message_for_store({"role": "assistant"}, calls, redact=redact)
+        self.assertIn(HERMES_ONLY_SHAPE, leaked[0]["function"]["arguments"])
 
     def test_responses_and_openrouter_shapes_have_their_prose_redacted(self):
         rules = self.tmp / "literal.yaml"

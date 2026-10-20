@@ -33,6 +33,7 @@ Usage::
 from __future__ import annotations
 
 import ast
+import importlib.util
 import io
 import logging
 import os
@@ -70,9 +71,10 @@ CURL_COMMAND = f"curl -sS -H 'Authorization: Bearer {TOKEN}' https://example.inv
 WORKER_TASK_ID = "t_verify"
 CLUSTER_NAME = "prod-eu-1"
 VERIFY_SALT = "verify-salt"
-#: A shape Hermes' prefix list masks and AuditRedactor's credential list does not,
-#: so masking it in a tool-call argument proves the forced Hermes layer ran there.
-SLACK_TOKEN = "xoxb-1234567890-" + "abcdefghij" * 2
+#: A shape Hermes' prefix list masks (``hf_``) and the shared module's credential
+#: list does not, so masking it in a tool-call argument proves the forced Hermes
+#: layer ran there; the premise is asserted before the checks that rest on it.
+HERMES_ONLY_TOKEN = "hf_" + "AbCdEfGhIj" * 3
 POD_IP = "10.1.2.3"
 RULES_YAML = (
     "ip:\n  action: pseudonym\nrules:\n"
@@ -332,9 +334,9 @@ from hermes_state import SessionDB
 home = Path(os.environ["HERMES_HOME"])
 db = SessionDB(home / "state.db")
 db.create_session("s_verify", "cli")
-slack = sys.argv[4]
+hermes_only = sys.argv[4]
 calls = [{"id": "c1", "type": "function", "function": {"name": "terminal", "arguments": json.dumps(
-    {"command": f"curl -H 'Authorization: Bearer {token}' -H 'X-Slack: {slack}' https://{ip}/"})}}]
+    {"command": f"curl -H 'Authorization: Bearer {token}' -H 'X-Hermes: {hermes_only}' https://{ip}/"})}}]
 db.append_message("s_verify", "assistant", content=f"token {token} on {cluster}", tool_calls=calls)
 db.append_message("s_verify", "tool", content=[{"type": "text", "text": f"{cluster} {ip}"}],
                   tool_call_id="c1", tool_name="terminal")
@@ -358,8 +360,16 @@ blocked = [list(r) for r in conn.execute("SELECT summary FROM task_runs WHERE ta
 events = [str(tuple(r)) for r in conn.execute("SELECT * FROM task_events WHERE task_id = ?", (blocked_id,)).fetchall()]
 print("kanban=" + json.dumps([list(row), summary, comment, blocked, events]))
 """
-REDACTOR_MODULE = os.environ.get("KUBE_AGENTS_REDACTOR_MODULE", "")
-check("KUBE_AGENTS_REDACTOR_MODULE names the shared redactor", bool(REDACTOR_MODULE) and Path(REDACTOR_MODULE).is_file(), REDACTOR_MODULE)
+REDACTOR_MODULE = os.environ.get("KUBE_AGENTS_REDACTOR_MODULE") or C.DEFAULT_REDACTOR_MODULE
+check("the shared redactor module is present (KUBE_AGENTS_REDACTOR_MODULE, else the image's path)", Path(REDACTOR_MODULE).is_file(), REDACTOR_MODULE)
+# The premise of the forced-leaves checks: a shape Hermes' prefix list masks and the
+# shared module does not, so masking it in a tool-call argument proves the Hermes layer ran.
+_spec = importlib.util.spec_from_file_location("verify_redactor", REDACTOR_MODULE)
+_module = importlib.util.module_from_spec(_spec)
+sys.modules[_spec.name] = _module
+_spec.loader.exec_module(_module)
+check("the shared module leaves the Hermes-only shape alone (premise)", HERMES_ONLY_TOKEN in _module.AuditRedactor.redact_text(f"x {HERMES_ONLY_TOKEN} y"), HERMES_ONLY_TOKEN)
+check("the Hermes layer masks the Hermes-only shape (premise)", HERMES_ONLY_TOKEN not in redact_sensitive_text(f"x {HERMES_ONLY_TOKEN} y", force=True), HERMES_ONLY_TOKEN)
 
 
 def run_rules_child(rule_file: str, home: str, opt_out: bool = False) -> str:
@@ -368,7 +378,7 @@ def run_rules_child(rule_file: str, home: str, opt_out: bool = False) -> str:
         env_extra["KUBE_AGENTS_REDACTION_CONFIG"] = rule_file
     if opt_out:
         env_extra["HERMES_REDACT_SECRETS"] = "false"
-    return run_child(RULES_CHILD_SCRIPT, TOKEN, CLUSTER_NAME, POD_IP, SLACK_TOKEN, env_extra=env_extra)
+    return run_child(RULES_CHILD_SCRIPT, TOKEN, CLUSTER_NAME, POD_IP, HERMES_ONLY_TOKEN, env_extra=env_extra)
 
 
 with tempfile.TemporaryDirectory() as rules_home:
@@ -383,7 +393,7 @@ check("the credential masking still runs first", not leaked(text_line) and TOKEN
 state_line = next((line for line in on.splitlines() if line.startswith("state=")), "")
 check("state.db holds no token, cluster name or address", state_line and not leaked(state_line)
       and CLUSTER_NAME not in state_line and POD_IP not in state_line, state_line[:DETAIL_CHARS])
-check("the Slack token in the tool-call arguments is masked by the forced Hermes layer", SLACK_TOKEN not in state_line, state_line[:DETAIL_CHARS])
+check("the Hermes-only token in the tool-call arguments is masked by the forced Hermes layer", HERMES_ONLY_TOKEN not in state_line, state_line[:DETAIL_CHARS])
 check("state.db still holds the tool call's shape", '\\"name\\": \\"terminal\\"' in state_line, state_line[:DETAIL_CHARS])
 kanban_line = next((line for line in on.splitlines() if line.startswith("kanban=")), "")
 check("the board holds no token, cluster name or address", kanban_line and not leaked(kanban_line)
@@ -397,7 +407,7 @@ with tempfile.TemporaryDirectory() as opted_out_home:
     opted = run_rules_child(str(opted_out_file), opted_out_home, opt_out=True)
 opted_state = next((line for line in opted.splitlines() if line.startswith("state=")), "")
 check("security.redact_secrets: false does not reopen state.db: no token", opted_state and not leaked(opted_state), opted_state[:DETAIL_CHARS])
-check("security.redact_secrets: false does not reopen the argument leaves: no Slack token", opted_state and SLACK_TOKEN not in opted_state, opted_state[:DETAIL_CHARS])
+check("security.redact_secrets: false does not reopen the argument leaves: no Hermes-only token", opted_state and HERMES_ONLY_TOKEN not in opted_state, opted_state[:DETAIL_CHARS])
 check("security.redact_secrets: false does not reopen the operator's rules", CLUSTER_NAME not in opted_state and POD_IP not in opted_state, opted_state[:DETAIL_CHARS])
 
 with tempfile.TemporaryDirectory() as plain_home:
