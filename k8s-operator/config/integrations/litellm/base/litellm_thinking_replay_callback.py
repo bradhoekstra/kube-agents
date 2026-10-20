@@ -21,9 +21,13 @@ thinking replayed and is not touched. The gate reads the alias's own
 deployments only; a router fallback to a Claude group from a Gemini alias
 would receive the stripped history, and neither shipped config has one.
 
-Fixed upstream in BerriAI/litellm#44661 (the Gemini request no longer builds a
-part from ``thinking_blocks``). Delete this hook, its mounts and its callback
-entry once images.json pins a LiteLLM release that carries that fix.
+Fixed upstream in BerriAI/litellm#44661, which LiteLLM v1.106.0 carries and
+images.json pins: the Gemini request no longer builds a part from
+``thinking_blocks``. The hook stays for now because it removes more than that
+fix does (the ``/v1/messages`` case above), and no thinking-enabled multi-turn
+session has been measured on the pinned release without it.
+gke-labs/kube-agents#2836 tracks deleting this hook, its mounts and its
+callback entry once that measurement is on record.
 
 The chart renders this file into the litellm-config ConfigMap; the kustomize
 base carries a copy (k8s-operator/config/integrations/litellm/base), and
