@@ -1809,7 +1809,7 @@ RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes
     test "$(grep -c '_kube_agents_install_transcript_redaction()' /opt/hermes/hermes_cli/main.py)" = "1" && \
     test "$(grep -c '_kube_agents_install_operator_rules(' /opt/hermes/agent/redact.py)" = "1" && \
     test "$(grep -c '_kube_agents_redact_message_for_store(' /opt/hermes/hermes_state_messages.py)" = "1" && \
-    test "$(grep -c '_kube_agents_redact_store_text(' /opt/hermes/hermes_cli/kanban_db.py)" = "6" && \
+    test "$(grep -c '_kube_agents_redact_store_text(' /opt/hermes/hermes_cli/kanban_db.py)" = "8" && \
     cp /tmp/latency-patches/skill_manage_image_owned.py /opt/hermes/tools/skill_manage_image_owned.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_skill_manage_image_owned.py /opt/hermes && \
     test "$(grep -c 'from tools.skill_manage_image_owned import image_owned_batch_refusal, image_owned_refusal' /opt/hermes/tools/skill_manager_tool.py)" = "1" && \
@@ -2093,7 +2093,13 @@ COPY agents/chat/SOUL.md agents/chat/AGENTS.md /opt/defaults/
 # sole writer, and the operator's settings reach it as a read-only managed-scope overlay
 # at /etc/hermes rather than by rewriting it.
 COPY --chown=hermes:hermes agents/chat/config.yaml /opt/chat-template/config.yaml
-RUN rm -f /opt/defaults/config.yaml
+# The second test pins the runtime path of the shared redactor the agent image
+# reads with the switch on (DEFAULT_REDACTOR_MODULE); the build-time verifier
+# in the agent-base stage ran against a copy, because /opt/defaults did not
+# exist there yet. See deploy/docker/patches/credential_redaction.py.
+RUN rm -f /opt/defaults/config.yaml && \
+    cd /opt/hermes && \
+    /opt/hermes/.venv/bin/python3 -c 'import os, sys; from agent import credential_redaction as c; sys.exit(0 if os.path.isfile(c.DEFAULT_REDACTOR_MODULE) else 1)'
 
 # --- Shared scripts (reachable by every profile at $HERMES_HOME/scripts) ---
 # Executable scripts are shared, not per-profile: the router (Chat Agent) and the

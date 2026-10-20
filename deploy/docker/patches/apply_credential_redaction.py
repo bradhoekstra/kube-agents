@@ -81,8 +81,8 @@ except Exception:  # noqa: BLE001 - a failed registration must not break import
 # every later import and every call through the module global gets the
 # composed form. Not inside the try above: a rule file that does not parse
 # must stop the process at import, as it stops the gateway, rather than let
-# it run with the rules silently off. Nothing changes while the variable is
-# unset. See agent/credential_redaction.py.
+# it run with the rules silently off. Nothing changes while no rule file is
+# projected or named. See agent/credential_redaction.py.
 try:
     from agent.credential_redaction import (
         install_operator_rules as _kube_agents_install_operator_rules,
@@ -148,30 +148,35 @@ STATE_PARAMETERS = ("msg", "tool_calls")
 STATE_MARKER = "_kube_agents_redact_message_for_store"
 #: Indented by the applier to the body's own indentation.
 STATE_PROLOGUE_LINES = (
-    "# kube-agents patch: with KUBE_AGENTS_REDACTION_CONFIG set, what this row",
-    "# carries to state.db -- content, reasoning, tool calls -- goes through",
-    "# the forced redactor first, credential shapes and the operator's rules",
-    "# alike, in copies. A no-op while the variable is unset.",
+    "# kube-agents patch: with the operator's rule file projected (or named by",
+    "# KUBE_AGENTS_REDACTION_CONFIG), what this row carries to state.db --",
+    "# content, reasoning, tool-call arguments -- goes through the forced",
+    "# redactor first, credential shapes and the operator's rules alike, in",
+    "# copies. A no-op while no rule file is present.",
     "# See agent/credential_redaction.py.",
     "from agent.credential_redaction import (",
     "    redact_message_for_store as _kube_agents_redact_message_for_store,",
     ")",
     "msg, tool_calls = _kube_agents_redact_message_for_store(msg, tool_calls)",
 )
-#: Each kanban writer and the text parameters its prologue rebinds. The
-#: board's ``tasks.title``, ``tasks.body``, ``tasks.result`` and
-#: ``task_runs.summary`` columns are what a worker's report and a card's ask
-#: land in; nothing else on the board is free text a tool wrote.
+#: Each kanban writer and the text parameters its prologue rebinds: a card's
+#: title and body, a worker's result and summary, a comment's body (the path
+#: the ended-run patch sends a worker's result down when a parent is linked
+#: mid-run) and a block's reason. The board's other text columns are names,
+#: states and ids the tools write from their own vocabulary.
 KANBAN_WRITERS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("create_task", ("title", "body")),
     ("complete_task", ("result", "summary")),
     ("edit_completed_task_result", ("result", "summary")),
+    ("add_comment", ("body",)),
+    ("block_task", ("reason",)),
 )
 KANBAN_MARKER = "_kube_agents_redact_store_text"
 KANBAN_PROLOGUE_HEAD = (
-    "# kube-agents patch: with KUBE_AGENTS_REDACTION_CONFIG set, the text this",
-    "# writer puts on the board goes through the forced redactor first. A no-op",
-    "# while the variable is unset. See agent/credential_redaction.py.",
+    "# kube-agents patch: with the operator's rule file projected (or named by",
+    "# KUBE_AGENTS_REDACTION_CONFIG), the text this writer puts on the board",
+    "# goes through the forced redactor first. A no-op while no rule file is",
+    "# present. See agent/credential_redaction.py.",
     "from agent.credential_redaction import (",
     "    redact_store_text as _kube_agents_redact_store_text,",
     ")",

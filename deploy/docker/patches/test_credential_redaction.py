@@ -340,6 +340,38 @@ class OperatorRulesTest(unittest.TestCase):
             with self.assertRaises(ValueError) as ctx:
                 cr.install_operator_rules(stub_redact)
         self.assertIn(str(self.rule_file), str(ctx.exception))
+        self.assertTrue(str(ctx.exception).startswith(cr.RULE_FILE_ENV + ":"))
+
+    def test_an_error_on_the_projected_file_names_the_file_not_the_variable(self):
+        self.rule_file.write_text("rules:\n  - name: bad\n    literal: ''\n")
+        with self.switched_off(), mock.patch.object(cr, "DEFAULT_RULE_FILE", str(self.rule_file)):
+            with mock.patch.dict(os.environ, {cr.REDACTOR_MODULE_ENV: str(GATEWAY_REDACTOR)}):
+                with self.assertRaises(ValueError) as ctx:
+                    cr.install_operator_rules(stub_redact)
+        self.assertTrue(str(ctx.exception).startswith(cr.RULE_FILE_SOURCE_NAME + ":"))
+        self.assertNotIn(cr.RULE_FILE_ENV, str(ctx.exception))
+
+    def test_a_missing_redactor_module_raises_naming_the_path(self):
+        with mock.patch.dict(os.environ, {**self.env, cr.REDACTOR_MODULE_ENV: str(self.tmp / "nowhere.py")}):
+            with self.assertRaises(ValueError) as ctx:
+                cr.install_operator_rules(stub_redact)
+        self.assertIn("nowhere.py", str(ctx.exception))
+
+    def test_the_default_redactor_module_is_where_the_image_puts_the_plugins(self):
+        dockerfile = (REPO_ROOT / "deploy" / "docker" / "Dockerfile").read_text()
+        self.assertIn("COPY --chown=hermes:hermes agents/chat/defaults/ /opt/defaults/\n", dockerfile)
+        relative = Path(cr.DEFAULT_REDACTOR_MODULE).relative_to("/opt/defaults")
+        self.assertTrue((REPO_ROOT / "agents" / "chat" / "defaults" / relative).is_file())
+        self.assertEqual(GATEWAY_REDACTOR, REPO_ROOT / "agents" / "chat" / "defaults" / relative)
+
+    def test_the_salt_is_resolved_before_the_composition_is_installed(self):
+        env = {k: v for k, v in self.env.items()}
+        with mock.patch.dict(os.environ, env):
+            os.environ.pop("SESSION_KV_SALT", None)
+            module = cr._redactor_module()
+            module._fallback_salt = None
+            cr.install_operator_rules(stub_redact)
+            self.assertIsNotNone(module._fallback_salt)
 
     def test_a_file_that_is_not_a_mapping_raises(self):
         self.rule_file.write_text("- a\n- b\n")
@@ -423,6 +455,45 @@ class StoreRedactionTest(unittest.TestCase):
         command = json.loads(out_calls[0]["function"]["arguments"])["command"]
         self.assertTrue(command.startswith("curl -H 'Authorization: Bearer ya29."))
         self.assertIn("...", command)
+
+    def test_tool_call_ids_names_and_types_are_structure_and_stay(self):
+        rules = self.tmp / "loose.yaml"
+        rules.write_text("ip:\n  action: \"off\"\nrules:\n  - name: project\n    pattern: \"[a-z][a-z0-9_-]{5,28}\"\n    action: pseudonym\n")
+        calls = [{"id": "call_abcdef123456", "type": "function", "function": {
+            "name": "terminal", "arguments": json.dumps({"command": "kubectl get pods -n acme-prod"})}}]
+        with mock.patch.dict(os.environ, {**self.env, cr.RULE_FILE_ENV: str(rules)}):
+            redact = cr.install_operator_rules(stub_redact)
+            out_msg, out_calls = cr.redact_message_for_store(
+                {"role": "assistant", "content": "", "tool_call_id": None}, calls, redact=redact
+            )
+        self.assertEqual(out_calls[0]["id"], "call_abcdef123456")
+        self.assertEqual(out_calls[0]["type"], "function")
+        self.assertEqual(out_calls[0]["function"]["name"], "terminal")
+        arguments = json.loads(out_calls[0]["function"]["arguments"])
+        self.assertNotIn("acme-prod", arguments["command"])
+        self.assertRegex(arguments["command"], r"\[project:[0-9a-f]{12}\]")
+
+    def test_a_greedy_pattern_leaves_the_arguments_parseable(self):
+        rules = self.tmp / "greedy.yaml"
+        rules.write_text("ip:\n  action: \"off\"\nrules:\n  - name: ctx\n    pattern: \"gke_\\\\S+\"\n")
+        raw = json.dumps({"command": "kubectl --context=gke_acme_us_prod get ns"})
+        calls = [{"id": "c1", "type": "function", "function": {"name": "terminal", "arguments": raw}}]
+        with mock.patch.dict(os.environ, {**self.env, cr.RULE_FILE_ENV: str(rules)}):
+            redact = cr.install_operator_rules(stub_redact)
+            _, out_calls = cr.redact_message_for_store({"role": "assistant"}, calls, redact=redact)
+            _, out_text = cr.redact_message_for_store({"role": "assistant"}, json.dumps(calls), redact=redact)
+        parsed = json.loads(out_calls[0]["function"]["arguments"])
+        self.assertEqual(parsed["command"], "kubectl --context=[REDACTED_CTX] get ns")
+        self.assertEqual(json.loads(json.loads(out_text)[0]["function"]["arguments"]), parsed)
+
+    def test_unchanged_arguments_keep_their_original_text(self):
+        raw = '{"command":   "echo hi"}'
+        calls = [{"id": "c1", "type": "function", "function": {"name": "terminal", "arguments": raw}}]
+        with mock.patch.dict(os.environ, self.env):
+            _, out_calls = cr.redact_message_for_store({"role": "assistant"}, calls, redact=stub_redact)
+            _, out_text = cr.redact_message_for_store({"role": "assistant"}, json.dumps(calls), redact=stub_redact)
+        self.assertIs(out_calls[0]["function"]["arguments"], raw)
+        self.assertEqual(out_text, json.dumps(calls))
 
     def test_a_string_content_and_a_string_tool_calls_column_are_redacted(self):
         with mock.patch.dict(os.environ, self.env):
@@ -516,6 +587,21 @@ def edit_completed_task_result(
 ) -> bool:
     """Backfill the user-visible result for an already completed task."""
     conn.execute("UPDATE tasks SET result = ? WHERE id = ?", (result, task_id))
+    return True
+
+
+def add_comment(conn: sqlite3.Connection, task_id: str, author: str, body: str) -> int:
+    if not body or not body.strip():
+        raise ValueError("comment body is required")
+    return conn.execute("INSERT INTO task_comments (task_id, author, body) VALUES (?, ?, ?)", (task_id, author, body)).lastrowid
+
+
+def block_task(
+    conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
+    kind: Optional[str] = None, expected_run_id: Optional[int] = None,
+) -> bool:
+    """``running``/``ready`` -> ``blocked``."""
+    conn.execute("UPDATE tasks SET status = 'blocked', block_reason = ? WHERE id = ?", (reason, task_id))
     return True
 '''
 
@@ -698,12 +784,15 @@ class ApplierTest(unittest.TestCase):
         with mock.patch("sys.stdout", new_callable=io.StringIO):
             apply_credential_redaction.apply(root)
         patched = self.read(root, apply_credential_redaction.KANBAN_RELATIVE)
-        self.assertEqual(patched.count("_kube_agents_redact_store_text("), 6)
+        self.assertEqual(patched.count("_kube_agents_redact_store_text("), 8)
         self.assertIn("    title = _kube_agents_redact_store_text(title)\n", patched)
-        self.assertIn("    body = _kube_agents_redact_store_text(body)\n", patched)
+        self.assertEqual(patched.count("    body = _kube_agents_redact_store_text(body)\n"), 2)
         self.assertEqual(patched.count("    result = _kube_agents_redact_store_text(result)\n"), 2)
         self.assertEqual(patched.count("    summary = _kube_agents_redact_store_text(summary)\n"), 2)
-        self.assertEqual(patched.count("from agent.credential_redaction import"), 3)
+        self.assertIn("    reason = _kube_agents_redact_store_text(reason)\n", patched)
+        # add_comment has no docstring: the prologue lands ahead of its first statement.
+        self.assertIn("    body = _kube_agents_redact_store_text(body)\n    if not body or not body.strip():", patched)
+        self.assertEqual(patched.count("from agent.credential_redaction import"), 5)
 
     def test_a_renamed_binder_parameter_fails_before_writing(self):
         root = self.write_tree()

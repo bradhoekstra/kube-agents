@@ -139,6 +139,11 @@ DEFAULT_REDACTOR_MODULE = "/opt/defaults/plugins/common/redactor.py"
 REDACTOR_MODULE_NAME = "kube_agents_redactor"
 RULES_INSTALLED_MARKER = "_kube_agents_operator_rules"
 RULE_FILE_ENCODING = "utf-8"
+#: Name of the resolved source in an error, when the variable did not name it.
+RULE_FILE_SOURCE_NAME = "redaction rule file"
+#: The keys of one tool call, as the gateway's hook reads them.
+TOOL_CALL_FUNCTION_KEY = "function"
+TOOL_CALL_ARGUMENTS_KEY = "arguments"
 #: The message-dict fields the session store persists as text, or as JSON that
 #: carries text: what ``_message_row_params`` binds besides ``tool_calls``.
 MESSAGE_TEXT_FIELDS: tuple[str, ...] = (
@@ -376,19 +381,21 @@ def install_or_report() -> bool:
 # --- The operator's rules, on disk (issue #1985) -----------------------------
 #
 # ``litellm.redaction`` masks or pseudonymises IP literals and operator-named
-# identifiers in every request the gateway forwards. The same rule file, named
-# by RULE_FILE_ENV, makes the durable writers in this pod apply those rules
+# identifiers in every request the gateway forwards. The same rule file,
+# projected at DEFAULT_RULE_FILE (or named by RULE_FILE_ENV for the verifier
+# and the tests), makes the durable writers in this pod apply those rules
 # too: the trailer on ``agent/redact.py`` wraps ``redact_sensitive_text`` so
 # ``agent.log``, the terminal-output cache, the worker transcript and the
 # ``💻 $`` line all carry them, and prologues on the session store's row
 # binder and the kanban board's writers run the wrapped redactor over what
-# those two databases receive. Without the variable none of this is installed
-# and the image behaves as before.
+# those two databases receive. Without the file none of this is installed and
+# the image behaves as before.
 
 _RULES_LOCK = threading.Lock()
 _RULES: dict[str, list] = {}
 _REDACTOR_MODULE: list = []
 _RULE_FILE: list = []
+_RULE_FILE_SOURCE: list = []
 
 
 def rule_file_path() -> str:
@@ -400,10 +407,18 @@ def rule_file_path() -> str:
     if _RULE_FILE:
         return _RULE_FILE[0]
     path = (os.environ.get(RULE_FILE_ENV) or "").strip()
+    source = RULE_FILE_ENV
     if not path and os.path.isfile(DEFAULT_RULE_FILE):
-        path = DEFAULT_RULE_FILE
+        path, source = DEFAULT_RULE_FILE, RULE_FILE_SOURCE_NAME
     _RULE_FILE.append(path)
+    _RULE_FILE_SOURCE.append(source)
     return path
+
+
+def rule_file_source() -> str:
+    """What named the rule file, for an error: the variable, or the projected file."""
+    rule_file_path()
+    return _RULE_FILE_SOURCE[0]
 
 
 def disk_redaction_enabled() -> bool:
@@ -416,6 +431,7 @@ def reset_operator_rules() -> None:
         _RULES.clear()
         _REDACTOR_MODULE.clear()
         _RULE_FILE.clear()
+        _RULE_FILE_SOURCE.clear()
 
 
 def _redactor_module():
@@ -427,9 +443,13 @@ def _redactor_module():
     if _REDACTOR_MODULE:
         return _REDACTOR_MODULE[0]
     path = (os.environ.get(REDACTOR_MODULE_ENV) or "").strip() or DEFAULT_REDACTOR_MODULE
+    if not os.path.isfile(path):
+        raise ValueError(f"the shared redactor module is not at {path} ({REDACTOR_MODULE_ENV} unset)"
+                         if path == DEFAULT_REDACTOR_MODULE else
+                         f"{REDACTOR_MODULE_ENV}: the shared redactor module is not at {path}")
     spec = importlib.util.spec_from_file_location(REDACTOR_MODULE_NAME, path)
     if spec is None or spec.loader is None:
-        raise ValueError(f"{REDACTOR_MODULE_ENV}: cannot load the redactor module from {path}")
+        raise ValueError(f"cannot load the shared redactor module from {path}")
     module = importlib.util.module_from_spec(spec)
     # Its frozen dataclasses resolve annotations through sys.modules.
     sys.modules[spec.name] = module
@@ -446,21 +466,22 @@ def _load_rules(path: str) -> list:
     """
     import yaml  # the Hermes venv ships it; not needed when the switch is off
 
+    source = rule_file_source()
     try:
         with open(path, encoding=RULE_FILE_ENCODING) as handle:
             config = yaml.safe_load(handle)
     except OSError as error:
-        raise ValueError(f"{RULE_FILE_ENV}: cannot read {path}: {error}") from error
+        raise ValueError(f"{source}: cannot read {path}: {error}") from error
     except yaml.YAMLError as error:
-        raise ValueError(f"{RULE_FILE_ENV}: {path} is not valid YAML: {error}") from error
+        raise ValueError(f"{source}: {path} is not valid YAML: {error}") from error
     if config is None:
         config = {}
     if not isinstance(config, dict):
-        raise ValueError(f"{RULE_FILE_ENV}: {path} must hold a mapping, got {type(config).__name__}")
+        raise ValueError(f"{source}: {path} must hold a mapping, got {type(config).__name__}")
     try:
         return _redactor_module().AuditRedactor.rules_from_config(config)
     except ValueError as error:
-        raise ValueError(f"{RULE_FILE_ENV}: {path}: {error}") from error
+        raise ValueError(f"{source}: {path}: {error}") from error
 
 
 def operator_rules() -> list:
@@ -499,6 +520,12 @@ def install_operator_rules(upstream: Callable[..., str]) -> Callable[..., str]:
     if not disk_redaction_enabled() or getattr(upstream, RULES_INSTALLED_MARKER, False):
         return upstream
     operator_rules()  # load now: a bad file fails the import, not the first write
+    # Resolve the pseudonym salt now, while the log formatter still runs the
+    # plain upstream redactor. ``_resolve_salt`` logs its missing-salt warning
+    # under a non-reentrant lock; once the composition below is in place that
+    # warning would be redacted on the same thread, and a pseudonym rule
+    # matching a word in it would re-enter the lock and hang the process.
+    _redactor_module().AuditRedactor.hmac_hash(RULES_INSTALLED_MARKER)
 
     @functools.wraps(upstream)
     def redact(text: str, *args, **kwargs) -> str:
@@ -521,6 +548,48 @@ def _redact_structure(value: Any, redact: Redactor) -> Any:
     return value
 
 
+def _redact_arguments(arguments: Any, redact: Redactor) -> Any:
+    """A tool call's arguments, redacted the way the gateway's hook does it.
+
+    The parsed document is walked rather than the raw string, so the stored
+    arguments still parse when Hermes replays the turn, and the result is
+    re-serialised only when something changed. Arguments that are not JSON are
+    redacted as text; arguments already an object are walked as they are.
+    """
+    if not isinstance(arguments, str):
+        return _redact_structure(arguments, redact)
+    try:
+        parsed = json.loads(arguments)
+    except ValueError:
+        return redact(arguments)
+    redacted = _redact_structure(parsed, redact)
+    if redacted == parsed:
+        return arguments
+    return json.dumps(redacted, ensure_ascii=False)
+
+
+def _redact_tool_calls(tool_calls: Any, redact: Redactor) -> Any:
+    """Copies of the calls with only ``function.arguments`` redacted.
+
+    The call id, its type and the function name are structure: Hermes matches
+    the id against the tool row's ``tool_call_id`` and dispatches on the name
+    when it replays the turn, so a rule loose enough to match them would break
+    the session. The gateway's hook leaves them alone for the same reason.
+    """
+    if not isinstance(tool_calls, list):
+        return tool_calls
+    redacted_calls = []
+    for call in tool_calls:
+        function = call.get(TOOL_CALL_FUNCTION_KEY) if isinstance(call, dict) else None
+        if isinstance(function, dict) and function.get(TOOL_CALL_ARGUMENTS_KEY) is not None:
+            call = {**call, TOOL_CALL_FUNCTION_KEY: {
+                **function,
+                TOOL_CALL_ARGUMENTS_KEY: _redact_arguments(function[TOOL_CALL_ARGUMENTS_KEY], redact),
+            }}
+        redacted_calls.append(call)
+    return redacted_calls
+
+
 def redact_store_text(value: Any, redact: Redactor | None = None) -> Any:
     """A string bound for the kanban board, redacted when the switch is on.
 
@@ -538,9 +607,10 @@ def redact_message_for_store(
     """The message dict and tool calls as the session store should persist them.
 
     When the switch is off both come back as the same objects. On, the text
-    fields in MESSAGE_TEXT_FIELDS and every string inside ``tool_calls``
-    (parsed, or still the JSON text some callers pass) go through ``redact``,
-    in copies; counters, ids, flags and the rest of the dict are untouched.
+    fields in MESSAGE_TEXT_FIELDS go through ``redact`` in copies, and each
+    tool call's ``function.arguments`` (the list, or still the JSON text some
+    callers pass) is redacted as the gateway's hook does it; call ids, types,
+    function names, counters, flags and the rest of the dict are untouched.
     """
     if not disk_redaction_enabled() or not isinstance(msg, dict):
         return msg, tool_calls
@@ -554,5 +624,6 @@ def redact_message_for_store(
             parsed = json.loads(tool_calls)
         except ValueError:
             return redacted, redactor(tool_calls)
-        return redacted, json.dumps(_redact_structure(parsed, redactor))
-    return redacted, _redact_structure(tool_calls, redactor)
+        redacted_calls = _redact_tool_calls(parsed, redactor)
+        return redacted, tool_calls if redacted_calls == parsed else json.dumps(redacted_calls)
+    return redacted, _redact_tool_calls(tool_calls, redactor)

@@ -17,9 +17,11 @@ this proves the behaviour the issue asked for, against the patched tree:
   with the operator opt-out set is still redacted;
 * with ``KUBE_AGENTS_REDACTION_CONFIG`` naming a rule file, ``redact_sensitive_text``
   is the composed form and applies the operator's rules, a session-store write
-  lands redacted in ``state.db`` and a kanban card's title, body, result and
-  summary land redacted on the board; without the variable the store and the
-  board are written as before (issue #1985).
+  lands redacted in ``state.db`` and a kanban card's title, body, result,
+  summary, a comment's body and a block's reason land redacted on the board;
+  without the variable the store and the board are written as before (issue
+  #1985). The runtime module path the image uses instead of the variable is
+  asserted later in the build, once ``/opt/defaults`` exists.
 
 Usage::
 
@@ -342,7 +344,13 @@ kanban_db.complete_task(conn, task_id, result=f"done on {cluster} at {ip} with {
                         summary=f"summary {token}", fire_lifecycle_hook=False)
 row = conn.execute("SELECT title, body, result FROM tasks WHERE id = ?", (task_id,)).fetchone()
 summary = [list(r) for r in conn.execute("SELECT summary FROM task_runs WHERE task_id = ?", (task_id,)).fetchall()]
-print("kanban=" + json.dumps([list(row), summary]))
+comment_id = kanban_db.add_comment(conn, task_id, "verify", f"comment {token} on {cluster} at {ip}")
+comment = conn.execute("SELECT body FROM task_comments WHERE id = ?", (comment_id,)).fetchone()[0]
+blocked_id = kanban_db.create_task(conn, title="second card", body="plain", created_by="verify")
+kanban_db.block_task(conn, blocked_id, reason=f"blocked on {cluster} ({ip}) with {token}")
+blocked = [list(r) for r in conn.execute("SELECT summary FROM task_runs WHERE task_id = ?", (blocked_id,)).fetchall()]
+events = [str(tuple(r)) for r in conn.execute("SELECT * FROM task_events WHERE task_id = ?", (blocked_id,)).fetchall()]
+print("kanban=" + json.dumps([list(row), summary, comment, blocked, events]))
 """
 REDACTOR_MODULE = os.environ.get("KUBE_AGENTS_REDACTOR_MODULE", "")
 check("KUBE_AGENTS_REDACTOR_MODULE names the shared redactor", bool(REDACTOR_MODULE) and Path(REDACTOR_MODULE).is_file(), REDACTOR_MODULE)
@@ -372,6 +380,7 @@ kanban_line = next((line for line in on.splitlines() if line.startswith("kanban=
 check("the board holds no token, cluster name or address", kanban_line and not leaked(kanban_line)
       and CLUSTER_NAME not in kanban_line and POD_IP not in kanban_line, kanban_line[:DETAIL_CHARS])
 check("the board's result and summary were written", "done on" in kanban_line and "summary" in kanban_line, kanban_line[:DETAIL_CHARS])
+check("a comment body and a block reason were written, redacted", "comment" in kanban_line and "blocked on" in kanban_line, kanban_line[:DETAIL_CHARS])
 
 with tempfile.TemporaryDirectory() as plain_home:
     off = run_rules_child("", plain_home)
