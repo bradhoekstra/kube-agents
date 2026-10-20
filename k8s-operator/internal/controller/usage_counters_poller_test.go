@@ -726,7 +726,7 @@ func TestUsagePoller_ReseedsAnInvalidDocument(t *testing.T) {
 		mutate func(*usageDocument)
 	}{
 		{"another CR's UID", func(d *usageDocument) { d.AgentUID = "predecessor" }},
-		{"a total above the int64 headroom", func(d *usageDocument) { d.Totals[usageCounterToolExecutions] = usageTotalCeiling + 1 }},
+		{"a total above the float64-exact ceiling", func(d *usageDocument) { d.Totals[usageCounterToolExecutions] = usageTotalCeiling + 1 }},
 		{"a total below the status", func(d *usageDocument) { d.Totals[usageCounterToolExecutions] = 1 }},
 		{"a first-recorded time in the future", func(d *usageDocument) { d.FirstRecorded = metav1.NewTime(usageClock(59)) }},
 		{"a first-recorded time before the CR", func(d *usageDocument) { d.FirstRecorded = metav1.NewTime(created.Add(-time.Minute)) }},

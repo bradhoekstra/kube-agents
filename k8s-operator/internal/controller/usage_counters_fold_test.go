@@ -942,9 +942,9 @@ func TestFoldUsage_TwoNewReplicasInOnePollDoNotDoubleCount(t *testing.T) {
 	}
 }
 
-// A total reaches the status through unstructured JSON, where it is a float64,
-// so the ceiling is the largest integer that representation keeps exact, and
-// no total under it can come back changed.
+// A reader that decodes the CR untyped gets a float64, so the ceiling is the
+// largest integer that representation keeps exact: it survives the round trip
+// itself, and the next integer does not.
 func TestUsageTotalCeiling_IsExactAsAFloat64(t *testing.T) {
 	const exact = int64(1) << 53
 	if usageTotalCeiling != exact {
@@ -952,6 +952,9 @@ func TestUsageTotalCeiling_IsExactAsAFloat64(t *testing.T) {
 	}
 	if back := int64(float64(usageTotalCeiling)); back != usageTotalCeiling {
 		t.Fatalf("the ceiling does not survive a float64 round trip: %d", back)
+	}
+	if float64(usageTotalCeiling+1) != float64(usageTotalCeiling) {
+		t.Fatalf("the ceiling is not the largest exact integer: %d is exact too", usageTotalCeiling+1)
 	}
 }
 

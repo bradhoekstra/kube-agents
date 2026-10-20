@@ -151,7 +151,10 @@ class UsageCountersSeriesNamesTest(unittest.TestCase):
             match = re.search(rf"{name}\s*=\s*map\[string\]bool\{{([^}}]*)\}}", source)
             self.assertIsNotNone(match, f"{name} not found")
             sets |= set(re.findall(r'"([^"]+)":\s*true', match.group(1)))
-        vocabulary = set(re.findall(r'^TOOL_STATUS_(?!LABEL\b)\w+\s*=\s*"([^"]+)"', _BROKER_PY.read_text(), re.M))
+        # Any module-level declaration shape: a bare name or an annotated one
+        # (NAME: Final = ...), either quote style, so a constant written in a
+        # shape this test did not foresee is still read rather than skipped.
+        vocabulary = set(re.findall(r'^TOOL_STATUS_(?!LABEL\b)\w+(?:\s*:[^=\n]+)?\s*=\s*["\']([^"\']+)["\']', _BROKER_PY.read_text(), re.M))
         self.assertTrue(vocabulary, "no TOOL_STATUS_* constants found in the broker")
         self.assertEqual(vocabulary, sets)
 

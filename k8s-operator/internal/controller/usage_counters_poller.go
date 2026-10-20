@@ -819,7 +819,7 @@ func (p *UsageCounterPoller) readDocument(ctx context.Context, log logr.Logger, 
 // bounds are the design's: the CR's UID in the document and on the owner
 // reference, the first-recorded time inside the CR's life and not in the
 // future, every sample and total non-negative and finite, every total under
-// the int64 headroom and not below the status it projects to.
+// the float64-exact ceiling and not below the status it projects to.
 func usageDocumentInvalid(doc *usageDocument, cm *corev1.ConfigMap, agent *agentv1alpha1.PlatformAgent, now time.Time) string {
 	if doc.Version != usageDocumentVersion {
 		return "unknown document version"
