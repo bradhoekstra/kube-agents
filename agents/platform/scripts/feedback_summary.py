@@ -7,7 +7,7 @@ module assembles that block from three sources and nothing else:
 
 * the ``PlatformAgent`` resource, read with ``kubectl get`` (required): mode,
   image tag, readiness, install age and ``status.usage``;
-* the gateway pod, through one ``kubectl exec`` each (optional): the session-kv
+* the gateway pod, through one ``kubectl exec`` for each (optional): the session-kv
   task feed on its loopback port, rolled up to counts and durations, and the
   inference gateway's Prometheus text for token, spend and latency figures;
 * ``kubectl version`` and the gateway's ConfigMap for the Kubernetes version and
@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import functools
 import datetime as dt
 import json
 import re
@@ -45,8 +46,8 @@ RECENT_TASKS_SHOWN = 5
 TASK_FEED_LIMIT = 200
 DEFAULT_NAMESPACE = "kubeagents-system"
 DEFAULT_AGENT_NAME = "platform-agent"
-GATEWAY_POD_LABEL = "app.kubernetes.io/component=gateway"
-GATEWAY_POD_PREFIX = "-gateway-"
+GATEWAY_POD_INFIX = "-gateway-"
+POD_PHASE_RUNNING = "Running"
 AGENT_CONTAINER = "platform-agent"
 SESSION_KV_URL = "http://127.0.0.1:8699/v1/tasks"
 SESSION_KV_KEY_ENV = "SESSION_KV_API_KEY"
@@ -65,6 +66,23 @@ EXIT_LEAK = 3
 UNAVAILABLE = "unavailable"
 NEVER = "never"
 UNKNOWN = "unknown"
+NONE = "none"
+DEFAULT_MODE = "today"
+READY_CONDITION = "Ready"
+OTHER_BUCKET = "other"
+SPEND_CURRENCY = "USD"
+TRUNCATED_SUFFIX = "+"
+SECONDS_PER_MINUTE = 60
+SECONDS_PER_HOUR = 3600
+SECONDS_PER_DAY = 86400
+#: The two spec strings the block prints by design; every other string leaf of
+#: the spec is an identifier the block must not carry.
+PRINTED_SPEC_PATHS: Tuple[Tuple[str, ...], ...] = (("mode",), ("deployment", "tag"))
+MIN_IDENTIFIER_LENGTH = 3
+IDENTIFIER_BOUNDARY = r"[A-Za-z0-9_.-]"
+TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_.-]+")
+#: The instant the template is rendered at to learn its own vocabulary.
+TEMPLATE_EPOCH = dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc)
 #: ``status.usage`` fields, in the order the block prints them; a missing one prints 0.
 USAGE_COUNTERS: Tuple[str, ...] = (
     "clustersRegistered",
@@ -81,7 +99,6 @@ STATUS_BUCKETS: Mapping[str, str] = {
     "done": "done",
     "archived": "done",
     "blocked": "blocked",
-    "gave_up": "gave_up",
     "running": "active",
     "ready": "active",
     "todo": "active",
@@ -89,7 +106,7 @@ STATUS_BUCKETS: Mapping[str, str] = {
     "scheduled": "active",
     "review": "active",
 }
-BUCKET_ORDER: Tuple[str, ...] = ("done", "blocked", "gave_up", "active", "other")
+BUCKET_ORDER: Tuple[str, ...] = ("done", "blocked", "active", OTHER_BUCKET)
 #: Prometheus families the inference gateway may publish, by LiteLLM version.
 TOKEN_FAMILIES: Mapping[str, Tuple[str, ...]] = {
     "in": ("litellm_input_tokens_metric_total", "litellm_input_tokens_metric", "litellm_input_tokens_total", "litellm_input_tokens"),
@@ -141,18 +158,42 @@ class Snapshot:
     tasks: Optional[Sequence[Mapping[str, Any]]]
     litellm_metrics: Optional[str]
     sources: Mapping[str, bool]
+    tasks_truncated: bool = False
 
     @property
     def identifiers(self) -> List[str]:
-        """Strings read from the resource that must never appear in the block."""
-        harness = (self.cr.get("spec") or {}).get("harness") or {}
+        """Strings read from the resource that must never appear in the block.
+
+        Every string leaf of the spec except the two the block prints by design,
+        plus the resource's name and namespace: cluster, project, location,
+        scope entries, repositories, channels, whatever the install declared.
+        """
+        spec = self.cr.get("spec") or {}
         metadata = self.cr.get("metadata") or {}
-        values = [harness.get("clusterName"), harness.get("projectId"), metadata.get("namespace")]
-        return [v for v in values if isinstance(v, str) and v]
+        printed = {_spec_value(spec, path) for path in PRINTED_SPEC_PATHS}
+        values = [metadata.get("name"), metadata.get("namespace"), *_string_leaves(spec)]
+        seen: List[str] = []
+        for value in values:
+            if isinstance(value, str) and len(value) >= MIN_IDENTIFIER_LENGTH and value not in printed and value not in seen:
+                seen.append(value)
+        return seen
 
 
-def build_snapshot(**fields: Any) -> Snapshot:
-    return Snapshot(**fields)
+def _spec_value(spec: Mapping[str, Any], path: Sequence[str]) -> Any:
+    value: Any = spec
+    for key in path:
+        value = value.get(key) if isinstance(value, Mapping) else None
+    return value
+
+
+def _string_leaves(value: Any) -> List[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, Mapping):
+        return [leaf for item in value.values() for leaf in _string_leaves(item)]
+    if isinstance(value, (list, tuple)):
+        return [leaf for item in value for leaf in _string_leaves(item)]
+    return []
 
 
 # --- parsing -------------------------------------------------------------------
@@ -247,7 +288,7 @@ def _as_epoch(value: Any) -> Optional[float]:
 
 def summarise_tasks(tasks: Sequence[Mapping[str, Any]], now: dt.datetime) -> Dict[str, Any]:
     """Counts by bucket, completion quantiles and the newest completed rows, without any text."""
-    cutoff = now.timestamp() - TASK_WINDOW_DAYS * 86400
+    cutoff = now.timestamp() - TASK_WINDOW_DAYS * SECONDS_PER_DAY
     buckets: Dict[str, int] = {bucket: 0 for bucket in BUCKET_ORDER}
     durations: List[float] = []
     recent: List[Tuple[float, str, float]] = []
@@ -258,7 +299,7 @@ def summarise_tasks(tasks: Sequence[Mapping[str, Any]], now: dt.datetime) -> Dic
         if latest is None or latest < cutoff:
             continue
         status = str(task.get("status") or "")
-        bucket = STATUS_BUCKETS.get(status, "other")
+        bucket = STATUS_BUCKETS.get(status, OTHER_BUCKET)
         buckets[bucket] += 1
         if completed is not None and created is not None:
             duration = max(0.0, completed - created)
@@ -277,43 +318,65 @@ def _nearest_rank(ordered: Sequence[float], quantile: float) -> float:
     return ordered[min(len(ordered) - 1, int(round(quantile * (len(ordered) - 1))))]
 
 
+@functools.lru_cache(maxsize=1)
+def template_tokens() -> frozenset:
+    """Every token the block prints with no source at all: the template's own vocabulary."""
+    empty = Snapshot(generated_at=TEMPLATE_EPOCH, cr={}, server_version=None, litellm_config=None,
+                     tasks=None, litellm_metrics=None, sources={})
+    return frozenset(TOKEN_PATTERN.findall(render(empty)))
+
+
 def audit(text: str, identifiers: Iterable[str]) -> List[str]:
-    """The identifiers that appear in ``text``; an empty list means the block is clean."""
-    return [identifier for identifier in identifiers if identifier and identifier in text]
+    """The identifiers that appear in ``text`` as whole tokens; an empty list means the block is clean.
+
+    Whole tokens, not substrings, and never a word the template prints on its
+    own: a namespace called ``kube-agents`` is not a leak because the title says
+    ``kube-agents``, and a cluster called ``today`` is not one because the mode
+    line can. Such an identifier cannot be told apart from the template, so the
+    audit does not try; everything else that the resource declared is refused.
+    """
+    leaked = []
+    for identifier in identifiers:
+        if not identifier or identifier in template_tokens():
+            continue
+        pattern = rf"(?<!{IDENTIFIER_BOUNDARY}){re.escape(identifier)}(?!{IDENTIFIER_BOUNDARY})"
+        if re.search(pattern, text):
+            leaked.append(identifier)
+    return leaked
 
 
 # --- rendering ------------------------------------------------------------------
 
 def _duration(seconds: float) -> str:
     seconds = int(round(seconds))
-    if seconds < 60:
+    if seconds < SECONDS_PER_MINUTE:
         return f"{seconds}s"
-    minutes, rest = divmod(seconds, 60)
-    if minutes < 60:
+    minutes, rest = divmod(seconds, SECONDS_PER_MINUTE)
+    if minutes < SECONDS_PER_MINUTE:
         return f"{minutes}m{rest:02d}s" if rest else f"{minutes}m"
-    hours, minutes = divmod(minutes, 60)
+    hours, minutes = divmod(minutes, SECONDS_PER_MINUTE)
     return f"{hours}h{minutes:02d}m"
 
 
 def _age(seconds: float) -> str:
     seconds = int(seconds)
-    if seconds < 3600:
-        return f"{max(1, seconds // 60)}m ago"
-    if seconds < 86400:
-        return f"{seconds // 3600}h ago"
-    return f"{seconds // 86400}d ago"
+    if seconds < SECONDS_PER_HOUR:
+        return f"{max(1, seconds // SECONDS_PER_MINUTE)}m ago"
+    if seconds < SECONDS_PER_DAY:
+        return f"{seconds // SECONDS_PER_HOUR}h ago"
+    return f"{seconds // SECONDS_PER_DAY}d ago"
 
 
 def _install_age(cr: Mapping[str, Any], now: dt.datetime) -> str:
     created = _as_epoch((cr.get("metadata") or {}).get("creationTimestamp"))
     if created is None:
         return UNKNOWN
-    return f"{int((now.timestamp() - created) // 86400)} days"
+    return f"{int((now.timestamp() - created) // SECONDS_PER_DAY)} days"
 
 
 def _ready(cr: Mapping[str, Any]) -> str:
     for condition in (cr.get("status") or {}).get("conditions") or []:
-        if condition.get("type") == "Ready":
+        if condition.get("type") == READY_CONDITION:
             return str(condition.get("status", UNKNOWN)).lower()
     return UNKNOWN
 
@@ -330,12 +393,12 @@ def render(snapshot: Snapshot) -> str:
     usage = status.get("usage") or {}
     lines: List[str] = ["```", f"{SUMMARY_TITLE} ({now.strftime('%Y-%m-%d')})", "environment:"]
     lines.append(f"  version: {(spec.get('deployment') or {}).get('tag') or UNKNOWN}")
-    lines.append(f"  mode: {spec.get('mode') or 'today'}")
+    lines.append(f"  mode: {spec.get('mode') or DEFAULT_MODE}")
     lines.append(f"  model: {model_from_litellm_config(snapshot.litellm_config) or UNAVAILABLE}")
     lines.append(f"  kubernetes: {_server_version(snapshot.server_version)}")
     lines.append(f"  installed: {_install_age(cr, now)}; ready: {_ready(cr)}")
     interfaces = usage.get("activeInterfaces") or []
-    lines.append(f"  interfaces: {', '.join(sorted(str(i) for i in interfaces)) or 'none'}")
+    lines.append(f"  interfaces: {', '.join(sorted(str(i) for i in interfaces)) or NONE}")
     lines.append("usage:")
     for counter in USAGE_COUNTERS:
         lines.append(f"  {counter}: {int(usage.get(counter) or 0)}")
@@ -351,14 +414,15 @@ def render(snapshot: Snapshot) -> str:
         tokens_in = tokens_out = spend = latency = None
     tokens = f"in {int(tokens_in)} / out {int(tokens_out)}" if tokens_in is not None and tokens_out is not None else UNAVAILABLE
     lines.append(f"  tokens: {tokens}")
-    lines.append(f"  spend: {spend:.2f} USD" if spend is not None else f"  spend: {UNAVAILABLE}")
+    lines.append(f"  spend: {spend:.2f} {SPEND_CURRENCY}" if spend is not None else f"  spend: {UNAVAILABLE}")
     lines.append(f"  latency p50 {latency[0]:.1f}s / p95 {latency[1]:.1f}s" if latency else f"  latency: {UNAVAILABLE}")
     if snapshot.tasks is None:
         lines.append(f"tasks ({TASK_WINDOW_DAYS} days): {UNAVAILABLE}")
     else:
         rollup = summarise_tasks(snapshot.tasks, now)
         counts = ", ".join(f"{bucket} {rollup['buckets'][bucket]}" for bucket in BUCKET_ORDER if rollup["buckets"][bucket])
-        lines.append(f"tasks ({TASK_WINDOW_DAYS} days): {rollup['total']}" + (f" ({counts})" if counts else ""))
+        total = f"{rollup['total']}{TRUNCATED_SUFFIX if snapshot.tasks_truncated else ''}"
+        lines.append(f"tasks ({TASK_WINDOW_DAYS} days): {total}" + (f" ({counts})" if counts else ""))
         if rollup["quantiles"]:
             lines.append(f"  completed p50 {_duration(rollup['quantiles'][0])} / p95 {_duration(rollup['quantiles'][1])}")
         for age, status_name, duration in rollup["recent"]:
@@ -399,8 +463,10 @@ def _gateway_pod(options: Options) -> Optional[str]:
     except ValueError:
         return None
     for item in items:
-        name = (item.get("metadata") or {}).get("name") or ""
-        if GATEWAY_POD_PREFIX in name and (item.get("status") or {}).get("phase") == "Running":
+        metadata = item.get("metadata") or {}
+        name = metadata.get("name") or ""
+        running = (item.get("status") or {}).get("phase") == POD_PHASE_RUNNING
+        if name.startswith(options.name + GATEWAY_POD_INFIX) and running and not metadata.get("deletionTimestamp"):
             return name
     return None
 
@@ -445,11 +511,12 @@ def collect(options: Options) -> Snapshot:
             server_version = None
     litellm_config = _litellm_config(options)
     tasks: Optional[Sequence[Mapping[str, Any]]] = None
+    truncated = False
     metrics: Optional[str] = None
     if options.in_pod:
         pod = _gateway_pod(options)
         if pod:
-            since = int(now.timestamp()) - TASK_WINDOW_DAYS * 86400
+            since = int(now.timestamp()) - TASK_WINDOW_DAYS * SECONDS_PER_DAY
             feed = _in_pod_curl(
                 options, pod,
                 f'curl -sS -m {CURL_TIMEOUT_SECONDS} -H "X-API-Key: ${SESSION_KV_KEY_ENV}" '
@@ -457,7 +524,9 @@ def collect(options: Options) -> Snapshot:
             )
             if feed:
                 try:
-                    tasks = json.loads(feed).get("tasks")
+                    body = json.loads(feed)
+                    tasks = body.get("tasks")
+                    truncated = bool(body.get("truncated"))
                 except ValueError:
                     tasks = None
             metrics = _in_pod_curl(options, pod, f"curl -sSL -m {CURL_TIMEOUT_SECONDS} {INFERENCE_GATEWAY_METRICS_URL}")
@@ -465,7 +534,7 @@ def collect(options: Options) -> Snapshot:
                 metrics = None
     return Snapshot(
         generated_at=now, cr=cr, server_version=server_version, litellm_config=litellm_config,
-        tasks=tasks, litellm_metrics=metrics,
+        tasks=tasks, litellm_metrics=metrics, tasks_truncated=truncated,
         sources={"session-kv": tasks is not None, "litellm-metrics": metrics is not None},
     )
 
@@ -485,6 +554,9 @@ def main(argv: Optional[Sequence[str]] = None, stdout: TextIO = sys.stdout, stde
         print(f"feedback-summary: {error}", file=stderr)
         return EXIT_COLLECT
     text = render(snapshot)
+    missing = [name for name, present in snapshot.sources.items() if not present]
+    if missing and options.in_pod:
+        print(f"feedback-summary: {', '.join(missing)} unavailable; the in-pod sources need pods/exec on the gateway pod", file=stderr)
     leaked = audit(text, snapshot.identifiers)
     if leaked:
         print(f"feedback-summary: refused to print: the block names {', '.join(leaked)}", file=stderr)

@@ -55,13 +55,13 @@ The `tool_call_audit` plugin (enabled on the Planning Agent and Platform Agent p
 
 ## Sharing a usage and feedback summary
 
-An install that cannot send telemetry can still share how it is doing: `scripts/feedback-summary.sh` prints one fenced Markdown block, short enough to read in full before pasting it into an email or a chat message. It reads the `PlatformAgent` resource with `kubectl get` and, unless `--no-exec` is given, runs one `kubectl exec` into the gateway pod for the optional figures: the kanban task feed on the pod's loopback (counts by status and completion times, never a title or a result) and the inference gateway's Prometheus text (tokens, spend and latency, when the gateway publishes them). A source that cannot be read prints as `unavailable`, so the block has the same shape on a `today` and a `next` install.
+An install that cannot send telemetry can still share how it is doing: `scripts/feedback-summary.sh` prints one fenced Markdown block, short enough to read in full before pasting it into an email or a chat message. It writes nothing. It reads the `PlatformAgent` resource with `kubectl get` and, unless `--no-exec` is given, runs two `kubectl exec` calls into the gateway pod (which need `pods/exec`) for the optional figures: the kanban task feed on the pod's loopback (counts by status and completion times, never a title or a result) and the inference gateway's Prometheus text (tokens, spend and latency, when the gateway publishes them). A source that cannot be read prints as `unavailable`, with one line on stderr saying so, and the block has the same shape on a `today` and a `next` install. A task count with a `+` means the feed was cut at its ceiling.
 
 ```bash
 scripts/feedback-summary.sh --namespace kubeagents-system
 ```
 
-The block carries the image tag, the mode, the model, the Kubernetes version, the install's age and readiness, the `status.usage` counters, the performance figures and a short feedback template. It names no cluster, project, namespace, user or workload: the script refuses to print, with exit code 3, if any identifier it read from the resource appears in the block. On a `next` install the task feed is the Platform Agent's own board; per-conversation session pods keep no board.
+The block carries the image tag, the mode, the model, the Kubernetes version, the install's age and readiness, the `status.usage` counters, the performance figures and a short feedback template. It names no cluster, project, namespace, user or workload: the script refuses to print, with exit code 3, if any string from the resource's spec other than the mode and the image tag appears in the block as a whole token. On a `next` install the task feed is the Platform Agent's own board; per-conversation session pods keep no board.
 
 ## Where to go next
 

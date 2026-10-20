@@ -30,6 +30,8 @@ CR = {
         "mode": "today",
         "deployment": {"tag": TAG},
         "harness": {"clusterName": CLUSTER, "projectId": PROJECT, "location": "us-central1"},
+        "scope": {"projects": ["acme-scope-dev"], "exclude": {"clusters": ["old-cluster"]}},
+        "integration": {"gitops": {"repository": "acme/gitops"}},
     },
     "status": {
         "conditions": [{"type": "Ready", "status": "True"}],
@@ -82,7 +84,7 @@ TASKS = [
     _task("done", 10, 95),
     _task("done", 60, 310),
     _task("blocked", 120, 40),
-    _task("gave_up", 600, 2000),
+    _task("blocked", 600, 2000),
     _task("running", 2),
     _task("done", 30 * 24 * 60, 50),  # outside the window
 ]
@@ -112,7 +114,7 @@ def full_snapshot(**overrides):
         sources={"session-kv": True, "litellm-metrics": True},
     )
     base.update(overrides)
-    return fs.build_snapshot(**base)
+    return fs.Snapshot(**base)
 
 
 class RenderTest(unittest.TestCase):
@@ -142,6 +144,30 @@ class RenderTest(unittest.TestCase):
     def test_audit_names_a_leaked_identifier(self):
         self.assertEqual(fs.audit(f"all good on {CLUSTER}", [CLUSTER, PROJECT]), [CLUSTER])
 
+    def test_audit_matches_whole_tokens_only(self):
+        text = fs.render(full_snapshot())
+        self.assertEqual(fs.audit(text, ["kube-agents", "today", "usage", "0.14"]), [])
+        self.assertEqual(fs.audit("version: 0.14.0-rc", ["0.14.0"]), [])
+        self.assertEqual(fs.audit("cluster prod-eu-1 here", ["prod-eu-1"]), ["prod-eu-1"])
+
+    def test_identifiers_are_every_spec_string_but_the_printed_two(self):
+        ids = full_snapshot().identifiers
+        for expected in (CLUSTER, PROJECT, NAMESPACE, "us-central1", "acme-scope-dev", "old-cluster", "acme/gitops", "platform-agent"):
+            self.assertIn(expected, ids)
+        self.assertNotIn(TAG, ids)
+        self.assertNotIn("today", ids)
+
+    def test_a_namespace_named_kube_agents_is_not_a_leak(self):
+        cr = json.loads(json.dumps(CR))
+        cr["metadata"]["namespace"] = "kube-agents"
+        cr["spec"]["harness"]["clusterName"] = "today"
+        snapshot = full_snapshot(cr=cr)
+        self.assertEqual(fs.audit(fs.render(snapshot), snapshot.identifiers), [])
+
+    def test_a_truncated_feed_prints_a_plus(self):
+        text = fs.render(full_snapshot(tasks_truncated=True))
+        self.assertIn("tasks (14 days): 5+ (", text)
+
     def test_rendering_is_deterministic(self):
         self.assertEqual(fs.render(full_snapshot()), fs.render(full_snapshot()))
 
@@ -149,12 +175,13 @@ class RenderTest(unittest.TestCase):
         text = fs.render(full_snapshot())
         self.assertIn("tasks (14 days): 5", text)
         self.assertIn("done 2", text)
-        self.assertIn("blocked 1", text)
-        self.assertIn("gave_up 1", text)
+        self.assertIn("blocked 2", text)
+        self.assertNotIn("gave_up", text)
         self.assertIn("active 1", text)
         self.assertIn("completed p50 1m35s / p95 5m10s", text)
         # the newest completed tasks, one line each, without titles
         self.assertRegex(text, r"\n  - 10m ago +done +1m35s\n")
+        self.assertIn("  - 10h ago  blocked  33m20s", text)
         self.assertNotIn("prod-eu", text)
 
     def test_tokens_and_spend_come_from_the_gateway_metrics(self):
@@ -241,8 +268,12 @@ class CollectTest(unittest.TestCase):
                 {"metadata": {"name": "other"}, "data": {"config.yaml": "model: x/y\n"}},
                 {"metadata": {"name": "litellm-config-k4b9ht22c7"}, "data": {"config.yaml": LITELLM_CONFIG_YAML}},
             ]}),
-            "get pods": json.dumps({"items": [{"metadata": {"name": "platform-agent-gateway-x"}, "status": {"phase": "Running"}}]}),
-            "/v1/tasks": json.dumps({"tasks": TASKS, "truncated": False, "board": True}),
+            "get pods": json.dumps({"items": [
+                {"metadata": {"name": "other-agent-gateway-y"}, "status": {"phase": "Running"}},
+                {"metadata": {"name": "platform-agent-gateway-old", "deletionTimestamp": "2026-10-20T17:00:00Z"}, "status": {"phase": "Running"}},
+                {"metadata": {"name": "platform-agent-gateway-x"}, "status": {"phase": "Running"}},
+            ]}),
+            "/v1/tasks": json.dumps({"tasks": TASKS, "truncated": True, "board": True}),
             "/metrics": LITELLM_METRICS,
         })
         with mock.patch.object(fs.subprocess, "run", run):
@@ -252,9 +283,18 @@ class CollectTest(unittest.TestCase):
         self.assertIn("tasks (14 days): 5", text)
         self.assertIn("model: vertex_ai/claude-opus-5", text)
         self.assertEqual(fs.audit(text, [CLUSTER, PROJECT, NAMESPACE]), [])
+        self.assertTrue(snapshot.tasks_truncated)
+        self.assertIn("tasks (14 days): 5+ (", text)
         exec_calls = [c for c in calls if "exec" in c]
         self.assertEqual(len(exec_calls), 2)
-        self.assertTrue(all("-c" in c and "platform-agent" in c for c in exec_calls))
+        for c in exec_calls:
+            self.assertEqual(c[:4], ["kubectl", "exec", "-n", NAMESPACE])
+            self.assertEqual(c[4], "platform-agent-gateway-x")
+            self.assertEqual(c[5:9], ["-c", "platform-agent", "--", "sh"])
+        feed_shell = exec_calls[0][-1]
+        self.assertIn('-H "X-API-Key: $SESSION_KV_API_KEY"', feed_shell)
+        self.assertIn("http://127.0.0.1:8699/v1/tasks?since=", feed_shell)
+        self.assertIn("http://inference-gateway/metrics/", exec_calls[1][-1])
         self.assertTrue(all(c[0] == "kubectl" for c in calls))
 
     def test_without_the_cr_the_collector_fails_loudly(self):
@@ -275,6 +315,10 @@ class CollectTest(unittest.TestCase):
         text = fs.render(snapshot)
         self.assertIn("tasks (14 days): unavailable", text)
         self.assertIn("tokens: unavailable", text)
+        err = io.StringIO()
+        with mock.patch.object(fs, "collect", return_value=snapshot):
+            self.assertEqual(fs.main(["--namespace", NAMESPACE], stdout=io.StringIO(), stderr=err), 0)
+        self.assertIn("pods/exec", err.getvalue())
 
     def test_no_exec_skips_the_in_pod_sources(self):
         run, calls = self.fake_run({"get platformagent": json.dumps(CR)})
