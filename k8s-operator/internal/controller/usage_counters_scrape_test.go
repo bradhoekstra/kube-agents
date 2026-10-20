@@ -234,6 +234,7 @@ func TestPodUsageSource_CountsTheBrokersProposals(t *testing.T) {
 	body := strings.Join([]string{
 		"# TYPE kubeagents_tool_invocations_total counter",
 		`kubeagents_tool_invocations_total{tool="kubectl",subcommand="get",status="success"} 4`,
+		`kubeagents_tool_invocations_total{tool="kubectl",subcommand="get",status="error"} 2`,
 		`kubeagents_tool_invocations_total{tool="kubectl",subcommand="delete",status="blocked"} 3`,
 		`kubeagents_tool_invocations_total{tool="kubectl",subcommand="get",status="busy"} 2`,
 		`kubeagents_tool_invocations_total{tool="gcloud",subcommand="container",status="abandoned"} 1`,
@@ -254,8 +255,8 @@ func TestPodUsageSource_CountsTheBrokersProposals(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Scrape: %v", err)
 	}
-	if reading.Samples[usageCounterToolExecutions] != 4 || reading.Samples[usageCounterToolExecutionsBlocked] != 6 || reading.Samples[usageCounterRemediationsProposed] != 3 || reading.Samples[usageCounterRemediationsMerged] != 2 {
-		t.Fatalf("samples = %v, want 4 tool executions, 6 refused, 3 proposals and 2 merged", reading.Samples)
+	if reading.Samples[usageCounterToolExecutions] != 6 || reading.Samples[usageCounterToolExecutionsBlocked] != 6 || reading.Samples[usageCounterRemediationsProposed] != 3 || reading.Samples[usageCounterRemediationsMerged] != 2 {
+		t.Fatalf("samples = %v, want 6 tool executions, 6 refused, 3 proposals and 2 merged", reading.Samples)
 	}
 	if reading.StartTime == nil || *reading.StartTime != 1759400000.25 {
 		t.Errorf("start time = %v", reading.StartTime)

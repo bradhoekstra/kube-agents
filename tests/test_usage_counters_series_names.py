@@ -143,6 +143,18 @@ class UsageCountersSeriesNamesTest(unittest.TestCase):
         for excluded in ("TOOL_STATUS_SUCCESS", "TOOL_STATUS_ERROR"):
             self.assertNotIn(_py_const(excluded), refused)
 
+    def test_the_two_status_sets_are_the_brokers_whole_vocabulary(self):
+        """A status the broker adds and neither set names would land in neither counter."""
+        source = _SCRAPE_GO.read_text()
+        sets = set()
+        for name in ("toolInvocationsCountedStatuses", "toolInvocationsRefusedStatuses"):
+            match = re.search(rf"{name}\s*=\s*map\[string\]bool\{{([^}}]*)\}}", source)
+            self.assertIsNotNone(match, f"{name} not found")
+            sets |= set(re.findall(r'"([^"]+)":\s*true', match.group(1)))
+        vocabulary = set(re.findall(r'^TOOL_STATUS_(?!LABEL\b)\w+\s*=\s*"([^"]+)"', _BROKER_PY.read_text(), re.M))
+        self.assertTrue(vocabulary, "no TOOL_STATUS_* constants found in the broker")
+        self.assertEqual(vocabulary, sets)
+
     def test_the_status_label_key_the_broker_writes_is_the_one_the_poller_filters_on(self):
         self.assertEqual(_py_const("TOOL_STATUS_LABEL"), _go_const(_SCRAPE_GO, "toolInvocationsStatusLabel"))
 

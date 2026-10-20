@@ -2159,7 +2159,7 @@ type AgentUsageStatus struct {
 	ChatMessagesInboundTotal int64 `json:"chatMessagesInboundTotal,omitempty"`
 
 	// ToolExecutionsBlockedTotal is the cumulative count of requests the
-	// credential broker turned away without running them: its blocked outcome
+	// credential broker did not run to an exit: its blocked outcome
 	// (a policy refusal), its busy outcome (the broker's command slots or its
 	// child memory budget held the request for the whole wait) and its
 	// abandoned outcome (the caller hung up while the request was queued or
