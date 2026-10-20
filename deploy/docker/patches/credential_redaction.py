@@ -152,9 +152,16 @@ TOOL_CALL_ARGUMENTS_KEY = "arguments"
 #: and stays byte for byte.
 PART_TYPE_KEY = "type"
 TEXT_PART_TYPE = "text"
-#: A reasoning part whose ``text`` is prose (``reasoning.text``); its ``signature`` stays.
+#: Part types whose ``text`` is prose: chat-completions text, the Responses
+#: API's input, output and summary text, and a ``reasoning.*`` part's text.
+PROSE_PART_TYPES: tuple[str, ...] = ("text", "output_text", "input_text", "summary_text")
 REASONING_PART_PREFIX = "reasoning"
 TEXT_KEY = "text"
+#: Container items whose prose sits one level down: a Responses ``message``
+#: item under ``content``, a Responses ``reasoning`` item and an OpenRouter
+#: ``reasoning.summary`` part under ``summary``. Their other keys
+#: (``encrypted_content``, ``signature``, ``id``) stay as they are.
+PART_CONTAINER_KEYS: Mapping[str, str] = {"message": "content", "reasoning": "summary", "reasoning.summary": "summary"}
 #: The message-dict fields the session store persists as text, or as JSON that
 #: carries text: what ``_message_row_params`` binds besides ``tool_calls``.
 MESSAGE_TEXT_FIELDS: tuple[str, ...] = (
@@ -404,9 +411,10 @@ def install_or_report() -> bool:
 
 _RULES_LOCK = threading.Lock()
 _RULES: dict[str, list] = {}
-#: The redactor ``install_operator_rules`` composed over: upstream's shapes, no
-#: operator rules. The key-aware argument walk applies the rules itself and runs
-#: this over the leaves, so a rule is applied once, as the gateway applies it.
+#: The redactor ``install_operator_rules`` composed over, bound ``force=True``:
+#: upstream's shapes, no operator rules. The key-aware argument walk applies the
+#: rules itself and runs this over the leaves, so a rule is applied once, as the
+#: gateway applies it, and the opt-out does not reopen the leaves.
 _UPSTREAM_REDACTOR: list = []
 _REDACTOR_MODULE: list = []
 _RULE_FILE: list = []
@@ -536,7 +544,9 @@ def install_operator_rules(upstream: Callable[..., str]) -> Callable[..., str]:
         return apply_operator_rules(upstream(text, *args, **kwargs))
 
     setattr(redact, RULES_INSTALLED_MARKER, True)
-    _UPSTREAM_REDACTOR[:] = [upstream]
+    # Forced, as every store path is: the profile's ``security.redact_secrets``
+    # opt-out must not reopen the Hermes layer on the argument leaves.
+    _UPSTREAM_REDACTOR[:] = [functools.partial(upstream, force=True)]
     return redact
 
 
@@ -544,7 +554,10 @@ def _redact_parts(value: Any, redact: Redactor) -> Any:
     """The gateway hook's content walk: strings, lists element-wise, ``text`` parts by their text.
 
     A ``reasoning.*`` part's ``text`` is prose and is redacted the same way; its
-    ``signature`` is not. A dict part of any other ``type``, an image, an
+    ``signature`` is not. A Responses ``message`` item is walked through its
+    ``content``, a Responses ``reasoning`` item and an OpenRouter
+    ``reasoning.summary`` part through their ``summary``; an untyped part with
+    a ``text`` is prose. A dict part of any other ``type``, an image, an
     encrypted reasoning block, is returned as it is: those values are opaque to the
     redactor and the provider rejects a replayed turn whose image or signature
     no longer verifies. A new structure where something changed; the input is
@@ -558,10 +571,18 @@ def _redact_parts(value: Any, redact: Redactor) -> Any:
         return tuple(_redact_parts(item, redact) for item in value)
     if isinstance(value, dict):
         part_type = str(value.get(PART_TYPE_KEY) or "")
-        prose = part_type == TEXT_PART_TYPE or part_type.startswith(REASONING_PART_PREFIX)
+        prose = (
+            not part_type
+            or part_type in PROSE_PART_TYPES
+            or part_type.startswith(REASONING_PART_PREFIX)
+        )
+        changed = dict(value)
         if prose and isinstance(value.get(TEXT_KEY), str):
-            return {**value, TEXT_KEY: redact(value[TEXT_KEY])}
-        return value
+            changed[TEXT_KEY] = redact(value[TEXT_KEY])
+        container = PART_CONTAINER_KEYS.get(part_type)
+        if container and container in value:
+            changed[container] = _redact_parts(value[container], redact)
+        return changed if changed != value else value
     return value
 
 
@@ -571,10 +592,11 @@ def _redact_parsed_arguments(value: Any, redact: Redactor) -> Any:
     ``AuditRedactor.redact`` masks by key name as well as by shape (a value
     under ``password``, a credential-named env ``name``/``value`` pair, a
     Secret's ``data``) and applies the operator's rules in the same pass; the
-    plain upstream redactor then runs over the leaf strings for the shapes only
+    forced upstream redactor then runs over the leaf strings for the shapes only
     it knows. Upstream's, not the composition: the rules have run once already,
     and a second pass would nest a marker inside the first, as the gateway's
-    single pass never does. One walker shared with the hook, not a third one.
+    single pass never does. Forced, so the profile's opt-out does not reopen the
+    leaves. One walker shared with the hook, not a third one.
     """
     redacted = _redactor_module().AuditRedactor.redact(value, operator_rules())
     leaves = _UPSTREAM_REDACTOR[0] if _UPSTREAM_REDACTOR else redact

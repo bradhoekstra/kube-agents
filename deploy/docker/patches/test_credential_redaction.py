@@ -32,9 +32,18 @@ TOKEN = "ya29." + "A" * 40
 TOKEN_RE = re.compile(cr.GCP_OAUTH_TOKEN_PATTERN)
 
 
-def stub_redact(text: str) -> str:
-    """A stand-in for redact_sensitive_text: masks the token shape, nothing else."""
+def stub_redact(text: str, **_kwargs) -> str:
+    """A stand-in for redact_sensitive_text: masks the token shape, nothing else; ``force`` is accepted."""
     return TOKEN_RE.sub(lambda m: m.group(0)[:6] + "..." + m.group(0)[-4:], text)
+
+
+# Built by concatenation: a literal of this shape trips GitHub's secret scanning on push.
+HERMES_ONLY_SHAPE = "xoxb-" + "1234567890" + "-" + "abcdefghij" * 2
+
+
+def opt_out_aware_redact(text: str, *, force: bool = False, **_kwargs) -> str:
+    """A stand-in that honours the profile opt-out unless forced, like upstream."""
+    return text.replace(HERMES_ONLY_SHAPE, "xoxb-...ghij") if force else text
 
 
 class FakeStream(io.StringIO):
@@ -514,6 +523,37 @@ class StoreRedactionTest(unittest.TestCase):
         self.assertEqual(out_msg["reasoning_details"][0]["signature"], "abcdefgh12345678")
         self.assertNotIn("acme-prod", out_msg["reasoning_details"][0]["text"])
         self.assertEqual(out_msg["reasoning_details"][1], encrypted)
+
+    def test_argument_leaves_are_redacted_forced_despite_the_profile_opt_out(self):
+        calls = [{"id": "c1", "type": "function", "function": {"name": "terminal", "arguments": json.dumps(
+            {"command": f"curl -H 'X-Token: {HERMES_ONLY_SHAPE}' https://example.invalid/"})}}]
+        with mock.patch.dict(os.environ, self.env):
+            redact = cr.install_operator_rules(opt_out_aware_redact)
+            _, out_calls = cr.redact_message_for_store({"role": "assistant"}, calls, redact=redact)
+        self.assertNotIn(HERMES_ONLY_SHAPE, out_calls[0]["function"]["arguments"])
+
+    def test_responses_and_openrouter_shapes_have_their_prose_redacted(self):
+        rules = self.tmp / "literal.yaml"
+        rules.write_text("ip:\n  action: \"off\"\nrules:\n  - name: cluster-name\n    literal: prod-eu-1\n")
+        msg = {
+            "role": "assistant",
+            "codex_message_items": [{"type": "message", "role": "assistant", "id": "msg_1",
+                                     "content": [{"type": "output_text", "text": "deploy to prod-eu-1"}]}],
+            "codex_reasoning_items": [{"type": "reasoning", "id": "rs_1", "encrypted_content": "prod-eu-1-looking-blob",
+                                       "summary": [{"type": "summary_text", "text": "about prod-eu-1"}]}],
+            "reasoning_details": [{"type": "reasoning.summary", "summary": "summary of prod-eu-1"},
+                                  {"text": "untyped prod-eu-1"}],
+        }
+        with mock.patch.dict(os.environ, {**self.env, cr.RULE_FILE_ENV: str(rules)}):
+            redact = cr.install_operator_rules(stub_redact)
+            out, _ = cr.redact_message_for_store(msg, None, redact=redact)
+        self.assertEqual(out["codex_message_items"][0]["content"][0]["text"], "deploy to [REDACTED_CLUSTER_NAME]")
+        self.assertEqual(out["codex_message_items"][0]["id"], "msg_1")
+        self.assertEqual(out["codex_reasoning_items"][0]["summary"][0]["text"], "about [REDACTED_CLUSTER_NAME]")
+        self.assertEqual(out["codex_reasoning_items"][0]["encrypted_content"], "prod-eu-1-looking-blob")
+        self.assertEqual(out["reasoning_details"][0]["summary"], "summary of [REDACTED_CLUSTER_NAME]")
+        self.assertEqual(out["reasoning_details"][1]["text"], "untyped [REDACTED_CLUSTER_NAME]")
+        self.assertIn("prod-eu-1", json.dumps(msg))
 
     def test_a_greedy_pattern_leaves_the_arguments_parseable(self):
         rules = self.tmp / "greedy.yaml"
