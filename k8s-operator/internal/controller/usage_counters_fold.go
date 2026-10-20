@@ -108,6 +108,19 @@ func usageSessionsTotal(totals map[string]int64) int64 {
 	return totals[usageCounterSessionsTriage] + totals[usageCounterSessionsChat]
 }
 
+// usageFieldFloor is the status floor of the field a counter projects to: the
+// counter's own for every counter but the sessions halves, whose one status
+// value the seed puts in the chat half. The unfolded rule reads this rather
+// than the half's own floor, because a zero floor means none of any sample is
+// in the total, and after a rollback and return the triage half's share of a
+// non-zero status is in the chat half's floor.
+func usageFieldFloor(floors map[string]int64, counter string) int64 {
+	if slices.Contains(usageSessionsCounters, counter) {
+		return floors[usageCounterSessionsChat]
+	}
+	return floors[counter]
+}
+
 // usagePodEntryKey is the document key of one pod's entry for one counter.
 func usagePodEntryKey(uid, counter string) string {
 	return uid + usagePodEntryKeySeparator + counter
@@ -209,9 +222,12 @@ func usageUnfolded(doc *usageDocument, counter string) bool {
 // wrote, and a zero under that floor would have usageDocumentInvalid refuse
 // the document and re-seed it, losing the interval's counts on every counter.
 // What the listeners counted during the rollback is not recovered: the pods
-// are baselined at their samples, and only a counter whose floor is zero, so
-// that none of any sample can be in the total, is recorded in Unfolded for
-// foldUsage to add whole, on this poll or on the first that reads the pod.
+// are baselined at their samples, and only a counter whose field's floor is
+// zero (usageFieldFloor), so that none of any sample can be in the total, is
+// recorded in Unfolded for foldUsage to add whole, on this poll or on the
+// first that reads the pod. The two sessions halves share one field: with a
+// status that carries sessions, neither half is unfolded, since the triage
+// half's share of that status sits in the chat half's floor.
 // Any other version is left for usageDocumentInvalid to refuse.
 func migrateUsageDocument(doc *usageDocument, floors map[string]int64) {
 	if doc.Pods == nil || doc.Totals == nil {
@@ -243,7 +259,7 @@ func migrateUsageDocument(doc *usageDocument, floors map[string]int64) {
 		}
 		doc.Totals[counter] = floors[counter]
 		doc.migrated = true
-		if floors[counter] == 0 && !usageUnfolded(doc, counter) {
+		if usageFieldFloor(floors, counter) == 0 && !usageUnfolded(doc, counter) {
 			doc.Unfolded = append(doc.Unfolded, counter)
 		}
 	}

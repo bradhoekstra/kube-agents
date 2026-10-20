@@ -178,6 +178,15 @@ class TestWriteThrough(SaltedTestCase):
             log_event_to_db(_event(), gateway=None, session_store=_SessionStore("sess-1"))
         self.assertEqual({}, self._sessions_counted(registry))
 
+    def test_a_registry_that_raises_is_logged_and_the_turn_continues(self):
+        class Exploding:
+            def record_session(self, platform):
+                raise RuntimeError("registry is down")
+
+        with mock.patch.object(chat_metrics, "REGISTRY", Exploding()), self.assertLogs(store.logger, level="ERROR"):
+            self.assertIsNone(log_event_to_db(_event(), gateway=None, session_store=_SessionStore("sess-9")))
+        self.assertIsNotNone(self._stored("sess-9"), "the row is written before the count")
+
     def test_an_empty_session_id_writes_nothing(self):
         # Not even the database file: the early return happens before the
         # connection is opened.
