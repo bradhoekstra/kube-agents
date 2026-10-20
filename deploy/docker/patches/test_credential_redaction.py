@@ -380,6 +380,16 @@ class OperatorRulesTest(unittest.TestCase):
                 cr.install_operator_rules(stub_redact)
         self.assertIn("mapping", str(ctx.exception))
 
+    def test_a_falsy_document_is_the_default_rules_as_at_the_gateway(self):
+        # The shared loader reads every falsy document as the empty mapping, as
+        # the gateway hook always did, so the two pods agree on the same file.
+        for document in ("", "# only a comment\n", "[]\n", "0\n", "false\n"):
+            cr.reset_operator_rules()
+            self.rule_file.write_text(document)
+            with mock.patch.dict(os.environ, self.env):
+                redact = cr.install_operator_rules(stub_redact)
+                self.assertNotIn("10.1.2.3", redact("at 10.1.2.3"), document)
+
     def test_a_missing_file_raises(self):
         self.rule_file.unlink()
         with mock.patch.dict(os.environ, self.env):
@@ -471,7 +481,10 @@ class StoreRedactionTest(unittest.TestCase):
         self.assertEqual(out_calls[0]["function"]["name"], "terminal")
         arguments = json.loads(out_calls[0]["function"]["arguments"])
         self.assertNotIn("acme-prod", arguments["command"])
-        self.assertRegex(arguments["command"], r"\[project:[0-9a-f]{12}\]")
+        # Applied once: the rules ran in the key-aware pass and not again over the
+        # leaves, so every marker is whole and none nests inside another.
+        self.assertRegex(arguments["command"], r"^(\[project:[0-9a-f]{12}\]|[^\[\]]+)+$")
+        self.assertIn(" get pods -n [project:", arguments["command"])
 
     def test_arguments_are_masked_by_key_name_as_the_hook_does(self):
         calls = [{"id": "c1", "type": "function", "function": {"name": "mcp_login", "arguments": json.dumps(

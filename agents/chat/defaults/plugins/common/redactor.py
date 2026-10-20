@@ -47,6 +47,7 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 logger = logging.getLogger("hermes.plugin.common.redactor")
 
 SALT_ENV_VAR = "SESSION_KV_SALT"
+RULE_FILE_ENCODING = "utf-8"
 
 # The two things a configured rule may do to a match. `mask` replaces it with
 # a fixed marker; `pseudonym` replaces it with a salted HMAC prefix, so the
@@ -697,6 +698,32 @@ class AuditRedactor:
             RedactionRule(IP_RULE_NAME, IPV4_CANDIDATE_PATTERN, action, canonical),
             RedactionRule(IP_RULE_NAME, IPV6_CANDIDATE_PATTERN, action, canonical),
         ]
+
+    @classmethod
+    def rules_from_file(cls, path: str) -> List[RedactionRule]:
+        """Read the rendered ``redaction.yaml`` and build the rule list; raise ``ValueError`` on any defect.
+
+        The one loader for the gateway's pre-call hook and the agent image's
+        on-disk redaction, so the two cannot drift on an edge case: an empty or
+        falsy document is the empty mapping (the default IP rules), anything
+        else that is not a mapping is refused by name, and a file that cannot
+        be read or parsed is refused with the reason.
+        """
+        import yaml  # every caller runs where PyYAML is installed; not needed by the string paths
+
+        try:
+            with open(path, "r", encoding=RULE_FILE_ENCODING) as handle:
+                config = yaml.safe_load(handle) or {}
+        except OSError as error:
+            raise ValueError(f"cannot read {path}: {error}") from error
+        except yaml.YAMLError as error:
+            raise ValueError(f"{path} is not valid YAML: {error}") from error
+        if not isinstance(config, dict):
+            raise ValueError(f"{path} must hold a mapping, not {type(config).__name__}")
+        try:
+            return cls.rules_from_config(config)
+        except ValueError as error:
+            raise ValueError(f"{path}: {error}") from error
 
     @classmethod
     def rules_from_config(cls, config: Optional[Mapping[str, Any]]) -> List[RedactionRule]:

@@ -31,6 +31,9 @@ _ENV_NAME = "KUBE_AGENTS_REDACTION_CONFIG"
 _PATCH_MODULE = _REPO_ROOT / "deploy" / "docker" / "patches" / "credential_redaction.py"
 _RULE_FILE = re.search(r'^DEFAULT_RULE_FILE = "([^"]+)"$', _PATCH_MODULE.read_text(), re.M).group(1)
 _VOLUME = "redaction-rules"
+#: The operator's read-only ConfigMap mount in the agent container (scopeDir in
+#: k8s-operator/internal/controller/platformagent_manifests.go).
+_OPERATOR_SCOPE_DIR = "/etc/kube-agents"
 _CONFIG_MAP = "litellm-config"
 _KEY = "redaction.yaml"
 
@@ -64,6 +67,10 @@ class DiskRedactionRenderTest(unittest.TestCase):
         mount = deployment["extraVolumeMounts"]
         self.assertEqual(mount, [{"name": _VOLUME, "mountPath": pathlib.PurePosixPath(_RULE_FILE).parent.as_posix(), "readOnly": True}])
         self.assertEqual(f"{mount[0]['mountPath']}/{_KEY}", _RULE_FILE)
+        # Neither the operator's read-only /etc/kube-agents mount nor a path under it:
+        # runc cannot create a mountpoint through a read-only parent.
+        rule_dir = pathlib.PurePosixPath(mount[0]["mountPath"])
+        self.assertNotIn(pathlib.PurePosixPath(_OPERATOR_SCOPE_DIR), [rule_dir, *rule_dir.parents])
 
     def test_the_rule_file_the_gateway_reads_is_the_same_key(self):
         args = [

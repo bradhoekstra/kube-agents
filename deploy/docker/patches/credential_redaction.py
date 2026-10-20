@@ -142,7 +142,6 @@ REDACTOR_MODULE_ENV = "KUBE_AGENTS_REDACTOR_MODULE"
 DEFAULT_REDACTOR_MODULE = "/opt/defaults/plugins/common/redactor.py"
 REDACTOR_MODULE_NAME = "kube_agents_redactor"
 RULES_INSTALLED_MARKER = "_kube_agents_operator_rules"
-RULE_FILE_ENCODING = "utf-8"
 #: Name of the resolved source in an error, when the variable did not name it.
 RULE_FILE_SOURCE_NAME = "redaction rule file"
 #: The keys of one tool call, as the gateway's hook reads them.
@@ -405,6 +404,10 @@ def install_or_report() -> bool:
 
 _RULES_LOCK = threading.Lock()
 _RULES: dict[str, list] = {}
+#: The redactor ``install_operator_rules`` composed over: upstream's shapes, no
+#: operator rules. The key-aware argument walk applies the rules itself and runs
+#: this over the leaves, so a rule is applied once, as the gateway applies it.
+_UPSTREAM_REDACTOR: list = []
 _REDACTOR_MODULE: list = []
 _RULE_FILE: list = []
 _RULE_FILE_SOURCE: list = []
@@ -444,6 +447,7 @@ def reset_operator_rules() -> None:
         _REDACTOR_MODULE.clear()
         _RULE_FILE.clear()
         _RULE_FILE_SOURCE.clear()
+        _UPSTREAM_REDACTOR.clear()
 
 
 def _redactor_module():
@@ -471,29 +475,17 @@ def _redactor_module():
 
 
 def _load_rules(path: str) -> list:
-    """Parse the rule file into ``RedactionRule`` objects; raise ``ValueError`` on anything wrong.
+    """Parse the rule file through the shared loader; raise ``ValueError`` naming the source.
 
-    The file was validated when the chart rendered it, and the gateway stops
-    at startup on the same file, so this fails only for a hand-authored one.
+    ``AuditRedactor.rules_from_file`` is the gateway hook's loader too, so the
+    same file reads the same way in both pods. The file was validated when the
+    chart rendered it, and the gateway stops at startup on the same file, so
+    this fails only for a hand-authored one.
     """
-    import yaml  # the Hermes venv ships it; not needed when the switch is off
-
-    source = rule_file_source()
     try:
-        with open(path, encoding=RULE_FILE_ENCODING) as handle:
-            config = yaml.safe_load(handle)
-    except OSError as error:
-        raise ValueError(f"{source}: cannot read {path}: {error}") from error
-    except yaml.YAMLError as error:
-        raise ValueError(f"{source}: {path} is not valid YAML: {error}") from error
-    if config is None:
-        config = {}
-    if not isinstance(config, dict):
-        raise ValueError(f"{source}: {path} must hold a mapping, got {type(config).__name__}")
-    try:
-        return _redactor_module().AuditRedactor.rules_from_config(config)
+        return _redactor_module().AuditRedactor.rules_from_file(path)
     except ValueError as error:
-        raise ValueError(f"{source}: {path}: {error}") from error
+        raise ValueError(f"{rule_file_source()}: {error}") from error
 
 
 def operator_rules() -> list:
@@ -544,6 +536,7 @@ def install_operator_rules(upstream: Callable[..., str]) -> Callable[..., str]:
         return apply_operator_rules(upstream(text, *args, **kwargs))
 
     setattr(redact, RULES_INSTALLED_MARKER, True)
+    _UPSTREAM_REDACTOR[:] = [upstream]
     return redact
 
 
@@ -578,11 +571,14 @@ def _redact_parsed_arguments(value: Any, redact: Redactor) -> Any:
     ``AuditRedactor.redact`` masks by key name as well as by shape (a value
     under ``password``, a credential-named env ``name``/``value`` pair, a
     Secret's ``data``) and applies the operator's rules in the same pass; the
-    composed Hermes redactor then runs over the leaf strings for the shapes
-    only it knows. One walker shared with the hook, not a third one.
+    plain upstream redactor then runs over the leaf strings for the shapes only
+    it knows. Upstream's, not the composition: the rules have run once already,
+    and a second pass would nest a marker inside the first, as the gateway's
+    single pass never does. One walker shared with the hook, not a third one.
     """
     redacted = _redactor_module().AuditRedactor.redact(value, operator_rules())
-    return _redact_leaves(redacted, redact)
+    leaves = _UPSTREAM_REDACTOR[0] if _UPSTREAM_REDACTOR else redact
+    return _redact_leaves(redacted, leaves)
 
 
 def _redact_leaves(value: Any, redact: Redactor) -> Any:
