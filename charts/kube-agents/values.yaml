@@ -463,7 +463,10 @@ litellm:
   # content, token usage, latency) is redacted through AuditRedactor (built-in
   # credential patterns, Secret data blocks, sensitive keys, emails, and IP
   # literals, plus any operator rules when redaction.enabled is also true) and
-  # appended as one JSONL record to traceLogPath. The file rotates at 5 MiB
+  # appended as one JSONL record to traceLogPath. IP literals are pseudonymised
+  # by default; with redaction.enabled they follow redaction.ip instead ("off"
+  # writes them verbatim, mask masks them, allowCidrs addresses pass through).
+  # The file rotates at 5 MiB
   # across 3 backups (.1-.3, 20 MiB max total) under an flock on <path>.lock.
   # Pass-through only: does not alter live requests or responses, and logs a
   # once-per-path warning to stderr on I/O failure rather than breaking inference.

@@ -9,6 +9,9 @@ Before a record reaches disk, `AuditRedactor` from the sibling `redactor.py`
 module strips credentials, Secret payloads, sensitive key/value pairs, email
 addresses, and IP literals (plus any operator rules in
 `KUBE_AGENTS_REDACTION_CONFIG` when `litellm.redaction.enabled` is also set).
+IP literals are pseudonymised by default; with that rule file they follow its
+`ip` block (`litellm.redaction.ip`) instead: `off` writes them verbatim, `mask`
+masks them, and addresses in `allowCidrs` pass through.
 The trace file rotates at `TRACE_FILE_MAX_BYTES` (5 MiB) across
 `TRACE_FILE_BACKUP_COUNT` (3) backups under an `flock` on `<path>.lock`,
 bounding disk use on the gateway pod's `/tmp` `emptyDir` to 20 MiB.

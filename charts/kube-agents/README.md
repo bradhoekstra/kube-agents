@@ -280,7 +280,10 @@ LLM provider, messages, tool definitions, assistant responses, reasoning content
 token usage, and latency) is redacted through `AuditRedactor` (credentials, Secret
 data blocks, sensitive keys, emails, and IP literals, plus operator rules when
 `litellm.redaction.enabled` is also set) before being appended as one JSONL line to
-the path. The trace file rotates at `5 MiB` across `3` backups (`.1`–`.3`, `20 MiB`
+the path. IP literals are pseudonymised by default; with `litellm.redaction.enabled`
+set, they follow `litellm.redaction.ip` instead: `"off"` writes them verbatim,
+`mask` masks them, and addresses in `allowCidrs` pass through. The trace file
+rotates at `5 MiB` across `3` backups (`.1`–`.3`, `20 MiB`
 total cap on the pod's `/tmp` `emptyDir`) under an `flock` on `<path>.lock`.
 Pass-through only: the logger never mutates live request or response payloads, and
 I/O failures log a once-per-path warning to stderr so inference never fails. Off by
