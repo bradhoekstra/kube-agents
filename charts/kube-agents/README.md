@@ -253,7 +253,7 @@ the redaction pre-call hook and a `redaction.yaml` rule file, all mounted beside
 `/app/config.yaml`, and the gateway container gets `KUBE_AGENTS_REDACTION_CONFIG`
 plus an optional `SESSION_KV_SALT` from the credentials Secret to salt the
 pseudonyms. The PlatformAgent CR gains a read-only projection of `redaction.yaml` from
-that ConfigMap at `/etc/kube-agents/redaction/redaction.yaml`, the fixed path
+that ConfigMap at `/etc/kube-agents-redaction/redaction.yaml`, the fixed path
 the agent image looks for, so the image applies the rules to what it writes to
 its volume as well. `litellm.redaction.ip.action` (`pseudonym`, `mask`, `"off"` — quoted,
 because YAML reads the bare word as a boolean and the render refuses it) and

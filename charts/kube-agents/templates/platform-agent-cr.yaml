@@ -225,7 +225,9 @@ spec:
       as well: below the env block, one read-only projection of the
       redaction.yaml key out of the gateway's ConfigMap, at the fixed path the
       image looks for (DEFAULT_RULE_FILE in
-      deploy/docker/patches/credential_redaction.py). The file's presence is
+      deploy/docker/patches/credential_redaction.py): a directory of its own,
+      not under the operator's read-only /etc/kube-agents mount, because runc
+      cannot create a mountpoint through a read-only parent. The file's presence is
       the switch; no env entry, because the operator admits no path-valued
       variable through spec.deployment.env into the agent container. The image
       then applies the same rules to what it writes to its volume: agent.log,
@@ -267,7 +269,7 @@ spec:
               path: redaction.yaml
     extraVolumeMounts:
       - name: redaction-rules
-        mountPath: /etc/kube-agents/redaction
+        mountPath: /etc/kube-agents-redaction
         readOnly: true
     {{- end }}
     {{- /*

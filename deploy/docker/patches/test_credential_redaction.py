@@ -453,8 +453,8 @@ class StoreRedactionTest(unittest.TestCase):
         self.assertEqual(out_msg["content"][1], self.MESSAGE["content"][1])
         self.assertEqual(out_calls[0]["function"]["name"], "terminal")
         command = json.loads(out_calls[0]["function"]["arguments"])["command"]
-        self.assertTrue(command.startswith("curl -H 'Authorization: Bearer ya29."))
-        self.assertIn("...", command)
+        self.assertTrue(command.startswith("curl -H 'Authorization: Bearer "))
+        self.assertNotIn(TOKEN, command)
 
     def test_tool_call_ids_names_and_types_are_structure_and_stay(self):
         rules = self.tmp / "loose.yaml"
@@ -472,6 +472,35 @@ class StoreRedactionTest(unittest.TestCase):
         arguments = json.loads(out_calls[0]["function"]["arguments"])
         self.assertNotIn("acme-prod", arguments["command"])
         self.assertRegex(arguments["command"], r"\[project:[0-9a-f]{12}\]")
+
+    def test_arguments_are_masked_by_key_name_as_the_hook_does(self):
+        calls = [{"id": "c1", "type": "function", "function": {"name": "mcp_login", "arguments": json.dumps(
+            {"user": "svc-reader", "password": "hunter2-example-pw", "env": [{"name": "API_TOKEN", "value": "plain-looking-value"}]})}}]
+        with mock.patch.dict(os.environ, self.env):
+            redact = cr.install_operator_rules(stub_redact)
+            _, out_calls = cr.redact_message_for_store({"role": "assistant"}, calls, redact=redact)
+        arguments = json.loads(out_calls[0]["function"]["arguments"])
+        self.assertNotIn("hunter2-example-pw", json.dumps(arguments))
+        self.assertNotIn("plain-looking-value", json.dumps(arguments))
+        self.assertEqual(arguments["user"], "svc-reader")
+        self.assertEqual(arguments["env"][0]["name"], "API_TOKEN")
+
+    def test_opaque_parts_stay_byte_for_byte_under_a_loose_rule(self):
+        rules = self.tmp / "loose.yaml"
+        rules.write_text("ip:\n  action: \"off\"\nrules:\n  - name: project\n    pattern: \"[a-z][a-z0-9_-]{5,28}\"\n    action: pseudonym\n")
+        image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGVsbG8gcHJvZC1ldS0x"}}
+        signed = {"type": "reasoning.text", "text": "thinking about acme-prod", "signature": "abcdefgh12345678"}
+        encrypted = {"type": "reasoning.encrypted", "data": "encryptedpayloadvalue"}
+        msg = {"role": "assistant", "content": [{"type": "text", "text": "deploy acme-prod"}, image],
+               "reasoning_details": [signed, encrypted]}
+        with mock.patch.dict(os.environ, {**self.env, cr.RULE_FILE_ENV: str(rules)}):
+            redact = cr.install_operator_rules(stub_redact)
+            out_msg, _ = cr.redact_message_for_store(msg, None, redact=redact)
+        self.assertNotIn("acme-prod", out_msg["content"][0]["text"])
+        self.assertEqual(out_msg["content"][1], image)
+        self.assertEqual(out_msg["reasoning_details"][0]["signature"], "abcdefgh12345678")
+        self.assertNotIn("acme-prod", out_msg["reasoning_details"][0]["text"])
+        self.assertEqual(out_msg["reasoning_details"][1], encrypted)
 
     def test_a_greedy_pattern_leaves_the_arguments_parseable(self):
         rules = self.tmp / "greedy.yaml"

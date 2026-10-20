@@ -131,7 +131,11 @@ INSTALL_FAILURE_PREFIX = "kube-agents: transcript redaction not installed: "
 #: the tests. Neither set means the switch is off and every function in the
 #: section below is a no-op.
 RULE_FILE_ENV = "KUBE_AGENTS_REDACTION_CONFIG"
-DEFAULT_RULE_FILE = "/etc/kube-agents/redaction/redaction.yaml"
+#: A directory of its own, beside the operator's read-only ``/etc/kube-agents``
+#: mount rather than inside it: runc cannot create a mountpoint through a
+#: read-only parent mount (``mkdir: read-only file system``), and only gVisor's
+#: synthetic mountpoints would let a nested path come up.
+DEFAULT_RULE_FILE = "/etc/kube-agents-redaction/redaction.yaml"
 #: Where the shared redactor module lives in the image; the gateway's hook
 #: runs the same file. Overridable for the build-time verifier and the tests.
 REDACTOR_MODULE_ENV = "KUBE_AGENTS_REDACTOR_MODULE"
@@ -144,6 +148,14 @@ RULE_FILE_SOURCE_NAME = "redaction rule file"
 #: The keys of one tool call, as the gateway's hook reads them.
 TOOL_CALL_FUNCTION_KEY = "function"
 TOOL_CALL_ARGUMENTS_KEY = "arguments"
+#: A content or reasoning part the hook redacts: ``{"type": "text", "text": ...}``.
+#: Every other part (an image, a signed or encrypted reasoning block) is opaque
+#: and stays byte for byte.
+PART_TYPE_KEY = "type"
+TEXT_PART_TYPE = "text"
+#: A reasoning part whose ``text`` is prose (``reasoning.text``); its ``signature`` stays.
+REASONING_PART_PREFIX = "reasoning"
+TEXT_KEY = "text"
 #: The message-dict fields the session store persists as text, or as JSON that
 #: carries text: what ``_message_row_params`` binds besides ``tool_calls``.
 MESSAGE_TEXT_FIELDS: tuple[str, ...] = (
@@ -535,16 +547,51 @@ def install_operator_rules(upstream: Callable[..., str]) -> Callable[..., str]:
     return redact
 
 
-def _redact_structure(value: Any, redact: Redactor) -> Any:
-    """``redact`` over every string in a JSON-shaped value; a new structure, the input untouched."""
+def _redact_parts(value: Any, redact: Redactor) -> Any:
+    """The gateway hook's content walk: strings, lists element-wise, ``text`` parts by their text.
+
+    A ``reasoning.*`` part's ``text`` is prose and is redacted the same way; its
+    ``signature`` is not. A dict part of any other ``type``, an image, an
+    encrypted reasoning block, is returned as it is: those values are opaque to the
+    redactor and the provider rejects a replayed turn whose image or signature
+    no longer verifies. A new structure where something changed; the input is
+    never mutated.
+    """
+    if isinstance(value, str):
+        return redact(value)
+    if isinstance(value, list):
+        return [_redact_parts(item, redact) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_parts(item, redact) for item in value)
+    if isinstance(value, dict):
+        part_type = str(value.get(PART_TYPE_KEY) or "")
+        prose = part_type == TEXT_PART_TYPE or part_type.startswith(REASONING_PART_PREFIX)
+        if prose and isinstance(value.get(TEXT_KEY), str):
+            return {**value, TEXT_KEY: redact(value[TEXT_KEY])}
+        return value
+    return value
+
+
+def _redact_parsed_arguments(value: Any, redact: Redactor) -> Any:
+    """The gateway hook's argument walk: ``AuditRedactor``'s key-aware pass, then the image's redactor.
+
+    ``AuditRedactor.redact`` masks by key name as well as by shape (a value
+    under ``password``, a credential-named env ``name``/``value`` pair, a
+    Secret's ``data``) and applies the operator's rules in the same pass; the
+    composed Hermes redactor then runs over the leaf strings for the shapes
+    only it knows. One walker shared with the hook, not a third one.
+    """
+    redacted = _redactor_module().AuditRedactor.redact(value, operator_rules())
+    return _redact_leaves(redacted, redact)
+
+
+def _redact_leaves(value: Any, redact: Redactor) -> Any:
     if isinstance(value, str):
         return redact(value)
     if isinstance(value, dict):
-        return {key: _redact_structure(item, redact) for key, item in value.items()}
+        return {key: _redact_leaves(item, redact) for key, item in value.items()}
     if isinstance(value, list):
-        return [_redact_structure(item, redact) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_redact_structure(item, redact) for item in value)
+        return [_redact_leaves(item, redact) for item in value]
     return value
 
 
@@ -557,12 +604,12 @@ def _redact_arguments(arguments: Any, redact: Redactor) -> Any:
     redacted as text; arguments already an object are walked as they are.
     """
     if not isinstance(arguments, str):
-        return _redact_structure(arguments, redact)
+        return _redact_parsed_arguments(arguments, redact)
     try:
         parsed = json.loads(arguments)
     except ValueError:
         return redact(arguments)
-    redacted = _redact_structure(parsed, redact)
+    redacted = _redact_parsed_arguments(parsed, redact)
     if redacted == parsed:
         return arguments
     return json.dumps(redacted, ensure_ascii=False)
@@ -606,11 +653,12 @@ def redact_message_for_store(
 ) -> tuple[dict, Any]:
     """The message dict and tool calls as the session store should persist them.
 
-    When the switch is off both come back as the same objects. On, the text
-    fields in MESSAGE_TEXT_FIELDS go through ``redact`` in copies, and each
-    tool call's ``function.arguments`` (the list, or still the JSON text some
-    callers pass) is redacted as the gateway's hook does it; call ids, types,
-    function names, counters, flags and the rest of the dict are untouched.
+    When the switch is off both come back as the same objects. On, the fields in
+    MESSAGE_TEXT_FIELDS get the hook's content walk (strings and ``text`` parts;
+    an image or a reasoning signature stays byte for byte), and each tool
+    call's ``function.arguments`` (the list, or still the JSON text some callers
+    pass) gets the hook's key-aware argument walk; call ids, types, function
+    names, counters, flags and the rest of the dict are untouched.
     """
     if not disk_redaction_enabled() or not isinstance(msg, dict):
         return msg, tool_calls
@@ -618,7 +666,7 @@ def redact_message_for_store(
     redacted = dict(msg)
     for field in MESSAGE_TEXT_FIELDS:
         if field in redacted:
-            redacted[field] = _redact_structure(redacted[field], redactor)
+            redacted[field] = _redact_parts(redacted[field], redactor)
     if isinstance(tool_calls, str):
         try:
             parsed = json.loads(tool_calls)
