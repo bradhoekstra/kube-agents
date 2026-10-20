@@ -369,7 +369,7 @@ _module = importlib.util.module_from_spec(_spec)
 sys.modules[_spec.name] = _module
 _spec.loader.exec_module(_module)
 check("the shared module leaves the Hermes-only shape alone (premise)", HERMES_ONLY_TOKEN in _module.AuditRedactor.redact_text(f"x {HERMES_ONLY_TOKEN} y"), HERMES_ONLY_TOKEN)
-check("the Hermes layer masks the Hermes-only shape (premise)", HERMES_ONLY_TOKEN not in redact_sensitive_text(f"x {HERMES_ONLY_TOKEN} y", force=True), HERMES_ONLY_TOKEN)
+check("the Hermes layer masks the Hermes-only shape (premise)", HERMES_ONLY_TOKEN not in R.redact_sensitive_text(f"x {HERMES_ONLY_TOKEN} y", force=True), HERMES_ONLY_TOKEN)
 
 
 def run_rules_child(rule_file: str, home: str, opt_out: bool = False) -> str:
