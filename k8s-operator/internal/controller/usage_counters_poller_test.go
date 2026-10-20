@@ -1352,9 +1352,8 @@ func TestUsagePoller_ChatMessagesCountFromTheA2AGatewayToo(t *testing.T) {
 // status.usage.sessionsTotal is the sum of two document counters: the
 // watcher's triage sessions, read from the gateway pods' watcher listener, and
 // the chat sessions, read from the leader's chat listener and from the A2A
-// gateway on a next install. Either half moves lastActiveTime, a failing chat
-// listener's Warning names the status field and not a document counter, and
-// the status value seeds the chat half and floors the pair's sum.
+// gateway on a next install. Either half moves lastActiveTime, and a failing
+// chat listener's Warning names the status field and not a document counter.
 func TestUsagePoller_SessionsTotalIsTheTriageSessionsPlusTheChatSessions(t *testing.T) {
 	created := usageClock(0).Add(-time.Hour)
 	a2a := usageA2AGatewayPod("agent-a2a-gateway-ccc", "a2a-c", usageTestA2AIP, created)

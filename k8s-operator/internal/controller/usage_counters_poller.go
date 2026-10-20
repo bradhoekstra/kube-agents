@@ -133,8 +133,7 @@ type UsageCounterPoller struct {
 	mu      sync.Mutex
 	streaks map[usageStreakKey]*usageScrapeStreak
 	// prunedNewerFields records, per CR and per newer field -- the cluster
-	// gauges as one, remediationsMergedTotal, chatMessagesInboundTotal,
-	// sessionsTotal -- the last poll in which that
+	// gauges as one, remediationsMergedTotal, chatMessagesInboundTotal -- the last poll in which that
 	// field was written and came back absent: a served CRD at a previous
 	// schema, which has the three first counters (every CRD with status.usage
 	// has carried remediationsProposedTotal) and not every later field. A
@@ -1037,11 +1036,13 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	gaugesPruned := p.newerFieldPruned(agent, usageNewerFieldGauges)
 	mergedPruned := p.newerFieldPruned(agent, usageCounterRemediationsMerged)
 	chatPruned := p.newerFieldPruned(agent, usageCounterChatMessagesInbound)
-	sessionsPruned := p.newerFieldPruned(agent, usageStatusFieldSessions)
 	gaugesMoved := gaugesKnown && !gaugesPruned &&
 		(!usageGaugeEqual(usage.ClustersRegistered, wantRegistered) || !usageGaugeEqual(usage.ClustersMonitored, wantMonitored))
-	newerBehind := (!mergedPruned && usage.RemediationsMergedTotal < merged) || (!chatPruned && usage.ChatMessagesInboundTotal < chat) || (!sessionsPruned && usage.SessionsTotal < sessions)
-	behind := usage.ToolExecutionsTotal < tool || usage.EventsIngestedTotal < events || usage.RemediationsProposedTotal < proposed || newerBehind || gaugesMoved ||
+	newerBehind := (!mergedPruned && usage.RemediationsMergedTotal < merged) || (!chatPruned && usage.ChatMessagesInboundTotal < chat)
+	// sessionsTotal is in the first schema beside the first three counters
+	// (every CRD with status.usage has carried it), so it has no record of
+	// its own: a served CRD prunes it only with status.usage whole.
+	behind := usage.ToolExecutionsTotal < tool || usage.EventsIngestedTotal < events || usage.RemediationsProposedTotal < proposed || usage.SessionsTotal < sessions || newerBehind || gaugesMoved ||
 		(doc.LastMoved != nil && (usage.LastActiveTime == nil || !usage.LastActiveTime.Equal(doc.LastMoved)))
 	if !behind || p.r.usageStatusPruned(agent) {
 		return nil
@@ -1063,7 +1064,7 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	if err := p.r.Status().Patch(ctx, agent, client.MergeFrom(base)); err != nil {
 		return fmt.Errorf("patching status.usage: %w", err)
 	}
-	// The echoes: the first three counters written non-zero that come back
+	// The echoes: the first-schema counters written non-zero that come back
 	// absent are the pruning of status.usage, recorded in the record the Ready
 	// writer shares; a newer field written -- a gauge reading, a zero one
 	// included since a pointer to zero serialises, or the merged counter
@@ -1071,8 +1072,8 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	// CRD at a previous schema prunes one or both and serves the first
 	// counters. A patch that wrote only a time, or cleared the gauges, says
 	// nothing either way.
-	if tool > 0 || events > 0 || proposed > 0 {
-		p.r.noteUsageEcho(ctx, agent, agent.Status.Usage.ToolExecutionsTotal == tool && agent.Status.Usage.EventsIngestedTotal == events && agent.Status.Usage.RemediationsProposedTotal == proposed)
+	if tool > 0 || events > 0 || proposed > 0 || sessions > 0 {
+		p.r.noteUsageEcho(ctx, agent, agent.Status.Usage.ToolExecutionsTotal == tool && agent.Status.Usage.EventsIngestedTotal == events && agent.Status.Usage.RemediationsProposedTotal == proposed && agent.Status.Usage.SessionsTotal == sessions)
 	}
 	if gauges != nil {
 		p.noteNewerFieldEcho(ctx, agent, usageNewerFieldGauges, usageGaugeEqual(agent.Status.Usage.ClustersRegistered, wantRegistered) && usageGaugeEqual(agent.Status.Usage.ClustersMonitored, wantMonitored))
@@ -1082,9 +1083,6 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	}
 	if chat > 0 {
 		p.noteNewerFieldEcho(ctx, agent, usageCounterChatMessagesInbound, agent.Status.Usage.ChatMessagesInboundTotal == chat)
-	}
-	if sessions > 0 {
-		p.noteNewerFieldEcho(ctx, agent, usageStatusFieldSessions, agent.Status.Usage.SessionsTotal == sessions)
 	}
 	return nil
 }

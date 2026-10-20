@@ -71,8 +71,9 @@ const (
 	usageCounterSessionsTriage = "sessionsTriage"
 	usageCounterSessionsChat   = "sessionsChat"
 	// usageStatusFieldSessions is the status field the two sessions
-	// counters project to, and the name their pruning record and the
-	// Warning for a failed listener carry.
+	// counters project to, and the name the Warning for a failed listener
+	// carries. The field is in status.usage's first schema, so it has no
+	// pruning record of its own.
 	usageStatusFieldSessions = "sessionsTotal"
 	// usagePodEntryKeySeparator joins a pod UID and a counter into an entry
 	// key; a UID carries no slash.

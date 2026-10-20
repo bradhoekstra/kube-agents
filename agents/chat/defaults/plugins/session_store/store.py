@@ -153,6 +153,9 @@ class SessionMetadataStore:
         sessions counter counts: Hermes' own store does not say whether
         get_or_create_session created, and the row is written under the same
         lock, so one session is counted once however many messages it has.
+        The retention sweep below bounds that: a session idle past
+        SESSION_KV_RETENTION_DAYS whose row was swept, then written to again,
+        is counted a second time.
         """
         payload = json.dumps(metadata, sort_keys=True)
         for attempt in range(2):

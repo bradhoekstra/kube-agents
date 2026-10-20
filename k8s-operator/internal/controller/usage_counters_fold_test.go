@@ -662,6 +662,36 @@ func TestFoldUsage_TriageSessionsTakeTheLargestDeltaAndChatSessionsTheSum(t *tes
 	}
 }
 
+// The triage half is the first Max counter a migration adds to a document
+// that predates it. On an HA install both gateway replicas are first read for
+// it in the same poll: each is a whole-sample candidate, the larger adds once,
+// not once per replica, and the next poll's deltas fold as the injected
+// events' do.
+func TestFoldUsage_AnUnfoldedMaxCounterFirstReadOnTwoReplicasAddsTheLargerOnce(t *testing.T) {
+	first := foldClock(0)
+	created := first.Add(-time.Hour)
+	doc := foldDoc(first, foldEntry(foldPodA, usageCounterEventsIngested, 100, ptr.To(1.0), first))
+	doc.Unfolded = []string{usageCounterSessionsTriage}
+	doc = runFoldSteps(t, doc, usageCounterSessionsTriage, []foldStep{
+		{minute: 5, live: []string{foldPodB}, scraped: []usageScrapedPod{
+			scrapedPod(foldPodA, usageCounterEventsIngested, created, 100, ptr.To(1.0)),
+			scrapedPod(foldPodA, usageCounterSessionsTriage, created, 30, ptr.To(1.0)),
+			scrapedPod(foldPodB, usageCounterSessionsTriage, created, 20, ptr.To(1.0)),
+		}, want: 30, moved: true},
+		{minute: 10, scraped: []usageScrapedPod{
+			scrapedPod(foldPodA, usageCounterEventsIngested, created, 100, ptr.To(1.0)),
+			scrapedPod(foldPodA, usageCounterSessionsTriage, created, 32, ptr.To(1.0)),
+			scrapedPod(foldPodB, usageCounterSessionsTriage, created, 22, ptr.To(1.0)),
+		}, want: 32, moved: true},
+	})
+	if len(doc.Unfolded) != 0 {
+		t.Fatalf("the unfolded mark outlived the first read: %v", doc.Unfolded)
+	}
+	if doc.Totals[usageCounterEventsIngested] != 0 {
+		t.Fatalf("a level injected counter moved: %v", doc.Totals)
+	}
+}
+
 // A partial straddle: both replicas move by different amounts, the total takes
 // the larger once, and the lagger's catch-up alone the poll after is reset
 // rather than counted on top.

@@ -2059,16 +2059,15 @@ type AgentStatus struct {
 // as the rest of the status.
 //
 // The operator writes ActiveInterfaces, from the spec, on every Ready status
-// update, and ToolExecutionsTotal, EventsIngestedTotal,
+// update, and ToolExecutionsTotal, EventsIngestedTotal, SessionsTotal,
 // RemediationsProposedTotal, RemediationsMergedTotal,
 // ChatMessagesInboundTotal, LastActiveTime, ClustersRegistered and
-// ClustersMonitored from the broker's, the event watcher's and the chat
-// plugin's metrics
+// ClustersMonitored from the broker's, the event watcher's, the chat
+// plugin's and, on a next install, the A2A gateway's metrics
 // listeners, which it reads every five minutes on the leader; the agent's own
-// ServiceAccount holds no write verb on this status. SessionsTotal and
-// RemediationsAppliedTotal are declared so that the schema names them, but
-// nothing writes them yet, and each is absent (omitempty) until a series
-// exists for it.
+// ServiceAccount holds no write verb on this status. RemediationsAppliedTotal
+// is declared so that the schema names it, but nothing writes it yet, and it
+// is absent (omitempty) until a series exists for it.
 type AgentUsageStatus struct {
 	// SessionsTotal is the cumulative count of sessions the agent opened: the
 	// triage sessions the event watcher asked the gateway for (its
