@@ -81,8 +81,10 @@ export interface Usage {
 export function usageOf(v: unknown): Usage | undefined {
   if (typeof v !== "object" || v === null || Array.isArray(v)) return undefined;
   const o = v as Record<string, unknown>;
+  // A zero is "not known" on the wire (the producer omits it), so an explicit
+  // zero reads as absent too rather than as a known nothing.
   const num = (k: string): number | undefined =>
-    typeof o[k] === "number" && Number.isFinite(o[k]) && (o[k] as number) >= 0 ? (o[k] as number) : undefined;
+    typeof o[k] === "number" && Number.isFinite(o[k]) && (o[k] as number) > 0 ? (o[k] as number) : undefined;
   const u: Usage = {
     model: typeof o.model === "string" && o.model !== "" ? o.model : undefined,
     inputTokens: num("inputTokens"),

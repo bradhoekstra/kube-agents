@@ -331,6 +331,23 @@ describe("artifact-update", () => {
     expect(state.chat).toHaveLength(1); // just the ask
   });
 
+  it("gives each turn's answer the usage part published ahead of it as its footer", () => {
+    let state = submission();
+    state = usageChunk(state, { inputTokens: 1000, outputTokens: 40, durationMs: 3000 });
+    state = artifact(state, "turn", "fleet: ");
+    state = artifact(state, "turn", "3 clusters green", true);
+    state = usageChunk(state, { inputTokens: 200, outputTokens: 10, durationMs: 500 }, true);
+    state = artifact(state, "result", "prod: green");
+    const answers = state.chat.filter((c) => c.kind === "answer");
+    expect(answers.map((a) => a.usage?.inputTokens)).toEqual([1000, 200]);
+    expect(answers[0].text).toBe("fleet: 3 clusters green");
+    // The part is spent on the answer it preceded: a further answer without
+    // its own part carries no footer.
+    state = artifact(state, "result", "prod: still green");
+    const again = state.chat.filter((c) => c.kind === "answer");
+    expect(again[2].usage).toBeUndefined();
+  });
+
   it("skips a usage part that is not usage, as the library's reader does", () => {
     let state = submission();
     state = usageChunk(state, { model: "m" }); // a name is not a figure

@@ -253,8 +253,8 @@ type apiUsage struct {
 // when it sent one (the alias the request named otherwise), its token
 // counts when it sent them, and the turn's wall time as the bridge measured
 // it from the request to the body read. No cost: Hermes behind the gateway
-// prices nothing (deploy/telemetry.md), and the artifact carries no figure
-// the producer invented.
+// prices nothing (docs/site/src/content/docs/deploy/telemetry.md), and the
+// artifact carries no figure the producer invented.
 func apiTurnUsage(out *apiChatResponse, requested string, took time.Duration) lib.Usage {
 	u := lib.Usage{Model: out.Model, DurationMs: turnMillis(took)}
 	if u.Model == "" {
@@ -524,6 +524,13 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 		if apiRateLimitedReasons[resp.Header.Get(apiFailureReasonHeader)] {
 			reason = "hermes-rate-limited"
 		}
+		// A turn that ran and failed still read tokens: its usage goes out
+		// ahead of the failed terminal, as the worker adapter's does.
+		run.mu.Lock()
+		if run.state == stateRunning {
+			b.publishUsageLocked(run, apiTurnUsage(&out, b.cfg.APIModel, time.Since(started)))
+		}
+		run.mu.Unlock()
 		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: %s - HTTP %d, turn failed; session: %s%s; error: %s",
 			reason, resp.StatusCode, sessionID, turnNote(turn), tail(out.Hermes.Error, apiBodyTailBytes)), nil)
 		return "", false

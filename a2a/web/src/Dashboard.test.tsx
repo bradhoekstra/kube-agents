@@ -136,7 +136,7 @@ describe("Dashboard", () => {
     const spend = document.querySelector('[data-panel="spend"]')!.textContent!;
     expect(spend).toContain("tasks reporting2");
     expect(spend).toContain("tokens2k in / 100 out");
-    expect(spend).toContain("cost$0.0123");
+    expect(spend).toContain("cost$0.0123 over 1 of 2 tasks");
     expect(spend).toContain("modelclaude-opus-5-5");
     expect(spend).toContain("turn time5s");
   });

@@ -92,7 +92,7 @@ describe("StatusStrip", () => {
     render(<StatusStrip state={priced} onFocus={() => {}} />);
     const tile = screen.getByTestId("tile-spend");
     expect(tile.textContent).toContain("$0.2500");
-    expect(tile.getAttribute("title")).toContain("2 tasks reported usage: 3k in / 100 out, $0.2500, 4s");
+    expect(tile.getAttribute("title")).toBe("2 tasks reported usage: $0.2500 over 1 of 2 tasks");
     cleanup();
     const counted: UiState = {
       ...state,

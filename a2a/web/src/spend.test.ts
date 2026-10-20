@@ -54,6 +54,17 @@ describe("usage parts", () => {
     expect(usageOf(null)).toBeUndefined();
   });
 
+  it("reads an explicit zero as unknown, as the wire rule says, never as a known nothing", () => {
+    expect(usageOf({ costUsd: 0 })).toBeUndefined();
+    expect(usageOf({ costUsd: 0, outputTokens: 3 })).toEqual({
+      model: undefined,
+      inputTokens: undefined,
+      outputTokens: 3,
+      costUsd: undefined,
+      durationMs: undefined,
+    });
+  });
+
   it("takes the data parts that are usage and skips the rest", () => {
     const parts = [
       { kind: "text", text: "not usage" },
@@ -124,6 +135,8 @@ describe("spend totals", () => {
     );
     expect(spendOf(state)).toEqual({
       reported: 2,
+      priced: 1,
+      counted: 2,
       total: {
         model: undefined,
         inputTokens: 150,
@@ -132,6 +145,20 @@ describe("spend totals", () => {
         durationMs: 20,
       },
     });
+  });
+
+  it("says how many of the reporting tasks a cost or token sum covers", () => {
+    const state = withTasks(
+      task("a", { usage: { inputTokens: 100, outputTokens: 10, costUsd: 0.1 } }),
+      task("b", { usage: { durationMs: 500 } }),
+      task("c", { usage: { inputTokens: 50, durationMs: 20 } }),
+    );
+    expect(spendOf(state)).toMatchObject({ reported: 3, priced: 1, counted: 2 });
+    expect(spendTile(state).title).toBe("3 tasks reported usage: $0.1000 over 1 of 3 tasks");
+    const counted = withTasks(task("b", { usage: { durationMs: 500 } }), task("c", { usage: { inputTokens: 50 } }));
+    expect(spendTile(counted).title).toBe("2 tasks reported usage: 50 tok over 1 of 2 tasks");
+    const all = withTasks(task("a", { usage: { costUsd: 0.5 } }), task("b", { usage: { costUsd: 0.5 } }));
+    expect(spendTile(all).title).toBe("2 tasks reported usage: $1.00");
   });
 
   it("tiles the empty reason, then cost, then tokens, then time", () => {

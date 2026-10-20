@@ -120,6 +120,8 @@ export interface TaskView {
   reason?: string;
   /** The `usage` artifact's turns summed; absent until a turn reports one. */
   usage?: Usage;
+  /** The latest turn's usage part, held until that turn's answer takes it as its footer. */
+  turnUsage?: Usage;
 }
 
 export interface AnomalyCounts {
@@ -195,6 +197,8 @@ export interface ChatEntry {
   taskId?: string;
   /** A sentence about the entry's delivery, shown under it. */
   note?: string;
+  /** An answer's footer: the usage part the turn published ahead of it. */
+  usage?: Usage;
 }
 
 export type ProbeOutcome = "refused" | "sent" | "error";
@@ -656,14 +660,18 @@ function reduceArtifactUpdate(
     text: payload.append && existing ? existing.text + text : text,
     chunks: (existing?.chunks ?? 0) + 1,
   });
-  // Each usage chunk is one turn's figures; the task keeps the sum. A part
-  // that is not usage is skipped, as the library's reader skips it.
+  // Each usage chunk is one turn's figures; the task keeps the sum, and the
+  // latest part waits for the turn's answer, which takes it as its footer.
+  // A part that is not usage is skipped, as the library's reader skips it.
   const turns = name === ARTIFACT_USAGE ? usageParts(artifact.parts) : [];
   const usage = turns.length > 0 ? usageTotal([...(prev?.usage ? [prev.usage] : []), ...turns]) : prev?.usage;
+  const answerOpens = (name === ARTIFACT_RESULT || name === ARTIFACT_TURN) && payload.append !== true;
+  const turnUsage = turns.length > 0 ? turns[turns.length - 1] : answerOpens ? undefined : prev?.turnUsage;
   next.tasks = upsertTask(state.tasks, env, subject, {
     artifacts,
     executor: prev?.executor ?? env.from.session,
     usage,
+    turnUsage,
   });
 
   if (name === ARTIFACT_RESULT || name === ARTIFACT_TURN) {
@@ -676,6 +684,7 @@ function reduceArtifactUpdate(
         text,
         correlationId: env.correlationId,
         taskId: env.taskId,
+        usage: prev?.turnUsage,
       },
       payload.append === true,
     );

@@ -218,29 +218,47 @@ export function taskSpend(t: TaskView): string {
 export interface Spend {
   /** Tasks whose turns reported usage. */
   reported: number;
+  /** Of those, the tasks whose turns carried a cost; the cost sum covers these alone. */
+  priced: number;
+  /** Of those, the tasks whose turns carried token counts; the token sums cover these alone. */
+  counted: number;
   /** Their usage summed; absent until one reports. */
   total?: Usage;
 }
 
 export function spendOf(state: UiState): Spend {
   const usages = [...state.tasks.values()].flatMap((t) => (t.usage ? [t.usage] : []));
-  return { reported: usages.length, total: usageTotal(usages) };
+  return {
+    reported: usages.length,
+    priced: usages.filter((u) => u.costUsd !== undefined).length,
+    counted: usages.filter((u) => u.inputTokens !== undefined || u.outputTokens !== undefined).length,
+    total: usageTotal(usages),
+  };
+}
+
+/** "over 1 of 3 tasks" when a sum covers fewer tasks than reported, else "". */
+export function spendCoverage(part: number, reported: number): string {
+  return part < reported ? ` over ${part} of ${reported} tasks` : "";
 }
 
 /**
  * The strip's spend tile: the cost when any task priced a turn, the tokens
  * when any counted them, the time when that is all there is, and why it is
- * empty before any of that.
+ * empty before any of that. A sum that covers fewer tasks than reported says
+ * so, since an unpriced task adds nothing rather than zero.
  */
 export function spendTile(state: UiState): { text: string; title: string } {
-  const { reported, total } = spendOf(state);
+  const { reported, priced, counted, total } = spendOf(state);
   if (total === undefined) return { text: "none yet", title: SPEND_EMPTY_REASON };
-  const title = `${reported} task${reported === 1 ? "" : "s"} reported usage: ${fmtUsage(total)}`;
-  if (total.costUsd !== undefined) return { text: fmtCost(total.costUsd), title };
-  if (total.inputTokens !== undefined || total.outputTokens !== undefined) {
-    return { text: `${fmtTokens((total.inputTokens ?? 0) + (total.outputTokens ?? 0))} tok`, title };
+  const tasks = `${reported} task${reported === 1 ? "" : "s"} reported usage`;
+  if (total.costUsd !== undefined) {
+    return { text: fmtCost(total.costUsd), title: `${tasks}: ${fmtCost(total.costUsd)}${spendCoverage(priced, reported)}` };
   }
-  return { text: fmtDuration(total.durationMs ?? 0), title };
+  if (total.inputTokens !== undefined || total.outputTokens !== undefined) {
+    const tok = `${fmtTokens((total.inputTokens ?? 0) + (total.outputTokens ?? 0))} tok`;
+    return { text: tok, title: `${tasks}: ${tok}${spendCoverage(counted, reported)}` };
+  }
+  return { text: fmtDuration(total.durationMs ?? 0), title: `${tasks}: ${fmtUsage(total)}` };
 }
 
 export type LivenessKind = "live" | "quiet" | "gone" | "idle" | "unknown" | "error" | "finished" | "stale";

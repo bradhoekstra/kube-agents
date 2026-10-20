@@ -357,6 +357,34 @@ type adapter struct {
 	// harnessModel is the model the harness named at init, carried onto
 	// each turn's usage part.
 	harnessModel string
+	// costSeen is the last result line's total_cost_usd, and costKnown
+	// whether one has been read: the harness reports a running total for
+	// the process, so a turn's cost is the difference from the line before
+	// (turnCost). resumedSession says this process resumed an earlier
+	// session, whose spend the first line's total also carries.
+	costSeen       float64
+	costKnown      bool
+	resumedSession bool
+}
+
+// turnCost is one result line's cost from the harness's running total: the
+// difference from the previous line, or the total itself on the first line
+// of a fresh process. The first line of a resumed session is unknown rather
+// than a figure: the harness restores the resumed session's spend into the
+// total, and nothing on the line says how much of it is this turn's. A
+// total that went down (a harness that reset it) is unknown too.
+func (a *adapter) turnCost(total float64) float64 {
+	prev, known := a.costSeen, a.costKnown
+	a.costSeen, a.costKnown = total, true
+	switch {
+	case !known && a.resumedSession:
+		return 0
+	case !known:
+		return total
+	case total < prev:
+		return 0
+	}
+	return total - prev
 }
 
 // Run executes the adapter's whole lifecycle and returns the terminal state of
@@ -622,6 +650,7 @@ func (a *adapter) execute(ctx context.Context, origin *lib.Envelope, originSeq u
 		}
 	}
 	argv = withResume(argv, plan.resume)
+	a.resumedSession = plan.resume != ""
 	env := cfg.HarnessEnv
 	if delegate && cfg.SessionReuse {
 		// A reused pod runs every turn of its conversation, and two turns
@@ -925,13 +954,15 @@ func (a *adapter) completeWith(resultText string) (Result, error) {
 }
 
 // publishUsage publishes one result line's cost as a part on the usage
-// artifact: the model from init, the prompt tokens as input, the harness's
-// price and wall time. A line with no figure publishes nothing, so a reader
-// sees absence rather than zeroes. Best-effort, like the other stream
-// telemetry: the deliverable and the terminal are the load-bearing
-// publishes.
+// artifact: the model from init, the prompt tokens as input, the wall time,
+// and this turn's share of the harness's running total (turnCost). A line
+// with no figure publishes nothing, so a reader sees absence rather than
+// zeroes. Best-effort, like the other stream telemetry: the deliverable and
+// the terminal are the load-bearing publishes.
 func (a *adapter) publishUsage(ctx context.Context, ev harnessEvent) {
-	part, err := lib.UsagePart(ev.usage(a.harnessModel))
+	u := ev.usage(a.harnessModel)
+	u.CostUsd = a.turnCost(ev.TotalCostUSD)
+	part, err := lib.UsagePart(u)
 	if err != nil {
 		return
 	}

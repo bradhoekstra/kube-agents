@@ -102,10 +102,15 @@ type harnessEvent struct {
 	// type:"result" fields.
 	Result  string `json:"result,omitempty"`
 	IsError bool   `json:"is_error,omitempty"`
-	// What the turn cost, on a result line: the harness's own token
-	// counts, its price for the turn and the turn's wall time. Each is
-	// optional; the adapter publishes what is there as the usage artifact
-	// (payload spec "Reserved artifact names") and nothing when none is.
+	// What the turn cost, on a result line: the harness's own token counts
+	// for the turn, the turn's wall time, and the harness's running price
+	// for the whole process. Usage and DurationMs are per turn;
+	// TotalCostUSD is cumulative across every result line the process has
+	// emitted, plus what a resumed session had already spent, so the
+	// adapter publishes the difference between consecutive lines
+	// (adapter.turnCost), never the figure itself. Each is optional; the
+	// adapter publishes what is there as the usage artifact (payload spec
+	// "Reserved artifact names") and nothing when none is.
 	Usage        *harnessUsage `json:"usage,omitempty"`
 	TotalCostUSD float64       `json:"total_cost_usd,omitempty"`
 	DurationMs   int64         `json:"duration_ms,omitempty"`
@@ -126,11 +131,12 @@ type harnessUsage struct {
 	CacheReadInputTokens     int64 `json:"cache_read_input_tokens,omitempty"`
 }
 
-// usage is the result line's figures as the usage artifact's part: model
-// from the init line, every prompt token as input, the harness's price and
-// wall time as it reported them. Zero where the line had nothing.
+// usage is the result line's per-turn figures as the usage artifact's part:
+// model from the init line, every prompt token as input, the wall time as
+// the harness reported it. Zero where the line had nothing. The cost is not
+// here: it is the running total's difference, which the adapter keeps.
 func (ev harnessEvent) usage(model string) lib.Usage {
-	u := lib.Usage{Model: model, CostUsd: ev.TotalCostUSD, DurationMs: ev.DurationMs}
+	u := lib.Usage{Model: model, DurationMs: ev.DurationMs}
 	if ev.Usage != nil {
 		u.InputTokens = ev.Usage.InputTokens + ev.Usage.CacheCreationInputTokens + ev.Usage.CacheReadInputTokens
 		u.OutputTokens = ev.Usage.OutputTokens

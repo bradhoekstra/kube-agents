@@ -99,6 +99,53 @@ func TestAPI_UsageWithoutCountsIsDurationAlone(t *testing.T) {
 	}
 }
 
+// A turn the server answered as failed still read tokens: its usage is on
+// the stream ahead of the failed terminal.
+func TestAPI_UsageOnAFailedTurn(t *testing.T) {
+	_, url := startServer(t)
+	stub := newAPIStub(t, func(w http.ResponseWriter, _ *http.Request, c apiCall) {
+		time.Sleep(stubTurnTime)
+		w.Header().Set(apiSessionIDHeader, c.sessionID)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []any{map[string]any{"message": map[string]any{"role": "assistant", "content": "The provider rate-limited me."}, "finish_reason": "error"}},
+			"hermes":  map[string]any{"failed": true, "error": "rate limited"},
+			"usage":   map[string]any{"prompt_tokens": 300, "completion_tokens": 12},
+		})
+	})
+	startAPIBridge(t, url, stub, nil)
+	c := gatewayClient(t, url)
+	origin := submitIn(t, c, "task-usage-failed", "ctx-usage-failed", "do the thing")
+	task := waitTerminal(t, c, origin.TaskID)
+	if task.State != lib.StateFailed {
+		t.Fatalf("state %s, want failed", task.State)
+	}
+	if err := task.ValidateArtifacts(); err != nil {
+		t.Fatalf("assertion 18: %v", err)
+	}
+	got := usageSeen(t, url, origin.TaskID)
+	if len(got) != 1 || got[0].InputTokens != 300 || got[0].OutputTokens != 12 || got[0].DurationMs <= 0 {
+		t.Fatalf("usage = %+v", got)
+	}
+}
+
+// A CLI run that exits non-zero on its own publishes its wall time ahead of
+// the failed terminal.
+func TestCLI_UsageOnAFailedRun(t *testing.T) {
+	_, url := startServer(t)
+	startBridge(t, url, script(t, `sleep 0.05; echo "boom" >&2; exit 3`))
+	c := gatewayClient(t, url)
+	origin := submit(t, c, "task-usage-cli-failed", "what is the fleet status")
+	task := waitTerminal(t, c, origin.TaskID)
+	if task.State != lib.StateFailed {
+		t.Fatalf("state %s, want failed", task.State)
+	}
+	got := usageSeen(t, url, origin.TaskID)
+	if len(got) != 1 || got[0].DurationMs <= 0 {
+		t.Fatalf("usage = %+v, want one part with a duration", got)
+	}
+}
+
 // The CLI executor knows no tokens, so its usage is the turn's wall time.
 func TestCLI_UsageIsDurationAlone(t *testing.T) {
 	_, url := startServer(t)

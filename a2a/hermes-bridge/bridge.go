@@ -1561,6 +1561,13 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 		// kill, so this arm wins only when the reap was quick.
 		b.finalize(run, lib.StateFailed, shutdownReason, nil)
 	default:
+		// A run that failed on its own still took its time; a killed one
+		// (the arms above) has no turn to account for.
+		run.mu.Lock()
+		if run.state == stateRunning {
+			b.publishUsageLocked(run, lib.Usage{DurationMs: turnMillis(reaped.Sub(started))})
+		}
+		run.mu.Unlock()
 		b.finalize(run, lib.StateFailed, failureReason(err, stdout.String(), stderr.String()), nil)
 	}
 }

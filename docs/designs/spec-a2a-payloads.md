@@ -431,13 +431,19 @@ nine carry reserved semantics. A `usage` part is one turn's figures as its produ
 `model` is the model the executor asked for or was told it ran; `inputTokens` is every token the
 model read for the turn, cached reads included, and `outputTokens` every token it wrote;
 `durationMs` is the turn's wall time as the producer measured it. `costUsd` is the producer's
-own estimate and is carried only when the producer had a figure it did not invent: a harness
-that prices its own turns (the worker adapter forwards its result line's `total_cost_usd`), never
-Hermes behind the inference gateway, which records no price for a turn (`deploy/telemetry.md`), so
-the hermes-bridge omits it and a cost reader turns to the gateway's `litellm_spend_metric_total`.
-A zero is "not known" and is omitted, so a reader never mistakes unknown for free, and a part
-with no figure at all is not published; the bridge's CLI executor, which sees no token counts,
-publishes the wall time alone. An `activity` entry is one `data` part whose object carries
+own estimate for that turn alone and is carried only when the producer had a figure it did not
+invent: a harness that prices its own turns, never Hermes behind the inference gateway, which
+records no price for a turn (`docs/site/src/content/docs/deploy/telemetry.md`), so the
+hermes-bridge omits it and a cost reader turns to the gateway's `litellm_spend_metric_total`. The
+worker adapter's harness reports a running total (`total_cost_usd`) across every result line of
+the process, a resumed session's earlier spend included, so the adapter publishes the difference
+between consecutive lines and omits the cost on the first line of a resumed session, where
+nothing says how much of the total is this turn's. A zero is "not known" and is omitted, so a
+reader never mistakes unknown for free, and a part with no figure at all is not published; the
+bridge's CLI executor, which sees no token counts, publishes the wall time alone. A turn that
+ran and failed still publishes what it read: the adapter on an errored result line, the bridge
+on a turn the API server answered as failed or a CLI run that exited on its own; a turn killed
+by a cancel, the deadline or a shutdown has no figure and publishes none. An `activity` entry is one `data` part whose object carries
 `tool`, `input` when the call had one, and may carry `callId`, `status` (`completed`, `error`,
 `interrupted` for a call still open at the terminal, or `truncated` on the one entry an executor
 publishes in place of the calls missing from the trace: past its budget, failed to publish,

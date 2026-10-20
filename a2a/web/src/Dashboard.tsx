@@ -17,6 +17,7 @@ import {
   fmtUsage,
   livenessOf,
   recentTasks,
+  spendCoverage,
   spendOf,
   taskSpend,
   taskTimes,
@@ -226,9 +227,14 @@ export default function Dashboard({
               "tokens",
               spend.total.inputTokens === undefined && spend.total.outputTokens === undefined
                 ? "not reported"
-                : `${fmtTokens(spend.total.inputTokens ?? 0)} in / ${fmtTokens(spend.total.outputTokens ?? 0)} out`,
+                : `${fmtTokens(spend.total.inputTokens ?? 0)} in / ${fmtTokens(spend.total.outputTokens ?? 0)} out${spendCoverage(spend.counted, spend.reported)}`,
             ],
-            ["cost", spend.total.costUsd === undefined ? "not reported" : fmtCost(spend.total.costUsd)],
+            [
+              "cost",
+              spend.total.costUsd === undefined
+                ? "not reported"
+                : `${fmtCost(spend.total.costUsd)}${spendCoverage(spend.priced, spend.reported)}`,
+            ],
             ["model", spend.total.model ?? "not reported"],
             ["turn time", spend.total.durationMs === undefined ? "not reported" : fmtDuration(spend.total.durationMs)],
           ].map(([f, v]) => (
