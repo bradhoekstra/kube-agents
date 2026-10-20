@@ -942,6 +942,19 @@ func TestFoldUsage_TwoNewReplicasInOnePollDoNotDoubleCount(t *testing.T) {
 	}
 }
 
+// A total reaches the status through unstructured JSON, where it is a float64,
+// so the ceiling is the largest integer that representation keeps exact, and
+// no total under it can come back changed.
+func TestUsageTotalCeiling_IsExactAsAFloat64(t *testing.T) {
+	const exact = int64(1) << 53
+	if usageTotalCeiling != exact {
+		t.Fatalf("usageTotalCeiling = %d, want %d", usageTotalCeiling, exact)
+	}
+	if back := int64(float64(usageTotalCeiling)); back != usageTotalCeiling {
+		t.Fatalf("the ceiling does not survive a float64 round trip: %d", back)
+	}
+}
+
 func TestAddUsageTotal_RefusesPastTheCeiling(t *testing.T) {
 	doc := foldDoc(foldClock(0))
 	doc.Totals[usageCounterToolExecutions] = usageTotalCeiling - 1

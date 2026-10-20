@@ -2,7 +2,8 @@
 
 The operator sums the credential broker's tool-invocation counter over its
 success and error outcomes (the commands it ran and the requests it rejected or
-failed on before running) and the event watcher's injected-event counter, and
+failed on before running), and the same counter over blocked, busy and abandoned
+into toolExecutionsBlockedTotal, and the event watcher's injected-event counter, and
 reads process_start_time_seconds from all four, and counts the watcher's per-cluster
 up gauge into the two cluster gauges, and sums the broker's version-control
 counter under one verb and status into remediationsProposedTotal, and its
@@ -129,6 +130,18 @@ class UsageCountersSeriesNamesTest(unittest.TestCase):
         self.assertEqual({_py_const("TOOL_STATUS_SUCCESS"), _py_const("TOOL_STATUS_ERROR")}, counted)
         for excluded in ("TOOL_STATUS_BLOCKED", "TOOL_STATUS_BUSY", "TOOL_STATUS_ABANDONED"):
             self.assertNotIn(_py_const(excluded), counted)
+
+    def test_the_refused_outcomes_are_the_brokers_blocked_busy_and_abandoned(self):
+        source = _SCRAPE_GO.read_text()
+        match = re.search(r"toolInvocationsRefusedStatuses\s*=\s*map\[string\]bool\{([^}]*)\}", source)
+        self.assertIsNotNone(match, "toolInvocationsRefusedStatuses not found")
+        refused = set(re.findall(r'"([^"]+)":\s*true', match.group(1)))
+        self.assertEqual(
+            {_py_const("TOOL_STATUS_BLOCKED"), _py_const("TOOL_STATUS_BUSY"), _py_const("TOOL_STATUS_ABANDONED")},
+            refused,
+        )
+        for excluded in ("TOOL_STATUS_SUCCESS", "TOOL_STATUS_ERROR"):
+            self.assertNotIn(_py_const(excluded), refused)
 
     def test_the_status_label_key_the_broker_writes_is_the_one_the_poller_filters_on(self):
         self.assertEqual(_py_const("TOOL_STATUS_LABEL"), _go_const(_SCRAPE_GO, "toolInvocationsStatusLabel"))
