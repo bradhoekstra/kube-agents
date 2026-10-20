@@ -62,6 +62,18 @@ const (
 	usageCounterRemediationsProposed = "remediationsProposedTotal"
 	usageCounterRemediationsMerged   = "remediationsMergedTotal"
 	usageCounterChatMessagesInbound  = "chatMessagesInboundTotal"
+	// sessionsTotal is two document counters, because its halves aggregate
+	// differently (usageAggregationFor): the sessions the watcher opens for
+	// triage, read on every gateway replica over the same event stream, and
+	// the sessions the chat gateways open for conversations, each listener
+	// counting its own. The status field is their sum
+	// (usageStatusFieldSessions); neither name is a status field.
+	usageCounterSessionsTriage = "sessionsTriage"
+	usageCounterSessionsChat   = "sessionsChat"
+	// usageStatusFieldSessions is the status field the two sessions
+	// counters project to, and the name their pruning record and the
+	// Warning for a failed listener carry.
+	usageStatusFieldSessions = "sessionsTotal"
 	// usagePodEntryKeySeparator joins a pod UID and a counter into an entry
 	// key; a UID carries no slash.
 	usagePodEntryKeySeparator = "/"
@@ -71,12 +83,29 @@ var (
 	// usageGatewayCounters, usageChatCounters and usageBrokerCounters are the
 	// counters each pod group's body feeds, in the order the stub source hands
 	// samples out.
-	usageGatewayCounters = []string{usageCounterEventsIngested}
-	usageChatCounters    = []string{usageCounterChatMessagesInbound}
+	usageGatewayCounters = []string{usageCounterEventsIngested, usageCounterSessionsTriage}
+	usageChatCounters    = []string{usageCounterChatMessagesInbound, usageCounterSessionsChat}
 	usageBrokerCounters  = []string{usageCounterToolExecutions, usageCounterRemediationsProposed, usageCounterRemediationsMerged}
 	// usageCounters is every counter the document keeps and the status seeds.
-	usageCounters = []string{usageCounterToolExecutions, usageCounterEventsIngested, usageCounterRemediationsProposed, usageCounterRemediationsMerged, usageCounterChatMessagesInbound}
+	usageCounters = []string{usageCounterToolExecutions, usageCounterEventsIngested, usageCounterRemediationsProposed, usageCounterRemediationsMerged, usageCounterChatMessagesInbound, usageCounterSessionsTriage, usageCounterSessionsChat}
+	// usageSessionsCounters is the pair that projects to usageStatusFieldSessions.
+	usageSessionsCounters = []string{usageCounterSessionsTriage, usageCounterSessionsChat}
 )
+
+// usageStatusFieldFor is the status.usage field a document counter projects
+// to: the counter's own name, except the two sessions halves, which share one.
+func usageStatusFieldFor(counter string) string {
+	if slices.Contains(usageSessionsCounters, counter) {
+		return usageStatusFieldSessions
+	}
+	return counter
+}
+
+// usageSessionsTotal is the sum of the two sessions halves in totals: the
+// value status.usage.sessionsTotal takes.
+func usageSessionsTotal(totals map[string]int64) int64 {
+	return totals[usageCounterSessionsTriage] + totals[usageCounterSessionsChat]
+}
 
 // usagePodEntryKey is the document key of one pod's entry for one counter.
 func usagePodEntryKey(uid, counter string) string {
@@ -107,9 +136,11 @@ const (
 	usageAggregateMax
 )
 
-// usageAggregationFor is the aggregation each counter takes.
+// usageAggregationFor is the aggregation each counter takes: the watcher's two
+// counters, read on every replica over the one event stream, the largest
+// delta; every other, the sum.
 func usageAggregationFor(counter string) usageAggregation {
-	if counter == usageCounterEventsIngested {
+	if counter == usageCounterEventsIngested || counter == usageCounterSessionsTriage {
 		return usageAggregateMax
 	}
 	return usageAggregateSum

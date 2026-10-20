@@ -7,7 +7,9 @@ reads process_start_time_seconds from all four, and counts the watcher's per-clu
 up gauge into the two cluster gauges, and sums the broker's version-control
 counter under one verb and status into remediationsProposedTotal, and its
 merged-proposals counter whole into remediationsMergedTotal, and the chat plugin's inbound-message
-counter over its platform label into chatMessagesInboundTotal. Each series name, the status label
+counter over its platform label into chatMessagesInboundTotal, and into sessionsTotal the watcher's
+session-create counter under its ok outcome, the chat plugin's sessions counter and the A2A
+gateway's. Each series name, the status label
 key the broker writes and the operator filters on, and each counted outcome
 value is a constant on the producer's side and a second copy on the operator's,
 and a rename on either side would freeze a status counter silently: the scrape
@@ -81,6 +83,19 @@ class UsageCountersSeriesNamesTest(unittest.TestCase):
         helpers = _REPO_ROOT / "k8s-operator" / "internal" / "controller" / "manifest_helpers.go"
         for gateway_const, operator_const in (("platformGoogleChat", "interfaceGoogleChat"), ("platformSlack", "interfaceSlack")):
             self.assertEqual(_go_const(_A2A_METRICS_GO, gateway_const), _go_const(helpers, operator_const))
+
+    def test_the_sessions_families_are_the_ones_the_poller_sums(self):
+        """sessionsTotal is read from three families: the watcher's session creates
+        under the one outcome that opened a session, the chat plugin's sessions
+        counter on its listener, and the A2A gateway's on a next-mode install."""
+        self.assertEqual(_watcher_family("sessionCreates"), _go_const(_SCRAPE_GO, "sessionCreatesSeries"))
+        watcher_main = (_REPO_ROOT / "k8s-operator" / "cmd" / "k8s-event-watcher" / "main.go").read_text()
+        outcome = _go_const(_SCRAPE_GO, "sessionCreateOutcomeOK")
+        self.assertRegex(watcher_main, rf'sessionCreates\.WithLabelValues\([^)]*"{outcome}"\)\.Inc\(\)')
+        self.assertEqual("outcome", _go_const(_SCRAPE_GO, "sessionCreateOutcome"))
+        self.assertEqual(_py_const("CHAT_SESSIONS_METRIC", _CHAT_METRICS_PY), _go_const(_SCRAPE_GO, "chatSessionsSeries"))
+        name = "_".join(_go_const(_A2A_METRICS_GO, c) for c in ("metricsNamespace", "metricsSubsystem", "sessionsName"))
+        self.assertEqual(name, _go_const(_SCRAPE_GO, "a2aSessionsSeries"))
 
     def test_the_chat_plugins_counter_is_the_one_the_poller_sums(self):
         plugin = _CHAT_METRICS_PY.read_text()

@@ -107,9 +107,9 @@ const (
 
 // UsageCounterPoller produces status.usage's toolExecutionsTotal,
 // eventsIngestedTotal, remediationsProposedTotal, remediationsMergedTotal,
-// chatMessagesInboundTotal and lastActiveTime on every
+// chatMessagesInboundTotal, sessionsTotal and lastActiveTime on every
 // PlatformAgent, and the two cluster gauges, from the broker's, the
-// watcher's and the chat plugin's metrics listeners, as a
+// watcher's, the chat plugin's and the A2A gateway's metrics listeners, as a
 // manager Runnable on the leader, off the reconcile path. docs/designs/usage-counters-producer.md is
 // the design; the rules the counters follow are in usage_counters_fold.go, the
 // scrape in usage_counters_scrape.go. This file is the loop and the two
@@ -133,7 +133,8 @@ type UsageCounterPoller struct {
 	mu      sync.Mutex
 	streaks map[usageStreakKey]*usageScrapeStreak
 	// prunedNewerFields records, per CR and per newer field -- the cluster
-	// gauges as one, remediationsMergedTotal, chatMessagesInboundTotal -- the last poll in which that
+	// gauges as one, remediationsMergedTotal, chatMessagesInboundTotal,
+	// sessionsTotal -- the last poll in which that
 	// field was written and came back absent: a served CRD at a previous
 	// schema, which has the three first counters (every CRD with status.usage
 	// has carried remediationsProposedTotal) and not every later field. A
@@ -821,14 +822,22 @@ func usageDocumentInvalid(doc *usageDocument, cm *corev1.ConfigMap, agent *agent
 	if doc.Totals == nil || doc.Pods == nil {
 		return "no totals or no pods"
 	}
-	for counter, floor := range usageStatusSeed(agent, now).Totals {
+	floors := usageStatusSeed(agent, now).Totals
+	for counter, floor := range floors {
 		total, ok := doc.Totals[counter]
 		if !ok || total < 0 || total > usageTotalCeiling {
 			return "a total is outside its bounds"
 		}
+		if slices.Contains(usageSessionsCounters, counter) {
+			// The pair is held to the status as a sum, below.
+			continue
+		}
 		if total < floor {
 			return "a total is below the status it projects to"
 		}
+	}
+	if usageSessionsTotal(doc.Totals) < floors[usageCounterSessionsChat] {
+		return "a total is below the status it projects to"
 	}
 	for _, counter := range doc.Unfolded {
 		if !slices.Contains(usageCounters, counter) || doc.Totals[counter] != 0 {
@@ -866,6 +875,10 @@ func usageStatusSeed(agent *agentv1alpha1.PlatformAgent, now time.Time) usageSee
 		usageCounterRemediationsProposed: usageStatusFloor(agent.Status.Usage.RemediationsProposedTotal),
 		usageCounterRemediationsMerged:   usageStatusFloor(agent.Status.Usage.RemediationsMergedTotal),
 		usageCounterChatMessagesInbound:  usageStatusFloor(agent.Status.Usage.ChatMessagesInboundTotal),
+		// One status value for two halves: it seeds the chat half, and the
+		// read-back bound holds the pair's sum to it (usageDocumentInvalid).
+		usageCounterSessionsTriage: 0,
+		usageCounterSessionsChat:   usageStatusFloor(agent.Status.Usage.SessionsTotal),
 	}}
 	if last := agent.Status.Usage.LastActiveTime; last != nil && !last.Time.After(now) {
 		seed.LastMoved = last.DeepCopy()
@@ -1012,6 +1025,7 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	proposed := doc.Totals[usageCounterRemediationsProposed]
 	merged := doc.Totals[usageCounterRemediationsMerged]
 	chat := doc.Totals[usageCounterChatMessagesInbound]
+	sessions := usageSessionsTotal(doc.Totals)
 	usage := &agent.Status.Usage
 	wantRegistered, wantMonitored := usageGaugeFields(gauges)
 	// The first three counters are in every served CRD that has status.usage;
@@ -1023,9 +1037,10 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	gaugesPruned := p.newerFieldPruned(agent, usageNewerFieldGauges)
 	mergedPruned := p.newerFieldPruned(agent, usageCounterRemediationsMerged)
 	chatPruned := p.newerFieldPruned(agent, usageCounterChatMessagesInbound)
+	sessionsPruned := p.newerFieldPruned(agent, usageStatusFieldSessions)
 	gaugesMoved := gaugesKnown && !gaugesPruned &&
 		(!usageGaugeEqual(usage.ClustersRegistered, wantRegistered) || !usageGaugeEqual(usage.ClustersMonitored, wantMonitored))
-	newerBehind := (!mergedPruned && usage.RemediationsMergedTotal < merged) || (!chatPruned && usage.ChatMessagesInboundTotal < chat)
+	newerBehind := (!mergedPruned && usage.RemediationsMergedTotal < merged) || (!chatPruned && usage.ChatMessagesInboundTotal < chat) || (!sessionsPruned && usage.SessionsTotal < sessions)
 	behind := usage.ToolExecutionsTotal < tool || usage.EventsIngestedTotal < events || usage.RemediationsProposedTotal < proposed || newerBehind || gaugesMoved ||
 		(doc.LastMoved != nil && (usage.LastActiveTime == nil || !usage.LastActiveTime.Equal(doc.LastMoved)))
 	if !behind || p.r.usageStatusPruned(agent) {
@@ -1037,6 +1052,7 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	usage.RemediationsProposedTotal = proposed
 	usage.RemediationsMergedTotal = merged
 	usage.ChatMessagesInboundTotal = chat
+	usage.SessionsTotal = sessions
 	if doc.LastMoved != nil {
 		usage.LastActiveTime = doc.LastMoved.DeepCopy()
 	}
@@ -1066,6 +1082,9 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	}
 	if chat > 0 {
 		p.noteNewerFieldEcho(ctx, agent, usageCounterChatMessagesInbound, agent.Status.Usage.ChatMessagesInboundTotal == chat)
+	}
+	if sessions > 0 {
+		p.noteNewerFieldEcho(ctx, agent, usageStatusFieldSessions, agent.Status.Usage.SessionsTotal == sessions)
 	}
 	return nil
 }
@@ -1143,7 +1162,10 @@ func (p *UsageCounterPoller) recordStandingFailures(agent *agentv1alpha1.Platfor
 func usageStatusFieldList(counters []string) string {
 	fields := make([]string, 0, len(counters))
 	for _, counter := range counters {
-		fields = append(fields, usageStatusFieldPrefix+counter)
+		field := usageStatusFieldPrefix + usageStatusFieldFor(counter)
+		if !slices.Contains(fields, field) {
+			fields = append(fields, field)
+		}
 	}
 	return strings.Join(fields, ", ")
 }

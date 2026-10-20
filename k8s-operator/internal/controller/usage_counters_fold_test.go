@@ -631,6 +631,37 @@ func TestFoldUsage_TheLargestDeltaAcrossGatewayPods(t *testing.T) {
 	})
 }
 
+// sessionsTotal is two document counters because its halves aggregate
+// differently: the watcher's triage sessions, read on every gateway replica
+// over the same event stream, take the largest delta like the injected events;
+// the chat sessions, from the leader's chat listener and the A2A gateway's
+// listener, each counting conversations of its own, sum.
+func TestFoldUsage_TriageSessionsTakeTheLargestDeltaAndChatSessionsTheSum(t *testing.T) {
+	first := foldClock(0)
+	created := first.Add(-time.Hour)
+	triage := foldDoc(first,
+		foldEntry(foldPodA, usageCounterSessionsTriage, 10, ptr.To(1.0), first),
+		foldEntry(foldPodB, usageCounterSessionsTriage, 10, ptr.To(1.0), first))
+	runFoldSteps(t, triage, usageCounterSessionsTriage, []foldStep{
+		{minute: 5, scraped: []usageScrapedPod{
+			scrapedPod(foldPodA, usageCounterSessionsTriage, created, 13, ptr.To(1.0)),
+			scrapedPod(foldPodB, usageCounterSessionsTriage, created, 12, ptr.To(1.0)),
+		}, want: 3, moved: true},
+	})
+	chat := foldDoc(first,
+		foldEntry(foldPodA, usageCounterSessionsChat, 4, ptr.To(1.0), first),
+		foldEntry("a2a-gateway", usageCounterSessionsChat, 20, ptr.To(1.0), first))
+	runFoldSteps(t, chat, usageCounterSessionsChat, []foldStep{
+		{minute: 5, scraped: []usageScrapedPod{
+			scrapedPod(foldPodA, usageCounterSessionsChat, created, 5, ptr.To(1.0)),
+			scrapedPod("a2a-gateway", usageCounterSessionsChat, created, 22, ptr.To(1.0)),
+		}, want: 3, moved: true},
+	})
+	if usageAggregationFor(usageCounterSessionsTriage) != usageAggregateMax || usageAggregationFor(usageCounterSessionsChat) != usageAggregateSum {
+		t.Fatal("the triage half is not Max or the chat half is not Sum")
+	}
+}
+
 // A partial straddle: both replicas move by different amounts, the total takes
 // the larger once, and the lagger's catch-up alone the poll after is reset
 // rather than counted on top.

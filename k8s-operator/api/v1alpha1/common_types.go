@@ -2070,8 +2070,14 @@ type AgentStatus struct {
 // nothing writes them yet, and each is absent (omitempty) until a series
 // exists for it.
 type AgentUsageStatus struct {
-	// SessionsTotal is the cumulative number of interactive sessions handled.
-	// Nothing writes it yet.
+	// SessionsTotal is the cumulative count of sessions the agent opened: the
+	// triage sessions the event watcher asked the gateway for (its
+	// k8s_event_watcher_session_creates_total under outcome="ok") plus the
+	// chat conversations the gateway opened a session for (the session_store
+	// plugin's kubeagents_chat_sessions_total on a today install, the A2A
+	// gateway's kubeagents_a2a_gateway_sessions_total on a next install).
+	// Read every five minutes and kept monotonic across restarts, like
+	// toolExecutionsTotal.
 	// +optional
 	SessionsTotal int64 `json:"sessionsTotal,omitempty"`
 
