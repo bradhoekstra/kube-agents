@@ -13,9 +13,12 @@ import {
   ARTIFACT_PROGRESS,
   ARTIFACT_RESULT,
   ARTIFACT_TURN,
+  ARTIFACT_USAGE,
   TERMINAL_STATES,
   authorityOf,
   partsText,
+  usageParts,
+  usageTotal,
   type Artifact,
   type ArtifactUpdate,
   type Envelope,
@@ -23,6 +26,7 @@ import {
   type StatusUpdate,
   type SubjectInfo,
   type TaskState,
+  type Usage,
 } from "./protocol.ts";
 import { turnFate, type ConsoleOutFrame } from "./console.ts";
 
@@ -114,6 +118,8 @@ export interface TaskView {
   endedAt?: number;
   /** The message text on that terminal status: why the task ended. */
   reason?: string;
+  /** The `usage` artifact's turns summed; absent until a turn reports one. */
+  usage?: Usage;
 }
 
 export interface AnomalyCounts {
@@ -650,9 +656,14 @@ function reduceArtifactUpdate(
     text: payload.append && existing ? existing.text + text : text,
     chunks: (existing?.chunks ?? 0) + 1,
   });
+  // Each usage chunk is one turn's figures; the task keeps the sum. A part
+  // that is not usage is skipped, as the library's reader skips it.
+  const turns = name === ARTIFACT_USAGE ? usageParts(artifact.parts) : [];
+  const usage = turns.length > 0 ? usageTotal([...(prev?.usage ? [prev.usage] : []), ...turns]) : prev?.usage;
   next.tasks = upsertTask(state.tasks, env, subject, {
     artifacts,
     executor: prev?.executor ?? env.from.session,
+    usage,
   });
 
   if (name === ARTIFACT_RESULT || name === ARTIFACT_TURN) {

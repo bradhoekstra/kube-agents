@@ -216,7 +216,9 @@ type apiChatMessage struct {
 }
 
 // apiChatResponse is the subset of the chat-completions response the bridge
-// reads: the first choice's text, and the server's own verdict on the turn.
+// reads: the first choice's text, the server's own verdict on the turn, and
+// what the turn cost (Model and Usage, each optional; a server that sends
+// neither leaves the usage artifact with the turn's wall time alone).
 // A turn that failed with no text comes back as an OpenAI error envelope
 // with a non-2xx status, read as text; one that failed with text (a
 // provider error, a rate limit the retries did not outlast, the failure
@@ -231,6 +233,48 @@ type apiChatResponse struct {
 		Failed bool   `json:"failed"`
 		Error  string `json:"error"`
 	} `json:"hermes"`
+	Model string    `json:"model"`
+	Usage *apiUsage `json:"usage"`
+}
+
+// apiUsage is a response's token counts, in either spelling the server may
+// use: the chat-completions one (prompt_tokens, completion_tokens) or the
+// responses one (input_tokens, output_tokens). Hermes's prompt_tokens is
+// every token the model read, cached reads included, which is what the
+// usage artifact's inputTokens means.
+type apiUsage struct {
+	PromptTokens     int64 `json:"prompt_tokens"`
+	CompletionTokens int64 `json:"completion_tokens"`
+	InputTokens      int64 `json:"input_tokens"`
+	OutputTokens     int64 `json:"output_tokens"`
+}
+
+// apiTurnUsage is one answered turn's usage part: the server's model name
+// when it sent one (the alias the request named otherwise), its token
+// counts when it sent them, and the turn's wall time as the bridge measured
+// it from the request to the body read. No cost: Hermes behind the gateway
+// prices nothing (deploy/telemetry.md), and the artifact carries no figure
+// the producer invented.
+func apiTurnUsage(out *apiChatResponse, requested string, took time.Duration) lib.Usage {
+	u := lib.Usage{Model: out.Model, DurationMs: turnMillis(took)}
+	if u.Model == "" {
+		u.Model = requested
+	}
+	if out.Usage != nil {
+		u.InputTokens = max(out.Usage.PromptTokens, out.Usage.InputTokens)
+		u.OutputTokens = max(out.Usage.CompletionTokens, out.Usage.OutputTokens)
+	}
+	return u
+}
+
+// turnMillis is a turn's wall time for the usage part: whole milliseconds,
+// and at least one for a turn that took any time at all, so a fast turn is
+// a figure rather than the zero the part omits.
+func turnMillis(took time.Duration) int64 {
+	if took <= 0 {
+		return 0
+	}
+	return max(1, took.Milliseconds())
 }
 
 // apiTurnFailed reports whether the server marked the turn failed, the case
@@ -426,6 +470,7 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 		run.mu.Unlock()
 	}
 
+	started := time.Now()
 	resp, err := b.sendAPI(taskCtx, req, body)
 	if err != nil {
 		b.finalizeAPIError(run, taskCtx, err, turn)
@@ -491,6 +536,9 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 	// Held until it is on the stream: shutdownTasks leaves the run to this
 	// worker from here (answerHeld).
 	run.answerHeld = true
+	// What the turn cost, ahead of its answer and under the same lock a
+	// finalizer takes, so the usage part never follows the terminal.
+	b.publishUsageLocked(run, apiTurnUsage(&out, b.cfg.APIModel, time.Since(started)))
 	return out.Choices[0].Message.Content, true
 }
 

@@ -23,6 +23,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
 // DefaultHarnessPath is where the worker image carries the harness: the
@@ -100,8 +102,40 @@ type harnessEvent struct {
 	// type:"result" fields.
 	Result  string `json:"result,omitempty"`
 	IsError bool   `json:"is_error,omitempty"`
+	// What the turn cost, on a result line: the harness's own token
+	// counts, its price for the turn and the turn's wall time. Each is
+	// optional; the adapter publishes what is there as the usage artifact
+	// (payload spec "Reserved artifact names") and nothing when none is.
+	Usage        *harnessUsage `json:"usage,omitempty"`
+	TotalCostUSD float64       `json:"total_cost_usd,omitempty"`
+	DurationMs   int64         `json:"duration_ms,omitempty"`
 	// type:"system" subtype:"init".
 	SessionID string `json:"session_id,omitempty"`
+	// Model is the model the harness runs, named once on the init line and
+	// carried onto every turn's usage.
+	Model string `json:"model,omitempty"`
+}
+
+// harnessUsage is a result line's token counts. The three prompt figures
+// are what the model read for the turn, split by cache state; the usage
+// artifact sums them as inputTokens, since a cached read is still a read.
+type harnessUsage struct {
+	InputTokens              int64 `json:"input_tokens,omitempty"`
+	OutputTokens             int64 `json:"output_tokens,omitempty"`
+	CacheCreationInputTokens int64 `json:"cache_creation_input_tokens,omitempty"`
+	CacheReadInputTokens     int64 `json:"cache_read_input_tokens,omitempty"`
+}
+
+// usage is the result line's figures as the usage artifact's part: model
+// from the init line, every prompt token as input, the harness's price and
+// wall time as it reported them. Zero where the line had nothing.
+func (ev harnessEvent) usage(model string) lib.Usage {
+	u := lib.Usage{Model: model, CostUsd: ev.TotalCostUSD, DurationMs: ev.DurationMs}
+	if ev.Usage != nil {
+		u.InputTokens = ev.Usage.InputTokens + ev.Usage.CacheCreationInputTokens + ev.Usage.CacheReadInputTokens
+		u.OutputTokens = ev.Usage.OutputTokens
+	}
+	return u
 }
 
 type harnessMessage struct {

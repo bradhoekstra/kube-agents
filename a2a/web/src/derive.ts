@@ -16,7 +16,7 @@ import {
   type TaskView,
   type UiState,
 } from "./model.ts";
-import { STREAMS, TERMINAL_STATES } from "./protocol.ts";
+import { STREAMS, TERMINAL_STATES, usageTotal, type Usage } from "./protocol.ts";
 
 /** A capacity fraction at or past this turns the tile amber. */
 export const CAPACITY_WARN = 0.8;
@@ -27,8 +27,11 @@ export const LIVENESS_STALE_POLLS = 5;
 /** `LIVENESS_STALE_POLLS` * the poller's own interval. */
 export const LIVENESS_STALE_MS = LIVENESS_STALE_POLLS * POLL_MS;
 
-export const SPEND_TBD_REASON =
-  "tbd: the worker adapter parses the harness result line and drops usage, total_cost_usd and duration_ms (a2a/worker-adapter/harness.go), so tokens, cost, model and duration never reach the bus";
+/** What the spend tile and panel say before any task has reported a turn's usage. */
+export const SPEND_EMPTY_REASON =
+  "no task has reported usage yet: each executor publishes a usage artifact when a turn finishes (the worker adapter from the harness result line, the hermes-bridge from the API turn's answer); the bridge's CLI executor reports duration alone, and cost is carried only by a harness that prices its own turns";
+/** The tasks table's cost cell for a task whose turns reported nothing. */
+export const SPEND_NONE = "—";
 export const KV_TBD_REASON =
   "tbd: the only KV size read (STREAM.INFO on the KV_ streams) also lists every key, so the console identity doesn't have it";
 
@@ -177,6 +180,67 @@ export function taskTimes(t: TaskView): string {
   return [q !== undefined ? `queued ${fmtDuration(q)}` : "", d !== undefined ? `ran ${fmtDuration(d)}` : ""]
     .filter(Boolean)
     .join(", ");
+}
+
+const THOUSAND = 1000;
+const MILLION = 1_000_000;
+/** Cents matter under a dollar, so a sub-dollar cost keeps four places. */
+const COST_SMALL_DECIMALS = 4;
+const COST_DECIMALS = 2;
+
+export function fmtTokens(n: number): string {
+  if (n < THOUSAND) return `${Math.round(n)}`;
+  if (n < MILLION) return `${(n / THOUSAND).toFixed(1).replace(/\.0$/, "")}k`;
+  return `${(n / MILLION).toFixed(1).replace(/\.0$/, "")}M`;
+}
+
+export function fmtCost(usd: number): string {
+  return `$${usd.toFixed(usd >= 1 ? COST_DECIMALS : COST_SMALL_DECIMALS)}`;
+}
+
+/** One line for a usage: the figures it has, in a fixed order, nothing for the ones it lacks. */
+export function fmtUsage(u: Usage): string {
+  const parts: string[] = [];
+  if (u.inputTokens !== undefined || u.outputTokens !== undefined) {
+    parts.push(`${fmtTokens(u.inputTokens ?? 0)} in / ${fmtTokens(u.outputTokens ?? 0)} out`);
+  }
+  if (u.costUsd !== undefined) parts.push(fmtCost(u.costUsd));
+  if (u.durationMs !== undefined) parts.push(fmtDuration(u.durationMs));
+  if (u.model) parts.push(u.model);
+  return parts.join(", ");
+}
+
+/** The tasks table's cost cell: what the task's turns reported, or a dash. */
+export function taskSpend(t: TaskView): string {
+  return t.usage ? fmtUsage(t.usage) : SPEND_NONE;
+}
+
+export interface Spend {
+  /** Tasks whose turns reported usage. */
+  reported: number;
+  /** Their usage summed; absent until one reports. */
+  total?: Usage;
+}
+
+export function spendOf(state: UiState): Spend {
+  const usages = [...state.tasks.values()].flatMap((t) => (t.usage ? [t.usage] : []));
+  return { reported: usages.length, total: usageTotal(usages) };
+}
+
+/**
+ * The strip's spend tile: the cost when any task priced a turn, the tokens
+ * when any counted them, the time when that is all there is, and why it is
+ * empty before any of that.
+ */
+export function spendTile(state: UiState): { text: string; title: string } {
+  const { reported, total } = spendOf(state);
+  if (total === undefined) return { text: "none yet", title: SPEND_EMPTY_REASON };
+  const title = `${reported} task${reported === 1 ? "" : "s"} reported usage: ${fmtUsage(total)}`;
+  if (total.costUsd !== undefined) return { text: fmtCost(total.costUsd), title };
+  if (total.inputTokens !== undefined || total.outputTokens !== undefined) {
+    return { text: `${fmtTokens((total.inputTokens ?? 0) + (total.outputTokens ?? 0))} tok`, title };
+  }
+  return { text: fmtDuration(total.durationMs ?? 0), title };
 }
 
 export type LivenessKind = "live" | "quiet" | "gone" | "idle" | "unknown" | "error" | "finished" | "stale";

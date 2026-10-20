@@ -296,6 +296,50 @@ describe("artifact-update", () => {
     expect(answers.map((a) => a.text)).toEqual(["fleet: 3 clusters green", "prod: green"]);
     expect(state.tasks.get("task-1")?.artifacts.get("result")?.text).toBe("prod: green");
   });
+
+  function usageChunk(state: UiState, data: unknown, append = false): UiState {
+    return onSubject(
+      state,
+      "a2a.tasks.platform.task-1.events",
+      env({
+        kind: "artifact-update",
+        taskId: "task-1",
+        contextId: "ctx-1",
+        from: bridge,
+        payload: {
+          taskId: "task-1",
+          contextId: "ctx-1",
+          artifact: { artifactId: "art-usage", name: "usage", parts: [{ kind: "data", data }] },
+          append,
+        },
+      }),
+    );
+  }
+
+  it("sums the usage artifact's turns onto the task and keeps it out of the transcript", () => {
+    let state = submission();
+    expect(state.tasks.get("task-1")?.usage).toBeUndefined();
+    state = usageChunk(state, { model: "claude-opus-5-5", inputTokens: 1000, outputTokens: 40, durationMs: 3000 });
+    state = usageChunk(state, { inputTokens: 200, outputTokens: 10, costUsd: 0.01, durationMs: 500 }, true);
+    expect(state.tasks.get("task-1")?.usage).toEqual({
+      model: "claude-opus-5-5",
+      inputTokens: 1200,
+      outputTokens: 50,
+      costUsd: 0.01,
+      durationMs: 3500,
+    });
+    expect(state.chat).toHaveLength(1); // just the ask
+  });
+
+  it("skips a usage part that is not usage, as the library's reader does", () => {
+    let state = submission();
+    state = usageChunk(state, { model: "m" }); // a name is not a figure
+    state = usageChunk(state, { inputTokens: -1 }, true);
+    state = usageChunk(state, "1200 tokens", true);
+    expect(state.tasks.get("task-1")?.usage).toBeUndefined();
+    state = usageChunk(state, { outputTokens: 3, vendorNote: "x" }, true);
+    expect(state.tasks.get("task-1")?.usage).toEqual({ outputTokens: 3 });
+  });
 });
 
 describe("directory and topics", () => {

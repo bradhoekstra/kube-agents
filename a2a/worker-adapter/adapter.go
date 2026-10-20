@@ -354,6 +354,9 @@ type adapter struct {
 	// harnessSession is the session id the harness reported at init, which
 	// the next task in a reused pod resumes (Config.SessionReuse).
 	harnessSession string
+	// harnessModel is the model the harness named at init, carried onto
+	// each turn's usage part.
+	harnessModel string
 }
 
 // Run executes the adapter's whole lifecycle and returns the terminal state of
@@ -736,12 +739,17 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 			switch ev.Type {
 			case "system":
 				if ev.Subtype == "init" {
-					log.Info("harness session started", "harnessSession", ev.SessionID)
+					log.Info("harness session started", "harnessSession", ev.SessionID, "model", ev.Model)
 					a.harnessSession = ev.SessionID
+					a.harnessModel = ev.Model
 				}
 			case "assistant":
 				a.publishAssistant(ctx, ev)
 			case "result":
+				// What the turn cost goes out first, whatever the turn
+				// decided: a delegating turn, a steered one and an errored
+				// one all read tokens.
+				a.publishUsage(ctx, ev)
 				if delegated {
 					log.Info("harness result after delegation ignored", "task", a.taskID)
 					continue
@@ -914,6 +922,20 @@ func (a *adapter) completeWith(resultText string) (Result, error) {
 	}
 	state := lib.StateCompleted
 	return Result{State: state}, a.finalize(state, "", "")
+}
+
+// publishUsage publishes one result line's cost as a part on the usage
+// artifact: the model from init, the prompt tokens as input, the harness's
+// price and wall time. A line with no figure publishes nothing, so a reader
+// sees absence rather than zeroes. Best-effort, like the other stream
+// telemetry: the deliverable and the terminal are the load-bearing
+// publishes.
+func (a *adapter) publishUsage(ctx context.Context, ev harnessEvent) {
+	part, err := lib.UsagePart(ev.usage(a.harnessModel))
+	if err != nil {
+		return
+	}
+	a.publishArtifactChunk(ctx, lib.ArtifactUsage, part, false)
 }
 
 // publishAssistant maps one assistant message's content blocks onto the
