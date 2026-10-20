@@ -2,7 +2,7 @@
 
 Installed at ``/opt/hermes/agent/credential_redaction.py`` by
 ``deploy/docker/Dockerfile``; ``apply_credential_redaction.py`` wires it into
-three upstream sites. Runtime code only: nothing here imports Hermes at module
+five upstream sites, the two for the operator's rules described at the end. Runtime code only: nothing here imports Hermes at module
 load, so the unit tests beside it run without the image.
 
 What leaked, and where (issue #603)
@@ -138,6 +138,7 @@ REDACTOR_MODULE_ENV = "KUBE_AGENTS_REDACTOR_MODULE"
 DEFAULT_REDACTOR_MODULE = "/opt/defaults/plugins/common/redactor.py"
 REDACTOR_MODULE_NAME = "kube_agents_redactor"
 RULES_INSTALLED_MARKER = "_kube_agents_operator_rules"
+RULE_FILE_ENCODING = "utf-8"
 #: The message-dict fields the session store persists as text, or as JSON that
 #: carries text: what ``_message_row_params`` binds besides ``tool_calls``.
 MESSAGE_TEXT_FIELDS: tuple[str, ...] = (
@@ -446,7 +447,7 @@ def _load_rules(path: str) -> list:
     import yaml  # the Hermes venv ships it; not needed when the switch is off
 
     try:
-        with open(path, encoding="utf-8") as handle:
+        with open(path, encoding=RULE_FILE_ENCODING) as handle:
             config = yaml.safe_load(handle)
     except OSError as error:
         raise ValueError(f"{RULE_FILE_ENV}: cannot read {path}: {error}") from error

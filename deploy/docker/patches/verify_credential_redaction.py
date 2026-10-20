@@ -65,6 +65,7 @@ FLOOR_SHAPES = {
 CURL_COMMAND = f"curl -sS -H 'Authorization: Bearer {TOKEN}' https://example.invalid/v1/x"
 WORKER_TASK_ID = "t_verify"
 CLUSTER_NAME = "prod-eu-1"
+VERIFY_SALT = "verify-salt"
 POD_IP = "10.1.2.3"
 RULES_YAML = (
     "ip:\n  action: pseudonym\nrules:\n"
@@ -348,7 +349,7 @@ check("KUBE_AGENTS_REDACTOR_MODULE names the shared redactor", bool(REDACTOR_MOD
 
 
 def run_rules_child(rule_file: str, home: str) -> str:
-    env_extra = {"HERMES_HOME": home, "SESSION_KV_SALT": "verify-salt", "KUBE_AGENTS_REDACTOR_MODULE": REDACTOR_MODULE}
+    env_extra = {"HERMES_HOME": home, "SESSION_KV_SALT": VERIFY_SALT, "KUBE_AGENTS_REDACTOR_MODULE": REDACTOR_MODULE}
     if rule_file:
         env_extra["KUBE_AGENTS_REDACTION_CONFIG"] = rule_file
     return run_child(RULES_CHILD_SCRIPT, TOKEN, CLUSTER_NAME, POD_IP, env_extra=env_extra)

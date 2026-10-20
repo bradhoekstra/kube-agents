@@ -232,7 +232,9 @@ spec:
       the terminal-output cache, the worker transcript, state.db and the kanban
       board. Nothing is rendered while the switch is off or the chart does not
       render the gateway, so a default render is unchanged. Each process reads
-      the file once at start: a changed rule file needs the pod rolled.
+      the file once at start: a long-lived process keeps the rules it started
+      with while a new worker process reads the current file, so roll the pod
+      to move them all.
     */}}
     {{- $redaction := (.Values.litellm | default dict).redaction | default dict }}
     {{- $diskRedaction := and .Values.litellm .Values.litellm.enabled ($redaction.enabled | default false) }}

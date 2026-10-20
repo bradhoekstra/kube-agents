@@ -1,4 +1,4 @@
-"""Wire agent/credential_redaction.py into the three upstream sites it needs.
+"""Wire agent/credential_redaction.py into the five upstream sites it needs.
 
 One edit per file, none of them touched by another applier, so this runs at any
 point after ``credential_redaction.py`` is installed at
@@ -20,8 +20,19 @@ point after ``credential_redaction.py`` is installed at
    statement of ``main()``, the console entry point every ``hermes`` argv
    resolves to, ahead of the fast-launch returns and of the first print.
    ``find_def("main").body_start`` places it after the docstring.
+4. ``hermes_state_messages.py`` -- ``SessionMessagesMixin._message_row_params``,
+   the one binder every message insert goes through, gets a prologue that
+   passes the message dict and its tool calls through
+   ``redact_message_for_store``. ``find_method`` locates it inside the mixin,
+   and ``expect_parameters`` asserts the two names the prologue rebinds.
+5. ``hermes_cli/kanban_db.py`` -- ``create_task``, ``complete_task`` and
+   ``edit_completed_task_result`` each get a prologue that passes their text
+   parameters (title and body; result and summary) through
+   ``redact_store_text``, located and checked the same way before any insert.
 
-None of the three consumes its anchor, so the count check cannot tell a fresh
+The trailer in 1 also rebinds ``redact_sensitive_text`` to the operator-rules
+composition, outside the registration's ``try``, so an unreadable rule file
+stops the import. None of the five consumes its anchor, so the count check cannot tell a fresh
 file from a patched one; each edit names a marker only the insert contains
 and refuses to run twice.
 
