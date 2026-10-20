@@ -74,7 +74,7 @@ import json
 import os
 import sys
 import threading
-from typing import Any, Callable, Iterable, TextIO
+from typing import Any, Callable, Iterable, Mapping, TextIO
 
 #: A GCP OAuth 2.0 access token. The same string as
 #: ``AuditRedactor.GCP_OAUTH_TOKEN_PATTERN`` in
