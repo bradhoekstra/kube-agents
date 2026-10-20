@@ -324,7 +324,7 @@ type usageHarness struct {
 	// the echo of a status patch comes back with the field empty.
 	pruning bool
 	// pruningGauges makes the fake behave like a served CRD at a previous
-	// schema: status.usage with its first three counters, without the fields
+	// schema: status.usage with its first-schema counters, without the fields
 	// added later (the cluster gauges, the merged counter, the chat counter). pruningMerged is
 	// the CRD from the release between: the gauges served, the merged counter
 	// not; pruningChat the one from the release before this: the gauges and
@@ -817,6 +817,50 @@ func TestUsagePoller_SharesThePrunedRecordWithTheReadyWriter(t *testing.T) {
 	}
 	if h.r.usageStatusPruned(agent) {
 		t.Error("the echo carried the counters and the record was not cleared")
+	}
+}
+
+// sessionsTotal is a first-schema field, so under a served CRD that prunes
+// status.usage whole a poll in which sessions alone move writes the probe
+// once, records the pruning in the record the Ready writer shares, and keeps
+// the ConfigMap current; a CRD at a previous schema, which serves the first
+// schema, lands it beside the first three counters.
+func TestUsagePoller_SessionsAloneRecordThePrunedStatus(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	agent := usageTestAgent(created)
+	h := newUsageHarness(t, agent, usageDefaultObjects(created)...)
+	h.pruning = true
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.stub.setSample(gatewayAddr(), usageCounterSessionsTriage, 10)
+	h.stub.set(brokerAddr(), 0, nil)
+	h.poll(5)
+	h.stub.setSample(gatewayAddr(), usageCounterSessionsTriage, 12)
+	h.poll(10)
+	if h.patches != 1 {
+		t.Fatalf("%d patches after sessions alone moved, want 1 (the probe)", h.patches)
+	}
+	if !h.r.usageStatusPruned(agent) {
+		t.Fatal("the echo came back without sessionsTotal and no pruning was recorded")
+	}
+	h.stub.setSample(gatewayAddr(), usageCounterSessionsTriage, 13)
+	h.poll(15)
+	if h.patches != 1 {
+		t.Fatalf("%d patches while the record is fresh, want 1", h.patches)
+	}
+	if doc := h.document(); usageSessionsTotal(doc.Totals) != 3 {
+		t.Fatalf("the ConfigMap fell behind under the pruning CRD: %v", doc.Totals)
+	}
+	// A CRD at a previous schema serves sessionsTotal with the first three
+	// counters: the field lands while the newer fields are pruned.
+	h.r.prunedUsageStatus.Store(client.ObjectKeyFromObject(agent), time.Now().Add(-2*usageStatusReprobeInterval))
+	h.pruning = false
+	h.pruningGauges = true
+	h.poll(20)
+	if status := h.status(); status.SessionsTotal != 3 {
+		t.Fatalf("status under a previous-schema CRD: %+v, want sessionsTotal 3", status)
+	}
+	if h.r.usageStatusPruned(agent) {
+		t.Error("the echo carried sessionsTotal and the record was not cleared")
 	}
 }
 

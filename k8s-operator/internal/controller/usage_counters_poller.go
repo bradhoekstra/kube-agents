@@ -135,8 +135,9 @@ type UsageCounterPoller struct {
 	// prunedNewerFields records, per CR and per newer field -- the cluster
 	// gauges as one, remediationsMergedTotal, chatMessagesInboundTotal -- the last poll in which that
 	// field was written and came back absent: a served CRD at a previous
-	// schema, which has the three first counters (every CRD with status.usage
-	// has carried remediationsProposedTotal) and not every later field. A
+	// schema, which has the first-schema counters (every CRD with status.usage
+	// has carried remediationsProposedTotal and sessionsTotal) and not every
+	// later field. A
 	// record per field rather than the counters' shared one, or one for all
 	// the newer fields, because each record suppresses the writes it covers
 	// for the interval and the fields such a CRD does serve should keep
@@ -1027,7 +1028,7 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	sessions := usageSessionsTotal(doc.Totals)
 	usage := &agent.Status.Usage
 	wantRegistered, wantMonitored := usageGaugeFields(gauges)
-	// The first three counters are in every served CRD that has status.usage;
+	// The first-schema counters are in every served CRD that has status.usage;
 	// the gauges, the merged counter and the chat counter arrived later, each
 	// at its own release, and a CRD at a previous schema prunes some or all of
 	// them, so a difference in one of them alone waits while that field's

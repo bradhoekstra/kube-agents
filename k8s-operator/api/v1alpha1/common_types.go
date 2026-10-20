@@ -2074,9 +2074,10 @@ type AgentUsageStatus struct {
 	// k8s_event_watcher_session_creates_total under outcome="ok") plus the
 	// chat conversations the gateway opened a session for (the session_store
 	// plugin's kubeagents_chat_sessions_total on a today install, the A2A
-	// gateway's kubeagents_a2a_gateway_sessions_total on a next install).
-	// Read every five minutes and kept monotonic across restarts, like
-	// toolExecutionsTotal.
+	// gateway's kubeagents_a2a_gateway_sessions_total on a next install). A
+	// chat conversation that resumes after the session store's retention
+	// window (seven days by default) counts again. Read every five minutes
+	// and kept monotonic across restarts, like toolExecutionsTotal.
 	// +optional
 	SessionsTotal int64 `json:"sessionsTotal,omitempty"`
 
