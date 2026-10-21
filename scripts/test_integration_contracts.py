@@ -70,6 +70,26 @@ RELEASE_STAGE_WATCHED_WORKFLOWS = (
     "Staging: Promotion Pipeline",
     "Release & Publish (GA)",
 )
+# The compensation and non-gating jobs of those workflows, by `name:`: the
+# ones the notifier names as the failing stage only when nothing else failed,
+# because they run after a gating failure or fail inside green runs and are
+# skipped on an ordinary green night. The notifier knows them by the
+# substrings in `COMPENSATION_JOB_MARKERS`; this tuple is what those
+# substrings have to select, so a rename of any of them reds the test.
+RELEASE_STAGE_COMPENSATION_JOBS = (
+    "Step 5 - Tear Down RC Environment",
+    "Next mode (non-gating) - Step 6 - Provision RC Environment",
+    "Next mode (non-gating) - Step 7 - Run E2E Tests",
+    "Next mode (non-gating) - Step 8 - Tear Down RC Environment",
+    "Step 3b - Roll Back to the Previous GA and Forward Again",
+    "Step 5b - Withdraw an Unsettled Nomination",
+    "Step 7 - Tear Down Nightly Environment",
+)
+# What marks a job as one that runs regardless of, or without failing, the
+# run: job-level `continue-on-error`, or an `if:` that runs it after a
+# failure. Every job of the watched workflows that carries one has to be in
+# the tuple above.
+RELEASE_STAGE_ALWAYS_RUN_CONDITIONS = ("always()", "!cancelled()")
 # The flaky-check reporter's contract is the inverse of the broken-main one:
 # not a fixed list it must contain, but that every pull-request check is
 # either watched or named here as left out on purpose. The watched list is
@@ -739,6 +759,38 @@ class WorkflowNameJoinTest(unittest.TestCase):
             missing,
             "watched release workflows that match no workflow name (renamed?): " + ", ".join(missing),
         )
+
+    def test_the_release_stage_notifier_knows_every_compensation_job(self):
+        """The jobs API carries neither `if:` nor `continue-on-error`, so the
+        notifier tells a compensation job (a withdrawal that runs because the
+        eval did not settle, a teardown, a rollback leg, a non-gating next-mode
+        leg) from a gating stage by its name. The markers have to select
+        exactly the jobs named above, and every job the workflow files mark as
+        running after a failure or without failing the run has to be among
+        them, or a renamed leg is named as the stage and holds its issue open
+        for good."""
+        markers = tuple(_release_stage_notifier().COMPENSATION_JOB_MARKERS)
+        documents = self._workflows()
+        watched = [document for document in documents.values() if document.get("name") in RELEASE_STAGE_WATCHED_WORKFLOWS]
+        self.assertEqual(len(watched), len(RELEASE_STAGE_WATCHED_WORKFLOWS))
+        selected, always_run = set(), set()
+        for document in watched:
+            for job in (document.get("jobs") or {}).values():
+                name = (job or {}).get("name") or ""
+                if any(marker in name for marker in markers):
+                    selected.add(name)
+                condition = str((job or {}).get("if", ""))
+                if (job or {}).get("continue-on-error") is True or any(each in condition for each in RELEASE_STAGE_ALWAYS_RUN_CONDITIONS):
+                    always_run.add(name)
+        self.assertEqual(
+            set(RELEASE_STAGE_COMPENSATION_JOBS),
+            selected,
+            "COMPENSATION_JOB_MARKERS selects a different set of jobs than RELEASE_STAGE_COMPENSATION_JOBS names",
+        )
+        unmarked = sorted(always_run - selected)
+        self.assertEqual([], unmarked, "jobs that run after a failure or without failing the run, and no marker selects: " + ", ".join(unmarked))
+        unused = [marker for marker in markers if not any(marker in name for name in selected)]
+        self.assertEqual([], unused, "markers that select no job: " + ", ".join(unused))
 
     def test_the_required_python_job_runs_the_suite_in_strict_mode(self):
         """The gate is one flag on one line, and losing it fails open.

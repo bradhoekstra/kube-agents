@@ -17,7 +17,11 @@ after the pipeline passes; and posting to Chat without an issue to cite.
 
 import io
 import json
+import os
+import stat
+import subprocess
 import sys
+import tempfile
 import unittest
 import urllib.error
 from pathlib import Path
@@ -49,6 +53,8 @@ STAGING_26_JOBS = json.loads((FIXTURES / "staging-26-jobs.json").read_text())
 GA_JOBS = json.loads((FIXTURES / "ga-10-jobs.json").read_text())
 ROLLBACK_LEG = "Step 3b - Roll Back to the Previous GA and Forward Again"
 EVAL_STAGE = "Step 5 - Await Release-Candidate Eval"
+WITHDRAWAL = "Step 5b - Withdraw an Unsettled Nomination"
+RECONCILE_STEP = "Reconcile the release pipelines' issues"
 RUN_30 = STAGING_RUNS["workflow_runs"][0]
 RUN_29 = STAGING_RUNS["workflow_runs"][1]
 STEP1_JOB = STAGING_JOBS["jobs"][0]["id"]
@@ -254,12 +260,15 @@ class LogReadingTest(unittest.TestCase):
         self.assertEqual(notifier.split_log_line("no stamp"), (None, "no stamp"))
 
 
-def jobs_with(jobs_document, **conclusions):
-    """A copy of a jobs document with the named jobs' conclusions changed."""
+def jobs_with(jobs_document, completed=None, **conclusions):
+    """A copy of a jobs document with the named jobs' conclusions changed,
+    and `completed` ({name: completed_at}) moving their completion."""
     jobs = [dict(job) for job in jobs_document["jobs"]]
     for job in jobs:
         if job["name"] in conclusions:
             job["conclusion"] = conclusions[job["name"]]
+        if job["name"] in (completed or {}):
+            job["completed_at"] = completed[job["name"]]
     return {"total_count": len(jobs), "jobs": jobs}
 
 
@@ -278,6 +287,20 @@ class JobReadingTest(unittest.TestCase):
         jobs = jobs_with(STAGING_26_JOBS, **{EVAL_STAGE: "failure"})["jobs"]
         self.assertEqual([job["name"] for job in jobs if job["conclusion"] == "failure"][0], ROLLBACK_LEG)
         self.assertEqual(notifier.failing_job(jobs)["name"], EVAL_STAGE)
+
+    def test_a_withdrawal_that_failed_after_the_eval_is_not_the_stage(self):
+        """Step 5b runs with `always()` because step 5 did not settle, and
+        can fail after it; it is skipped on a green night, so naming it
+        would hold the issue for good. The stage is the eval wait."""
+        jobs = jobs_with(STAGING_26_JOBS, completed={WITHDRAWAL: "2026-10-17T05:12:00Z"}, **{EVAL_STAGE: "failure", WITHDRAWAL: "failure"})["jobs"]
+        self.assertEqual(notifier.failing_job(jobs)["name"], EVAL_STAGE)
+
+    def test_a_compensation_job_is_the_stage_when_nothing_else_failed(self):
+        jobs = jobs_with(STAGING_26_JOBS, ROLLBACK_LEG="success", **{WITHDRAWAL: "failure"})["jobs"]
+        self.assertEqual(notifier.failing_job(jobs)["name"], WITHDRAWAL)
+        self.assertTrue(notifier.is_compensation({"name": "Next mode (non-gating) - Step 7 - Run E2E Tests"}))
+        self.assertTrue(notifier.is_compensation({"name": "Step 7 - Tear Down Nightly Environment"}))
+        self.assertFalse(notifier.is_compensation({"name": EVAL_STAGE}))
 
     def test_a_failing_job_without_a_time_sorts_first_and_ties_keep_list_order(self):
         jobs = [
@@ -466,6 +489,21 @@ class ReconcileTest(unittest.TestCase):
                 self.assertEqual(reconcile(github)[0], "closed")
                 self.assertEqual(github.writes[1][2], {"state": "closed"})
 
+    def test_a_green_night_with_the_withdrawal_skipped_closes_an_issue_stamped_on_the_eval(self):
+        """Staging #26 again: step 5b is skipped on a green night, which
+        must not hold an issue whose stage is step 5."""
+        self.assertEqual(next(job["conclusion"] for job in STAGING_26_JOBS["jobs"] if job["name"] == WITHDRAWAL), "skipped")
+        run_31 = run_like(31, 39600000000)
+        github = staging_github(runs=runs_list(run_31, *STAGING_RUNS["workflow_runs"]), open_issues=[issue(4001, body_with([RUN_29["id"], RUN_30["id"]], stage=EVAL_STAGE))])
+        github.responses[jobs_path(run_31["id"])] = STAGING_26_JOBS
+        self.assertEqual(reconcile(github)[0], "closed")
+
+    def test_a_red_night_where_the_eval_and_its_withdrawal_both_failed_stamps_the_eval(self):
+        github = staging_github()
+        github.responses[jobs_path(RUN_30["id"])] = jobs_with(STAGING_26_JOBS, completed={WITHDRAWAL: "2026-10-17T05:12:00Z"}, **{EVAL_STAGE: "failure", WITHDRAWAL: "failure"})
+        self.assertEqual(reconcile(github)[0], "opened")
+        self.assertEqual(notifier.stamped_stage(github.writes[1][2]["body"]), EVAL_STAGE)
+
     def test_a_red_night_with_the_rollback_leg_and_the_eval_both_failed_names_the_eval(self):
         github = staging_github()
         github.responses[jobs_path(RUN_30["id"])] = jobs_with(STAGING_26_JOBS, **{EVAL_STAGE: "failure"})
@@ -570,10 +608,30 @@ class ReconcileTest(unittest.TestCase):
     def test_an_unconfigured_sender_files_the_issue_and_posts_nothing(self):
         github = staging_github()
         sender = notifier.Sender(opener=FakeChat())
-        with mock.patch("sys.stderr", new=io.StringIO()) as err:
-            self.assertEqual(notifier.reconcile(github.api(), STAGING, sender, dry_run=False), "opened")
+        with mock.patch("sys.stderr", new=io.StringIO()) as err, mock.patch("sys.stdout", new=io.StringIO()) as out:
+            self.assertEqual(notifier.reconcile(github.api(), STAGING, sender, dry_run=False, environ={}), "opened")
         self.assertEqual(github.writes[1][0], "POST")
         self.assertIn(notifier.NOT_CONFIGURED, err.getvalue())
+        self.assertNotIn("::warning::", out.getvalue())
+
+    def test_a_chat_the_workflow_expected_and_could_not_send_is_a_warning_annotation(self):
+        """A persistent mint failure would otherwise show nowhere: the issue
+        files, the log line scrolls past, and no one hears from Chat."""
+        expected = {notifier.CHAT_EXPECTED_ENV: notifier.CHAT_EXPECTED_VALUE}
+        github = staging_github()
+        with mock.patch("sys.stderr", new=io.StringIO()), mock.patch("sys.stdout", new=io.StringIO()) as out:
+            self.assertEqual(notifier.reconcile(github.api(), STAGING, notifier.Sender(opener=FakeChat()), dry_run=False, environ=expected), "opened")
+        self.assertEqual(github.writes[1][0], "POST")
+        self.assertIn("::warning::chat not configured", out.getvalue())
+
+        def refused(request, timeout=None):
+            raise urllib.error.HTTPError(request.full_url, 403, "forbidden", {}, None)
+
+        github = staging_github()
+        with mock.patch("sys.stderr", new=io.StringIO()), mock.patch("sys.stdout", new=io.StringIO()) as out:
+            self.assertEqual(notifier.reconcile(github.api(), STAGING, notifier.Sender(space="spaces/AAA", token="t", opener=refused), dry_run=False, environ=expected), "opened")
+        self.assertEqual(github.writes[1][0], "POST")
+        self.assertIn("::warning::chat post failed", out.getvalue())
 
     def test_a_dry_run_writes_and_posts_nothing(self):
         github = staging_github()
@@ -684,8 +742,39 @@ class WorkflowContractTest(unittest.TestCase):
         for step_id in ("auth", "gcloud", "chat_token"):
             self.assertTrue(steps[step_id].get("continue-on-error"), step_id)
             self.assertIn("if", steps[step_id], step_id)
-        reconcile_step = steps["Reconcile the release pipelines' issues"]
+        reconcile_step = steps[RECONCILE_STEP]
         self.assertNotIn("if", reconcile_step)
+        self.assertIn(notifier.CHAT_EXPECTED_ENV, reconcile_step["env"])
+
+    def test_the_reconcile_step_maps_its_inputs_to_the_script_flags(self):
+        """The step's `run:` block, lifted out of the YAML and run against a
+        stub `python3` that echoes its argv: the dispatch's boolean arrives
+        as the string "true", a schedule has no inputs at all, and `run_id`
+        replaces the sweep."""
+        document, _ = self._document(NOTIFIER_WORKFLOW)
+        block = next(step["run"] for step in document["jobs"]["notify"]["steps"] if step.get("name") == RECONCILE_STEP)
+        cases = [
+            ({"DRY_RUN": "true", "RUN_ID": ""}, ["--sweep", "--dry-run"]),
+            ({"DRY_RUN": "false", "RUN_ID": ""}, ["--sweep"]),
+            ({"DRY_RUN": "", "RUN_ID": ""}, ["--sweep"]),
+            ({"DRY_RUN": "true", "RUN_ID": "39533999681"}, ["--run-id", "39533999681", "--dry-run"]),
+            ({"DRY_RUN": "false", "RUN_ID": "39533999681"}, ["--run-id", "39533999681"]),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            stub = Path(tmp) / "python3"
+            stub.write_text("#!/usr/bin/env bash\nprintf '%s\\n' \"$@\"\n", encoding="utf-8")
+            stub.chmod(stub.stat().st_mode | stat.S_IXUSR)
+            for env, flags in cases:
+                with self.subTest(env=env):
+                    proc = subprocess.run(
+                        ["bash", "-e", "-c", block],
+                        env={**os.environ, **env, "PATH": f"{tmp}{os.pathsep}{os.environ['PATH']}"},
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    self.assertEqual(proc.stdout.splitlines(), ["scripts/release/notify_release_stage_broken.py", *flags])
 
     def test_the_chat_variables_match_the_ci_health_poster(self):
         """One space, one identity: the env names and defaults are the

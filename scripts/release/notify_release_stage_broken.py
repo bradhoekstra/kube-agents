@@ -18,9 +18,11 @@ completed run that said anything and brings the tracking issue into line:
     anything already recorded   -> nothing
 
 One open issue per workflow at a time, found by a hidden marker in its body
-rather than by title. The body names the stage (the first failing job), the
-step inside it, the candidate the run tested, the first failure line the
-job's log shows, and the runs of the current streak; hidden stamps list the
+rather than by title. The body names the stage (the failing job that
+completed last, leaving aside the compensation and non-gating jobs named in
+`COMPENSATION_JOB_MARKERS` unless nothing else failed), the step inside it,
+the candidate the run tested, the first failure line the job's log shows,
+and the runs of the current streak; hidden stamps list the
 run ids the body already reflects and the stage that failed, so handling a
 run twice writes nothing. An issue a person closed while the pipeline was
 still red stays closed for the runs it names; the next failing run opens a
@@ -165,6 +167,26 @@ JOB_NOT_RUN_CONCLUSIONS = ("skipped", "cancelled")
 STEP_FAILED = "failure"
 # A job without a `completed_at` sorts before every job that has one.
 NO_TIME = ""
+# Substrings of the job names that are compensation or non-gating legs in
+# the watched workflows: the promotion pipeline's rollback leg (`Roll
+# Back`, `continue-on-error`), its withdrawal of an unsettled nomination
+# (`Withdraw`, `always()`) and its teardown (`Tear Down`, `!cancelled()`),
+# the RC pipeline's teardown and its `(non-gating)` next-mode legs. The
+# jobs API carries neither `if:` nor `continue-on-error`, so the names are
+# the only handle. Such a job fails after the gating failure (a withdrawal
+# runs because step 5 did not settle) or inside green runs, and is skipped
+# on an ordinary green night, so naming it as the stage would hold the
+# issue open for good. `test_integration_contracts.py` pins this tuple to
+# the workflow files, so a rename of those jobs reds the test.
+COMPENSATION_JOB_MARKERS = ("(non-gating)", "Roll Back", "Withdraw", "Tear Down")
+
+# Set by the workflow when the Chat token was meant to be minted (a write
+# on `main`, not muted): an unconfigured or failed post is then a warning
+# annotation on the job rather than a log line nobody reads, since this
+# workflow is the only place a persistent mint failure would show.
+CHAT_EXPECTED_ENV = "RELEASE_STAGE_CHAT_EXPECTED"
+CHAT_EXPECTED_VALUE = "true"
+WARNING_PREFIX = "::warning::"
 # A job of a reusable workflow is listed as `<caller job> / <called job>`,
 # and the same stage is listed under the short name when the call itself
 # never expanded, so a stage is matched on either side of the separator.
@@ -284,19 +306,29 @@ def extract_first_failure(log_text: str, window: tuple | None = None) -> str | N
     return _first_match([line for _, line in stamped])
 
 
+def is_compensation(job: dict) -> bool:
+    name = job.get("name") or ""
+    return any(marker in name for marker in COMPENSATION_JOB_MARKERS)
+
+
 def failing_job(jobs: list) -> dict | None:
-    """The job the run stopped at: of the jobs that failed, the one that
-    completed last, else the first that was cancelled in list order.
+    """The job the run stopped at: of the gating jobs that failed, the one
+    that completed last; of the compensation jobs, the same, when nothing
+    else failed; else the first that was cancelled in list order.
 
     Last to complete, not first in the list: a `continue-on-error` job that
-    failed (the promotion pipeline's rollback leg) sits in the list beside
-    the gating stages and fails inside green runs too, while the failure
-    that ends a run is the one that finishes it. Ties and missing times
-    fall back to list order.
+    failed sits in the list beside the gating stages and fails inside green
+    runs too, while the failure that ends a run is the one that finishes
+    it. Compensation jobs last of all: a withdrawal or a teardown runs
+    because a stage failed and can fail after it, and is skipped on a green
+    night, so it is the stage only when it is the only failure. Ties and
+    missing times fall back to list order.
     """
     failed = [(job.get("completed_at") or NO_TIME, -index, job) for index, job in enumerate(jobs) if job.get("conclusion") in FAILING_CONCLUSIONS]
-    if failed:
-        return max(failed, key=lambda item: item[:2])[2]
+    gating = [item for item in failed if not is_compensation(item[2])]
+    for candidates in (gating, failed):
+        if candidates:
+            return max(candidates, key=lambda item: item[:2])[2]
     for job in jobs:
         if job.get("conclusion") in JOB_STOPPED_CONCLUSIONS:
             return job
@@ -593,15 +625,26 @@ class GitHubAPI(FlakyGitHubAPI):
 # --------------------------------------------------------------------------- #
 
 
-def post(sender: Sender, text: str, dry_run: bool) -> None:
+def warn(message: str, environ=os.environ) -> None:
+    """A log line that, when the workflow meant to post to Chat, is also a
+    warning annotation on the job. Stdout, where the runner reads workflow
+    commands."""
+    if environ.get(CHAT_EXPECTED_ENV) == CHAT_EXPECTED_VALUE:
+        print(f"{WARNING_PREFIX}{message}", flush=True)
+    log(message)
+
+
+def post(sender: Sender, text: str, dry_run: bool, environ=os.environ) -> None:
     if dry_run:
         log(f"dry-run: would post to chat ({sender.describe()}):\n{text}")
         return
     if not sender.configured:
-        log(NOT_CONFIGURED)
+        warn(f"{NOT_CONFIGURED}; the issue is filed, the chat message is not", environ)
         return
     if sender.send(text):
         log("posted to chat")
+    else:
+        warn(f"chat post failed ({sender.describe()}); the issue is filed, the chat message is not", environ)
 
 
 def recovery_jobs(api: GitHubAPI, name: str, green: dict, issue: dict) -> tuple:
@@ -634,7 +677,7 @@ def recovery_jobs(api: GitHubAPI, name: str, green: dict, issue: dict) -> tuple:
     return jobs, None
 
 
-def reconcile(api: GitHubAPI, workflow: dict, sender: Sender, dry_run: bool) -> str:
+def reconcile(api: GitHubAPI, workflow: dict, sender: Sender, dry_run: bool, environ=os.environ) -> str:
     """Bring the workflow's issue into line with its newest reporting run.
     Returns a one-word outcome for the log and the tests."""
     name, workflow_id = workflow["name"], workflow["id"]
@@ -662,7 +705,7 @@ def reconcile(api: GitHubAPI, workflow: dict, sender: Sender, dry_run: bool) -> 
         api.comment(issue["number"], render_recovered(details, note))
         api.update_issue(issue["number"], state=ISSUE_CLOSED)
         log(f"{name}: run #{current['run_number']} passed; closed #{issue['number']}")
-        post(sender, render_chat_recovered(name, details, issue["number"]), dry_run)
+        post(sender, render_chat_recovered(name, details, issue["number"]), dry_run, environ)
         return "closed"
 
     streak = decision["streak"]
@@ -684,7 +727,7 @@ def reconcile(api: GitHubAPI, workflow: dict, sender: Sender, dry_run: bool) -> 
     api.ensure_label()
     created = api.create_issue(render_title(name), render_body(name, workflow_id, details, streak))
     log(f"{name}: run #{current['run_number']} failed; opened #{created['number']}")
-    post(sender, render_chat_broken(name, details, created["number"]), dry_run)
+    post(sender, render_chat_broken(name, details, created["number"]), dry_run, environ)
     return "opened"
 
 
@@ -721,7 +764,7 @@ def main(argv=None, environ=os.environ, api: GitHubAPI | None = None, opener=Non
         api = GitHubAPI(args.repo, token, dry_run=args.dry_run)
     sender = Sender.from_env(environ, opener) if opener else Sender.from_env(environ)
     if not sender.configured:
-        log(f"{NOT_CONFIGURED} ({SPACE_ENV}={'set' if environ.get(SPACE_ENV) else 'unset'}, {TOKEN_ENV}={'set' if environ.get(TOKEN_ENV) else 'unset'})")
+        warn(f"{NOT_CONFIGURED} ({SPACE_ENV}={'set' if environ.get(SPACE_ENV) else 'unset'}, {TOKEN_ENV}={'set' if environ.get(TOKEN_ENV) else 'unset'})", environ)
     try:
         if args.sweep:
             targets = watched_workflows(api)
@@ -732,7 +775,7 @@ def main(argv=None, environ=os.environ, api: GitHubAPI | None = None, opener=Non
                 return 0
             targets = [{"id": run["workflow_id"], "name": run["name"]}]
         for workflow in targets:
-            outcome = reconcile(api, workflow, sender, args.dry_run)
+            outcome = reconcile(api, workflow, sender, args.dry_run, environ)
             log(f"{workflow['name']}: {outcome}")
     except (RuntimeError, OSError) as exc:
         # `urllib.error.HTTPError` and `URLError` are `OSError`s: a read that
