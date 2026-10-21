@@ -254,10 +254,17 @@ is true when the text after the word is exactly `summary`, and `IsCommand` repor
 chat message's button may not carry it either. The dispatch case sits beside the bare form,
 ahead of `/session`, status, stop and steer, and changes nothing about the record's task
 state. `a2a/gateway/feedback_summary.go` renders the install's usage and feedback summary
-deterministically, in the shape `scripts/feedback-summary.sh` prints from a workstation
+deterministically, with the sections `scripts/feedback-summary.sh` prints from a workstation
 (epic #3426's share surface): environment (tag, mode, Kubernetes version, install age,
-readiness, active interfaces), the `status.usage` counters, a roll-up of the last fourteen
-days of the gateway's own task records by outcome, and the feedback template. It reads the
+readiness, active interfaces), the `status.usage` counters, a roll-up of the gateway's own
+task records, and the feedback template. The roll-up splits by what a `TaskRef` holds: the
+record's `ActiveTask` names the running task, `Canceled` marks a published cancel, and the
+rest ended (the ordinary relay path writes no end marker; `TerminalObserved` is the heal
+path's dedupe flag, not an outcome), so its buckets are `ended`, `cancelled`, `active` where
+the script's kanban read tells `done` from `failed`. Its window is fourteen days clamped to
+`SessionTTL`, because the reaper deletes a record, tasks and all, once idle past it, and the
+label prints the window it used. The scan is the reaper's, run once under its own ten-second
+budget inside the turn; past that the line reads `unavailable`. It reads the
 `PlatformAgent` resource through the gateway's ServiceAccount, which the operator's Role
 grants one `get` on, pinned by `resourceNames` to this agent's resource; the server version
 needs no grant. Tokens, spend and latency are not the gateway's to see and the block says

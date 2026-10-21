@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -40,30 +41,50 @@ func summaryCR() map[string]any {
 func summaryRecords() []*SessionRecord {
 	ago := func(d time.Duration) time.Time { return summaryNow.Add(-d) }
 	return []*SessionRecord{
-		{Key: "a", Tasks: []TaskRef{
-			{ID: "t1", StartedAt: ago(10 * time.Minute), TerminalObserved: true},
-			{ID: "t2", StartedAt: ago(time.Hour), TerminalObserved: true},
-			{ID: "t3", StartedAt: ago(2 * time.Hour), Canceled: true, TerminalObserved: true},
+		// The ordinary relay path leaves no end marker on a TaskRef (only the
+		// heal path sets TerminalObserved): what tells a running task from an
+		// ended one is the record's ActiveTask.
+		{Key: "a", ActiveTask: &ActiveTask{TaskID: "t4"}, Tasks: []TaskRef{
+			{ID: "t1", StartedAt: ago(10 * time.Minute)},
+			{ID: "t2", StartedAt: ago(time.Hour), TerminalObserved: true}, // healed: ended all the same
+			{ID: "t3", StartedAt: ago(2 * time.Hour), Canceled: true},
 			{ID: "t4", StartedAt: ago(2 * time.Minute)},
 		}},
 		{Key: "b", Tasks: []TaskRef{
-			{ID: "t5", StartedAt: ago(3 * 24 * time.Hour), TerminalObserved: true},
-			{ID: "t6", StartedAt: ago(30 * 24 * time.Hour), TerminalObserved: true}, // outside the window
+			{ID: "t5", StartedAt: ago(3 * 24 * time.Hour)},
+			{ID: "t6", StartedAt: ago(30 * 24 * time.Hour)}, // outside the window
 			{ID: "t7"}, // never started: not counted
 		}},
 	}
 }
 
-func TestRollupTasksBucketsByOutcomeWithinTheWindow(t *testing.T) {
-	got := rollupTasks(summaryRecords(), summaryNow)
-	want := taskRollup{Total: 5, Finished: 3, Canceled: 1, Active: 1}
+func TestRollupTasksBucketsByRecordStateWithinTheWindow(t *testing.T) {
+	got := rollupTasks(summaryRecords(), summaryNow, usageSummaryWindow)
+	want := taskRollup{Total: 5, Ended: 3, Cancelled: 1, Active: 1}
 	if got != want {
 		t.Fatalf("rollupTasks = %+v, want %+v", got, want)
 	}
 }
 
+func TestUsageWindowClampsToTheSessionTTL(t *testing.T) {
+	if got := usageWindow(0); got != usageSummaryWindow {
+		t.Fatalf("usageWindow(0) = %v, want the full window", got)
+	}
+	if got := usageWindow(30 * 24 * time.Hour); got != usageSummaryWindow {
+		t.Fatalf("usageWindow(30d) = %v, want the full window", got)
+	}
+	if got := usageWindow(7 * 24 * time.Hour); got != 7*24*time.Hour {
+		t.Fatalf("usageWindow(7d) = %v, want 7d", got)
+	}
+	// t5 started three days ago: a two-day window drops it.
+	got := rollupTasks(summaryRecords(), summaryNow, 2*24*time.Hour)
+	if want := (taskRollup{Total: 4, Ended: 2, Cancelled: 1, Active: 1}); got != want {
+		t.Fatalf("rollupTasks(2d) = %+v, want %+v", got, want)
+	}
+}
+
 func TestRenderUsageSummaryHasTheScriptsShapeAndNoIdentifier(t *testing.T) {
-	text := renderUsageSummary(summaryNow, summaryCR(), "v1.33.4-gke.1234000", rollupTasks(summaryRecords(), summaryNow), true)
+	text := renderUsageSummary(summaryNow, summaryCR(), "v1.33.4-gke.1234000", usageSummaryWindow, rollupTasks(summaryRecords(), summaryNow, usageSummaryWindow), true)
 	lines := strings.Split(text, "\n")
 	if lines[0] != "```" || lines[len(lines)-1] != "```" {
 		t.Fatalf("the block must be fenced, got first %q last %q", lines[0], lines[len(lines)-1])
@@ -77,7 +98,7 @@ func TestRenderUsageSummaryHasTheScriptsShapeAndNoIdentifier(t *testing.T) {
 		"  installed: 19 days; ready: true", "  interfaces: googlechat, slack",
 		"  toolExecutionsTotal: 19127", "  sessionsTotal: 7", "  remediationsMergedTotal: 1",
 		"  lastActive: 2026-10-21T11:34:06Z",
-		"tasks (14 days): 5 (finished 3, canceled 1, active 1)",
+		"tasks (14 days): 5 (ended 3, cancelled 1, active 1)",
 		"performance: " + usageSummaryPerformanceNote,
 		"  Rating:", "  What worked well:", "  What failed or was slow:",
 	} {
@@ -96,8 +117,8 @@ func TestRenderUsageSummaryHasTheScriptsShapeAndNoIdentifier(t *testing.T) {
 }
 
 func TestRenderUsageSummaryDegradesWhenSourcesAreMissing(t *testing.T) {
-	text := renderUsageSummary(summaryNow, map[string]any{}, "", taskRollup{}, false)
-	for _, want := range []string{"  version: unknown", "  mode: today", "  kubernetes: unavailable", "  installed: unknown; ready: unknown", "  interfaces: none", "  toolExecutionsTotal: 0", "  lastActive: never", "tasks (14 days): unavailable"} {
+	text := renderUsageSummary(summaryNow, map[string]any{}, "", 7*24*time.Hour, taskRollup{}, false)
+	for _, want := range []string{"  version: unknown", "  mode: today", "  kubernetes: unavailable", "  installed: unknown; ready: unknown", "  interfaces: none", "  toolExecutionsTotal: 0", "  lastActive: never", "tasks (7 days): unavailable"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("block lacks %q:\n%s", want, text)
 		}
@@ -162,6 +183,11 @@ func TestFeedbackSummaryPostsTheBlockAndStartsNoTask(t *testing.T) {
 	waitFor(t, "summary", postedContaining(r, usageSummaryTitle))
 	if !postedContaining(r, "toolExecutionsTotal: 19127")() {
 		t.Fatal("the block must carry the usage counters")
+	}
+	// The tasks line is the live scan of the rig's bucket under the rig's
+	// SessionTTL, which this turn added nothing to.
+	if line := fmt.Sprintf("tasks (%d days): 0", windowDays(usageWindow(r.g.cfg.SessionTTL))); !postedContaining(r, line)() {
+		t.Fatalf("the block must carry %q from the record scan", line)
 	}
 	if postedContaining(r, "prod-eu-1")() || postedContaining(r, "kubeagents-system")() {
 		t.Fatal("the block named an identifier of the install")
