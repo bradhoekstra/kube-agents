@@ -57,6 +57,8 @@ PULL_BACKOFF_INITIAL_SECONDS = 2
 PULL_BACKOFF_MAX_SECONDS = 30
 # How long disconnect() waits for each pull thread to notice the stop flag.
 PULL_THREAD_JOIN_SECONDS = 5
+# The relay answer for a subscription that does not exist, as Pub/Sub gives it.
+HTTP_NOT_FOUND = 404
 
 # Hermes asks every platform plugin whether its dependencies are present. This one
 # speaks HTTP to the broker with the standard library and needs nothing installed.
@@ -264,7 +266,9 @@ class PubSubAdapter(BasePlatformAdapter):
 
     def _parse_topic_config(self, sub_cfg: dict, project_id: str, name: str) -> Optional[tuple]:
         """Parse topic path and simple name from config."""
-        topic_input = sub_cfg.get("topic")
+        # Stripped, as the operator strips it when it renders the broker's set, so a
+        # quoted value with a stray space composes the same path on both sides.
+        topic_input = (sub_cfg.get("topic") or "").strip()
         if not topic_input:
             return None
         if topic_input.startswith("projects/"):
@@ -273,7 +277,7 @@ class PubSubAdapter(BasePlatformAdapter):
 
     def _parse_subscription_config(self, sub_cfg: dict, project_id: str, topic_name: Optional[str]) -> str:
         """Parse or generate subscription path based on topic or configured subscription name."""
-        sub_input = sub_cfg.get("subscription")
+        sub_input = (sub_cfg.get("subscription") or "").strip()
         if not sub_input:
             if not topic_name:
                 raise ValueError("Either 'topic' or 'subscription' must be configured.")
@@ -300,7 +304,7 @@ class PubSubAdapter(BasePlatformAdapter):
         try:
             self._relay.get_subscription(sub_path, timeout=PREFLIGHT_RPC_TIMEOUT_SECONDS)
         except RelayRefused as exc:
-            if exc.status == 404:
+            if exc.status == HTTP_NOT_FOUND:
                 logger.warning(
                     "PubSub: Subscription '%s' is NOT present in GCP (%.1fs). Please ensure it is created prior to running.",
                     sub_path, time.monotonic() - started,
@@ -354,8 +358,8 @@ class PubSubAdapter(BasePlatformAdapter):
         rather than guessed. A route that names only a topic subscribes to
         `<topic>-sub`, the name the installers create.
         """
-        sub_input = sub_cfg.get("subscription")
-        if sub_input and sub_input.startswith("projects/"):
+        sub_input = (sub_cfg.get("subscription") or "").strip()
+        if sub_input.startswith("projects/"):
             return sub_input
         if not project_id:
             return None

@@ -192,6 +192,11 @@ class ConnectTest(RelayTestCase):
         self.assertIn(f"Callback entry received message on route '{ROUTE}', msg_id=m-1", text)
         self.assertIn("connected through the credential broker relay", text)
 
+    def test_a_quoted_value_with_a_stray_space_composes_the_same_path_the_operator_renders(self):
+        self.adapter._subscriptions_config = {ROUTE: {"subscription": " stockout-alerts-sub ", "topic": "stockout-alerts "}}
+        self.run_connect(connected_for=0.1)
+        self.assertTrue(any(path == PULL_PATH for _, path, _, _ in self.broker.calls), self.broker.calls)
+
     def test_a_short_subscription_name_is_qualified_with_the_projects_environment(self):
         self.adapter._subscriptions_config = {ROUTE: {"topic": "stockout-alerts"}}
         self.run_connect(connected_for=0.1)
