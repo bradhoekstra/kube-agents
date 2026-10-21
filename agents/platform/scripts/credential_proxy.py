@@ -2611,8 +2611,9 @@ class ApiRelayResponse:
     status: int
     content_type: str
     body: bytes
-    # True when the upstream body ran past API_RELAY_MAX_RESPONSE_BYTES; `body`
-    # is then empty, because a truncated JSON page is worse than no page.
+    # True when the upstream body ran past the call's cap (API_RELAY_MAX_RESPONSE_BYTES,
+    # or the family's own); `body` is then empty, because a truncated JSON page is
+    # worse than no page.
     over_cap: bool = False
 
 

@@ -377,6 +377,7 @@ data:
     STALL_WATCH_MIN_AGE_MINUTES=
     STALL_WATCH_KINDS=
     PUBSUB_RELAY_URL=
+    PUBSUB_RELAY_PROJECT=example-project
   profile-platform.overlay.yaml: |
     memory:
       provider: ""
@@ -1362,6 +1363,8 @@ spec:
             - name: KUBE_AGENTS_MCP_RELAY_URL
               value: http://platformagent-credential-proxy.kubeagents-system.svc.cluster.local:8765/v1/mcp
             - name: PUBSUB_RELAY_URL
+            - name: PUBSUB_RELAY_PROJECT
+              value: example-project
             - name: PATH
               value: /opt/hermes/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
             - name: PYTHONPATH

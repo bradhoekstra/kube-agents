@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -193,7 +194,11 @@ platforms:
         gke_stockout_alerts:
           subscription: projects/my-gcp-project/subscriptions/ab
 `)
-	plugin.Spec.Env = []corev1.EnvVar{{Name: pubsubRelayURLEnvVar, Value: "http://attacker.example"}}
+	plugin.Spec.Env = []corev1.EnvVar{
+		{Name: pubsubRelayURLEnvVar, Value: "http://attacker.example"},
+		{Name: pubsubRelayProjectEnvVar, Value: "elsewhere"},
+		{Name: "GCP_PROJECT_ID", Value: "elsewhere"},
+	}
 	plugins := []*agentv1alpha1.AgentPlugin{plugin}
 	if url := pubsubRelayURL(agent, plugins); url != "" {
 		t.Fatalf("a route outside the grammar rendered a relay URL %q", url)
@@ -203,8 +208,41 @@ platforms:
 	if value, count := envValueCount(agentContainer.Env, pubsubRelayURLEnvVar); count != 1 || value != "" {
 		t.Fatalf("the plugin's %s reached the gateway: value %q count %d", pubsubRelayURLEnvVar, value, count)
 	}
-	if !strings.Contains(buildConfigMapData(agent, plugins)[managedEnvKey], "\n"+pubsubRelayURLEnvVar+"=\n") {
-		t.Fatalf("%s is not pinned empty in the managed .env:\n%s", pubsubRelayURLEnvVar, buildConfigMapData(agent, plugins)[managedEnvKey])
+	// The project the adapter qualifies a short name with is the operator's,
+	// whatever a plugin says in its own env, GCP_PROJECT_ID included.
+	if value, count := envValueCount(agentContainer.Env, pubsubRelayProjectEnvVar); count != 1 || value != "my-gcp-project" {
+		t.Fatalf("%s on the gateway: value %q count %d, want the harness project once", pubsubRelayProjectEnvVar, value, count)
+	}
+	managed := buildConfigMapData(agent, plugins)[managedEnvKey]
+	if !strings.Contains(managed, "\n"+pubsubRelayURLEnvVar+"=\n") {
+		t.Fatalf("%s is not pinned empty in the managed .env:\n%s", pubsubRelayURLEnvVar, managed)
+	}
+	if !strings.Contains(managed, "\n"+pubsubRelayProjectEnvVar+"=my-gcp-project\n") {
+		t.Fatalf("%s is not pinned to the harness project in the managed .env:\n%s", pubsubRelayProjectEnvVar, managed)
+	}
+}
+
+func TestTheRouteIssuesStayInsideTheConditionMessageCap(t *testing.T) {
+	agent := agentInProject("my-gcp-project")
+	long := "projects/my-gcp-project/subscriptions/" + strings.Repeat("x", 40000)
+	var routes strings.Builder
+	for i := 0; i < 30; i++ {
+		fmt.Fprintf(&routes, "        route%02d:\n          subscription: %s\n", i, long)
+	}
+	plugin := pubsubPlugin("stockout", "platforms:\n  pubsub:\n    enabled: true\n    extra:\n      subscriptions:\n"+routes.String())
+	issues := pubsubRouteIssues(agent, plugin)
+	if len(issues) != pubsubRouteIssueBudget+1 {
+		t.Fatalf("want %d route lines and one overflow line, got %d", pubsubRouteIssueBudget, len(issues))
+	}
+	joined := strings.Join(issues, " ")
+	if len(joined) > 8192 {
+		t.Fatalf("the joined issues are %d bytes; the CRD caps a condition message at 32768 and the budget is meant to stay far under it", len(joined))
+	}
+	if !strings.Contains(issues[0], pubsubRouteIssueEllipsis) {
+		t.Fatalf("an over-long path is not cut: %s", issues[0])
+	}
+	if !strings.Contains(issues[len(issues)-1], "22 more") {
+		t.Fatalf("the overflow line does not count the rest: %s", issues[len(issues)-1])
 	}
 }
 

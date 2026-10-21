@@ -326,7 +326,6 @@ readonly PUBSUB_RELAY_BROKER_MARKER="platform pubsub forwarded"
 # says a pull went through (watcher_policy composes it from the family's
 # allowed prefix and the verb).
 readonly PUBSUB_RELAY_BROKER_RULE="rule=gcp.pubsub.subscription-pull"
-readonly PUBSUB_RELAY_ROUTE="gke_stockout_alerts"
 # The gateway container the adapter logs from, and how much of each log the
 # gate's failure dump shows.
 readonly PUBSUB_RELAY_GATEWAY_CONTAINER="platform-agent"
@@ -2446,8 +2445,7 @@ done
 if [[ "${pubsub_relay_connected}" != "true" ]]; then
   echo "ERROR: the Pub/Sub platform adapter did not pull through the credential broker on this install"
   echo "       (wanted '${PUBSUB_RELAY_ADAPTER_MARKER}' in the platform-agent container and"
-  echo "        '${PUBSUB_RELAY_BROKER_MARKER}' with '${PUBSUB_RELAY_BROKER_RULE}' in the credential proxy,"
-  echo "        for route ${PUBSUB_RELAY_ROUTE})"
+  echo "        '${PUBSUB_RELAY_BROKER_MARKER}' with '${PUBSUB_RELAY_BROKER_RULE}' in the credential proxy)"
   kubectl get agentplugins -n "${NAMESPACE}" -o wide || true
   kubectl logs -n "${NAMESPACE}" "deployment/${AGENT_DEPLOYMENT_NAME}" -c "${PUBSUB_RELAY_GATEWAY_CONTAINER}" --tail="${PUBSUB_RELAY_DIAG_LOG_LINES}" 2>/dev/null | grep -i "pubsub" || true
   kubectl logs -n "${NAMESPACE}" "deployment/${CREDENTIAL_PROXY_DEPLOYMENT_NAME}" --tail="${PUBSUB_RELAY_DIAG_LOG_LINES}" 2>/dev/null | grep -i "pubsub" || true

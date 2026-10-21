@@ -760,6 +760,7 @@ func renderManagedEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agentPlugins
 	// integration. Not a "platform" for the gateway-wide allowlist pair below,
 	// which is about chat users.
 	add(pubsubRelayURLEnvVar, pubsubRelayURL(agent, agentPlugins))
+	add(pubsubRelayProjectEnvVar, pubsubRelayProject(agent))
 
 	integration := agent.Spec.Integration
 	if integration == nil {
@@ -3207,6 +3208,16 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	envVars = append(envVars, corev1.EnvVar{
 		Name:  pubsubRelayURLEnvVar,
 		Value: pubsubRelayURL(agent, agentPlugins),
+	})
+	// The project the adapter qualifies a short route name with: the one the
+	// operator composed the broker's set with, so the two cannot disagree.
+	// GCP_PROJECT_ID above is on the overridable side of the plugin merge; a
+	// plugin that set it would have the adapter ask for a subscription the
+	// broker refuses, and the route would deliver nothing. Pinned in the
+	// managed .env too.
+	envVars = append(envVars, corev1.EnvVar{
+		Name:  pubsubRelayProjectEnvVar,
+		Value: pubsubRelayProject(agent),
 	})
 	// The A2A bus, under `next` only: the address, and the name this container
 	// authenticates as. There is no password here since A5. The credential is

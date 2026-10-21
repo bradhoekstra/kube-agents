@@ -39,9 +39,12 @@ PUBSUB_RELAY_URL_ENV = "PUBSUB_RELAY_URL"
 # The projected token the broker authenticates the gateway by, read on every call
 # because the kubelet rotates it in place (the same file credential_proxy_client reads).
 CREDENTIAL_PROXY_TOKEN_FILE_ENV = "CREDENTIAL_PROXY_TOKEN_FILE"
-# Where the project of a short subscription name comes from, in order: the operator's
-# own variable on the gateway, then the conventional one.
-PROJECT_ID_ENVS = ("GCP_PROJECT_ID", "GOOGLE_CLOUD_PROJECT")
+# Where the project of a short subscription name comes from, in order. The first is the
+# operator's, rendered beside PUBSUB_RELAY_URL from the same project it composed the
+# broker's subscription set with, and pinned, so this side cannot be made to ask for a
+# subscription the broker refuses; GCP_PROJECT_ID is a plugin's to override and is the
+# fallback for an install without the operator's variable.
+PROJECT_ID_ENVS = ("PUBSUB_RELAY_PROJECT", "GCP_PROJECT_ID", "GOOGLE_CLOUD_PROJECT")
 RELAY_PREFIX = "/v1/pubsub/gcp/"
 RELAY_PUBSUB_HOST = "pubsub.googleapis.com"
 # One pull asks for one message. A pull is a lease: by the time the broker reads the

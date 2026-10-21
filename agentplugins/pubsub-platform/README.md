@@ -42,7 +42,9 @@ owns that boundary. What this plugin needs from an install: the operator fills `
 on the gateway and the subscription set on the broker once at least one route names a subscription
 the operator can qualify (a full `projects/<project>/subscriptions/<name>` path, or a short
 subscription or topic name on an agent whose `spec.harness.projectId` is set); with no such route
-the variable is rendered empty and the adapter does not connect. The install's
+the variable is rendered empty, the adapter does not connect, and the AgentPlugin's status names
+the route. A short name is qualified on both sides with the same project, which the operator
+renders as `PUBSUB_RELAY_PROJECT` beside the URL. The install's
 identity needs `roles/pubsub.subscriber` on each subscription to pull, and `roles/pubsub.viewer`
 for the read the adapter makes on connect, without which every connect logs a 403 on that read
 while pulls still work. The root installer and the stockout investigator's own installer grant

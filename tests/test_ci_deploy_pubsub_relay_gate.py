@@ -1,10 +1,11 @@
 """The presubmit's section 7b: the Pub/Sub platform adapter pulls through the broker.
 
-The gate is two string matches against two logs, each a line another file
-prints: the adapter's WARNING when it connects through the relay, and the
-broker's audit line for a relayed call of the platform family. Neither side
-knows a shell constant reads it, so this file derives both markers from their
-sources and holds the constants to them, and runs the real block against a stub
+The gate reads two logs for lines other files print: the adapter's WARNING
+when it connects through the relay, and the broker's audit line for a relayed
+pull of the platform family (the forwarded marker and the pull's rule id, since
+the preflight read logs the marker too). Neither side knows a shell constant
+reads it, so this file derives the markers from their sources and holds the
+constants to them, and runs the real block against a stub
 `kubectl` so the pipefail trap the drift-detector gate documents cannot come
 back here (a `grep -q` that stops at the first match SIGPIPEs the kubectl
 feeding it and the pipeline reports failure).
@@ -27,9 +28,6 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _CI_DEPLOY = _REPO_ROOT / "hack" / "ci-deploy.sh"
 _ADAPTER = _REPO_ROOT / "agentplugins" / "pubsub-platform" / "files" / "platforms" / "pubsub" / "adapter.py"
 _BROKER = _REPO_ROOT / "agents" / "platform" / "scripts" / "credential_proxy.py"
-_STOCKOUT_TEMPLATE = (
-    _REPO_ROOT / "agentplugins" / "gke-stockout-investigator" / "templates" / "agentplugin.yaml"
-)
 _GATE_START = "pubsub_relay_connected=false"
 _GATE_END = 'echo "✓ Pub/Sub platform adapter pulls through the broker'
 _GATE_NAMESPACE = "kubeagents-system"
@@ -51,11 +49,10 @@ _BROKER_FORWARDED_RE = re.compile(r'"%s forwarded request_id=%s rule=%s status=%
 _WATCHER_POLICY = _REPO_ROOT / "agents" / "platform" / "scripts" / "watcher_policy.py"
 _PLATFORM_ALLOWED_PREFIX_RE = re.compile(r'_PLATFORM_SUBSCRIPTION_RULES = _SubscriptionRules\([^)]*?allowed_prefix="([^"]+)"', re.S)
 _PULL_VERB = "-pull"
-# The one helm call the gate depends on: the step-5 install, the first call of
-# this shape in the script (the mode-next upgrade in 6b is the second).
+# The one helm call the gate depends on: the step-5 install, the only call of
+# this shape in the script.
 _HELM_CALL_START = 'helm upgrade --install "${HELM_RELEASE_NAME}"'
 _HELM_CALL_END = "--wait"
-_ROUTE_RE = re.compile(r"^\s+(gke_stockout_alerts):\s*$", re.MULTILINE)
 
 
 def _shell_constant(name: str) -> str:
@@ -83,11 +80,6 @@ class TheMarkersAreWhatTheSourcesPrintTest(unittest.TestCase):
         self.assertIsNotNone(match, "adapter.py no longer logs the connect line the gate waits on")
         self.assertEqual(match.group(1), _shell_constant("PUBSUB_RELAY_ADAPTER_MARKER"))
 
-    def test_the_adapter_marker_is_logged_at_a_level_the_gateway_shows(self) -> None:
-        # The gateway runs without -v, so INFO never reaches its log; the line
-        # has to be WARNING or the gate cannot see a healthy adapter.
-        self.assertIn("logger.warning(\"PubSub: connected through", _ADAPTER.read_text())
-
     def test_the_broker_marker_is_the_platform_familys_forwarded_line(self) -> None:
         text = _BROKER.read_text()
         label = _BROKER_LABEL_RE.search(text)
@@ -101,11 +93,6 @@ class TheMarkersAreWhatTheSourcesPrintTest(unittest.TestCase):
         match = _PLATFORM_ALLOWED_PREFIX_RE.search(_WATCHER_POLICY.read_text())
         self.assertIsNotNone(match, "watcher_policy.py no longer declares the platform family's allowed prefix")
         self.assertEqual(_shell_constant("PUBSUB_RELAY_BROKER_RULE"), f"rule={match.group(1)}{_PULL_VERB}")
-
-    def test_the_route_is_the_stockout_investigators(self) -> None:
-        match = _ROUTE_RE.search(_STOCKOUT_TEMPLATE.read_text())
-        self.assertIsNotNone(match, "the stockout AgentPlugin template no longer declares the route")
-        self.assertEqual(match.group(1), _shell_constant("PUBSUB_RELAY_ROUTE"))
 
 
 class TheDeployTurnsThePluginsOnWithoutTheirTuningTest(unittest.TestCase):

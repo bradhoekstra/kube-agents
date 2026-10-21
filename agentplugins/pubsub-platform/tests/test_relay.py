@@ -208,6 +208,16 @@ class ConnectTest(RelayTestCase):
         self.run_connect(connected_for=0.1)
         self.assertTrue(any(path == PULL_PATH for _, path, _, _ in self.broker.calls), self.broker.calls)
 
+    def test_the_operators_project_wins_over_the_overridable_one(self):
+        """PUBSUB_RELAY_PROJECT is the project the broker's set was composed with;
+        GCP_PROJECT_ID is a plugin's to override."""
+        os.environ["PUBSUB_RELAY_PROJECT"] = "operators-project"
+        os.environ["GCP_PROJECT_ID"] = "a-plugins-project"
+        self.run_connect(connected_for=0.2)
+        pulls = [c for c in self.broker.calls if c[1].endswith(":pull")]
+        self.assertTrue(pulls)
+        self.assertIn("/v1/projects/operators-project/subscriptions/", pulls[0][1])
+
     def test_a_route_with_a_short_name_and_no_project_is_skipped_loudly(self):
         for name in adapter_mod.PROJECT_ID_ENVS:
             os.environ.pop(name, None)
@@ -270,15 +280,22 @@ class ConnectTest(RelayTestCase):
         """A batch a stopped generation receives is nacked, not processed or held to the deadline."""
         self.broker.pull_hold = threading.Event()
         self.broker.pulls = [[{"ackId": "late-1", "message": {"data": "e30=", "messageId": "m1"}}]]
+        threads = []
         with mock.patch.object(adapter_mod, "PULL_THREAD_JOIN_SECONDS", 0.1):
             async def session():
                 await self.adapter.connect()
+                threads.extend(self.adapter._pull_threads)
                 self.broker.wait_for(lambda calls: any(c[1].endswith(":pull") for c in calls))
                 await self.adapter.disconnect()
             with self.assertLogs(LOGGER_NAME, logging.WARNING) as logs:
                 asyncio.run(session())
                 self.broker.pull_hold.set()
                 calls = self.broker.wait_for(lambda calls: any(c[1].endswith(":modifyAckDeadline") for c in calls))
+                # The thread logs after it has read the nack's answer; wait for
+                # the thread, not for the broker's record of the call.
+                for thread in threads:
+                    thread.join(5)
+                    self.assertFalse(thread.is_alive(), "the stopped pull thread did not end")
         nacks = [c for c in calls if c[1].endswith(":modifyAckDeadline")]
         self.assertEqual([c[3] for c in nacks], [{"ackIds": ["late-1"], "ackDeadlineSeconds": 0}])
         self.assertFalse([c for c in calls if c[1].endswith(":acknowledge")])

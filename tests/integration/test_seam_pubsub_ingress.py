@@ -3,10 +3,12 @@
 The alert front door: the Pub/Sub platform adapter (agentplugins/pubsub-platform)
 runs in the gateway pod, which holds no Google credential, and pulls its
 subscriptions through the credential proxy's `/v1/pubsub/gcp/` relay. Here the
-real adapter module drives the real `CredentialProxyHandler` over a socket; the
-fakes sit at the seam's two ends — a Pub/Sub upstream the broker's Cloud API
-relay is pointed at, and the hermes gateway package the adapter imports (the
-component this repo does not own).
+real adapter module drives the real `CredentialProxyHandler` over a socket, with
+the broker's real role gate in front of the route and the adapter presenting the
+projected token the operator mounts; the fakes sit at the seam's two ends — a
+Pub/Sub upstream the broker's Cloud API relay is pointed at, the token review
+(the cluster's TokenReview answer), and the hermes gateway package the adapter
+imports (the component this repo does not own).
 
 This is the test that reads red on the adapter as it stood when the gateway lost
 Workload Identity: that adapter never spoke to the broker, so nothing here would
@@ -23,10 +25,12 @@ import importlib.util
 import json
 import os
 import sys
+import tempfile
 import threading
 import types
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest import mock
 
 from _seams import REPO_ROOT, SCRIPTS_DIR
 
@@ -36,6 +40,9 @@ ADAPTER = REPO_ROOT / "agentplugins" / "pubsub-platform" / "files" / "platforms"
 PROJECT = "seam-project"
 ALERTS = f"projects/{PROJECT}/subscriptions/gke-stockout-alerts-sub"
 ROUTE = "gke_stockout_alerts"
+GATEWAY = "system:serviceaccount:kubeagents-system:platform-agent-gateway-agent"
+# What the cluster's TokenReview says about each token the test can mount.
+TOKEN_ROLES = {"gateway-chat-token": "chat", "watcher-token": "watcher"}
 
 
 def load_adapter_module():
@@ -120,10 +127,27 @@ class PubsubIngressSeamTest(unittest.TestCase):
             def connection(self, host):
                 return http.client.HTTPConnection("127.0.0.1", upstream_port, timeout=5)
 
-        for attribute in ("api_relay", "policy", "max_request_bytes", "platform_pubsub_subscriptions"):
+        for attribute in ("api_relay", "authenticator", "policy", "max_request_bytes", "platform_pubsub_subscriptions"):
             self.addCleanup(self._restore, CredentialProxyHandler, attribute,
                             attribute in CredentialProxyHandler.__dict__, CredentialProxyHandler.__dict__.get(attribute))
         CredentialProxyHandler.api_relay = FakeApiRelay()
+        # The real authenticator and role gate; only the TokenReview is faked.
+        authenticator = credential_proxy.ServiceAccountAuthenticator(
+            audience_roles={
+                "kubeagents-credential-proxy-chat": credential_proxy.CALLER_ROLE_CHAT,
+                "kubeagents-credential-proxy-watcher": credential_proxy.CALLER_ROLE_WATCHER,
+            },
+            allowed_callers=frozenset({GATEWAY}),
+            api_host="10.0.0.1", api_port="443", ca_file="", token_file="/nonexistent", cache_seconds=0.0,
+        )
+
+        def fake_review(token):
+            if token not in TOKEN_ROLES:
+                raise credential_proxy.AuthenticationError("not a token this cluster issued")
+            return credential_proxy.Principal(workload=GATEWAY, uid="sa-uid", role=TOKEN_ROLES[token])
+
+        authenticator._review = fake_review
+        CredentialProxyHandler.authenticator = authenticator
         CredentialProxyHandler.policy = credential_proxy.Policy(rules=[], blocked_message="blocked")
         CredentialProxyHandler.max_request_bytes = 65536
         # What the operator renders from the AgentPlugin config: this one subscription.
@@ -135,14 +159,22 @@ class PubsubIngressSeamTest(unittest.TestCase):
 
         self.module, saved = load_adapter_module()
         self.addCleanup(self._restore_modules, saved)
-        self.env = {
+        self.token_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.token_dir.cleanup)
+        self.token_file = os.path.join(self.token_dir.name, "token")
+        self.mount_token("gateway-chat-token")
+        env = mock.patch.dict(os.environ, {
             "PUBSUB_RELAY_URL": f"http://127.0.0.1:{self.broker.server_port}",
-            "GCP_PROJECT_ID": PROJECT,
-        }
-        self.saved_env = {key: os.environ.get(key) for key in self.env}
-        os.environ.update(self.env)
-        os.environ.pop("CREDENTIAL_PROXY_TOKEN_FILE", None)
-        self.addCleanup(self._restore_env)
+            "PUBSUB_RELAY_PROJECT": PROJECT,
+            "CREDENTIAL_PROXY_TOKEN_FILE": self.token_file,
+        })
+        env.start()
+        self.addCleanup(env.stop)
+
+    def mount_token(self, token):
+        """The projected token as the kubelet writes it."""
+        with open(self.token_file, "w", encoding="utf-8") as handle:
+            handle.write(token + "\n")
 
     @staticmethod
     def _restore(cls, attribute, was_set, original):
@@ -158,13 +190,6 @@ class PubsubIngressSeamTest(unittest.TestCase):
                 sys.modules.pop(name, None)
             else:
                 sys.modules[name] = module
-
-    def _restore_env(self):
-        for key, value in self.saved_env.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
 
     def _adapter(self, route_config):
         adapter = self.module.PubSubAdapter.__new__(self.module.PubSubAdapter)
@@ -214,6 +239,17 @@ class PubsubIngressSeamTest(unittest.TestCase):
         ack = next(body for _, path, body in FakePubsub.calls if path.endswith(":acknowledge"))
         self.assertEqual(ack, {"ackIds": ["ack-7"]})
         self.assertEqual(adapter.fatal, [])
+
+    def test_a_token_of_another_role_is_refused_on_the_route_and_nothing_is_pulled(self):
+        """The route admits the chat role only; the adapter presents whatever
+        token is mounted, and the broker's role gate is what decides."""
+        self.mount_token("watcher-token")
+        adapter = self._adapter({"subscription": "gke-stockout-alerts-sub"})
+        with self.assertLogs(self.module.__name__, "WARNING") as logs:
+            self._run(adapter, until=lambda: any("CALLER_ROLE_FORBIDDEN" in line for line in logs.output), run_for=4.0)
+        self.assertEqual(FakePubsub.calls, [], "the broker forwarded a call for a token outside the chat role")
+        self.assertIn("CALLER_ROLE_FORBIDDEN", "\n".join(logs.output))
+        self.assertEqual(adapter.processed, [])
 
     def test_a_subscription_the_operator_did_not_render_is_refused_by_the_broker_not_pulled(self):
         adapter = self._adapter({"subscription": "projects/seam-project/subscriptions/someone-elses-sub"})

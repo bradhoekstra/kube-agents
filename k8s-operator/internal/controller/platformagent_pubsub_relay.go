@@ -17,20 +17,33 @@ import (
 // Google credential, so the broker pulls on the install's identity, confined by
 // its policy to the subscriptions rendered here. The operator is the one reader
 // of both the AgentPlugin configs and the project, so it is the one writer of
-// the set: the broker learns it from platformPubsubSubscriptionsEnvVar and the
-// gateway learns where the relay is from pubsubRelayURLEnvVar. With no route
+// the set: the broker learns it from platformPubsubSubscriptionsEnvVar, and the
+// gateway learns where the relay is from pubsubRelayURLEnvVar and which project
+// qualifies a short route name from pubsubRelayProjectEnvVar, the same project
+// this file composes the set with, so the two sides cannot name different
+// subscriptions (GCP_PROJECT_ID sits on the overridable side of the plugin env
+// merge; these two are appended after it and pinned). With no route
 // the operator can qualify, the set is absent, the URL is rendered empty
 // (pubsubRelayURL), and the broker refuses every relayed Pub/Sub call. A route
 // it refuses is reported on the plugin's status (pubsubRouteIssues), since the
 // adapter cannot tell a refused route from an install with no Pub/Sub platform.
 const (
 	pubsubRelayURLEnvVar              = "PUBSUB_RELAY_URL"
+	pubsubRelayProjectEnvVar          = "PUBSUB_RELAY_PROJECT"
 	platformPubsubSubscriptionsEnvVar = "PLATFORM_PUBSUB_SUBSCRIPTIONS"
 	// The adapter's own rule for a route that names a topic and no
 	// subscription: it subscribes to `<topic>-sub`, the name the installers
 	// create (adapter.py, _parse_subscription_config).
 	pubsubDerivedSubscriptionSuffix = "-sub"
-	// The plugin-status lines for a route the broker's set will not carry.
+	// The plugin-status lines for a route the broker's set will not carry, and
+	// the bounds that keep them inside the CRD's condition-message cap: a path
+	// is the author's text with no length bound, and a spec can carry any
+	// number of routes (see hostPathDroppedEntryBudget for the failure an
+	// unbounded status message buys).
+	pubsubRouteIssuePathBudget      = 256
+	pubsubRouteIssueBudget          = 8
+	pubsubRouteIssueEllipsis        = "..."
+	pubsubRouteIssueOverflowFormat  = "%d more Pub/Sub route(s) are left out of the broker's set for the same reasons."
 	pubsubRouteNoProjectIssueFormat = "Pub/Sub route %s names a short subscription or topic and spec.harness.projectId is empty, so the broker relays nothing for it; name it as projects/<project>/subscriptions/<name> or set the project."
 	pubsubRouteGrammarIssueFormat   = "Pub/Sub route %s composes to %q, which is not a subscription path the broker relays; it is left out of the broker's set."
 	pubsubSubscriptionPathFormat    = "projects/%s/subscriptions/%s"
@@ -64,10 +77,7 @@ func pluginPubsubSubscriptions(agent *agentv1alpha1.PlatformAgent, agentPlugins 
 	if len(agentPlugins) == 0 {
 		return nil
 	}
-	project := ""
-	if agent != nil && agent.Spec.Harness != nil {
-		project = strings.TrimSpace(agent.Spec.Harness.ProjectID)
-	}
+	project := pubsubRelayProject(agent)
 	seen := map[string]struct{}{}
 	for _, plugin := range agentPlugins {
 		if plugin == nil || strings.TrimSpace(plugin.Spec.Config) == "" {
@@ -105,11 +115,9 @@ func pubsubRouteIssues(agent *agentv1alpha1.PlatformAgent, plugin *agentv1alpha1
 	if err := yaml.Unmarshal([]byte(plugin.Spec.Config), &config); err != nil {
 		return nil
 	}
-	project := ""
-	if agent != nil && agent.Spec.Harness != nil {
-		project = strings.TrimSpace(agent.Spec.Harness.ProjectID)
-	}
+	project := pubsubRelayProject(agent)
 	var issues []string
+	refused := 0
 	for _, name := range pubsubRouteNames(config) {
 		route, _ := pubsubRouteMap(config)[name].(map[string]any)
 		if route == nil {
@@ -121,14 +129,37 @@ func pubsubRouteIssues(agent *agentv1alpha1.PlatformAgent, plugin *agentv1alpha1
 			continue
 		}
 		path := pubsubSubscriptionPath(route, project)
+		var issue string
 		switch {
 		case path == "":
-			issues = append(issues, fmt.Sprintf(pubsubRouteNoProjectIssueFormat, name))
+			issue = fmt.Sprintf(pubsubRouteNoProjectIssueFormat, name)
 		case !pubsubSubscriptionPathPattern.MatchString(path):
-			issues = append(issues, fmt.Sprintf(pubsubRouteGrammarIssueFormat, name, path))
+			if len(path) > pubsubRouteIssuePathBudget {
+				path = truncateToValidUTF8(path, pubsubRouteIssuePathBudget) + pubsubRouteIssueEllipsis
+			}
+			issue = fmt.Sprintf(pubsubRouteGrammarIssueFormat, name, path)
+		default:
+			continue
+		}
+		refused++
+		if refused <= pubsubRouteIssueBudget {
+			issues = append(issues, issue)
 		}
 	}
+	if refused > pubsubRouteIssueBudget {
+		issues = append(issues, fmt.Sprintf(pubsubRouteIssueOverflowFormat, refused-pubsubRouteIssueBudget))
+	}
 	return issues
+}
+
+// pubsubRelayProject is the project a short route name is qualified with, on
+// both sides: the set this file composes and the adapter, through
+// pubsubRelayProjectEnvVar. Empty when the agent names no harness project.
+func pubsubRelayProject(agent *agentv1alpha1.PlatformAgent) string {
+	if agent == nil || agent.Spec.Harness == nil {
+		return ""
+	}
+	return strings.TrimSpace(agent.Spec.Harness.ProjectID)
 }
 
 // pubsubRouteMap is the route map under platforms.pubsub.extra.subscriptions,
