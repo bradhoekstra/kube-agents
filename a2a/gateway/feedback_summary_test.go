@@ -68,11 +68,27 @@ func summaryRecords() []*SessionRecord {
 	}
 }
 
-func TestRollupTasksBucketsByRecordStateWithinTheWindow(t *testing.T) {
-	got := rollupTasks(summaryRecords(), summaryNow, usageSummaryWindow)
+// rollup runs the shipped fold over a slice, as the gateway runs it over the
+// bucket's watch stream.
+func rollup(t *testing.T, records []*SessionRecord, now time.Time, window time.Duration) taskRollup {
+	t.Helper()
+	got, err := rollupRecords(func(fn func(*SessionRecord)) error {
+		for _, rec := range records {
+			fn(rec)
+		}
+		return nil
+	}, now, window)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return got
+}
+
+func TestRollupRecordsBucketsByRecordStateWithinTheWindow(t *testing.T) {
+	got := rollup(t, summaryRecords(), summaryNow, usageSummaryWindow)
 	want := taskRollup{Total: 6, Ended: 3, Cancelled: 2, Active: 1}
 	if got != want {
-		t.Fatalf("rollupTasks = %+v, want %+v", got, want)
+		t.Fatalf("rollupRecords = %+v, want %+v", got, want)
 	}
 }
 
@@ -90,14 +106,14 @@ func TestUsageWindowClampsToTheSessionTTL(t *testing.T) {
 		t.Fatalf("usageWindow(6h) = %v, want the one-day floor", got)
 	}
 	// t5 started three days ago: a two-day window drops it.
-	got := rollupTasks(summaryRecords(), summaryNow, 2*24*time.Hour)
+	got := rollup(t, summaryRecords(), summaryNow, 2*24*time.Hour)
 	if want := (taskRollup{Total: 5, Ended: 2, Cancelled: 2, Active: 1}); got != want {
-		t.Fatalf("rollupTasks(2d) = %+v, want %+v", got, want)
+		t.Fatalf("rollupRecords(2d) = %+v, want %+v", got, want)
 	}
 }
 
 func TestRenderUsageSummaryHasTheScriptsShapeAndNoIdentifier(t *testing.T) {
-	text := renderUsageSummary(summaryNow, summaryCR(), "v1.33.4-gke.1234000", usageSummaryWindow, rollupTasks(summaryRecords(), summaryNow, usageSummaryWindow), true)
+	text := renderUsageSummary(summaryNow, summaryCR(), "v1.33.4-gke.1234000", usageSummaryWindow, rollup(t, summaryRecords(), summaryNow, usageSummaryWindow), true)
 	lines := strings.Split(text, "\n")
 	if lines[0] != "```" || lines[len(lines)-1] != "```" {
 		t.Fatalf("the block must be fenced, got first %q last %q", lines[0], lines[len(lines)-1])

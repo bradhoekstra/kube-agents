@@ -159,9 +159,11 @@ func IsSessionCommand(text string) (string, bool) {
 
 // IsFeedbackCommand reports whether the turn is "/feedback": the same shape
 // as IsSessionCommand. rest is "" for a bare "/feedback", which the gateway
-// answers itself with FeedbackTrackerURL and FeedbackFormURL; anything else
-// is the report the person wants written up, and the gateway hands the text
-// on as typed, prefix included, for the agent to compose and confirm.
+// answers itself with FeedbackTrackerURL and FeedbackFormURL; "summary" is
+// the usage summary the gateway also answers itself (IsFeedbackSummaryCommand);
+// anything else is the report the person wants written up, and the gateway
+// hands the text on as typed, prefix included, for the agent to compose and
+// confirm.
 func IsFeedbackCommand(text string) (string, bool) {
 	return slashWord(text, slashFeedbackWord)
 }

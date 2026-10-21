@@ -264,8 +264,9 @@ rest ended (the ordinary relay path writes no end marker; `TerminalObserved` is 
 path's dedupe flag, not an outcome), so its buckets are `ended`, `cancelled`, `active` where
 the script's kanban read tells `done` from `failed`. Its window is fourteen days clamped to
 `SessionTTL`, because the reaper deletes a record, tasks and all, once idle past it, and the
-label prints the window it used, never under one day. The scan is the reaper's, run once under its own ten-second
-budget inside the turn; past that the line reads `unavailable`. It reads the
+label prints the window it used, never under one day. The records are read as the busy count reads them, through one
+KV watch stream rather than a Get per record, under a ten-second budget inside the turn; past
+that the line reads `unavailable`. It reads the
 `PlatformAgent` resource through the gateway's ServiceAccount, which the operator's Role
 grants one `get` on, pinned by `resourceNames` to this agent's resource; the server version
 needs no grant. Tokens, spend and latency are not the gateway's to see and the block says

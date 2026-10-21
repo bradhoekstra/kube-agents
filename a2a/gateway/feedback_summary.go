@@ -3,7 +3,6 @@ package gateway
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"regexp"
@@ -89,9 +88,11 @@ var usageSummaryCounters = []string{
 }
 
 // : Spec subtrees whose string leaves name the install and must not reach the
-// : block. deployment is left out on purpose: its env values, annotations and
-// : sidecar args are settings, and one spelled "true" would collide with the
-// : block's own "ready: true" (the script makes the same choice).
+// : block: the script's list verbatim, so the two audits read the same (chat
+// : names no field of today's CRD and yields nothing). deployment is left out
+// : on purpose: its env values, annotations and sidecar args are settings, and
+// : one spelled "true" would collide with the block's own "ready: true" (the
+// : script makes the same choice).
 var usageSummaryIdentifierSubtrees = []string{"harness", "scope", "integration", "security", "chat", "telemetry", "networkPolicy"}
 
 // : The values the operator writes to status.usage.activeInterfaces (the
@@ -104,10 +105,9 @@ var usageSummaryInterfaceWords = []string{"dashboard", "googlechat", "slack", "t
 var usageSummaryStopwords = map[string]bool{"true": true, "false": true, "yes": true, "no": true, "on": true, "off": true, "none": true, "null": true}
 
 var (
-	usageSummaryNumeric    = regexp.MustCompile(`^[0-9][0-9._%:-]*$`)
-	usageSummaryToken      = regexp.MustCompile(usageSummaryTokenClass + `+`)
-	usageSummaryBoundary   = `[^` + usageSummaryTokenClass[1:]
-	errUsageScanIncomplete = errors.New("the session record scan stopped before the end of the bucket")
+	usageSummaryNumeric  = regexp.MustCompile(`^[0-9][0-9._%:-]*$`)
+	usageSummaryToken    = regexp.MustCompile(usageSummaryTokenClass + `+`)
+	usageSummaryBoundary = `[^` + usageSummaryTokenClass[1:]
 )
 
 var usageSummaryFeedbackTemplate = []string{
@@ -234,13 +234,15 @@ func (r *taskRollup) add(rec *SessionRecord, cutoff time.Time) {
 	}
 }
 
-func rollupTasks(records []*SessionRecord, now time.Time, window time.Duration) taskRollup {
+// rollupRecords folds every record that each yields into the roll-up; the
+// gateway streams the bucket through it, a test hands it a slice.
+func rollupRecords(each func(func(*SessionRecord)) error, now time.Time, window time.Duration) (taskRollup, error) {
 	cutoff := now.Add(-window)
 	var r taskRollup
-	for _, rec := range records {
-		r.add(rec, cutoff)
+	if err := each(func(rec *SessionRecord) { r.add(rec, cutoff) }); err != nil {
+		return taskRollup{}, err
 	}
-	return r
+	return r, nil
 }
 
 // usageWindow is the roll-up's window: the script's fourteen days, or
@@ -469,23 +471,12 @@ func (g *Gateway) feedbackSummary(ctx context.Context, rec *SessionRecord) {
 	g.post(rec.Key, text)
 }
 
-// scanTaskRollup folds the record scan the reaper paces by cursor into one
-// pass under its own budget, so a large bucket costs this conversation at
-// most usageSummaryScanTimeout of its turn and then reads "unavailable".
+// scanTaskRollup reads the bucket as the busy count does, through one KV
+// watch stream (eachSessionRecord) rather than a Get per record, under its
+// own budget: a large bucket costs this conversation at most
+// usageSummaryScanTimeout of its turn and then reads "unavailable".
 func (g *Gateway) scanTaskRollup(ctx context.Context, now time.Time, window time.Duration) (taskRollup, error) {
 	ctx, cancel := context.WithTimeout(ctx, usageSummaryScanTimeout)
 	defer cancel()
-	cutoff := now.Add(-window)
-	var r taskRollup
-	_, done, err := g.reg.ScanSessions(ctx, "", func(rec *SessionRecord) (bool, error) {
-		r.add(rec, cutoff)
-		return true, nil
-	})
-	if err == nil && !done {
-		err = errUsageScanIncomplete
-	}
-	if err != nil {
-		return taskRollup{}, err
-	}
-	return r, nil
+	return rollupRecords(func(fn func(*SessionRecord)) error { return g.reg.eachSessionRecord(ctx, fn) }, now, window)
 }
