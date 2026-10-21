@@ -186,6 +186,12 @@ class PlatformPubsubRelayOverTheSocketTest(unittest.TestCase):
         self.assertEqual(status, 403)
         self.assertEqual(json.loads(body)["rule"], watcher_policy.RULE_PUBSUB_SUBSCRIPTION)
 
+    def test_a_query_the_relay_does_not_forward_is_refused_in_this_familys_name(self):
+        status, body = self._request("POST", PULL + "?fields=x", body=b'{"maxMessages":1}')
+        self.assertEqual(status, 400)
+        self.assertIn("the platform Pub/Sub relay forwards no query keys", json.loads(body)["error"])
+        self.assertEqual(self.google_requests, [])
+
     def test_the_audit_lines_name_the_family_and_the_rule(self):
         with self.assertLogs("credential-proxy", "INFO") as logs:
             status, _ = self._request("POST", PULL, body=b'{"maxMessages":1}')
@@ -211,12 +217,22 @@ class PlatformPubsubSubscriptionsFromEnvTest(unittest.TestCase):
                 os.environ.update(value)
                 self.assertEqual(credential_proxy.platform_pubsub_subscriptions(), frozenset())
 
-    def test_an_entry_that_is_not_a_qualified_subscription_refuses_the_boot(self):
-        for bad in ("gke-stockout-alerts-sub", "projects/p/topics/t", "projects/p/subscriptions/", "projects/p/subscriptions/a b"):
+    def test_an_entry_that_is_not_a_qualified_subscription_is_dropped_not_fatal(self):
+        """A typo in one AgentPlugin route must not take the whole broker down.
+
+        The operator renders the list from user-authored configs. A malformed entry
+        is dropped with a warning that counts it and does not repeat it; the well
+        formed entries stay, and the broker boots.
+        """
+        for bad in ("gke-stockout-alerts-sub", "projects/p/topics/t", "projects/p/subscriptions/", "projects/p/subscriptions/a b",
+                    "projects/My-Project/subscriptions/alerts"):
             with self.subTest(bad=bad), mock.patch.dict(os.environ, {"PLATFORM_PUBSUB_SUBSCRIPTIONS": f"{ALERTS},{bad}"}):
-                with self.assertRaises(RuntimeError) as caught:
-                    credential_proxy.platform_pubsub_subscriptions()
-                self.assertIn("PLATFORM_PUBSUB_SUBSCRIPTIONS", str(caught.exception))
+                with self.assertLogs("credential-proxy", "WARNING") as logs:
+                    got = credential_proxy.platform_pubsub_subscriptions()
+                self.assertEqual(got, frozenset({ALERTS}))
+                text = "\n".join(logs.output)
+                self.assertIn("PLATFORM_PUBSUB_SUBSCRIPTIONS holds 1 entry", text)
+                self.assertNotIn(bad, text)
 
 
 if __name__ == "__main__":

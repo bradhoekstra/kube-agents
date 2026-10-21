@@ -9956,6 +9956,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             lambda host, path, body: watcher_policy.evaluate_pubsub(
                 self.command, host, path, body, self.platform_pubsub_subscriptions
             ),
+            family="platform Pub/Sub relay",
         )
 
     def _relay_google_call(
@@ -9963,6 +9964,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         label: str,
         prefix: str,
         decide: Callable[[str, str, bytes], command_policy.Decision],
+        family: str = "watcher relay",
     ) -> None:
         """Forward one `<prefix><host>/<path>` Google call that `decide` allows.
 
@@ -9994,7 +9996,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         problem = api_relay_target_problem(host, path, parts.query)
         query = urllib.parse.parse_qs(parts.query, keep_blank_values=True)
         if problem is None and not set(query) <= WATCHER_GCP_QUERY_KEYS:
-            problem = (API_RELAY_BAD_QUERY, "the watcher relay forwards no query keys but alt and prettyPrint")
+            problem = (API_RELAY_BAD_QUERY, f"the {family} forwards no query keys but alt and prettyPrint")
         if problem is not None:
             code, reason = problem
             LOGGER.warning("%s rejected request_id=%s code=%s", label, request_id, code)
@@ -11271,21 +11273,33 @@ def platform_pubsub_subscriptions() -> frozenset[str]:
     `PLATFORM_PUBSUB_SUBSCRIPTIONS` is a comma-separated list of
     `projects/<p>/subscriptions/<s>`, rendered by the operator from the
     AgentPlugin configs; unset or empty means no Pub/Sub platform is configured
-    and the relay refuses every call. An entry of any other shape refuses the
-    boot: it could only be a rendering bug, and a broker that started with it
-    would refuse the adapter's every pull while the variable read as set.
+    and the relay refuses every call. An entry of any other shape is dropped
+    with a warning rather than refusing the boot: the operator renders the
+    list from user-authored AgentPlugin configs, and one typo in a route must
+    not take the broker, and with it every other route, off the air. A dropped
+    entry's route is refused by the policy, which the adapter logs with the
+    rule, so the typo is still loud where it was made.
     """
     raw = os.getenv(PLATFORM_PUBSUB_SUBSCRIPTIONS_ENV, "")
     entries = [entry.strip() for entry in raw.split(",")]
-    subscriptions = frozenset(entry for entry in entries if entry)
-    malformed = sorted(entry for entry in subscriptions if not _QUALIFIED_SUBSCRIPTION.fullmatch(entry))
-    if malformed:
-        raise RuntimeError(
-            f"{PLATFORM_PUBSUB_SUBSCRIPTIONS_ENV} holds {len(malformed)} entr"
-            f"{'y' if len(malformed) == 1 else 'ies'} that is not a "
-            "projects/<project>/subscriptions/<name> path"
+    kept: set[str] = set()
+    dropped = 0
+    for entry in entries:
+        if not entry:
+            continue
+        if _QUALIFIED_SUBSCRIPTION.fullmatch(entry):
+            kept.add(entry)
+        else:
+            dropped += 1
+    if dropped:
+        # The count, not the entries: the value is caller text from a CR.
+        LOGGER.warning(
+            "%s holds %d entr%s that is not a projects/<project>/subscriptions/<name> path; dropped",
+            PLATFORM_PUBSUB_SUBSCRIPTIONS_ENV,
+            dropped,
+            "y" if dropped == 1 else "ies",
         )
-    return subscriptions
+    return frozenset(kept)
 
 
 def serve(args: argparse.Namespace) -> None:
