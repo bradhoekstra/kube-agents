@@ -50,6 +50,12 @@ PULL_MAX_MESSAGES = 10
 PULL_REQUEST_TIMEOUT_SECONDS = 130
 # A settle (acknowledge, nack) is one short call.
 SETTLE_REQUEST_TIMEOUT_SECONDS = 20
+# The pause after a pull that returned nothing. Pub/Sub holds an empty synchronous
+# pull for a while on most answers (about twenty seconds through the relay on a live
+# install), but not on every answer, and a loop with no pause of its own spins against
+# the API and fills the broker's audit log when it does not. The drift detector pulls
+# through the same relay with the same pause (k8s-operator/cmd/drift-detector).
+PULL_IDLE_INTERVAL_SECONDS = 5
 # Back-off between failed pulls: doubles from the first value to the ceiling, so a
 # broker that is restarting is not hammered and a refused subscription logs a line
 # every half minute rather than a storm.
@@ -429,6 +435,9 @@ class PubSubAdapter(BasePlatformAdapter):
             backoff = PULL_BACKOFF_INITIAL_SECONDS
             if stop.is_set():
                 return
+            if not received:
+                stop.wait(PULL_IDLE_INTERVAL_SECONDS)
+                continue
             for item in received:
                 try:
                     message = RelayMessage(relay, subscription_path, item)

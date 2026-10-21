@@ -232,6 +232,14 @@ class ConnectTest(RelayTestCase):
         pulls = [c for c in self.broker.calls if c[1] == PULL_PATH]
         self.assertGreaterEqual(len(pulls), 3, "the loop keeps pulling after a refusal")
 
+    def test_an_empty_pull_is_followed_by_a_pause_not_another_pull(self):
+        with mock.patch.object(adapter_mod, "PULL_IDLE_INTERVAL_SECONDS", 0.4):
+            self.run_connect(connected_for=1.0)
+        pulls = [c for c in self.broker.calls if c[1] == PULL_PATH]
+        # ~1 s connected, every answer empty, 0.4 s pause each: three pulls, not dozens.
+        self.assertLessEqual(len(pulls), 4, f"{len(pulls)} pulls in a second: the loop spins on an empty backlog")
+        self.assertGreaterEqual(len(pulls), 2)
+
     def test_disconnect_stops_the_pull_thread(self):
         self.run_connect(connected_for=0.2)
         before = len(self.broker.calls)
