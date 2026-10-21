@@ -41,7 +41,7 @@ flowchart TB
     end
     AGENT -->|ssh| SHELL
     SHELL -->|"HTTP (structured argv, relayed GETs) + bearer token"| ENVOY
-    AGENT -->|"chat relay + bearer token"| ENVOY
+    AGENT -->|"chat, MCP and Pub/Sub relays + bearer token"| ENVOY
     ENVOY -->|private Unix socket| RUNTIME
 ```
 

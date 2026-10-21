@@ -50,9 +50,10 @@ fi
 # Overridable so a second deployment in the same project — a demo fleet alongside a
 # development one — gets its own ingress rather than sharing these. All three names must
 # match the ones the chart templates into the subscription block, which is why the same
-# variables are passed to helm below. The sink included: its startup presence check in the
-# adapter is disabled for now, but the name can only ever come from here, so it is still
-# passed through rather than left to be re-plumbed when the check comes back.
+# variables are passed to helm below. The sink included: the adapter has no sink check
+# (it reaches Google only through the credential broker, which relays no Logging call),
+# but the name can only ever come from here, so it is still passed through for a check
+# added later behind a broker route.
 TOPIC="${STOCKOUT_TOPIC:-gke-stockout-alerts-topic}"
 SUBSCRIPTION="${STOCKOUT_SUBSCRIPTION:-gke-stockout-alerts-sub}"
 SINK_NAME="${STOCKOUT_SINK:-gke-stockout-alerts-sink}"

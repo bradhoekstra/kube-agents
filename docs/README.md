@@ -36,6 +36,7 @@ kube-agents/
 │                                                  the session agent's persona);
 │                                                  a2a/lib/persona/: the persona
 │                                                  format (+ cmd/persona)
+├── agentplugins/                                  AgentPlugin charts (plugin READMEs, the Pub/Sub adapter's, the stockout scenarios')
 ├── agents/                                        agent blueprints (runtime docs)
 │   ├── chat/                                      Planning Agent front door: persona
 │   │                                              docs, onboarding templates,

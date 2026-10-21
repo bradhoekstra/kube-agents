@@ -652,14 +652,8 @@
                     "anyOf": [
                       {
                         "allOf": [
-                          {
-                            "contains": {
-                              "const": "all"
-                            }
-                          },
-                          {
-                            "minItems": 2
-                          }
+                          { "contains": { "const": "all" } },
+                          { "minItems": 2 }
                         ]
                       },
                       {
@@ -1215,7 +1209,10 @@
                   "type": "string"
                 },
                 "tag": {
-                  "type": ["string", "integer"]
+                  "type": [
+                    "string",
+                    "integer"
+                  ]
                 },
                 "pullPolicy": {
                   "type": "string"
