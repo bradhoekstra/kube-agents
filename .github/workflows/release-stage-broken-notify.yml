@@ -7,8 +7,8 @@ name: Notify on Broken Release Stage
 # watched list and the issue and message formats; this file is the schedule,
 # the guards and the Chat credential.
 #
-# The three watched workflows (`RC: Release Pipeline`, `Staging: Promotion
-# Pipeline`, `Release & Publish (GA)`) run on `workflow_dispatch` from their
+# The watched workflows (`WATCHED_WORKFLOWS` in the script: the RC, staging
+# promotion and GA pipelines) run on `workflow_dispatch` from their
 # schedulers, so a red run is a red row in the Actions tab and nothing more:
 # on 2026-10-20 and 2026-10-21 the promotion pipeline failed two nights
 # running and the GA scheduler skipped two mornings before anyone asked
@@ -30,9 +30,11 @@ name: Notify on Broken Release Stage
 # mint leaves the token empty, the script says "chat not configured" and
 # files the issue anyway. The repository variable `CI_HEALTH_MUTE=true`
 # silences the Chat half here as it does in `ci-health.yml`; the issues
-# still file. The token is minted only from `main` and never under a
+# still file. The Chat token is minted only from `main` and never under a
 # dry run, so a dispatch from a branch (the way to try a branch's script,
-# with `dry_run` set) holds no credential.
+# with `dry_run` set) holds no Chat credential; it still holds the job's
+# own GITHUB_TOKEN with `issues: write`, which `dry_run` keeps from
+# writing.
 #
 # No other setup: it writes to this repository with its own GITHUB_TOKEN and
 # creates the label the first time it needs one. Issues opened with
@@ -49,7 +51,7 @@ on:
         type: boolean
         default: true
       run_id:
-        description: One completed run of a watched workflow to reconcile instead of sweeping all three
+        description: One completed run of a watched workflow to reconcile instead of sweeping every watched pipeline
         type: string
         default: ""
 
@@ -136,7 +138,7 @@ jobs:
       # string "true"; the schedule has no inputs and always writes.
       - name: Reconcile the release pipelines' issues
         env:
-          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CI_HEALTH_CHAT_TOKEN: ${{ steps.chat_token.outputs.token }}
           DRY_RUN: ${{ inputs.dry_run }}
           RUN_ID: ${{ inputs.run_id }}

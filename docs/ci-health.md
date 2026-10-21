@@ -1099,8 +1099,10 @@ An incoming-webhook URL in Secret Manager
 `post_health.py --dry-run` prints the messages instead of posting them.
 
 The release-stage notifier (`.github/workflows/release-stage-broken-notify.yml`,
-`scripts/release/notify_release_stage_broken.py`) posts to the same space as the
-same app, with the same variables and defaults, when it opens or closes a
+`scripts/release/notify_release_stage_broken.py`) posts to the same space with
+the same app identity and variables when it opens or closes a
 `ci:release-stage-broken` issue for a failed run of a release pipeline
-([`scripts/release/README.md`](../scripts/release/README.md), "When a stage fails");
-`CI_HEALTH_MUTE=true` silences it too, and its issues still file.
+([`scripts/release/README.md`](../scripts/release/README.md), "Pipeline Cadence &
+Execution Flow", the "When a stage fails" bullet). It mints the app token only;
+the webhook alternative does not apply to it. `CI_HEALTH_MUTE=true` silences it
+too, and its issues still file.

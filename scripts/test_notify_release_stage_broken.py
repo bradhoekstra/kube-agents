@@ -7,18 +7,19 @@ The fixtures under `testdata/release_stage_broken/` are recorded from the
 runs the notifier exists for: `Staging: Promotion Pipeline` #30 (2026-10-21,
 the second of the two silent nights), `RC: Release Pipeline` #404 and
 `Release & Publish (GA)` #10, each trimmed to the log lines the script reads.
-Four failure modes matter more than the rest: staying quiet on a red run,
+Five failure modes matter more than the rest: staying quiet on a red run,
 which is the gap this closes; opening a second issue for a run already
-recorded, which the fifteen-minute sweep would turn into a flood; leaving an
-issue open after the pipeline passes; and posting to Chat without an issue
-to cite.
+recorded, which the fifteen-minute sweep would turn into a flood; closing on
+a green that is not a recovery, whether an older run read while the red one
+is re-run or a run whose failed stage was skipped; leaving an issue open
+after the pipeline passes; and posting to Chat without an issue to cite.
 """
 
 import io
 import json
-import subprocess
 import sys
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest import mock
 
@@ -31,6 +32,7 @@ for path in (str(_HERE), str(_RELEASE)):
         sys.path.insert(0, path)
 
 import notify_release_stage_broken as notifier  # noqa: E402
+from github_api import API_ROOT  # noqa: E402
 
 FIXTURES = _HERE / "testdata" / "release_stage_broken"
 WORKFLOWS = _HERE.parent / ".github" / "workflows"
@@ -45,57 +47,92 @@ RUN_30 = STAGING_RUNS["workflow_runs"][0]
 RUN_29 = STAGING_RUNS["workflow_runs"][1]
 STEP1_JOB = STAGING_JOBS["jobs"][0]["id"]
 E2E_JOB = STAGING_JOBS["jobs"][2]["id"]
+E2E_STAGE = "Step 3 - Run Nightly E2E Matrix / Run E2E (rc)"
+# A green run's job list with the stage run and passed, the shape of every
+# ordinary green night.
+GREEN_JOBS = {
+    "total_count": 2,
+    "jobs": [
+        {"id": 1, "name": "Step 1 - Resolve Promotion Candidate", "conclusion": "success", "steps": []},
+        {"id": 2, "name": E2E_STAGE, "conclusion": "success", "steps": []},
+    ],
+}
 
 
 def fixture(name):
     return (FIXTURES / name).read_text()
 
 
-def green_run(number, run_id):
+def run_like(number, run_id, conclusion="success", status="completed", attempt=1):
     run = dict(RUN_30)
-    run.update(id=run_id, run_number=number, conclusion="success", html_url=f"https://github.com/{REPO}/actions/runs/{run_id}")
+    run.update(
+        id=run_id,
+        run_number=number,
+        conclusion=conclusion,
+        status=status,
+        run_attempt=attempt,
+        html_url=f"https://github.com/{REPO}/actions/runs/{run_id}",
+    )
     return run
 
 
-class FakeRunner:
-    """Answers `gh api` reads from a path map and records every write.
+def runs_list(*runs):
+    return {"total_count": len(runs), "workflow_runs": list(runs)}
 
-    `responses` maps the exact API path (query string included) to the JSON
-    answer; `logs` maps a job id to its raw log. A read with no answer fails
-    the way `gh` does, so a test that reaches a path it did not declare is a
-    test with a hole in it.
+
+class _Response(io.BytesIO):
+    status = 200
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+class FakeGitHub:
+    """Answers the client's reads from a path map and records every write.
+
+    `responses` maps the API path (query string included) to the JSON
+    answer; `logs` maps a job id to its raw log, served on the first hop
+    without a redirect (the redirect itself is the flaky-check client's
+    tested path). A read with no answer is a 404, so a test that reaches a
+    path it did not declare is a test with a hole in it.
     """
 
     def __init__(self, responses=None, logs=None):
         self.responses = dict(responses or {})
         self.logs = dict(logs or {})
         self.writes = []
+        self.log_reads = []
         self.next_issue = 4000
 
-    def __call__(self, argv, input=None, **kwargs):
-        assert argv[0] == "gh"
-        if argv[1] == "label":
-            self.writes.append(("label", argv[3]))
-            return subprocess.CompletedProcess(argv, 0, "", "")
-        if "--allow-escape-sequences" in argv:
-            job_id = int(argv[-1].rsplit("/", 2)[1])
-            if job_id not in self.logs:
-                return subprocess.CompletedProcess(argv, 1, "", "HTTP 410: Gone")
-            return subprocess.CompletedProcess(argv, 0, self.logs[job_id], "")
-        method, path = argv[3], argv[4]
+    def opener(self, request):
+        path = request.full_url[len(API_ROOT) :]
+        method = request.get_method()
         if method == "GET":
             if path not in self.responses:
-                return subprocess.CompletedProcess(argv, 1, "", f"HTTP 404: Not Found ({path})")
-            return subprocess.CompletedProcess(argv, 0, json.dumps(self.responses[path]), "")
-        payload = json.loads(input)
+                raise urllib.error.HTTPError(request.full_url, 404, "Not Found", {}, None)
+            return _Response(json.dumps(self.responses[path]).encode())
+        payload = json.loads(request.data)
         self.writes.append((method, path, payload))
         if method == "POST" and path.endswith("/issues"):
             self.next_issue += 1
-            return subprocess.CompletedProcess(argv, 0, json.dumps({"number": self.next_issue}), "")
-        return subprocess.CompletedProcess(argv, 0, "{}", "")
+            return _Response(json.dumps({"number": self.next_issue}).encode())
+        return _Response(b"{}")
+
+    def redirect_opener(self, request):
+        job_id = int(request.full_url.rsplit("/", 2)[1])
+        self.log_reads.append(job_id)
+        if job_id not in self.logs:
+            raise urllib.error.HTTPError(request.full_url, 410, "Gone", {}, None)
+        return _Response(self.logs[job_id].encode())
+
+    def api(self, dry_run=False):
+        return notifier.GitHubAPI(REPO, "tok", dry_run=dry_run, opener=self.opener, redirect_opener=self.redirect_opener, sleep=lambda s: None)
 
 
-class FakeOpener:
+class FakeChat:
     """Records what the Chat sender posts and answers 200."""
 
     def __init__(self):
@@ -103,44 +140,33 @@ class FakeOpener:
 
     def __call__(self, request, timeout=None):
         self.posted.append(json.loads(request.data.decode())["text"])
-        opener = self
-
-        class Response:
-            status = 200
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *exc):
-                return False
-
-        return Response()
+        return _Response(b"{}")
 
 
 def runs_path(workflow_id=STAGING["id"]):
-    return (
-        f"repos/{REPO}/actions/workflows/{workflow_id}/runs"
-        f"?status=completed&exclude_pull_requests=true&per_page={notifier.HISTORY_DEPTH}"
-    )
+    return f"/repos/{REPO}/actions/workflows/{workflow_id}/runs?exclude_pull_requests=true&per_page={notifier.HISTORY_DEPTH}"
 
 
 def jobs_path(run_id):
-    return f"repos/{REPO}/actions/runs/{run_id}/jobs?per_page={notifier.PAGE_SIZE}&page=1"
+    return f"/repos/{REPO}/actions/runs/{run_id}/jobs?per_page=100&page=1"
 
 
 def issues_path(state):
-    return f"repos/{REPO}/issues?labels=ci%3Arelease-stage-broken&state={state}&sort=updated&direction=desc&per_page={notifier.ISSUE_PAGE}"
+    return f"/repos/{REPO}/issues?labels=ci%3Arelease-stage-broken&state={state}&sort=updated&direction=desc&per_page={notifier.ISSUE_PAGE}"
 
 
 def issue(number, body, state="open"):
     return {"number": number, "body": body, "state": state, "html_url": f"https://github.com/{REPO}/issues/{number}"}
 
 
-def body_with(run_ids, workflow_id=STAGING["id"]):
-    return "\n".join([notifier.marker(workflow_id), notifier.STAMP.format(run_ids=",".join(map(str, run_ids))), "", "body"])
+def body_with(run_ids, stage=E2E_STAGE, workflow_id=STAGING["id"]):
+    lines = [notifier.marker(workflow_id), notifier.STAMP.format(run_ids=",".join(map(str, run_ids)))]
+    if stage:
+        lines.append(notifier.STAGE_STAMP.format(stage=stage))
+    return "\n".join(lines + ["", "body"])
 
 
-def staging_runner(runs=STAGING_RUNS, open_issues=(), closed_issues=(), logs=None):
+def staging_github(runs=STAGING_RUNS, open_issues=(), closed_issues=(), logs=None):
     responses = {
         runs_path(): runs,
         jobs_path(RUN_30["id"]): STAGING_JOBS,
@@ -148,18 +174,18 @@ def staging_runner(runs=STAGING_RUNS, open_issues=(), closed_issues=(), logs=Non
         issues_path("closed"): list(closed_issues),
     }
     default_logs = {STEP1_JOB: fixture("staging-30-step1.log"), E2E_JOB: fixture("staging-30-e2e.log")}
-    return FakeRunner(responses, logs if logs is not None else default_logs)
+    return FakeGitHub(responses, logs if logs is not None else default_logs)
 
 
-def reconcile(runner, opener=None, dry_run=False):
-    gh = notifier.Gh(REPO, runner=runner, dry_run=dry_run)
-    sender = notifier.Sender(space="spaces/AAA", token="t", opener=opener or FakeOpener())
-    with mock.patch("sys.stderr", new=io.StringIO()):
-        return notifier.reconcile(gh, STAGING, sender, dry_run)
+def reconcile(github, chat=None, dry_run=False):
+    sender = notifier.Sender(space="spaces/AAA", token="t", opener=chat or FakeChat())
+    with mock.patch("sys.stderr", new=io.StringIO()) as err:
+        outcome = notifier.reconcile(github.api(dry_run), STAGING, sender, dry_run)
+    return outcome, err.getvalue()
 
 
 class LogReadingTest(unittest.TestCase):
-    """What the script reads out of the logs the three pipelines write."""
+    """What the script reads out of the logs the watched pipelines write."""
 
     def test_the_staging_resolver_names_tag_and_commit(self):
         candidate = notifier.extract_candidate(fixture("staging-30-step1.log"))
@@ -176,8 +202,7 @@ class LogReadingTest(unittest.TestCase):
         self.assertEqual(candidate, {"tag": "staging_2609301327_d817b3b", "sha": "d817b3b2c4e5f92e84d2a62636d6279b571a82d7"})
 
     def test_a_second_log_fills_only_the_holes(self):
-        first = {"tag": "rc_x"}
-        merged = notifier.extract_candidate(fixture("ga-10-publish.log"), first)
+        merged = notifier.extract_candidate(fixture("ga-10-publish.log"), {"tag": "rc_x"})
         self.assertEqual(merged, {"tag": "rc_x", "sha": "d817b3b2c4e5f92e84d2a62636d6279b571a82d7"})
 
     def test_a_pytest_summary_line_is_the_first_failure(self):
@@ -189,45 +214,80 @@ class LogReadingTest(unittest.TestCase):
         line = notifier.extract_first_failure(fixture("rc-404-e2e.log"))
         self.assertTrue(line.startswith("FAILED tests/e2e/gchat_agent_test.py::test_gchat_agent_math_response"), line)
 
-    def test_a_script_error_line_beats_the_runner_annotation(self):
+    def test_a_script_error_line_beats_the_generic_exit_annotation(self):
         line = notifier.extract_first_failure(fixture("ga-10-publish.log"))
         self.assertTrue(line.startswith("❌ ERROR: Required container images"), line)
+
+    def test_an_annotation_beats_a_generic_error_line(self):
+        text = "2026-10-21T03:00:01.0Z ERROR: a warning-ish line\n2026-10-21T03:00:02.0Z ##[error]verify.sh: cluster not ready\n"
+        self.assertEqual(notifier.extract_first_failure(text), "##[error]verify.sh: cluster not ready")
+
+    def test_the_failing_step_window_is_searched_before_the_whole_log(self):
+        """An `ERROR:` an earlier step printed and survived must not stand
+        in for what failed the job."""
+        text = (
+            "2026-10-21T03:00:01.0000000Z ERROR: earlier step grumbled and passed\n"
+            "2026-10-21T03:10:05.1234567Z ❌ ERROR: the gate refused the candidate\n"
+            "2026-10-21T03:10:06.0000000Z ##[error]Process completed with exit code 1.\n"
+        )
+        window = ("2026-10-21T03:10:00Z", "2026-10-21T03:10:06Z")
+        self.assertEqual(notifier.extract_first_failure(text, window), "❌ ERROR: the gate refused the candidate")
+        self.assertEqual(notifier.extract_first_failure(text), "ERROR: earlier step grumbled and passed")
+        self.assertEqual(notifier.extract_first_failure(text, (None, None)), "ERROR: earlier step grumbled and passed")
+
+    def test_a_window_with_nothing_in_it_falls_back_to_the_whole_log(self):
+        text = "2026-10-21T03:00:01.0Z ##[error]only line\n"
+        self.assertEqual(notifier.extract_first_failure(text, ("2026-10-21T04:00:00Z", "2026-10-21T04:00:01Z")), "##[error]only line")
 
     def test_a_log_with_no_failure_line_yields_none(self):
         self.assertIsNone(notifier.extract_first_failure(fixture("staging-30-step1.log")))
 
-    def test_colour_codes_and_timestamps_are_stripped(self):
-        self.assertEqual(notifier.clean_log_line("2026-10-21T02:37:11.1014977Z \x1b[36;1mhello\x1b[0m\r"), "hello")
+    def test_colour_codes_and_timestamps_are_stripped_and_the_second_kept(self):
+        stamp, line = notifier.split_log_line("﻿2026-10-21T02:37:11.1014977Z \x1b[36;1mhello\x1b[0m\r")
+        self.assertEqual((stamp, line), ("2026-10-21T02:37:11Z", "hello"))
+        self.assertEqual(notifier.split_log_line("no stamp"), (None, "no stamp"))
 
 
 class JobReadingTest(unittest.TestCase):
     def test_the_stage_is_the_first_failed_job_in_run_order(self):
         job = notifier.failing_job(STAGING_JOBS["jobs"])
-        self.assertEqual(job["name"], "Step 3 - Run Nightly E2E Matrix / Run E2E (rc)")
-        self.assertEqual(notifier.failing_step(job), "Execute Blocking E2E Gate")
+        self.assertEqual(job["name"], E2E_STAGE)
+        step = notifier.failing_step(job)
+        self.assertEqual(step["name"], "Execute Blocking E2E Gate")
+        self.assertEqual((step["started_at"], step["completed_at"]), ("2026-10-21T03:29:21Z", "2026-10-21T03:37:38Z"))
 
     def test_the_ga_publish_job_and_its_step(self):
         job = notifier.failing_job(GA_JOBS["jobs"])
         self.assertEqual(job["name"], "Publish GA Release")
-        self.assertEqual(notifier.failing_step(job), "Verify Release Eligibility")
+        self.assertEqual(notifier.failing_step(job)["name"], "Verify Release Eligibility")
 
     def test_a_cancelled_job_is_the_stage_only_when_none_failed(self):
         jobs = [{"name": "a", "conclusion": "success"}, {"name": "b", "conclusion": "cancelled"}]
         self.assertEqual(notifier.failing_job(jobs)["name"], "b")
         self.assertIsNone(notifier.failing_job([{"name": "a", "conclusion": "success"}]))
 
+    def test_a_stage_is_found_across_the_reusable_workflow_separator(self):
+        """A skipped call is listed under its short name, an expanded one
+        under `<caller> / <called>`; the same stage either way."""
+        jobs = [{"name": "Step 4 - Tag Validated Release / validate-tag", "conclusion": "success"}]
+        self.assertIsNotNone(notifier.job_named(jobs, "Step 4 - Tag Validated Release"))
+        self.assertIsNotNone(notifier.job_named([{"name": "Step 4 - Tag Validated Release"}], "Step 4 - Tag Validated Release / validate-tag"))
+        self.assertIsNone(notifier.job_named(jobs, "Step 4"))
+
 
 class RenderTest(unittest.TestCase):
-    def test_the_stamp_round_trips(self):
+    def test_the_stamps_round_trip(self):
         body = body_with([1, 22, 333])
         self.assertEqual(notifier.stamped_runs(body), {1, 22, 333})
+        self.assertEqual(notifier.stamped_stage(body), E2E_STAGE)
         self.assertEqual(notifier.stamped_runs(""), set())
         self.assertEqual(notifier.stamped_runs(None), set())
+        self.assertIsNone(notifier.stamped_stage(body_with([1], stage=None)))
 
     def test_the_body_names_stage_candidate_failure_and_streak(self):
         details = {
             "run": RUN_30,
-            "stage": "Step 3 - Run Nightly E2E Matrix / Run E2E (rc)",
+            "stage": E2E_STAGE,
             "stage_url": "https://example/job",
             "step": "Execute Blocking E2E Gate",
             "failure": "FAILED tests/e2e/x.py::test_y - AssertionError",
@@ -236,14 +296,16 @@ class RenderTest(unittest.TestCase):
         body = notifier.render_body(STAGING["name"], STAGING["id"], details, [RUN_29, RUN_30])
         self.assertIn(notifier.marker(STAGING["id"]), body)
         self.assertEqual(notifier.stamped_runs(body), {RUN_29["id"], RUN_30["id"]})
-        for expected in ("Step 3 - Run Nightly E2E Matrix / Run E2E (rc)", "Execute Blocking E2E Gate", "rc_1_abc", "a" * 40, "FAILED tests/e2e/x.py::test_y", RUN_30["html_url"], "[#29]", "[#30]", "2026-10-21 02:36 UTC"):
+        self.assertEqual(notifier.stamped_stage(body), E2E_STAGE)
+        for expected in (E2E_STAGE, "Execute Blocking E2E Gate", "rc_1_abc", "a" * 40, "FAILED tests/e2e/x.py::test_y", RUN_30["html_url"], "[#29]", "[#30]", "2026-10-21 02:36 UTC"):
             self.assertIn(expected, body)
 
-    def test_an_unknown_candidate_is_said_not_omitted(self):
+    def test_an_unknown_candidate_and_stage_are_said_not_omitted(self):
         details = {"run": RUN_30, "stage": None, "stage_url": None, "step": None, "failure": None, "candidate": {}}
         body = notifier.render_body(STAGING["name"], STAGING["id"], details, [RUN_30])
         self.assertIn(notifier.CANDIDATE_UNKNOWN, body)
         self.assertIn(notifier.STAGE_UNKNOWN, body)
+        self.assertIsNone(notifier.stamped_stage(body))
         self.assertNotIn("Failing runs in this streak", body)
 
     def test_the_chat_messages_are_short_and_carry_the_links(self):
@@ -267,143 +329,251 @@ class ReconcileTest(unittest.TestCase):
     """The state machine against recorded runs: open, update, close, nothing."""
 
     def test_a_red_run_with_no_issue_opens_one_and_posts(self):
-        runner = staging_runner()
-        opener = FakeOpener()
-        self.assertEqual(reconcile(runner, opener), "opened")
-        self.assertEqual(runner.writes[0], ("label", notifier.LABEL))
-        method, path, payload = runner.writes[1]
-        self.assertEqual((method, path), ("POST", f"repos/{REPO}/issues"))
+        github = staging_github()
+        chat = FakeChat()
+        self.assertEqual(reconcile(github, chat)[0], "opened")
+        method, path, payload = github.writes[0]
+        self.assertEqual((method, path, payload["name"]), ("POST", f"/repos/{REPO}/labels", notifier.LABEL))
+        method, path, payload = github.writes[1]
+        self.assertEqual((method, path), ("POST", f"/repos/{REPO}/issues"))
         self.assertEqual(payload["title"], "🔴 release pipeline stage broken: Staging: Promotion Pipeline")
         self.assertEqual(payload["labels"], [notifier.LABEL])
         self.assertEqual(notifier.stamped_runs(payload["body"]), {RUN_29["id"], RUN_30["id"]})
+        self.assertEqual(notifier.stamped_stage(payload["body"]), E2E_STAGE)
         self.assertIn("rc_2610210024_8dc552a_validated", payload["body"])
         self.assertIn("test_stockout_ingress_alert_smoke", payload["body"])
-        self.assertEqual(len(runner.writes), 2)
-        self.assertEqual(len(opener.posted), 1)
-        self.assertIn("Tracking #4001", opener.posted[0])
-        self.assertIn("Step 3 - Run Nightly E2E Matrix / Run E2E (rc)", opener.posted[0])
-        self.assertIn(RUN_30["html_url"], opener.posted[0])
+        self.assertEqual(len(github.writes), 2)
+        self.assertEqual(len(chat.posted), 1)
+        self.assertIn("Tracking #4001", chat.posted[0])
+        self.assertIn(E2E_STAGE, chat.posted[0])
+        self.assertIn(RUN_30["html_url"], chat.posted[0])
+
+    def test_each_log_is_read_once(self):
+        """The failing job is often among the first jobs read for the
+        candidate; its log is downloaded once, not twice."""
+        jobs = {"total_count": 2, "jobs": [dict(STAGING_JOBS["jobs"][2]), dict(STAGING_JOBS["jobs"][0])]}
+        github = staging_github()
+        github.responses[jobs_path(RUN_30["id"])] = jobs
+        self.assertEqual(reconcile(github)[0], "opened")
+        self.assertEqual(github.log_reads, [E2E_JOB, STEP1_JOB])
 
     def test_a_red_run_already_recorded_writes_nothing(self):
-        runner = staging_runner(open_issues=[issue(4001, body_with([RUN_29["id"], RUN_30["id"]]))])
-        opener = FakeOpener()
-        self.assertEqual(reconcile(runner, opener), "nothing")
-        self.assertEqual(runner.writes, [])
-        self.assertEqual(opener.posted, [])
+        github = staging_github(open_issues=[issue(4001, body_with([RUN_29["id"], RUN_30["id"]]))])
+        chat = FakeChat()
+        self.assertEqual(reconcile(github, chat)[0], "nothing")
+        self.assertEqual(github.writes, [])
+        self.assertEqual(chat.posted, [])
 
     def test_a_new_red_run_rewrites_the_body_and_comments_once_without_chat(self):
-        runner = staging_runner(open_issues=[issue(4001, body_with([RUN_29["id"]]))])
-        opener = FakeOpener()
-        self.assertEqual(reconcile(runner, opener), "updated")
-        self.assertEqual([(w[0], w[1]) for w in runner.writes], [("PATCH", f"repos/{REPO}/issues/4001"), ("POST", f"repos/{REPO}/issues/4001/comments")])
-        self.assertEqual(notifier.stamped_runs(runner.writes[0][2]["body"]), {RUN_29["id"], RUN_30["id"]})
-        comment = runner.writes[1][2]["body"]
+        github = staging_github(open_issues=[issue(4001, body_with([RUN_29["id"]]))])
+        chat = FakeChat()
+        self.assertEqual(reconcile(github, chat)[0], "updated")
+        self.assertEqual([(w[0], w[1]) for w in github.writes], [("PATCH", f"/repos/{REPO}/issues/4001"), ("POST", f"/repos/{REPO}/issues/4001/comments")])
+        self.assertEqual(notifier.stamped_runs(github.writes[0][2]["body"]), {RUN_29["id"], RUN_30["id"]})
+        comment = github.writes[1][2]["body"]
         self.assertIn("Still failing", comment)
         self.assertIn("[#30]", comment)
         self.assertIn("rc_2610210024_8dc552a_validated", comment)
-        self.assertEqual(opener.posted, [])
+        self.assertEqual(chat.posted, [])
 
-    def test_a_green_run_closes_the_open_issue_and_posts(self):
-        run_31 = green_run(31, 39600000000)
-        runs = {"total_count": 7, "workflow_runs": [run_31, *STAGING_RUNS["workflow_runs"]]}
-        runner = staging_runner(runs=runs, open_issues=[issue(4001, body_with([RUN_29["id"], RUN_30["id"]]))])
-        runner.responses[jobs_path(run_31["id"])] = {"total_count": 1, "jobs": [{"id": 1, "name": "Step 1", "conclusion": "success", "steps": []}]}
-        runner.logs[1] = fixture("staging-30-step1.log")
-        opener = FakeOpener()
-        self.assertEqual(reconcile(runner, opener), "closed")
-        self.assertEqual([(w[0], w[1]) for w in runner.writes], [("POST", f"repos/{REPO}/issues/4001/comments"), ("PATCH", f"repos/{REPO}/issues/4001")])
-        self.assertIn("[#31]", runner.writes[0][2]["body"])
-        self.assertIn("passed", runner.writes[0][2]["body"])
-        self.assertEqual(runner.writes[1][2], {"state": "closed"})
-        self.assertEqual(len(opener.posted), 1)
-        self.assertIn("passes again", opener.posted[0])
-        self.assertIn("Closed #4001", opener.posted[0])
-        self.assertIn("rc_2610210024_8dc552a_validated", opener.posted[0])
+    def test_a_green_run_with_the_stage_run_closes_the_issue_and_posts(self):
+        run_31 = run_like(31, 39600000000)
+        github = staging_github(runs=runs_list(run_31, *STAGING_RUNS["workflow_runs"]), open_issues=[issue(4001, body_with([RUN_29["id"], RUN_30["id"]]))])
+        github.responses[jobs_path(run_31["id"])] = GREEN_JOBS
+        github.logs[1] = fixture("staging-30-step1.log")
+        chat = FakeChat()
+        self.assertEqual(reconcile(github, chat)[0], "closed")
+        self.assertEqual([(w[0], w[1]) for w in github.writes], [("POST", f"/repos/{REPO}/issues/4001/comments"), ("PATCH", f"/repos/{REPO}/issues/4001")])
+        self.assertIn("[#31]", github.writes[0][2]["body"])
+        self.assertIn("passed", github.writes[0][2]["body"])
+        self.assertEqual(github.writes[1][2], {"state": "closed"})
+        self.assertEqual(len(chat.posted), 1)
+        self.assertIn("passes again", chat.posted[0])
+        self.assertIn("Closed #4001", chat.posted[0])
+        self.assertIn("rc_2610210024_8dc552a_validated", chat.posted[0])
+
+    def test_a_green_run_whose_stage_was_skipped_is_no_recovery(self):
+        """`release-publish.yml` under `schedule_gate=dry-run`, a promotion
+        run with `skip_pipeline`, an RC run that skips: the run concludes
+        success with the stage skipped, and says nothing about the failure."""
+        run_31 = run_like(31, 39600000000)
+        skipped = {"total_count": 2, "jobs": [dict(GREEN_JOBS["jobs"][0]), dict(GREEN_JOBS["jobs"][1], conclusion="skipped")]}
+        github = staging_github(runs=runs_list(run_31, *STAGING_RUNS["workflow_runs"]), open_issues=[issue(4001, body_with([RUN_29["id"], RUN_30["id"]]))])
+        github.responses[jobs_path(run_31["id"])] = skipped
+        chat = FakeChat()
+        outcome, err = reconcile(github, chat)
+        self.assertEqual(outcome, "nothing")
+        self.assertEqual(github.writes, [])
+        self.assertEqual(chat.posted, [])
+        self.assertIn("concluded skipped", err)
+        self.assertIn("#4001 stays open", err)
+
+    def test_a_green_run_without_the_stage_at_all_is_no_recovery(self):
+        run_31 = run_like(31, 39600000000)
+        github = staging_github(runs=runs_list(run_31, *STAGING_RUNS["workflow_runs"]), open_issues=[issue(4001, body_with([RUN_29["id"], RUN_30["id"]]))])
+        github.responses[jobs_path(run_31["id"])] = {"total_count": 1, "jobs": [dict(GREEN_JOBS["jobs"][0])]}
+        outcome, err = reconcile(github)
+        self.assertEqual(outcome, "nothing")
+        self.assertEqual(github.writes, [])
+        self.assertIn("is not in it", err)
+
+    def test_a_green_run_closes_an_issue_that_recorded_no_stage(self):
+        """No stage on record means nothing to hold the close to."""
+        run_31 = run_like(31, 39600000000)
+        github = staging_github(runs=runs_list(run_31, *STAGING_RUNS["workflow_runs"]), open_issues=[issue(4001, body_with([RUN_29["id"], RUN_30["id"]], stage=None))])
+        github.responses[jobs_path(run_31["id"])] = {"total_count": 1, "jobs": [dict(GREEN_JOBS["jobs"][0])]}
+        self.assertEqual(reconcile(github)[0], "closed")
 
     def test_a_green_run_with_no_issue_writes_nothing(self):
-        runs = {"total_count": 7, "workflow_runs": [green_run(31, 39600000000), *STAGING_RUNS["workflow_runs"]]}
-        runner = staging_runner(runs=runs)
-        opener = FakeOpener()
-        self.assertEqual(reconcile(runner, opener), "nothing")
-        self.assertEqual(runner.writes, [])
-        self.assertEqual(opener.posted, [])
+        github = staging_github(runs=runs_list(run_like(31, 39600000000), *STAGING_RUNS["workflow_runs"]))
+        chat = FakeChat()
+        self.assertEqual(reconcile(github, chat)[0], "nothing")
+        self.assertEqual(github.writes, [])
+        self.assertEqual(chat.posted, [])
+
+    def test_a_red_run_being_re_run_decides_nothing(self):
+        """A re-run moves the run out of `completed`; read only completed
+        runs, the green before it would be the newest and close the issue
+        citing a run that finished before the failure."""
+        re_running = run_like(30, RUN_30["id"], conclusion=None, status="in_progress", attempt=2)
+        github = staging_github(runs=runs_list(re_running, *STAGING_RUNS["workflow_runs"][1:]), open_issues=[issue(4001, body_with([RUN_29["id"], RUN_30["id"]]))])
+        chat = FakeChat()
+        outcome, err = reconcile(github, chat)
+        self.assertEqual(outcome, "nothing")
+        self.assertEqual(github.writes, [])
+        self.assertEqual(chat.posted, [])
+        self.assertIn("run #30 is in_progress", err)
+
+    def test_a_newer_run_still_queued_decides_nothing(self):
+        queued = run_like(31, 39600000000, conclusion=None, status="queued")
+        github = staging_github(runs=runs_list(queued, *STAGING_RUNS["workflow_runs"]))
+        outcome, err = reconcile(github)
+        self.assertEqual(outcome, "nothing")
+        self.assertEqual(github.writes, [])
+        self.assertIn("run #31 is queued", err)
+
+    def test_a_re_run_that_fails_again_is_already_recorded(self):
+        failed_again = run_like(30, RUN_30["id"], conclusion="failure", attempt=2)
+        github = staging_github(runs=runs_list(failed_again, *STAGING_RUNS["workflow_runs"][1:]), open_issues=[issue(4001, body_with([RUN_29["id"], RUN_30["id"]]))])
+        self.assertEqual(reconcile(github)[0], "nothing")
+        self.assertEqual(github.writes, [])
+
+    def test_a_re_run_that_passes_is_the_recovery(self):
+        """The failing run passing on its own candidate ends the streak, as
+        it does for the broken-main notifier; the stage has to have run."""
+        passed = run_like(30, RUN_30["id"], conclusion="success", attempt=2)
+        github = staging_github(runs=runs_list(passed, *STAGING_RUNS["workflow_runs"][1:]), open_issues=[issue(4001, body_with([RUN_29["id"], RUN_30["id"]]))])
+        github.responses[jobs_path(RUN_30["id"])] = GREEN_JOBS
+        github.logs[1] = fixture("staging-30-step1.log")
+        self.assertEqual(reconcile(github)[0], "closed")
+        self.assertEqual(github.writes[1][2], {"state": "closed"})
+
+    def test_a_green_older_than_the_recorded_failure_is_no_recovery(self):
+        """A page that lacks the failing run (the history endpoint has
+        answered short pages) must not close on the green before it."""
+        github = staging_github(runs=runs_list(*STAGING_RUNS["workflow_runs"][2:]), open_issues=[issue(4001, body_with([RUN_29["id"], RUN_30["id"]]))])
+        outcome, err = reconcile(github)
+        self.assertEqual(outcome, "nothing")
+        self.assertEqual(github.writes, [])
+        self.assertIn("older than the failing run", err)
 
     def test_a_red_run_a_person_closed_the_issue_for_is_not_refiled(self):
         closed = issue(3999, body_with([RUN_29["id"], RUN_30["id"]]), state="closed")
-        runner = staging_runner(closed_issues=[closed])
-        opener = FakeOpener()
-        self.assertEqual(reconcile(runner, opener), "nothing")
-        self.assertEqual(runner.writes, [])
-        self.assertEqual(opener.posted, [])
+        github = staging_github(closed_issues=[closed])
+        chat = FakeChat()
+        self.assertEqual(reconcile(github, chat)[0], "nothing")
+        self.assertEqual(github.writes, [])
+        self.assertEqual(chat.posted, [])
+
+    def test_every_closed_issue_is_checked_not_only_the_newest(self):
+        newest = issue(3999, body_with([RUN_29["id"]]), state="closed")
+        older = issue(3990, body_with([RUN_30["id"]]), state="closed")
+        github = staging_github(closed_issues=[newest, older])
+        self.assertEqual(reconcile(github)[0], "nothing")
+        self.assertEqual(github.writes, [])
 
     def test_a_newer_red_run_after_a_closed_issue_opens_a_fresh_one(self):
-        closed = issue(3999, body_with([RUN_29["id"]]), state="closed")
-        runner = staging_runner(closed_issues=[closed])
-        self.assertEqual(reconcile(runner), "opened")
-        self.assertEqual(runner.writes[1][0], "POST")
+        github = staging_github(closed_issues=[issue(3999, body_with([RUN_29["id"]]), state="closed")])
+        self.assertEqual(reconcile(github)[0], "opened")
+        self.assertEqual(github.writes[1][0], "POST")
 
     def test_a_cancelled_newest_run_says_nothing(self):
-        cancelled = dict(green_run(31, 39600000000), conclusion="cancelled")
-        runs = {"total_count": 7, "workflow_runs": [cancelled, *STAGING_RUNS["workflow_runs"]]}
-        runner = staging_runner(runs=runs, open_issues=[issue(4001, body_with([RUN_29["id"], RUN_30["id"]]))])
-        self.assertEqual(reconcile(runner), "nothing")
-        self.assertEqual(runner.writes, [])
+        cancelled = run_like(31, 39600000000, conclusion="cancelled")
+        github = staging_github(runs=runs_list(cancelled, *STAGING_RUNS["workflow_runs"]), open_issues=[issue(4001, body_with([RUN_29["id"], RUN_30["id"]]))])
+        self.assertEqual(reconcile(github)[0], "nothing")
+        self.assertEqual(github.writes, [])
 
     def test_an_unreadable_log_still_files_with_the_candidate_unknown(self):
-        runner = staging_runner(logs={})
-        self.assertEqual(reconcile(runner), "opened")
-        body = runner.writes[1][2]["body"]
+        github = staging_github(logs={})
+        self.assertEqual(reconcile(github)[0], "opened")
+        body = github.writes[1][2]["body"]
         self.assertIn(notifier.CANDIDATE_UNKNOWN, body)
         self.assertIn("Execute Blocking E2E Gate", body)
 
     def test_an_unconfigured_sender_files_the_issue_and_posts_nothing(self):
-        runner = staging_runner()
-        gh = notifier.Gh(REPO, runner=runner)
-        sender = notifier.Sender(opener=FakeOpener())
+        github = staging_github()
+        sender = notifier.Sender(opener=FakeChat())
         with mock.patch("sys.stderr", new=io.StringIO()) as err:
-            self.assertEqual(notifier.reconcile(gh, STAGING, sender, dry_run=False), "opened")
-        self.assertEqual(runner.writes[1][0], "POST")
+            self.assertEqual(notifier.reconcile(github.api(), STAGING, sender, dry_run=False), "opened")
+        self.assertEqual(github.writes[1][0], "POST")
         self.assertIn(notifier.NOT_CONFIGURED, err.getvalue())
 
     def test_a_dry_run_writes_and_posts_nothing(self):
-        runner = staging_runner()
-        opener = FakeOpener()
-        with mock.patch("sys.stderr", new=io.StringIO()) as err:
-            gh = notifier.Gh(REPO, runner=runner, dry_run=True)
-            sender = notifier.Sender(space="spaces/AAA", token="t", opener=opener)
-            self.assertEqual(notifier.reconcile(gh, STAGING, sender, dry_run=True), "opened")
-        self.assertEqual(runner.writes, [])
-        self.assertEqual(opener.posted, [])
-        self.assertIn("would open an issue", err.getvalue())
-        self.assertIn("would post to chat", err.getvalue())
+        github = staging_github()
+        chat = FakeChat()
+        outcome, err = reconcile(github, chat, dry_run=True)
+        self.assertEqual(outcome, "opened")
+        self.assertEqual(github.writes, [])
+        self.assertEqual(chat.posted, [])
+        self.assertIn("would open an issue", err)
+        self.assertIn("would post to chat", err)
 
-    def test_a_failed_read_writes_nothing_and_reds_the_run(self):
-        runner = FakeRunner({})
+    def test_a_transient_server_error_on_a_read_is_retried(self):
+        github = staging_github()
+        failures = [1]
+        real = github.opener
+
+        def flaky(request):
+            if failures and request.full_url.endswith(runs_path()):
+                failures.pop()
+                raise urllib.error.HTTPError(request.full_url, 502, "bad gateway", {}, None)
+            return real(request)
+
+        github.opener = flaky
+        self.assertEqual(reconcile(github)[0], "opened")
+
+    def test_a_read_that_fails_past_the_retries_writes_nothing_and_reds_the_run(self):
+        github = FakeGitHub({})
         with mock.patch("sys.stderr", new=io.StringIO()):
-            code = notifier.main(["--sweep"], runner=runner, environ={})
+            code = notifier.main(["--sweep"], environ={}, api=github.api())
         self.assertEqual(code, 1)
-        self.assertEqual(runner.writes, [])
+        self.assertEqual(github.writes, [])
 
 
 class MainTest(unittest.TestCase):
-    def test_a_run_of_an_unwatched_workflow_is_declined(self):
-        runner = FakeRunner({f"repos/{REPO}/actions/runs/5": {"id": 5, "name": "Docker Build", "workflow_id": 9}})
+    def test_a_missing_token_is_refused_before_any_read(self):
         with mock.patch("sys.stderr", new=io.StringIO()) as err:
-            self.assertEqual(notifier.main(["--run-id", "5"], runner=runner, environ={}), 0)
+            self.assertEqual(notifier.main(["--sweep"], environ={}), 1)
+        self.assertIn("GITHUB_TOKEN or GH_TOKEN", err.getvalue())
+
+    def test_a_run_of_an_unwatched_workflow_is_declined(self):
+        github = FakeGitHub({f"/repos/{REPO}/actions/runs/5": {"id": 5, "name": "Docker Build", "workflow_id": 9}})
+        with mock.patch("sys.stderr", new=io.StringIO()) as err:
+            self.assertEqual(notifier.main(["--run-id", "5"], environ={}, api=github.api()), 0)
         self.assertIn("not watched", err.getvalue())
-        self.assertEqual(runner.writes, [])
+        self.assertEqual(github.writes, [])
 
     def test_a_run_id_reconciles_that_workflow(self):
-        runner = staging_runner()
-        runner.responses[f"repos/{REPO}/actions/runs/{RUN_30['id']}"] = {"id": RUN_30["id"], "name": STAGING["name"], "workflow_id": STAGING["id"]}
+        github = staging_github()
+        github.responses[f"/repos/{REPO}/actions/runs/{RUN_30['id']}"] = {"id": RUN_30["id"], "name": STAGING["name"], "workflow_id": STAGING["id"]}
         with mock.patch("sys.stderr", new=io.StringIO()):
-            self.assertEqual(notifier.main(["--run-id", str(RUN_30["id"])], runner=runner, environ={}, opener=FakeOpener()), 0)
-        self.assertEqual(runner.writes[1][0], "POST")
+            self.assertEqual(notifier.main(["--run-id", str(RUN_30["id"])], environ={}, api=github.api(), opener=FakeChat()), 0)
+        self.assertEqual(github.writes[1][0], "POST")
 
     def test_the_sweep_reds_on_a_watched_name_that_matches_no_workflow(self):
-        runner = FakeRunner({f"repos/{REPO}/actions/workflows?per_page={notifier.PAGE_SIZE}&page=1": {"total_count": 1, "workflows": [{"id": 1, "name": "Docker Build"}]}})
+        github = FakeGitHub({f"/repos/{REPO}/actions/workflows?per_page=100&page=1": {"total_count": 1, "workflows": [{"id": 1, "name": "Docker Build"}]}})
         with mock.patch("sys.stderr", new=io.StringIO()) as err:
-            self.assertEqual(notifier.main(["--sweep"], runner=runner, environ={}), 1)
+            self.assertEqual(notifier.main(["--sweep"], environ={}, api=github.api()), 1)
         self.assertIn("renamed?", err.getvalue())
 
 
@@ -445,6 +615,7 @@ class WorkflowContractTest(unittest.TestCase):
             self.assertEqual(job["permissions"]["id-token"], "write", name)
         text = NOTIFIER_WORKFLOW.read_text()
         self.assertIn("scripts/release/notify_release_stage_broken.py", text)
+        self.assertIn("GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}", text)
         self.assertTrue((_RELEASE / "notify_release_stage_broken.py").exists())
 
     def test_the_chat_variables_match_the_ci_health_poster(self):
@@ -456,6 +627,13 @@ class WorkflowContractTest(unittest.TestCase):
             self.assertEqual(document["env"][key], health["env"][key], key)
         self.assertEqual(notifier.SPACE_ENV, "CI_HEALTH_CHAT_SPACE")
         self.assertEqual(notifier.TOKEN_ENV, "CI_HEALTH_CHAT_TOKEN")
+
+    def test_the_runbook_pointer_names_a_heading_and_bullet_that_exist(self):
+        readme = (_RELEASE / "README.md").read_text()
+        self.assertIn("## Pipeline Cadence & Execution Flow", readme)
+        self.assertIn("**When a stage fails", readme)
+        self.assertIn("Pipeline Cadence & Execution Flow", notifier.RUNBOOK)
+        self.assertIn("When a stage fails", notifier.RUNBOOK)
 
 
 if __name__ == "__main__":
