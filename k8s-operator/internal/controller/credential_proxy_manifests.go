@@ -344,6 +344,12 @@ func buildCredentialProxyService(agent *agentv1alpha1.PlatformAgent) *corev1.Ser
 	return svc
 }
 
+// buildCredentialProxyDeployment is buildCredentialProxyDeploymentForPlugins
+// with no plugins.
+func buildCredentialProxyDeployment(agent *agentv1alpha1.PlatformAgent, policyHash string) *appsv1.Deployment {
+	return buildCredentialProxyDeploymentForPlugins(agent, policyHash, nil)
+}
+
 // buildCredentialProxyDeployment renders the standalone proxy pod.
 //
 // Recreate, not RollingUpdate. The Google Chat relay pulls from a Pub/Sub
@@ -360,15 +366,9 @@ func buildCredentialProxyService(agent *agentv1alpha1.PlatformAgent) *corev1.Ser
 // decision, the load it was sized against, and the split exec tier to build if
 // it reopens.
 //
-// buildCredentialProxyDeployment is buildCredentialProxyDeploymentForPlugins
-// with no plugins.
-func buildCredentialProxyDeployment(agent *agentv1alpha1.PlatformAgent, policyHash string) *appsv1.Deployment {
-	return buildCredentialProxyDeploymentForPlugins(agent, policyHash, nil)
-}
-
-// buildCredentialProxyDeploymentForPlugins renders the broker Deployment for an
-// agent and the AgentPlugins resolved for it, which reach the container's
-// environment (buildCredentialProxyEnvForPlugins).
+// The AgentPlugins resolved for the agent reach the container's environment
+// (buildCredentialProxyEnvForPlugins); buildCredentialProxyDeployment is this
+// with none.
 func buildCredentialProxyDeploymentForPlugins(agent *agentv1alpha1.PlatformAgent, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin) *appsv1.Deployment {
 	saName := agent.Name
 	if agent.Spec.Security != nil && agent.Spec.Security.ServiceAccountName != "" {
@@ -439,6 +439,12 @@ func buildCredentialProxyDeploymentForPlugins(agent *agentv1alpha1.PlatformAgent
 	return dep
 }
 
+// buildCredentialProxyContainer is buildCredentialProxyContainerForPlugins with
+// no plugins.
+func buildCredentialProxyContainer(agent *agentv1alpha1.PlatformAgent) corev1.Container {
+	return buildCredentialProxyContainerForPlugins(agent, nil)
+}
+
 // buildCredentialProxyContainer is the credential half of the old sidecar: Envoy
 // and the credential runtime, with the chat relays the runtime hosts. The event
 // watcher and the agent API authenticator stay in the gateway pod, because both
@@ -447,12 +453,6 @@ func buildCredentialProxyDeploymentForPlugins(agent *agentv1alpha1.PlatformAgent
 // One variant, because the broker has one placement: a Deployment of its own.
 // It shares no pod with the agent, which holds the credentials it mints from,
 // and no pod with the sandbox, which runs model-authored code.
-// buildCredentialProxyContainer is buildCredentialProxyContainerForPlugins with
-// no plugins.
-func buildCredentialProxyContainer(agent *agentv1alpha1.PlatformAgent) corev1.Container {
-	return buildCredentialProxyContainerForPlugins(agent, nil)
-}
-
 func buildCredentialProxyContainerForPlugins(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin) corev1.Container {
 	pullPolicy := corev1.PullAlways
 	if agent.Spec.Deployment != nil && agent.Spec.Deployment.ImagePullPolicy != nil {

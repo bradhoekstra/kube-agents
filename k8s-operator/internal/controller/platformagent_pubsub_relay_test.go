@@ -85,6 +85,31 @@ platforms:
 	}
 }
 
+func TestPluginPubsubSubscriptionsLeavesOutWhatTheBrokerWouldNotAdmit(t *testing.T) {
+	// A typo in one route must not reach the broker's variable: an uppercase
+	// project, a space in a topic, a two-letter subscription. The well formed
+	// route beside them still renders.
+	agent := agentInProject("my-gcp-project")
+	plugins := []*agentv1alpha1.AgentPlugin{pubsubPlugin("typos", `
+platforms:
+  pubsub:
+    extra:
+      subscriptions:
+        upper:
+          subscription: projects/My-Project/subscriptions/alerts
+        spaced:
+          topic: "gke alerts"
+        short:
+          subscription: ab
+        good:
+          subscription: gke-stockout-alerts-sub
+`)}
+	got := pluginPubsubSubscriptions(agent, plugins)
+	if len(got) != 1 || got[0] != "projects/my-gcp-project/subscriptions/gke-stockout-alerts-sub" {
+		t.Fatalf("got %v, want only the well formed route", got)
+	}
+}
+
 func TestPluginPubsubSubscriptionsWithoutAProjectKeepsOnlyFullPaths(t *testing.T) {
 	agent := agentInProject("")
 	plugins := []*agentv1alpha1.AgentPlugin{pubsubPlugin("stockout", stockoutPluginConfig), pubsubPlugin("full", `
@@ -93,10 +118,10 @@ platforms:
     extra:
       subscriptions:
         r:
-          subscription: projects/p/subscriptions/s
+          subscription: projects/other-project/subscriptions/their-sub
 `)}
 	got := pluginPubsubSubscriptions(agent, plugins)
-	if len(got) != 1 || got[0] != "projects/p/subscriptions/s" {
+	if len(got) != 1 || got[0] != "projects/other-project/subscriptions/their-sub" {
 		t.Fatalf("got %v, want the one full path", got)
 	}
 	if pluginPubsubSubscriptions(agent, nil) != nil && len(pluginPubsubSubscriptions(agent, nil)) != 0 {

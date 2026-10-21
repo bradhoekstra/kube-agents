@@ -594,6 +594,11 @@ func buildConfigMapData(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agen
 	return data
 }
 
+// renderManagedEnv is renderManagedEnvForPlugins with no plugins.
+func renderManagedEnv(agent *agentv1alpha1.PlatformAgent) string {
+	return renderManagedEnvForPlugins(agent, nil)
+}
+
 // renderManagedEnv pins the platform settings that decide whether the agent can reach
 // chat at all, for the ones that have no config.yaml equivalent.
 //
@@ -620,14 +625,10 @@ func buildConfigMapData(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agen
 // that names a missing key fails the mount and the pod never starts. Since API_SERVER_KEY
 // below is unconditional it is no longer ever empty in practice, but the projection still
 // depends on the key existing, not on it having content.
-// renderManagedEnv is renderManagedEnvForPlugins with no plugins.
-func renderManagedEnv(agent *agentv1alpha1.PlatformAgent) string {
-	return renderManagedEnvForPlugins(agent, nil)
-}
-
-// renderManagedEnvForPlugins renders the managed .env for an agent and the
-// AgentPlugins resolved for it; the plugins pin one key, the Pub/Sub platform
-// relay's URL, when one of them configures a Pub/Sub platform.
+//
+// The AgentPlugins resolved for the agent pin one more key, the Pub/Sub
+// platform relay's URL, when one of their routes names a subscription the
+// operator can qualify. renderManagedEnv is this with none.
 func renderManagedEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin) string {
 	// Fixed order, not map iteration: this render feeds the config hash, and a hash that
 	// reshuffles on every reconcile would roll the pod for no reason.

@@ -2,6 +2,7 @@ package controller
 
 import (
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -32,6 +33,16 @@ const (
 	pubsubSubscriptionsSeparator    = ","
 )
 
+// The shape the broker's policy matches a subscription on the wire by
+// (agents/platform/scripts/watcher_policy.py: PUBSUB_PROJECT and SUBSCRIPTION).
+// A route that does not render to this shape is left out of the set rather than
+// handed to the broker: the broker drops such an entry too, and the route's
+// pulls are then refused by the policy, which the adapter logs with the rule.
+// Validating here as well keeps the rendered variable honest.
+var pubsubSubscriptionPathPattern = regexp.MustCompile(
+	`^projects/((?:[a-z0-9][a-z0-9.-]*[a-z0-9]:)?[a-z][a-z0-9-]{4,28}[a-z0-9]|[0-9]{1,20})/subscriptions/[A-Za-z][A-Za-z0-9._~+%-]{2,254}$`,
+)
+
 // pluginPubsubSubscriptions is the sorted, deduplicated set of fully qualified
 // subscriptions the agent's plugins configure under
 // `platforms.pubsub.extra.subscriptions.<route>`, qualified with the harness
@@ -57,7 +68,7 @@ func pluginPubsubSubscriptions(agent *agentv1alpha1.PlatformAgent, agentPlugins 
 			continue
 		}
 		for _, route := range pubsubRoutes(config) {
-			if path := pubsubSubscriptionPath(route, project); path != "" {
+			if path := pubsubSubscriptionPath(route, project); pubsubSubscriptionPathPattern.MatchString(path) {
 				seen[path] = struct{}{}
 			}
 		}
@@ -95,7 +106,7 @@ func pubsubRoutes(config map[string]any) []map[string]any {
 // by the adapter's rule: a `subscription` that is already a path as it is; a
 // short one under the project; a `topic` alone as `<topic>-sub` under the
 // project. "" when the route names nothing, or names a short name with no
-// project to qualify it by.
+// project to qualify it by. The caller checks the shape; this only composes.
 func pubsubSubscriptionPath(route map[string]any, project string) string {
 	subscription, _ := route["subscription"].(string)
 	subscription = strings.TrimSpace(subscription)
