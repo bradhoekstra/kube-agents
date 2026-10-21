@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -13,6 +14,7 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/version"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
@@ -45,6 +47,12 @@ const (
 	usageBucketEnded     = "ended"
 	usageBucketCancelled = "cancelled"
 	usageBucketActive    = "active"
+	//: One clock on every API call the summary makes: the PlatformAgent get and
+	//: the /version read both run under the turn's context and this client
+	//: timeout, so a server that accepts and never answers cannot hold the
+	//: conversation's worker.
+	usageSummaryAPITimeout = 10 * time.Second
+	serverVersionPath      = "/version"
 	//: The performance figures the script reads in-pod (tokens, spend,
 	//: latency) are not the gateway's to see; the block says where they are.
 	usageSummaryPerformanceNote   = "tokens, spend and latency are in scripts/feedback-summary.sh's block"
@@ -79,6 +87,12 @@ var usageSummaryCounters = []string{
 // : sidecar args are settings, and one spelled "true" would collide with the
 // : block's own "ready: true" (the script makes the same choice).
 var usageSummaryIdentifierSubtrees = []string{"harness", "scope", "integration", "security", "chat", "telemetry", "networkPolicy"}
+
+// : The values the operator writes to status.usage.activeInterfaces (the
+// : interfaceDashboard.. constants in k8s-operator/internal/controller/
+// : manifest_helpers.go): block vocabulary, so a spec string spelled like one
+// : is not refused for appearing on the interfaces line.
+var usageSummaryInterfaceWords = []string{"dashboard", "googlechat", "slack", "teams"}
 
 // : Spec strings that are settings in any subtree.
 var usageSummaryStopwords = map[string]bool{"true": true, "false": true, "yes": true, "no": true, "on": true, "off": true, "none": true, "null": true}
@@ -127,6 +141,7 @@ func newK8sUsageSource(cfg *Config) (*k8sUsageSource, error) {
 	if err != nil {
 		return nil, err
 	}
+	rc.Timeout = usageSummaryAPITimeout
 	dyn, err := dynamic.NewForConfig(rc)
 	if err != nil {
 		return nil, err
@@ -147,9 +162,16 @@ func (s *k8sUsageSource) PlatformAgent(ctx context.Context) (map[string]any, err
 	return obj.UnstructuredContent(), nil
 }
 
-func (s *k8sUsageSource) ServerVersion(context.Context) (string, error) {
-	info, err := s.disc.ServerVersion()
+// ServerVersion reads /version under ctx. discovery's ServerVersion() takes
+// no context, and a stalled server would otherwise hold the turn past its
+// deadline.
+func (s *k8sUsageSource) ServerVersion(ctx context.Context) (string, error) {
+	raw, err := s.disc.RESTClient().Get().AbsPath(serverVersionPath).Do(ctx).Raw()
 	if err != nil {
+		return "", err
+	}
+	var info version.Info
+	if err := json.Unmarshal(raw, &info); err != nil {
 		return "", err
 	}
 	return info.GitVersion, nil
@@ -171,7 +193,9 @@ func (r *taskRollup) add(rec *SessionRecord, cutoff time.Time) {
 		}
 		r.Total++
 		switch {
-		case rec.ActiveTask != nil && rec.ActiveTask.TaskID == task.ID:
+		// Running is spelled as every other reader spells it: a detached
+		// ActiveTask is a stop already sent, and its TaskRef carries Canceled.
+		case rec.ActiveTask != nil && !rec.ActiveTask.Detached && rec.ActiveTask.TaskID == task.ID:
 			r.Active++
 		case task.Canceled:
 			r.Cancelled++
@@ -358,10 +382,24 @@ func usageIdentifiers(cr map[string]any) []string {
 	return ids
 }
 
+// usageSummaryTemplateTokens is the block's own vocabulary: the words of the
+// degraded render and of a full one (every bucket present, every interface the
+// operator can write), so that an install whose spec spells one of them is
+// not refused for a line the template prints anyway.
 var usageSummaryTemplateTokens = func() map[string]bool {
+	var interfaces []any
+	for _, word := range usageSummaryInterfaceWords {
+		interfaces = append(interfaces, word)
+	}
+	full := map[string]any{"status": map[string]any{"usage": map[string]any{"activeInterfaces": interfaces}}}
 	tokens := map[string]bool{}
-	for _, tok := range usageSummaryToken.FindAllString(renderUsageSummary(time.Unix(0, 0).UTC(), map[string]any{}, "", usageSummaryWindow, taskRollup{}, false), -1) {
-		tokens[tok] = true
+	for _, text := range []string{
+		renderUsageSummary(time.Unix(0, 0).UTC(), map[string]any{}, "", usageSummaryWindow, taskRollup{}, false),
+		renderUsageSummary(time.Unix(0, 0).UTC(), full, "", usageSummaryWindow, taskRollup{Total: 3, Ended: 1, Cancelled: 1, Active: 1}, true),
+	} {
+		for _, tok := range usageSummaryToken.FindAllString(text, -1) {
+			tokens[tok] = true
+		}
 	}
 	return tokens
 }()

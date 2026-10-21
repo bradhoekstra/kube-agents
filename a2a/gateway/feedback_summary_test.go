@@ -4,9 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+
+	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/rest"
 )
 
 var summaryNow = time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)
@@ -55,12 +60,17 @@ func summaryRecords() []*SessionRecord {
 			{ID: "t6", StartedAt: ago(30 * 24 * time.Hour)}, // outside the window
 			{ID: "t7"}, // never started: not counted
 		}},
+		// A stop already sent: ActiveTask stays until the executor confirms,
+		// detached, and the TaskRef carries Canceled. Cancelled, not active.
+		{Key: "c", ActiveTask: &ActiveTask{TaskID: "t8", Detached: true}, Tasks: []TaskRef{
+			{ID: "t8", StartedAt: ago(5 * time.Minute), Canceled: true},
+		}},
 	}
 }
 
 func TestRollupTasksBucketsByRecordStateWithinTheWindow(t *testing.T) {
 	got := rollupTasks(summaryRecords(), summaryNow, usageSummaryWindow)
-	want := taskRollup{Total: 5, Ended: 3, Cancelled: 1, Active: 1}
+	want := taskRollup{Total: 6, Ended: 3, Cancelled: 2, Active: 1}
 	if got != want {
 		t.Fatalf("rollupTasks = %+v, want %+v", got, want)
 	}
@@ -78,7 +88,7 @@ func TestUsageWindowClampsToTheSessionTTL(t *testing.T) {
 	}
 	// t5 started three days ago: a two-day window drops it.
 	got := rollupTasks(summaryRecords(), summaryNow, 2*24*time.Hour)
-	if want := (taskRollup{Total: 4, Ended: 2, Cancelled: 1, Active: 1}); got != want {
+	if want := (taskRollup{Total: 5, Ended: 2, Cancelled: 2, Active: 1}); got != want {
 		t.Fatalf("rollupTasks(2d) = %+v, want %+v", got, want)
 	}
 }
@@ -98,7 +108,7 @@ func TestRenderUsageSummaryHasTheScriptsShapeAndNoIdentifier(t *testing.T) {
 		"  installed: 19 days; ready: true", "  interfaces: googlechat, slack",
 		"  toolExecutionsTotal: 19127", "  sessionsTotal: 7", "  remediationsMergedTotal: 1",
 		"  lastActive: 2026-10-21T11:34:06Z",
-		"tasks (14 days): 5 (ended 3, cancelled 1, active 1)",
+		"tasks (14 days): 6 (ended 3, cancelled 2, active 1)",
 		"performance: " + usageSummaryPerformanceNote,
 		"  Rating:", "  What worked well:", "  What failed or was slow:",
 	} {
@@ -150,6 +160,76 @@ func TestAuditUsageSummaryMatchesWholeTokensAndSkipsTheTemplate(t *testing.T) {
 		t.Fatalf("audit matched inside a token: %v", got)
 	}
 }
+
+// TestAuditSkipsTheBlocksOwnVocabulary: a spec string spelled like a bucket,
+// an interface the operator can write, the default mode or a notice word is
+// not refused for the line the template prints anyway; a name is.
+func TestAuditSkipsTheBlocksOwnVocabulary(t *testing.T) {
+	text := renderUsageSummary(summaryNow, summaryCR(), "v1.33.4-gke.1234000", usageSummaryWindow, taskRollup{Total: 3, Ended: 1, Cancelled: 1, Active: 1}, true)
+	for _, word := range []string{usageBucketEnded, usageBucketCancelled, usageBucketActive, "slack"} {
+		if !strings.Contains(text, word) {
+			t.Fatalf("fixture: %q is not in the block", word)
+		}
+	}
+	vocabulary := append([]string{usageBucketEnded, usageBucketCancelled, usageBucketActive, "today", "unavailable", "tasks", "performance"}, usageSummaryInterfaceWords...)
+	if leaked := auditUsageSummary(text, vocabulary); len(leaked) != 0 {
+		t.Fatalf("the audit refused the block's own words: %v", leaked)
+	}
+	if leaked := auditUsageSummary(text+"\ncluster: prod-eu-1", []string{"prod-eu-1"}); len(leaked) != 1 {
+		t.Fatalf("a name must still be refused, got %v", leaked)
+	}
+}
+
+// TestServerVersionReadsUnderTheContext: the /version read ends at the
+// context's deadline on a server that accepts and never answers, and parses
+// the gitVersion when one does.
+func TestServerVersionReadsUnderTheContext(t *testing.T) {
+	stall := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != serverVersionPath {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Header.Get("X-Stall") == "" {
+			_, _ = w.Write([]byte(`{"gitVersion":"v1.33.4-gke.1234000"}`))
+			return
+		}
+		<-stall
+	}))
+	defer srv.Close()
+	defer close(stall)
+	disc, err := discovery.NewDiscoveryClientForConfig(&rest.Config{Host: srv.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := &k8sUsageSource{disc: disc}
+	got, err := src.ServerVersion(context.Background())
+	if err != nil || got != "v1.33.4-gke.1234000" {
+		t.Fatalf("ServerVersion = %q, %v", got, err)
+	}
+	stalled, err := discovery.NewDiscoveryClientForConfig(&rest.Config{Host: srv.URL, WrapTransport: func(rt http.RoundTripper) http.RoundTripper {
+		return roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+			r.Header.Set("X-Stall", "1")
+			return rt.RoundTrip(r)
+		})
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	if _, err := (&k8sUsageSource{disc: stalled}).ServerVersion(ctx); err == nil {
+		t.Fatal("a stalled /version must fail at the deadline, not succeed")
+	}
+	if waited := time.Since(start); waited > 5*time.Second {
+		t.Fatalf("the stalled read held for %v past a 200ms deadline", waited)
+	}
+}
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
 func contains(list []string, want string) bool {
 	for _, item := range list {

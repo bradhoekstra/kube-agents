@@ -181,7 +181,8 @@ export function feedbackCommandRest(text: string): string | null {
 /** Mirrors chattext.IsFeedbackSummaryCommand: `/feedback summary`, case-insensitively, and nothing after it. */
 export function isFeedbackSummaryCommand(text: string): boolean {
   const rest = feedbackCommandRest(text);
-  return rest !== null && rest.toLowerCase() === FEEDBACK_SUMMARY_WORD;
+  // The same long-s fold as the slash word: Go's EqualFold reads ſummary as summary.
+  return rest !== null && rest.replace(LONG_S, "s").toLowerCase() === FEEDBACK_SUMMARY_WORD;
 }
 
 /** Mirrors commands.go slashWord: a leading `/`, the word case-insensitively, then the end or whitespace. */

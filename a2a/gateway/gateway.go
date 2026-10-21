@@ -296,9 +296,6 @@ type Options struct {
 	Backend string
 	// Spawner overrides the k8s-backed pod spawner - test injection only.
 	Spawner spawner
-	// UsageSource overrides the in-cluster reader behind "/feedback summary"
-	// (tests); nil builds one from the in-cluster config when there is one.
-	UsageSource usageSource
 	// Metrics is where the gateway counts what it relays, shared with the
 	// metrics listener and the chat adapter that counts its own pulls. Nil
 	// means a private set nobody serves, which is what a test gets.
@@ -538,9 +535,8 @@ func New(o Options) (*Gateway, error) {
 		}
 		g.spawner = s
 	}
-	if o.UsageSource != nil {
-		g.usage = o.UsageSource
-	} else if src, err := newK8sUsageSource(o.Config); err == nil {
+	// Tests set g.usage directly; there is no option for it.
+	if src, err := newK8sUsageSource(o.Config); err == nil {
 		g.usage = src
 	} else {
 		log.Info("feedback summary: no in-cluster reader; /feedback summary will answer unavailable", "reason", err)
@@ -936,9 +932,10 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		// without the prefix, not a confirmation that drops the ask.
 		msg.Text, sessionCmd = sessionRest, false
 	}
-	// The bare "/feedback" is answered in place whatever the conversation's
-	// route or task state; with text after it the message is the agent's and
-	// nothing here changes (chattext.IsFeedbackCommand).
+	// The bare "/feedback" and "/feedback summary" are answered in place
+	// whatever the conversation's route or task state; any other text after
+	// the word makes the message the agent's and nothing here changes
+	// (chattext.IsFeedbackCommand, IsFeedbackSummaryCommand).
 	feedbackRest, feedbackCmd := chattext.IsFeedbackCommand(msg.Text)
 	bareFeedback := feedbackCmd && feedbackRest == ""
 	summaryFeedback := feedbackCmd && chattext.IsFeedbackSummaryCommand(msg.Text)

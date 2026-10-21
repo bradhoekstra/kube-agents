@@ -4015,16 +4015,18 @@ func buildA2AGatewayServiceAccount(agent *agentv1alpha1.PlatformAgent) *corev1.S
 	}
 }
 
-// buildA2AGatewayRole carries exactly what the gateway's boot and its session
-// spawning need, and nothing else. Both rules arrive with their consumer: the
-// owner read shipped with the Deployment that reads it, and the pod verbs ship
-// here, with the worker image and the A2A_SPAWN_SESSIONS that make the gateway
-// use them. A pod-lifecycle grant with nothing spawning pods would be a
-// standing grant nobody can point at a caller for.
+// buildA2AGatewayRole carries exactly what the gateway's boot, its session
+// spawning and its "/feedback summary" answer need, and nothing else. Each
+// rule arrives with its consumer: the owner read shipped with the Deployment
+// that reads it, the pod verbs ship here with the worker image and the
+// A2A_SPAWN_SESSIONS that make the gateway use them, and the PlatformAgent
+// read with the gateway code that renders the summary from it. A grant with
+// nothing calling it would be a standing grant nobody can point at a caller
+// for.
 //
-// Namespaced, and pods only. The gateway creates and reaps one pod per
-// delegated task in its own namespace; it reads no Secret, no ConfigMap and no
-// other namespace.
+// Namespaced: pods, its own Deployment and its own PlatformAgent, the last two
+// pinned by name. The gateway creates and reaps one pod per delegated task in
+// its own namespace; it reads no Secret, no ConfigMap and no other namespace.
 //
 // What it does NOT bound, stated because the next reader will otherwise take
 // this rule for a ceiling: `create` on pods is a privilege-escalation
