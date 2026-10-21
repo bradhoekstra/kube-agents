@@ -308,6 +308,22 @@ class JobReadingTest(unittest.TestCase):
         self.assertTrue(notifier.is_compensation({"name": "Step 7 - Tear Down Nightly Environment"}))
         self.assertFalse(notifier.is_compensation({"name": EVAL_STAGE}))
 
+    def test_two_gating_failures_name_the_one_that_completed_last_not_the_first_listed(self):
+        """Two matrix legs of the E2E, or a gate and a later stage that ran
+        anyway: the stage is the one that ended the run, whatever its place
+        in the list. Pinned on its own because every fixture night has one
+        failed job per rank, so rank alone decided every other case."""
+        jobs = [
+            {"name": "gate", "conclusion": "failure", "completed_at": "2026-10-21T05:10:00Z"},
+            {"name": "leg-a", "conclusion": "failure", "completed_at": "2026-10-21T05:00:00Z"},
+            {"name": "leg-b", "conclusion": "failure", "completed_at": "2026-10-21T05:20:00Z"},
+            {"name": "ok", "conclusion": "success", "completed_at": "2026-10-21T05:30:00Z"},
+        ]
+        self.assertEqual(notifier.failing_job(jobs)["name"], "leg-b")
+        self.assertEqual(notifier.failing_job(list(reversed(jobs)))["name"], "leg-b")
+        timed_last_but_cancelled = jobs + [{"name": "late-cancel", "conclusion": "cancelled", "completed_at": "2026-10-21T06:00:00Z"}]
+        self.assertEqual(notifier.failing_job(timed_last_but_cancelled)["name"], "leg-b")
+
     def test_a_failing_job_without_a_time_sorts_first_and_ties_keep_list_order(self):
         jobs = [
             {"name": "late", "conclusion": "failure", "completed_at": "2026-10-21T05:00:00Z"},
@@ -510,7 +526,7 @@ class ReconcileTest(unittest.TestCase):
 
     def test_a_green_run_without_the_stage_at_all_is_a_rename_and_closes_with_a_note(self):
         """A job renamed between the failure and the recovery (the RC
-        pipeline's "Today mode" jobs became "Next mode") would otherwise
+        pipeline's "Next mode" jobs became "Today mode") would otherwise
         leave an issue nothing can ever close."""
         run_31 = run_like(31, 39600000000)
         github = staging_github(runs=runs_list(run_31, *STAGING_RUNS["workflow_runs"]), open_issues=[issue(4001, body_with([RUN_29["id"], RUN_30["id"]]))])
@@ -767,7 +783,9 @@ class ReconcileTest(unittest.TestCase):
         github.opener = flaky
         self.assertEqual(reconcile(github)[0], "opened")
 
-    def test_a_read_that_fails_past_the_retries_writes_nothing_and_reds_the_run(self):
+    def test_a_read_the_api_refuses_writes_nothing_and_reds_the_run(self):
+        """A 404 on the runs list is not retried; the sweep writes nothing and
+        exits 1 so the job is red. (The retried 502 is the test above.)"""
         github = FakeGitHub({})
         with mock.patch("sys.stderr", new=io.StringIO()):
             code = notifier.main(["--sweep"], environ={}, api=github.api())
