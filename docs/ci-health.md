@@ -1097,3 +1097,10 @@ An incoming-webhook URL in Secret Manager
 (`ci-health-chat-webhook`, `kube-agents-prow`) is the optional alternative.
 
 `post_health.py --dry-run` prints the messages instead of posting them.
+
+The release-stage notifier (`.github/workflows/release-stage-broken-notify.yml`,
+`scripts/release/notify_release_stage_broken.py`) posts to the same space as the
+same app, with the same variables and defaults, when it opens or closes a
+`ci:release-stage-broken` issue for a failed run of a release pipeline
+([`scripts/release/README.md`](../scripts/release/README.md), "When a stage fails");
+`CI_HEALTH_MUTE=true` silences it too, and its issues still file.

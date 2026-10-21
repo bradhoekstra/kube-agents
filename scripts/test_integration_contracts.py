@@ -59,6 +59,17 @@ BROKEN_MAIN_WATCHED_WORKFLOWS = (
     "Python Unit Tests",
     "Validate Repo Structure",
 )
+# The release pipelines `release-stage-broken-notify.yml` must watch: the three
+# `workflow_dispatch` workflows the schedulers start, whose red run is
+# otherwise a row in the Actions tab and nothing more (gke-labs/kube-agents#1978).
+# The watched list is `WATCHED_WORKFLOWS` in
+# `scripts/release/notify_release_stage_broken.py`, which the sweep reads.
+RELEASE_STAGE_NOTIFIER = "release-stage-broken-notify.yml"
+RELEASE_STAGE_WATCHED_WORKFLOWS = (
+    "RC: Release Pipeline",
+    "Staging: Promotion Pipeline",
+    "Release & Publish (GA)",
+)
 # The flaky-check reporter's contract is the inverse of the broken-main one:
 # not a fixed list it must contain, but that every pull-request check is
 # either watched or named here as left out on purpose. The watched list is
@@ -100,6 +111,15 @@ def _flaky_check_reporter():
     finally:
         sys.path.remove(str(REPO_SCRIPTS))
     return notify_flaky_check
+
+
+def _release_stage_notifier():
+    sys.path.insert(0, str(REPO_SCRIPTS / "release"))
+    try:
+        import notify_release_stage_broken
+    finally:
+        sys.path.remove(str(REPO_SCRIPTS / "release"))
+    return notify_release_stage_broken
 
 
 class SpecToolRegistryTest(unittest.TestCase):
@@ -695,6 +715,29 @@ class WorkflowNameJoinTest(unittest.TestCase):
             f"{BROKEN_MAIN_NOTIFIER} no longer watches these push-to-main "
             "workflows, so a red on main from any of them files no issue: "
             + ", ".join(missing),
+        )
+
+    def test_the_release_stage_notifier_watches_every_release_pipeline(self):
+        """A release pipeline missing from the watch list fails silently: its
+        red run is a row in the Actions tab, the next scheduler tick skips,
+        and nobody is told (gke-labs/kube-agents#1978). The notifier is a
+        sweep rather than a `workflow_run` consumer, so the list lives in the
+        script alone; this holds it to the roster above and to the workflows
+        that exist, since a rename would otherwise red every sweep."""
+        watched = tuple(_release_stage_notifier().WATCHED_WORKFLOWS)
+        self.assertEqual(
+            RELEASE_STAGE_WATCHED_WORKFLOWS,
+            watched,
+            f"{RELEASE_STAGE_NOTIFIER}'s script no longer watches the release pipelines named here",
+        )
+        documents = self._workflows()
+        self.assertIn(RELEASE_STAGE_NOTIFIER, documents)
+        display_names = {document.get("name") for document in documents.values() if document.get("name")}
+        missing = sorted(set(watched) - display_names)
+        self.assertEqual(
+            [],
+            missing,
+            "watched release workflows that match no workflow name (renamed?): " + ", ".join(missing),
         )
 
     def test_the_required_python_job_runs_the_suite_in_strict_mode(self):
