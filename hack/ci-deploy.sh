@@ -619,6 +619,9 @@ PUBSUB_RELAY_READY_INTERVAL_SECONDS=5
 PUBSUB_RELAY_ADAPTER_MARKER="connected through the credential broker relay"
 PUBSUB_RELAY_BROKER_MARKER="platform pubsub forwarded"
 PUBSUB_RELAY_ROUTE="gke_stockout_alerts"
+# The broker Deployment, named after the CR the way the operator names it
+# (credential_proxy_manifests.go).
+readonly CREDENTIAL_PROXY_DEPLOYMENT_NAME="${PLATFORM_AGENT_CR_NAME}-credential-proxy"
 if [ -n "${BUILD_ID:-}" ]; then
   TAG="${TAG}-${BUILD_ID}"
 fi
@@ -2419,9 +2422,9 @@ echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Verifying the Pub/Sub platform adap
 pubsub_relay_connected=false
 for _ in $(seq "${PUBSUB_RELAY_READY_ATTEMPTS}"); do
   # `grep -F ... >/dev/null`, not `-q`: see the drift-detector gate in 6.
-  if kubectl logs -n "${NAMESPACE}" deployment/platform-agent-gateway -c platform-agent 2>/dev/null |
+  if kubectl logs -n "${NAMESPACE}" "deployment/${AGENT_DEPLOYMENT_NAME}" -c platform-agent 2>/dev/null |
     grep -F "${PUBSUB_RELAY_ADAPTER_MARKER}" >/dev/null &&
-    kubectl logs -n "${NAMESPACE}" deployment/platform-agent-credential-proxy 2>/dev/null |
+    kubectl logs -n "${NAMESPACE}" "deployment/${CREDENTIAL_PROXY_DEPLOYMENT_NAME}" 2>/dev/null |
     grep -F "${PUBSUB_RELAY_BROKER_MARKER}" >/dev/null; then
     pubsub_relay_connected=true
     break
@@ -2433,8 +2436,8 @@ if [[ "${pubsub_relay_connected}" != "true" ]]; then
   echo "       (wanted '${PUBSUB_RELAY_ADAPTER_MARKER}' in the platform-agent container and"
   echo "        '${PUBSUB_RELAY_BROKER_MARKER}' in the credential proxy, for route ${PUBSUB_RELAY_ROUTE})"
   kubectl get agentplugins -n "${NAMESPACE}" -o wide || true
-  kubectl logs -n "${NAMESPACE}" deployment/platform-agent-gateway -c platform-agent --tail=200 2>/dev/null | grep -i "pubsub" || true
-  kubectl logs -n "${NAMESPACE}" deployment/platform-agent-credential-proxy --tail=100 2>/dev/null | grep -i "pubsub" || true
+  kubectl logs -n "${NAMESPACE}" "deployment/${AGENT_DEPLOYMENT_NAME}" -c platform-agent --tail=200 2>/dev/null | grep -i "pubsub" || true
+  kubectl logs -n "${NAMESPACE}" "deployment/${CREDENTIAL_PROXY_DEPLOYMENT_NAME}" --tail=100 2>/dev/null | grep -i "pubsub" || true
   exit 1
 fi
 echo "✓ Pub/Sub platform adapter pulls through the broker, verified in $((SECONDS - STEP_START))s"
