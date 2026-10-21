@@ -306,6 +306,22 @@ readonly PLATFORM_AGENT_CR_DELETE_TIMEOUT="120s"
 readonly EVAL_MODE_NEXT_JOB_NAMES="pull-kube-agents-smoke-test ci-kube-agents-eval-today ci-kube-agents-eval-nightly-next-claude ci-kube-agents-eval-nightly-gitlab-next post-kube-agents-eval-rc"
 readonly AGENT_DEPLOYMENT_NAME="${PLATFORM_AGENT_CR_NAME}-gateway"
 readonly OPERATOR_DEPLOYMENT_NAME="${HELM_RELEASE_NAME}-controller-manager"
+# The broker Deployment, named after the CR the way the operator names it
+# (credential_proxy_manifests.go).
+readonly CREDENTIAL_PROXY_DEPLOYMENT_NAME="${PLATFORM_AGENT_CR_NAME}-credential-proxy"
+# The two AgentPlugin images, under the names docker-publish-*.yml and
+# scripts/release/common.sh publish them by.
+readonly PLUGIN_IMAGE_PUBSUB_PLATFORM="pubsub-platform"
+readonly PLUGIN_IMAGE_STOCKOUT_INVESTIGATOR="gke-stockout-investigator"
+# Section 7b: the Pub/Sub platform adapter must pull through the credential
+# broker. The adapter logs the first line when it connects; the broker logs
+# the second for every relayed pull. The route is the stockout investigator's
+# (agentplugins/gke-stockout-investigator/templates/agentplugin.yaml).
+readonly PUBSUB_RELAY_READY_ATTEMPTS=24
+readonly PUBSUB_RELAY_READY_INTERVAL_SECONDS=5
+readonly PUBSUB_RELAY_ADAPTER_MARKER="connected through the credential broker relay"
+readonly PUBSUB_RELAY_BROKER_MARKER="platform pubsub forwarded"
+readonly PUBSUB_RELAY_ROUTE="gke_stockout_alerts"
 # The first change: the mode, and the maxSessions section 2b sizes for the
 # rendered bridge's workers, as one values document for one `helm upgrade`, so
 # the first render -- and so the first provision Job -- sees both. A printf
@@ -606,22 +622,6 @@ else
 fi
 TAG_COMMIT="${TAG_COMMIT:-${CI_IMAGE_TAG_NO_COMMIT}}"
 TAG="${CI_IMAGE_TAG_PREFIX}${PULL_NUMBER:-${CI_IMAGE_TAG_NO_PULL}}-${TAG_COMMIT:0:${CI_IMAGE_TAG_SHA_CHARS}}"
-# The two AgentPlugin images, under the names docker-publish-*.yml and
-# scripts/release/common.sh publish them by.
-PLUGIN_IMAGE_PUBSUB_PLATFORM="pubsub-platform"
-PLUGIN_IMAGE_STOCKOUT_INVESTIGATOR="gke-stockout-investigator"
-# Section 7b: the Pub/Sub platform adapter must pull through the credential
-# broker. The adapter logs the first line when it connects; the broker logs
-# the second for every relayed pull. The route is the stockout investigator's
-# (agentplugins/gke-stockout-investigator/templates/agentplugin.yaml).
-PUBSUB_RELAY_READY_ATTEMPTS=24
-PUBSUB_RELAY_READY_INTERVAL_SECONDS=5
-PUBSUB_RELAY_ADAPTER_MARKER="connected through the credential broker relay"
-PUBSUB_RELAY_BROKER_MARKER="platform pubsub forwarded"
-PUBSUB_RELAY_ROUTE="gke_stockout_alerts"
-# The broker Deployment, named after the CR the way the operator names it
-# (credential_proxy_manifests.go).
-readonly CREDENTIAL_PROXY_DEPLOYMENT_NAME="${PLATFORM_AGENT_CR_NAME}-credential-proxy"
 if [ -n "${BUILD_ID:-}" ]; then
   TAG="${TAG}-${BUILD_ID}"
 fi
@@ -734,8 +734,6 @@ if [ -n "${RC_COMMIT_SHA:-}" ]; then
     --set-string "plugins.pubsubPlatform.image.tag=${TAG}"
     --set-string "plugins.stockoutInvestigator.image.tag=${TAG}"
   )
-  # The candidate's published plugin images; nothing to build here.
-  PLUGIN_IMAGE_SUBSTITUTIONS=""
   DEPLOY_SOURCE="release candidate ${RC_COMMIT_SHA:0:7} from ${RC_REGISTRY_PREFIX}"
 else
   IMAGE_ARGS=(
@@ -750,7 +748,6 @@ else
     --set-string "plugins.stockoutInvestigator.image.repository=${AR_REPO}/${PLUGIN_IMAGE_STOCKOUT_INVESTIGATOR}"
     --set-string "plugins.stockoutInvestigator.image.tag=${TAG}"
   )
-  PLUGIN_IMAGE_SUBSTITUTIONS=",_PUBSUB_PLATFORM_URI=${AR_REPO}/${PLUGIN_IMAGE_PUBSUB_PLATFORM}:${TAG},_STOCKOUT_INVESTIGATOR_URI=${AR_REPO}/${PLUGIN_IMAGE_STOCKOUT_INVESTIGATOR}:${TAG}"
   DEPLOY_SOURCE="PR #${PULL_NUMBER:-local} build (${TAG})"
 fi
 
@@ -1450,6 +1447,14 @@ else
   # substitutions absent that step is a no-op and the build is the four-image
   # one above. Empty otherwise, so the command below is byte-for-byte what it
   # was.
+  # The two AgentPlugin images, on the pull-request path only: the
+  # release-candidate path installs the candidate's published ones (section
+  # 2a) and builds nothing here. Empty otherwise, for the same reason as the
+  # A2A pair below.
+  PLUGIN_IMAGE_SUBSTITUTIONS=""
+  if [ -z "${RC_COMMIT_SHA:-}" ]; then
+    PLUGIN_IMAGE_SUBSTITUTIONS=",_PUBSUB_PLATFORM_URI=${AR_REPO}/${PLUGIN_IMAGE_PUBSUB_PLATFORM}:${TAG},_STOCKOUT_INVESTIGATOR_URI=${AR_REPO}/${PLUGIN_IMAGE_STOCKOUT_INVESTIGATOR}:${TAG}"
+  fi
   A2A_BUILD_SUBSTITUTIONS=""
   if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
     A2A_BUILD_SUBSTITUTIONS=",_A2A_GATEWAY_URI=${A2A_GATEWAY_URI},_A2A_CALLOUT_URI=${A2A_CALLOUT_URI},_A2A_WORKER_URI=${A2A_WORKER_URI},_A2A_VERIFIER_URI=${A2A_VERIFIER_URI},_A2A_CONSOLE_URI=${A2A_CONSOLE_URI},_A2A_BRIDGE_URI=${A2A_BRIDGE_URI}"
