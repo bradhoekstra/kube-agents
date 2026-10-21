@@ -247,8 +247,33 @@ its issue is closed afterwards.
   does; the broker's and the gateway's link constants equal the persona's.
 - `make docs-generate` refreshes the skills catalog; `make docs-check` passes.
 
+### 7. `/feedback summary` (added 2026-10-21, issue #3428)
+
+The one `/feedback <text>` the gateway answers itself: `chattext.IsFeedbackSummaryCommand`
+is true when the text after the word is exactly `summary`, and `IsCommand` reports it, so a
+chat message's button may not carry it either. The dispatch case sits beside the bare form,
+ahead of `/session`, status, stop and steer, and changes nothing about the record's task
+state. `a2a/gateway/feedback_summary.go` renders the install's usage and feedback summary
+deterministically, in the shape `scripts/feedback-summary.sh` prints from a workstation
+(epic #3426's share surface): environment (tag, mode, Kubernetes version, install age,
+readiness, active interfaces), the `status.usage` counters, a roll-up of the last fourteen
+days of the gateway's own task records by outcome, and the feedback template. It reads the
+`PlatformAgent` resource through the gateway's ServiceAccount, which the operator's Role
+grants one `get` on, pinned by `resourceNames` to this agent's resource; the server version
+needs no grant. Tokens, spend and latency are not the gateway's to see and the block says
+where they are. Before posting, the block is audited as the script audits its own: every
+string leaf of the spec's naming subtrees plus the resource's name and namespace, as whole
+tokens, with booleans, numbers, short strings and the template's own vocabulary skipped; a
+hit posts a fixed refusal instead, and a resource that cannot be read posts a fixed
+unavailability notice. No error text reaches chat. The web console classifies the turn as
+settled, like the bare form. No model is in the loop, so the eval loop does not apply.
+
 ## Calls made in the build
 
+- `/feedback summary` is answered by the gateway rather than by a platform card: a block a
+  customer pastes must be a function of the sources alone, which a model-composed answer
+  cannot promise, and the gateway is the one component that both sees the resource and
+  posts into the conversation.
 - The bare-`/feedback` branch is the first case of the gateway's dispatch switch, ahead of
   `/session`, status, stop and steer, gated on a message with no programmatic intent.
 - The sandbox client keeps one marker per payload hash in the task workspace. A broker that

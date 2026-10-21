@@ -128,6 +128,10 @@ const (
 	slashSessionWord  = "session"
 	slashOffWord      = "off"
 	slashFeedbackWord = "feedback"
+	// slashFeedbackSummaryWord is the one argument the gateway answers itself:
+	// "/feedback summary" posts the install's identifier-free usage and
+	// feedback summary (docs/designs/chat-feedback-command.md, part 7).
+	slashFeedbackSummaryWord = "summary"
 )
 
 // The two places a report about kube-agents itself goes, as the gateway's
@@ -160,6 +164,14 @@ func IsSessionCommand(text string) (string, bool) {
 // on as typed, prefix included, for the agent to compose and confirm.
 func IsFeedbackCommand(text string) (string, bool) {
 	return slashWord(text, slashFeedbackWord)
+}
+
+// IsFeedbackSummaryCommand reports whether the turn is "/feedback summary",
+// the one "/feedback <text>" the gateway answers in place rather than handing
+// to the agent: the text after the word is exactly "summary", case-insensitively.
+func IsFeedbackSummaryCommand(text string) bool {
+	rest, ok := IsFeedbackCommand(text)
+	return ok && strings.EqualFold(rest, slashFeedbackSummaryWord)
 }
 
 // slashWord resolves one slash command: a leading "/" (after trimming)
@@ -212,9 +224,10 @@ func IsCommand(text string) bool {
 	if _, ok := IsSessionCommand(text); ok {
 		return true
 	}
-	// Only the bare form: "/feedback <text>" is an ordinary turn the agent
+	// The bare form and "/feedback summary", the two the gateway answers in
+	// place: any other "/feedback <text>" is an ordinary turn the agent
 	// answers, and a button may well offer one.
-	if rest, ok := IsFeedbackCommand(text); ok && rest == "" {
+	if rest, ok := IsFeedbackCommand(text); ok && (rest == "" || IsFeedbackSummaryCommand(text)) {
 		return true
 	}
 	_, ok := IsDelegate(text)

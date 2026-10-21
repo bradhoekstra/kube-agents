@@ -172,6 +172,10 @@ type Gateway struct {
 	ps      *Pseudonymizer
 	log     *slog.Logger
 	spawner spawner // nil until SpawnSessions arms (W4)
+	// usage reads what "/feedback summary" prints (feedback_summary.go);
+	// nil where the gateway has no cluster credentials, and the command then
+	// answers that the summary is unavailable.
+	usage usageSource
 	// metrics is the gateway's counters (metrics.go); never nil after New.
 	metrics *Metrics
 
@@ -292,6 +296,9 @@ type Options struct {
 	Backend string
 	// Spawner overrides the k8s-backed pod spawner - test injection only.
 	Spawner spawner
+	// UsageSource overrides the in-cluster reader behind "/feedback summary"
+	// (tests); nil builds one from the in-cluster config when there is one.
+	UsageSource usageSource
 	// Metrics is where the gateway counts what it relays, shared with the
 	// metrics listener and the chat adapter that counts its own pulls. Nil
 	// means a private set nobody serves, which is what a test gets.
@@ -530,6 +537,13 @@ func New(o Options) (*Gateway, error) {
 			return nil, fmt.Errorf("session-pod spawning is enabled but the k8s client failed: %w", err)
 		}
 		g.spawner = s
+	}
+	if o.UsageSource != nil {
+		g.usage = o.UsageSource
+	} else if src, err := newK8sUsageSource(o.Config); err == nil {
+		g.usage = src
+	} else {
+		log.Info("feedback summary: no in-cluster reader; /feedback summary will answer unavailable", "reason", err)
 	}
 	if o.Config.DefaultAddressee == RouteSession && g.spawner == nil {
 		return nil, fmt.Errorf("A2A_DEFAULT_ADDRESSEE=%s requires A2A_SPAWN_SESSIONS=true: without a spawner the sentinel would publish tasks to a literal %q addressee no executor owns", RouteSession, RouteSession)
@@ -927,6 +941,7 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 	// nothing here changes (chattext.IsFeedbackCommand).
 	feedbackRest, feedbackCmd := chattext.IsFeedbackCommand(msg.Text)
 	bareFeedback := feedbackCmd && feedbackRest == ""
+	summaryFeedback := feedbackCmd && chattext.IsFeedbackSummaryCommand(msg.Text)
 	// An explicit cancel from a backend that can express one is read before
 	// the text is read at all: it is not an ask, and a program must never
 	// have to spell "stop" to reach a control path. Read after the strip
@@ -959,6 +974,10 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		// not a stop, not a new task.
 		g.log.Info("feedback notice", "conversation", rec.Key)
 		g.post(rec.Key, feedbackCommandNotice)
+	case msg.Intent == "" && summaryFeedback:
+		// The same contract as the bare form: the gateway's own answer, the
+		// usage summary block (feedback_summary.go), and no task.
+		g.feedbackSummary(ctx, rec)
 	case msg.Intent == "" && sessionCmd:
 		if !g.sessionCommand(ctx, rec, msg, backend, sessionRest, principal, authority) {
 			return

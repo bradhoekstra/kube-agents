@@ -4064,6 +4064,16 @@ func buildA2AGatewayRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Role {
 				ResourceNames: []string{a2aGatewayName(agent)},
 				Verbs:         []string{"get"},
 			},
+			// One more read, on one named object: "/feedback summary" prints
+			// the PlatformAgent's status.usage counters, mode, tag and age
+			// (a2a/gateway/feedback_summary.go). resourceNames pins it to this
+			// agent's resource; the gateway cannot list or write any.
+			{
+				APIGroups:     []string{agentv1alpha1.GroupVersion.Group},
+				Resources:     []string{"platformagents"},
+				ResourceNames: []string{agent.Name},
+				Verbs:         []string{"get"},
+			},
 		},
 	}
 }
