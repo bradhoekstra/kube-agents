@@ -33,6 +33,16 @@ This plugin has no `targetProfile`. Platform adapters are gateway singletons: on
 default profile runs the listener, so the operator keeps the `platforms` subtree there even
 when the work it produces belongs elsewhere.
 
+## How it reaches Pub/Sub
+
+The adapter runs in the gateway Pod, which holds no Google credential of its own. It pulls through
+the credential broker's Pub/Sub relay: the operator sets `PUBSUB_RELAY_URL` on the gateway and the
+list of subscriptions the plugins configure on the broker, and the broker pulls, acknowledges and
+reads those subscriptions on the install's identity and nothing else. A route whose subscription
+the operator did not render is refused by the broker, and the adapter logs the refusal with the
+rule that made it. The install's identity needs `roles/pubsub.subscriber` and `roles/pubsub.viewer`
+on each subscription; the root installer grants both for the stockout investigator's.
+
 ## Routes
 
 A route is one subscription plus the rules for what to do with its messages. Consumers
