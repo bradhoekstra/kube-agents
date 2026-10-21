@@ -53,7 +53,7 @@ _REDACTOR_KEY = "redactor.py"
 _MOUNT = "/app/llm_trace_logger.py"
 _REDACTOR_MOUNT = "/app/redactor.py"
 _DEFAULT_LOG_PATH = "/tmp/litellm_traces.jsonl"
-_OAUTH_TOKEN = "ya29." + "A" * 195
+_YA29_SHAPED_VALUE = "ya29." + "A" * 195
 _HELM_BASE_ARGS = [
     "helm",
     "template",
@@ -333,8 +333,8 @@ class TestPassThroughTrajectoryLoggerUnit(unittest.TestCase):
 
     def test_redaction_strips_secrets_emails_and_ips_without_mutating_caller_payloads(self):
         logger = self.mod.PassThroughTrajectoryLogger()
-        raw_user_msg = f"token {_OAUTH_TOKEN} ip 10.0.0.5 email alice@example.com"
-        raw_assistant_msg = f"found secret {_OAUTH_TOKEN} on 10.0.0.5 for bob@example.com"
+        raw_user_msg = f"token {_YA29_SHAPED_VALUE} ip 10.0.0.5 email alice@example.com"
+        raw_assistant_msg = f"found secret {_YA29_SHAPED_VALUE} on 10.0.0.5 for bob@example.com"
         kwargs = {
             "model": "model-default",
             "litellm_params": {"custom_llm_provider": "gemini"},
@@ -361,14 +361,14 @@ class TestPassThroughTrajectoryLoggerUnit(unittest.TestCase):
         record = json.loads(pathlib.Path(self.log_path).read_text(encoding="utf-8").strip())
         logged_user = record["messages"][0]["content"]
         logged_assistant = record["response"]["choices"][0]["message"]["content"]
-        self.assertNotIn(_OAUTH_TOKEN, logged_user)
+        self.assertNotIn(_YA29_SHAPED_VALUE, logged_user)
         self.assertNotIn("10.0.0.5", logged_user)
         self.assertNotIn("alice@example.com", logged_user)
         self.assertIn("[REDACTED_SECRET]", logged_user)
         self.assertIn("[REDACTED_EMAIL]", logged_user)
         self.assertRegex(logged_user, r"\[ip:[0-9a-f]{12}\]")
 
-        self.assertNotIn(_OAUTH_TOKEN, logged_assistant)
+        self.assertNotIn(_YA29_SHAPED_VALUE, logged_assistant)
         self.assertNotIn("10.0.0.5", logged_assistant)
         self.assertNotIn("bob@example.com", logged_assistant)
         self.assertIn("[REDACTED_SECRET]", logged_assistant)
@@ -444,6 +444,47 @@ class TestPassThroughTrajectoryLoggerUnit(unittest.TestCase):
         for candidate in [base] + [base.with_name(f"{base.name}.{i}") for i in range(1, 4)]:
             if candidate.exists():
                 self.assertLessEqual(candidate.stat().st_size, 600, candidate)
+
+    def test_oversize_error_is_clipped_and_the_cap_holds_without_payload(self):
+        # The cap must hold whatever field is large: a long error is clipped
+        # at the hook, and a record still over after the payload drop loses
+        # the error too.
+        logger = self.mod.PassThroughTrajectoryLogger(max_bytes=600, backup_count=3, record_max_bytes=300)
+        kwargs = {"model": "model-default", "messages": [], "exception": RuntimeError("e" * 10000)}
+        asyncio.run(logger.async_log_failure_event(kwargs, None, None, None))
+        base = pathlib.Path(self.log_path)
+        self.assertLessEqual(base.stat().st_size, 300 + 1)
+        latest = json.loads(base.read_text(encoding="utf-8").strip())
+        self.assertEqual(latest["status"], "failure")
+        self.assertIsNone(latest["error"])
+        self.assertIn("truncated", latest)
+
+    def test_the_writer_is_one_thread_and_records_keep_their_order(self):
+        # Many hooks at once must not contend for the lock: everything goes
+        # through one writer thread, in submission order.
+        logger = self.mod.PassThroughTrajectoryLogger()
+        threads = set()
+        original = self.mod._append_line
+
+        def recording_append(line, path, **kw):
+            threads.add(threading.current_thread().name)
+            return original(line, path, **kw)
+
+        self.mod._append_line = recording_append
+        try:
+            async def burst():
+                await asyncio.gather(*[
+                    logger.async_log_success_event({"model": "m", "messages": [{"role": "user", "content": f"n{i}"}]}, {}, None, None)
+                    for i in range(40)
+                ])
+            asyncio.run(burst())
+        finally:
+            self.mod._append_line = original
+        self.assertEqual(len(threads), 1)
+        self.assertTrue(next(iter(threads)).startswith(self.mod.WRITER_THREAD_NAME))
+        lines = pathlib.Path(self.log_path).read_text(encoding="utf-8").strip().splitlines()
+        self.assertEqual(len(lines), 40)
+        self.assertEqual([json.loads(l)["messages"][0]["content"] for l in lines], [f"n{i}" for i in range(40)])
 
     def test_reuses_the_redaction_hooks_redactor_module(self):
         # With litellm.redaction.enabled on, the hook has already loaded

@@ -210,7 +210,7 @@
   "model-default", but a caller that names the harness ("hermes-agent") or the
   concrete model gets routed rather than a 404 from the gateway.
 */}}
-{{- $config := include "kube-agents.litellmConfig" (merge (dict "provider" $provider "model" $model "callbacks" $callbacks "maxTokens" .Values.litellm.maxTokens "reasoningEffort" .Values.litellm.reasoningEffort "traceLogEnabled" $traceLogEnabled) $configEndpoint) }}
+{{- $config := include "kube-agents.litellmConfig" (merge (dict "provider" $provider "model" $model "callbacks" $callbacks "maxTokens" .Values.litellm.maxTokens "reasoningEffort" .Values.litellm.reasoningEffort) $configEndpoint) }}
 {{- /*
   Every key the ConfigMap carries feeds the checksum: the thinking-replay
   hook, the rule file, the two redaction modules, the OAuth2 hook and the

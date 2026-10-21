@@ -506,8 +506,8 @@ litellm:
   # The file rotates at 5 MiB across 3 backups (.1-.3) under an flock on
   # <path>.lock; a record over 1 MiB keeps its metadata and drops messages,
   # tools and response behind a truncated marker, so the trail holds at most
-  # 20 MiB. Each record is written in a worker thread, off the proxy's event
-  # loop. Pass-through only: does not alter live requests or responses, and
+  # 20 MiB. Each record is written on one writer thread, off the proxy's
+  # event loop. Pass-through only: does not alter live requests or responses, and
   # logs a once-per-path warning to stderr on I/O failure rather than breaking
   # inference.
   traceLogEnabled: false

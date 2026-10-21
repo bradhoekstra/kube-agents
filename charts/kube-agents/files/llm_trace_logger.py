@@ -17,8 +17,8 @@ The trace file rotates at `TRACE_FILE_MAX_BYTES` (5 MiB) across
 record over `TRACE_RECORD_MAX_BYTES` (1 MiB) keeps its metadata and drops
 `messages`, `tools` and `response` behind a `truncated` marker, so no file
 grows past its cap and the trail on the gateway pod's `/tmp` `emptyDir` holds
-at most 20 MiB. Each record is serialised, redacted and written in a worker
-thread (`asyncio.to_thread`), off the proxy's event loop.
+at most 20 MiB. Each record is serialised, redacted and written on one writer
+thread, off the proxy's event loop, so records never contend for the file.
 
 Designed to be registered in `litellm_settings.callbacks` alongside
 `litellm_thinking_replay_callback.proxy_handler_instance`. Never mutates the
@@ -29,6 +29,7 @@ stderr if a write fails rather than breaking inference.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import datetime as dt
 import fcntl
 import importlib.util
@@ -36,7 +37,6 @@ import json
 import logging
 import os
 import sys
-import time
 from pathlib import Path
 from typing import Any, List, Optional
 
@@ -79,10 +79,22 @@ TRACE_RECORD_PAYLOAD_FIELDS = ("messages", "tools", "response")
 TRUNCATED_FIELD = "truncated"
 TRACE_FILE_MODE = 0o600
 TRACE_LOCK_FILE_SUFFIX = ".lock"
-LOCK_WAIT_SECONDS = 1.5
-LOCK_RETRY_INTERVAL_SECONDS = 0.05
 _OPEN_FLAGS = os.O_WRONLY | os.O_APPEND | os.O_CREAT
 _ENCODING = "utf-8"
+# An error string is clipped before the record is measured, so the record cap
+# cannot be defeated by a field the cap does not drop.
+ERROR_MAX_CHARS = 4096
+UNKNOWN_ERROR = "unknown"
+STATUS_SUCCESS = "success"
+STATUS_FAILURE = "failure"
+MS_PER_SECOND = 1000.0
+TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
+# One writer thread, as audit_sink.py has: records queue in order, the flock
+# never contends inside the process (LiteLLM's logging worker awaits up to a
+# hundred hooks at once, and threads redacting in parallel would starve the
+# one holding the lock), and the event loop is never the thread that writes.
+WRITER_THREADS = 1
+WRITER_THREAD_NAME = "llm-trace-writer"
 
 LOG_LEVEL = logging.WARNING
 LOG_FORMAT = "%(asctime)s %(name)s %(levelname)s %(message)s"
@@ -177,16 +189,22 @@ def _rotated(path: Path, index: int) -> Path:
     return path.with_name(f"{path.name}.{index}")
 
 
-def _acquire_lock(lock_fd: int, lock_path: Path) -> None:
-    deadline = time.monotonic() + LOCK_WAIT_SECONDS
-    while True:
-        try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return
-        except BlockingIOError:
-            if time.monotonic() >= deadline:
-                raise TimeoutError(f"another writer has held {lock_path} for {LOCK_WAIT_SECONDS}s")
-            time.sleep(LOCK_RETRY_INTERVAL_SECONDS)
+_writer: Optional[concurrent.futures.ThreadPoolExecutor] = None
+
+
+def _writer_thread() -> concurrent.futures.ThreadPoolExecutor:
+    global _writer
+    if _writer is None:
+        _writer = concurrent.futures.ThreadPoolExecutor(
+            max_workers=WRITER_THREADS, thread_name_prefix=WRITER_THREAD_NAME
+        )
+    return _writer
+
+
+def _acquire_lock(lock_fd: int) -> None:
+    # Blocking: the only other holder is another process on the same volume,
+    # and this runs on the writer thread, never on the event loop.
+    fcntl.flock(lock_fd, fcntl.LOCK_EX)
 
 
 def _rotate_if_full(
@@ -237,7 +255,7 @@ def _append_line(
     os.makedirs(lock_path.parent, exist_ok=True)
     lock_fd = os.open(lock_path, _OPEN_FLAGS, TRACE_FILE_MODE)
     try:
-        _acquire_lock(lock_fd, lock_path)
+        _acquire_lock(lock_fd)
         _rotate_if_full(path, len(data), max_bytes=max_bytes, backup_count=backup_count)
         fd = os.open(path, _OPEN_FLAGS, TRACE_FILE_MODE)
         try:
@@ -262,27 +280,38 @@ class PassThroughTrajectoryLogger(CustomLogger):
 
     # LiteLLM awaits these hooks on its event loop. Serialising, redacting and
     # writing a record takes tens to hundreds of milliseconds on an agent-sized
-    # conversation, and the lock wait sleeps, so the whole of it runs in a
-    # worker thread and the loop keeps serving requests and probes meanwhile.
+    # conversation, so the whole of it runs on the writer thread and the loop
+    # keeps serving requests and probes meanwhile.
     async def async_log_success_event(
         self, kwargs: dict, response_obj: Any, start_time: Any, end_time: Any
     ) -> None:
-        await asyncio.to_thread(
-            self._write_record, "success", kwargs, response_obj, start_time, end_time, None
-        )
+        await self._submit(STATUS_SUCCESS, kwargs, response_obj, start_time, end_time, None)
 
     async def async_log_failure_event(
         self, kwargs: dict, response_obj: Any, start_time: Any, end_time: Any
     ) -> None:
         err = kwargs.get("exception") or kwargs.get("traceback_exception")
-        await asyncio.to_thread(
-            self._write_record,
-            "failure",
+        await self._submit(
+            STATUS_FAILURE,
             kwargs,
             response_obj,
             start_time,
             end_time,
-            str(err) if err else "unknown",
+            str(err)[:ERROR_MAX_CHARS] if err else UNKNOWN_ERROR,
+        )
+
+    async def _submit(
+        self,
+        status: str,
+        kwargs: dict,
+        response_obj: Any,
+        start_time: Any,
+        end_time: Any,
+        error: Optional[str],
+    ) -> None:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            _writer_thread(), self._write_record, status, kwargs, response_obj, start_time, end_time, error
         )
 
     def _write_record(
@@ -301,7 +330,7 @@ class PassThroughTrajectoryLogger(CustomLogger):
             latency_ms = None
             if start_time and end_time:
                 try:
-                    latency_ms = round((end_time - start_time).total_seconds() * 1000.0, 2)
+                    latency_ms = round((end_time - start_time).total_seconds() * MS_PER_SECOND, 2)
                 except Exception:
                     latency_ms = None
 
@@ -312,7 +341,7 @@ class PassThroughTrajectoryLogger(CustomLogger):
             raw_api_base = _safe_serialize(litellm_params.get("api_base"))
 
             record = {
-                "timestamp": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                "timestamp": dt.datetime.now(dt.timezone.utc).strftime(TIMESTAMP_FORMAT),
                 "status": status,
                 "model_alias": kwargs.get("model"),
                 "custom_llm_provider": litellm_params.get("custom_llm_provider"),
@@ -327,7 +356,13 @@ class PassThroughTrajectoryLogger(CustomLogger):
             line = json.dumps(record, ensure_ascii=False)
             size = len(line.encode(_ENCODING))
             if size > self.record_max_bytes:
-                line = json.dumps(_truncate_record(record, size), ensure_ascii=False)
+                slim = _truncate_record(record, size)
+                line = json.dumps(slim, ensure_ascii=False)
+                if len(line.encode(_ENCODING)) > self.record_max_bytes:
+                    # Only a metadata field can still be over: the error is the
+                    # one with a free-form value, so it goes too.
+                    slim["error"] = None
+                    line = json.dumps(slim, ensure_ascii=False)
             _append_line(
                 line,
                 Path(log_path),
