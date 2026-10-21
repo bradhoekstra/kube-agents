@@ -8,7 +8,6 @@ import socket
 import threading
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
 
 os.environ["PUBSUB_HOME_CHANNEL"] = "none"
@@ -30,9 +29,12 @@ PREFLIGHT_RPC_TIMEOUT_SECONDS = 30
 # The credential broker's Pub/Sub relay. The gateway pod holds no Google credential of
 # its own: the broker pulls on the install's identity, confined by its policy to the
 # subscriptions the operator rendered from the AgentPlugin configs, and this adapter
-# speaks the Pub/Sub REST API to it. The operator sets PUBSUB_RELAY_URL on the gateway
-# whenever a plugin configures a Pub/Sub platform; without it the adapter refuses to
-# connect rather than pull on a credential it cannot have.
+# speaks the Pub/Sub REST API to it. The operator renders PUBSUB_RELAY_URL on every
+# gateway: the broker's address once a plugin route names a subscription it can qualify
+# (a full projects/<project>/subscriptions/<name> path, or a short name on an agent with
+# a harness project), empty otherwise. Empty, the adapter refuses to connect rather than
+# pull on a credential it cannot have, and the AgentPlugin's status says which route the
+# operator could not qualify.
 PUBSUB_RELAY_URL_ENV = "PUBSUB_RELAY_URL"
 # The projected token the broker authenticates the gateway by, read on every call
 # because the kubelet rotates it in place (the same file credential_proxy_client reads).
@@ -42,9 +44,13 @@ CREDENTIAL_PROXY_TOKEN_FILE_ENV = "CREDENTIAL_PROXY_TOKEN_FILE"
 PROJECT_ID_ENVS = ("GCP_PROJECT_ID", "GOOGLE_CLOUD_PROJECT")
 RELAY_PREFIX = "/v1/pubsub/gcp/"
 RELAY_PUBSUB_HOST = "pubsub.googleapis.com"
-# One pull asks for this many; Pub/Sub answers with what it has, and an empty answer
-# after the server-side wait is the normal idle case.
-PULL_MAX_MESSAGES = 10
+# One pull asks for one message. A pull is a lease: by the time the broker reads the
+# answer, Pub/Sub has delivered the batch and started its ack deadline, and the ack ids
+# are in the body, so an answer the broker cannot relay (its response cap) strands every
+# message in it until the deadline. One message per pull keeps every answer under the
+# cap the broker gives this family, which covers Pub/Sub's largest message. Each message
+# here becomes an agent turn, so the round trip per message costs nothing that matters.
+PULL_MAX_MESSAGES = 1
 # Above the broker's own relay deadline (API_RELAY_DEADLINE_S, 120 s), so a pull that
 # the broker ends is answered by the broker rather than torn down by this side.
 PULL_REQUEST_TIMEOUT_SECONDS = 130
@@ -136,18 +142,28 @@ class RelayRefused(Exception):
         return self.status == HTTP_NOT_FOUND and self._error_status == GOOGLE_NOT_FOUND_STATUS
 
 
+class _NoRedirects(urllib.request.HTTPRedirectHandler):
+    """A 3xx from the relay is an error, not a place to re-send the token to."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401
+        return None
+
+
 class PubsubRelay:
     """The Pub/Sub REST API, spoken to the credential broker's relay.
 
     Four calls, the ones the broker's policy forwards for the platform adapter:
     a read of the subscription, pull, acknowledge and modifyAckDeadline. The
     broker adds the Google credential; this side presents the gateway's
-    projected token, read from CREDENTIAL_PROXY_TOKEN_FILE on every call.
+    projected token, read from CREDENTIAL_PROXY_TOKEN_FILE on every call, and
+    never follows a redirect with it (credential_proxy_client's guard, kept
+    here because this file is loaded by path with no sibling module).
     """
 
     def __init__(self, base_url: str, token_file: str) -> None:
         self.base_url = base_url.rstrip("/")
         self.token_file = token_file
+        self._opener = urllib.request.build_opener(_NoRedirects)
 
     def _headers(self) -> Dict[str, str]:
         headers = {"Content-Type": "application/json"}
@@ -169,7 +185,7 @@ class PubsubRelay:
         request = urllib.request.Request(self._url(subscription_path, verb), data=data, method=method,
                                          headers=self._headers())
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            with self._opener.open(request, timeout=timeout) as response:
                 raw = response.read()
         except urllib.error.HTTPError as exc:
             try:
@@ -492,9 +508,11 @@ class PubSubAdapter(BasePlatformAdapter):
         relay_url = os.environ.get(PUBSUB_RELAY_URL_ENV, "").strip()
         if not relay_url:
             logger.error(
-                "PubSub: %s is not set. The gateway holds no Google credential, so this adapter pulls only "
-                "through the credential broker's relay; the operator sets the variable when an AgentPlugin "
-                "configures a Pub/Sub platform.", PUBSUB_RELAY_URL_ENV,
+                "PubSub: %s is empty. The gateway holds no Google credential, so this adapter pulls only "
+                "through the credential broker's relay. The operator fills the variable once a plugin route "
+                "names a subscription it can qualify: a full projects/<project>/subscriptions/<name> path, "
+                "or a short subscription or topic name on an agent whose spec.harness.projectId is set. "
+                "The AgentPlugin's status names a route it could not qualify.", PUBSUB_RELAY_URL_ENV,
             )
             self._set_fatal_error("relay_not_configured", f"{PUBSUB_RELAY_URL_ENV} not set", retryable=False)
             return False
@@ -529,6 +547,10 @@ class PubSubAdapter(BasePlatformAdapter):
         # WARNING, not INFO: the gateway runs without -v, so INFO never reaches its log, and
         # this line is what an operator (and the presubmit's deploy gate) reads to know the
         # adapter is pulling through the broker rather than failing quietly.
+        if started == 0:
+            logger.error("PubSub: no route started; every configured route was skipped above, so nothing is pulled")
+            self._mark_connected()
+            return True
         logger.warning("PubSub: connected through the credential broker relay at %s for %d route(s)", relay_url, started)
         self._mark_connected()
         return True

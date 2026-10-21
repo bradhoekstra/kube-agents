@@ -321,6 +321,11 @@ readonly PUBSUB_RELAY_READY_ATTEMPTS=24
 readonly PUBSUB_RELAY_READY_INTERVAL_SECONDS=5
 readonly PUBSUB_RELAY_ADAPTER_MARKER="connected through the credential broker relay"
 readonly PUBSUB_RELAY_BROKER_MARKER="platform pubsub forwarded"
+# The forwarded line is logged for every relayed call of the family, the
+# adapter's preflight read of the subscription included; the rule id is what
+# says a pull went through (watcher_policy composes it from the family's
+# allowed prefix and the verb).
+readonly PUBSUB_RELAY_BROKER_RULE="rule=gcp.pubsub.subscription-pull"
 readonly PUBSUB_RELAY_ROUTE="gke_stockout_alerts"
 # The gateway container the adapter logs from, and how much of each log the
 # gate's failure dump shows.
@@ -1706,7 +1711,6 @@ for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
     --set-string "platformAgent.harness.driftDetector.subscription=${EVAL_DRIFT_SUBSCRIPTION}" \
     --set "plugins.pubsubPlatform.enabled=true" \
     --set "plugins.stockoutInvestigator.enabled=true" \
-    --set-string "plugins.stockoutInvestigator.clusterName=${CLUSTER_NAME}" \
     --set "plugins.stockoutInvestigator.applyTuning=false" \
     ${A2A_OPERATOR_ENV_ARGS[@]+"${A2A_OPERATOR_ENV_ARGS[@]}"} \
     ${MODE_NEXT_ENV_ARGS[@]+"${MODE_NEXT_ENV_ARGS[@]}"} \
@@ -2433,7 +2437,7 @@ for _ in $(seq "${PUBSUB_RELAY_READY_ATTEMPTS}"); do
   if kubectl logs -n "${NAMESPACE}" "deployment/${AGENT_DEPLOYMENT_NAME}" -c "${PUBSUB_RELAY_GATEWAY_CONTAINER}" 2>/dev/null |
     grep -F "${PUBSUB_RELAY_ADAPTER_MARKER}" >/dev/null &&
     kubectl logs -n "${NAMESPACE}" "deployment/${CREDENTIAL_PROXY_DEPLOYMENT_NAME}" 2>/dev/null |
-    grep -F "${PUBSUB_RELAY_BROKER_MARKER}" >/dev/null; then
+    grep -F "${PUBSUB_RELAY_BROKER_MARKER}" | grep -F "${PUBSUB_RELAY_BROKER_RULE}" >/dev/null; then
     pubsub_relay_connected=true
     break
   fi
@@ -2442,7 +2446,8 @@ done
 if [[ "${pubsub_relay_connected}" != "true" ]]; then
   echo "ERROR: the Pub/Sub platform adapter did not pull through the credential broker on this install"
   echo "       (wanted '${PUBSUB_RELAY_ADAPTER_MARKER}' in the platform-agent container and"
-  echo "        '${PUBSUB_RELAY_BROKER_MARKER}' in the credential proxy, for route ${PUBSUB_RELAY_ROUTE})"
+  echo "        '${PUBSUB_RELAY_BROKER_MARKER}' with '${PUBSUB_RELAY_BROKER_RULE}' in the credential proxy,"
+  echo "        for route ${PUBSUB_RELAY_ROUTE})"
   kubectl get agentplugins -n "${NAMESPACE}" -o wide || true
   kubectl logs -n "${NAMESPACE}" "deployment/${AGENT_DEPLOYMENT_NAME}" -c "${PUBSUB_RELAY_GATEWAY_CONTAINER}" --tail="${PUBSUB_RELAY_DIAG_LOG_LINES}" 2>/dev/null | grep -i "pubsub" || true
   kubectl logs -n "${NAMESPACE}" "deployment/${CREDENTIAL_PROXY_DEPLOYMENT_NAME}" --tail="${PUBSUB_RELAY_DIAG_LOG_LINES}" 2>/dev/null | grep -i "pubsub" || true

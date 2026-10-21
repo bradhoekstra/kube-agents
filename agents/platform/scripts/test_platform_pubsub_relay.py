@@ -31,6 +31,8 @@ class PlatformPubsubRelayOverTheSocketTest(unittest.TestCase):
     def setUp(self):
         owner = self
         self.google_requests = []
+        # Extra bytes on every pull answer, for the response-cap tests.
+        self.pull_padding = 0
 
         class Google(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
@@ -51,7 +53,8 @@ class PlatformPubsubRelayOverTheSocketTest(unittest.TestCase):
                 owner.google_requests.append(("POST", self.path, dict(self.headers), self.rfile.read(length)))
                 if self.path.endswith(":pull"):
                     self._answer(json.dumps({"receivedMessages": [{"ackId": "ack-1", "message": {
-                        "data": "eyJ4IjogMX0=", "messageId": "m-1", "attributes": {"k": "v"}}}]}).encode())
+                        "data": "eyJ4IjogMX0=", "messageId": "m-1",
+                        "attributes": {"k": "v", "pad": "x" * owner.pull_padding}}}]}).encode())
                 else:
                     self._answer(b"{}")
 
@@ -151,6 +154,31 @@ class PlatformPubsubRelayOverTheSocketTest(unittest.TestCase):
                 with self.subTest(sub=sub, path=path):
                     status, answer = self._request(method, path, body=body)
                     self.assertEqual(status, 200, answer)
+
+    def test_a_pull_answer_over_the_relays_default_cap_is_still_relayed_to_the_adapter(self):
+        """A pull is a lease: Pub/Sub has delivered the batch and started its ack
+        deadline by the time the broker reads the answer, and the ack ids are
+        in the body. A refused answer would leave the batch undeliverable until
+        the deadline, forever for a message that is always over the cap. The
+        platform family carries a cap no legal Pub/Sub message can exceed; the
+        read-only watcher family keeps the relay's own."""
+        self.pull_padding = 4000
+        with mock.patch.object(credential_proxy, "API_RELAY_MAX_RESPONSE_BYTES", 1024), \
+                mock.patch.object(credential_proxy, "PLATFORM_PUBSUB_MAX_RESPONSE_BYTES", 16384):
+            status, body = self._request("POST", PULL, body=b'{"maxMessages":1}')
+            self.assertEqual(status, 200, body)
+            self.assertEqual(json.loads(body)["receivedMessages"][0]["ackId"], "ack-1")
+            watcher_pull = f"{watcher_policy.WATCHER_GCP_PREFIX}pubsub.googleapis.com/v1/{DRIFT}:pull"
+            status, body = self._request("POST", watcher_pull, token="watcher-token", body=b'{"maxMessages":1}')
+            self.assertEqual(status, 502, body)
+            self.assertEqual(json.loads(body)["code"], "UPSTREAM_UNRELAYABLE")
+
+    def test_the_platform_cap_covers_one_largest_pubsub_message(self):
+        """10 MiB of payload is 13.4 MiB once base64-encoded, plus the envelope."""
+        self.assertGreaterEqual(
+            credential_proxy.PLATFORM_PUBSUB_MAX_RESPONSE_BYTES,
+            credential_proxy.PUBSUB_MAX_MESSAGE_BYTES * 4 // 3 + 64 * 1024,
+        )
 
     def test_the_watchers_subscription_is_outside_the_platform_set(self):
         status, body = self._request("POST", f"{PREFIX}pubsub.googleapis.com/v1/{DRIFT}:pull", body=b"{}")

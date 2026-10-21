@@ -215,16 +215,30 @@ class ConnectTest(RelayTestCase):
             ok = self.run_connect(connected_for=0.1)
         self.assertTrue(ok)
         self.assertEqual(self.broker.calls, [])
-        self.assertIn(f"Route '{ROUTE}' missing 'subscription' path", "\n".join(logs.output))
+        output = "\n".join(logs.output)
+        self.assertIn(f"Route '{ROUTE}' missing 'subscription' path", output)
+        # The presubmit gate reads the connected line; a connect that started no
+        # route must not print it.
+        self.assertNotIn("connected through the credential broker relay", output)
+        self.assertIn("no route started", output)
 
     def test_no_relay_url_is_a_fatal_error_not_a_pull_on_a_missing_credential(self):
-        os.environ.pop("PUBSUB_RELAY_URL", None)
-        with self.assertLogs(LOGGER_NAME, logging.ERROR) as logs:
-            ok = asyncio.run(self.adapter.connect())
-        self.assertFalse(ok)
-        self.assertEqual(self.fatal, [("relay_not_configured", "PUBSUB_RELAY_URL not set", False)])
-        self.assertIn("PUBSUB_RELAY_URL is not set", "\n".join(logs.output))
-        self.assertEqual(self.broker.calls, [])
+        # Unset, and the empty value the operator renders when no route qualified.
+        for value in (None, ""):
+            with self.subTest(value=value):
+                self.fatal.clear()
+                if value is None:
+                    os.environ.pop("PUBSUB_RELAY_URL", None)
+                else:
+                    os.environ["PUBSUB_RELAY_URL"] = value
+                with self.assertLogs(LOGGER_NAME, logging.ERROR) as logs:
+                    ok = asyncio.run(self.adapter.connect())
+                self.assertFalse(ok)
+                self.assertEqual(self.fatal, [("relay_not_configured", "PUBSUB_RELAY_URL not set", False)])
+                output = "\n".join(logs.output)
+                self.assertIn("PUBSUB_RELAY_URL is empty", output)
+                self.assertIn("AgentPlugin's status names a route", output)
+                self.assertEqual(self.broker.calls, [])
 
     def test_a_refused_pull_names_the_rule_and_backs_off(self):
         self.broker.pulls = [403, 403]

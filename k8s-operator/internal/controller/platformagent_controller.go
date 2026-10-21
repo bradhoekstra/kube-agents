@@ -5890,7 +5890,7 @@ func evaluatePluginReadiness(
 	if !imageVolumeSupported {
 		message = fmt.Sprintf("Plugin successfully staged via init container for agent %s (ImageVolumeSource unsupported).", agent.Name)
 	}
-	if issues := pluginConfigIssues(plugin); len(issues) > 0 {
+	if issues := append(pluginConfigIssues(plugin), pubsubRouteIssues(agent, plugin)...); len(issues) > 0 {
 		message = fmt.Sprintf("%s %s", message, strings.Join(issues, " "))
 	}
 	return "Ready", metav1.Condition{

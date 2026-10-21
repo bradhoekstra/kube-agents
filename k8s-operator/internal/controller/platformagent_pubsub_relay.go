@@ -18,9 +18,11 @@ import (
 // its policy to the subscriptions rendered here. The operator is the one reader
 // of both the AgentPlugin configs and the project, so it is the one writer of
 // the set: the broker learns it from platformPubsubSubscriptionsEnvVar and the
-// gateway learns where the relay is from pubsubRelayURLEnvVar. Neither is set
-// when no plugin configures a Pub/Sub platform, and the broker refuses every
-// relayed Pub/Sub call then.
+// gateway learns where the relay is from pubsubRelayURLEnvVar. With no route
+// the operator can qualify, the set is absent, the URL is rendered empty
+// (pubsubRelayURL), and the broker refuses every relayed Pub/Sub call. A route
+// it refuses is reported on the plugin's status (pubsubRouteIssues), since the
+// adapter cannot tell a refused route from an install with no Pub/Sub platform.
 const (
 	pubsubRelayURLEnvVar              = "PUBSUB_RELAY_URL"
 	platformPubsubSubscriptionsEnvVar = "PLATFORM_PUBSUB_SUBSCRIPTIONS"
@@ -28,6 +30,9 @@ const (
 	// subscription: it subscribes to `<topic>-sub`, the name the installers
 	// create (adapter.py, _parse_subscription_config).
 	pubsubDerivedSubscriptionSuffix = "-sub"
+	// The plugin-status lines for a route the broker's set will not carry.
+	pubsubRouteNoProjectIssueFormat = "Pub/Sub route %s names a short subscription or topic and spec.harness.projectId is empty, so the broker relays nothing for it; name it as projects/<project>/subscriptions/<name> or set the project."
+	pubsubRouteGrammarIssueFormat   = "Pub/Sub route %s composes to %q, which is not a subscription path the broker relays; it is left out of the broker's set."
 	pubsubSubscriptionPathFormat    = "projects/%s/subscriptions/%s"
 	pubsubSubscriptionPathPrefix    = "projects/"
 	pubsubSubscriptionsSeparator    = ","
@@ -84,6 +89,67 @@ func pluginPubsubSubscriptions(agent *agentv1alpha1.PlatformAgent, agentPlugins 
 	}
 	sort.Strings(paths)
 	return paths
+}
+
+// pubsubRouteIssues names each Pub/Sub route of one plugin the operator cannot
+// render into the broker's set, for the plugin's status: the adapter then sees
+// an empty relay URL and cannot say why. A route that names nothing is the
+// adapter's own error to report; one that names a short subscription or topic
+// on an agent with no spec.harness.projectId, or that composes to a path
+// outside the subscription grammar, is the operator's.
+func pubsubRouteIssues(agent *agentv1alpha1.PlatformAgent, plugin *agentv1alpha1.AgentPlugin) []string {
+	if plugin == nil || strings.TrimSpace(plugin.Spec.Config) == "" {
+		return nil
+	}
+	var config map[string]any
+	if err := yaml.Unmarshal([]byte(plugin.Spec.Config), &config); err != nil {
+		return nil
+	}
+	project := ""
+	if agent != nil && agent.Spec.Harness != nil {
+		project = strings.TrimSpace(agent.Spec.Harness.ProjectID)
+	}
+	var issues []string
+	for _, name := range pubsubRouteNames(config) {
+		route, _ := pubsubRouteMap(config)[name].(map[string]any)
+		if route == nil {
+			continue
+		}
+		subscription, _ := route["subscription"].(string)
+		topic, _ := route["topic"].(string)
+		if strings.TrimSpace(subscription) == "" && strings.TrimSpace(topic) == "" {
+			continue
+		}
+		path := pubsubSubscriptionPath(route, project)
+		switch {
+		case path == "":
+			issues = append(issues, fmt.Sprintf(pubsubRouteNoProjectIssueFormat, name))
+		case !pubsubSubscriptionPathPattern.MatchString(path):
+			issues = append(issues, fmt.Sprintf(pubsubRouteGrammarIssueFormat, name, path))
+		}
+	}
+	return issues
+}
+
+// pubsubRouteMap is the route map under platforms.pubsub.extra.subscriptions,
+// or nil when the config carries no such map.
+func pubsubRouteMap(config map[string]any) map[string]any {
+	platforms, _ := config["platforms"].(map[string]any)
+	pubsub, _ := platforms["pubsub"].(map[string]any)
+	extra, _ := pubsub["extra"].(map[string]any)
+	subscriptions, _ := extra["subscriptions"].(map[string]any)
+	return subscriptions
+}
+
+// pubsubRouteNames is the route map's keys in order.
+func pubsubRouteNames(config map[string]any) []string {
+	subscriptions := pubsubRouteMap(config)
+	names := make([]string, 0, len(subscriptions))
+	for name := range subscriptions {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 // pubsubRoutes is the route map under platforms.pubsub.extra.subscriptions, in

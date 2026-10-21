@@ -46,6 +46,15 @@ _ADAPTER_CONNECT_RE = re.compile(r'logger\.warning\("PubSub: (connected through 
 # The broker: the label the platform handler passes, and the forwarded line's format.
 _BROKER_LABEL_RE = re.compile(r'_relay_google_call\(\s*"(platform pubsub)",')
 _BROKER_FORWARDED_RE = re.compile(r'"%s forwarded request_id=%s rule=%s status=%d bytes=%d"')
+# The platform family's allowed-rule prefix; a pull's rule id is it plus `-pull`
+# (watcher_policy._evaluate_subscription_call).
+_WATCHER_POLICY = _REPO_ROOT / "agents" / "platform" / "scripts" / "watcher_policy.py"
+_PLATFORM_ALLOWED_PREFIX_RE = re.compile(r'_PLATFORM_SUBSCRIPTION_RULES = _SubscriptionRules\([^)]*?allowed_prefix="([^"]+)"', re.S)
+_PULL_VERB = "-pull"
+# The one helm call the gate depends on: the step-5 install, the first call of
+# this shape in the script (the mode-next upgrade in 6b is the second).
+_HELM_CALL_START = 'helm upgrade --install "${HELM_RELEASE_NAME}"'
+_HELM_CALL_END = "--wait"
 _ROUTE_RE = re.compile(r"^\s+(gke_stockout_alerts):\s*$", re.MULTILINE)
 
 
@@ -86,6 +95,13 @@ class TheMarkersAreWhatTheSourcesPrintTest(unittest.TestCase):
         self.assertIsNotNone(_BROKER_FORWARDED_RE.search(text), "the relay's forwarded audit line changed shape")
         self.assertEqual(f"{label.group(1)} forwarded", _shell_constant("PUBSUB_RELAY_BROKER_MARKER"))
 
+    def test_the_broker_rule_is_the_platform_familys_pull(self) -> None:
+        """The forwarded line is logged for the preflight read too; only the
+        pull's rule id says the adapter pulled."""
+        match = _PLATFORM_ALLOWED_PREFIX_RE.search(_WATCHER_POLICY.read_text())
+        self.assertIsNotNone(match, "watcher_policy.py no longer declares the platform family's allowed prefix")
+        self.assertEqual(_shell_constant("PUBSUB_RELAY_BROKER_RULE"), f"rule={match.group(1)}{_PULL_VERB}")
+
     def test_the_route_is_the_stockout_investigators(self) -> None:
         match = _ROUTE_RE.search(_STOCKOUT_TEMPLATE.read_text())
         self.assertIsNotNone(match, "the stockout AgentPlugin template no longer declares the route")
@@ -94,10 +110,14 @@ class TheMarkersAreWhatTheSourcesPrintTest(unittest.TestCase):
 
 class TheDeployTurnsThePluginsOnWithoutTheirTuningTest(unittest.TestCase):
     def test_the_helm_upgrade_enables_both_plugins_and_leaves_the_tuning_off(self) -> None:
+        # The step-5 call itself, not the whole file: a flag in a comment or on
+        # the mode-next upgrade would otherwise satisfy this.
         text = _CI_DEPLOY.read_text()
+        self.assertIn(_HELM_CALL_START, text)
+        helm_call = text.partition(_HELM_CALL_START)[2].partition(_HELM_CALL_END)[0]
         for flag in _PLUGIN_FLAGS:
             self.assertIn(
-                flag, text,
+                flag, helm_call,
                 "hack/ci-deploy.sh must enable both AgentPlugins for the gate and keep "
                 "the stockout investigator's execution limits off the eval agent, which is "
                 "graded under its own tuning.",
@@ -167,6 +187,18 @@ exit 0
         adapter = _shell_constant("PUBSUB_RELAY_ADAPTER_MARKER")
         proc = self._run_gate(f"PubSub: {adapter} at http://broker:8765 for 1 route(s)\n", _FILLER_LINE * _FILLER_LINES)
         self.assertEqual(proc.returncode, 1, f"stdout: {proc.stdout}\nstderr: {proc.stderr}")
+
+    def test_a_broker_that_relayed_only_the_preflight_read_fails_the_gate(self) -> None:
+        """The adapter reads the subscription before it pulls; that line alone
+        is not a pull."""
+        adapter = _shell_constant("PUBSUB_RELAY_ADAPTER_MARKER")
+        broker = _shell_constant("PUBSUB_RELAY_BROKER_MARKER")
+        proc = self._run_gate(
+            f"PubSub: {adapter} at http://broker:8765 for 1 route(s)\n",
+            f'{{"message":"{broker} request_id=1 rule=gcp.pubsub.subscription-get status=200 bytes=120"}}\n' + _FILLER_LINE * _FILLER_LINES,
+        )
+        self.assertEqual(proc.returncode, 1, f"stdout: {proc.stdout}\nstderr: {proc.stderr}")
+        self.assertIn("did not pull through the credential broker", proc.stdout)
 
 
 if __name__ == "__main__":

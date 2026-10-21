@@ -223,6 +223,48 @@ func TestTheManagedEnvPinsTheRelayURLWhenAPluginConfiguresPubsub(t *testing.T) {
 	}
 }
 
+func TestARefusedRouteIsReportedOnThePluginsStatus(t *testing.T) {
+	// The adapter sees an empty relay URL either way; the plugin's status is
+	// where the reason has to be.
+	withoutProject := agentInProject("")
+	short := pubsubPlugin("stockout", stockoutPluginConfig)
+	issues := pubsubRouteIssues(withoutProject, short)
+	if len(issues) != 1 || !strings.Contains(issues[0], "spec.harness.projectId is empty") {
+		t.Fatalf("a short route on an agent with no project: %v", issues)
+	}
+	if issues := pubsubRouteIssues(agentInProject("my-gcp-project"), short); len(issues) != 0 {
+		t.Fatalf("a short route on an agent with a project is fine, got %v", issues)
+	}
+	outside := pubsubPlugin("stockout", `
+platforms:
+  pubsub:
+    enabled: true
+    extra:
+      subscriptions:
+        gke_stockout_alerts:
+          subscription: projects/my-gcp-project/subscriptions/ab
+`)
+	issues = pubsubRouteIssues(agentInProject("my-gcp-project"), outside)
+	if len(issues) != 1 || !strings.Contains(issues[0], "not a subscription path the broker relays") {
+		t.Fatalf("a route outside the grammar: %v", issues)
+	}
+	empty := pubsubPlugin("stockout", `
+platforms:
+  pubsub:
+    enabled: true
+    extra:
+      subscriptions:
+        gke_stockout_alerts:
+          filter: "true"
+`)
+	if issues := pubsubRouteIssues(withoutProject, empty); len(issues) != 0 {
+		t.Fatalf("a route naming nothing is the adapter's own error to report, got %v", issues)
+	}
+	if issues := pubsubRouteIssues(withoutProject, nil); issues != nil {
+		t.Fatalf("nil plugin: %v", issues)
+	}
+}
+
 func TestTheReservedListNamesThePlatformPubsubSubscriptions(t *testing.T) {
 	merged := mergeCredentialProxyEnv(nil, []corev1.EnvVar{
 		{Name: platformPubsubSubscriptionsEnvVar, Value: "projects/p/subscriptions/theirs"},
