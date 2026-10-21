@@ -88,14 +88,14 @@ platforms:
 
 ### Configuration Parameters
 
-| Parameter         | Type           | Required | Description                                                                                                                                                       |
-| :---------------- | :------------- | :------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `topic`           | `string`       | No       | Simple topic name or full GCP resource path (`projects/<project>/topics/<name>`).                                                                                 |
-| `subscription`    | `string`       | Yes      | Simple subscription name or full GCP path (`projects/<project>/subscriptions/<name>`).                                                                            |
-| `query`           | `string`       | No       | GCP Cloud Logging filter query. Recorded only; the adapter reads no Logging API.                                                                                  |
-| `sink`            | `string`       | No       | Name of the Cloud Logging sink exporting to this topic. Recorded but **not read**: there is no sink check, and one would need a broker route for the Logging API. |
-| `validation_code` | `string`       | No       | Python code snippet to programmatically validate payload. Can define `validate(payload, config)` returning boolean `True` or `False`.                             |
-| `prompt`          | `string`       | Yes      | Markdown template. Supports placeholder substitution using dot-notation (e.g., `{incident.summary}`). Use `{__raw__}` for a raw JSON payload string.              |
-| `skills`          | `list[string]` | No       | List of skill command aliases (without leading `/`) that the agent should execute with the rendered prompt.                                                       |
-| `deliver`         | `string`       | Yes      | Destination platform for the response. Can be `log` (default) or any active platform adapter name (e.g., `google_chat`, `discord`).                               |
-| `deliver_extra`   | `dict`         | No       | Extra configuration variables for the target delivery adapter (e.g., `chat_id`, `thread_id`). Values support placeholder rendering.                               |
+| Parameter         | Type           | Required | Description                                                                                                                                                            |
+| :---------------- | :------------- | :------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `topic`           | `string`       | No       | Simple topic name or full GCP resource path (`projects/<project>/topics/<name>`).                                                                                      |
+| `subscription`    | `string`       | No       | Simple subscription name or full GCP path (`projects/<project>/subscriptions/<name>`). Defaults to `<topic>-sub` when only `topic` is set; one of the two is required. |
+| `query`           | `string`       | No       | GCP Cloud Logging filter query. Recorded only; the adapter reads no Logging API.                                                                                       |
+| `sink`            | `string`       | No       | Name of the Cloud Logging sink exporting to this topic. Recorded but **not read**: there is no sink check, and one would need a broker route for the Logging API.      |
+| `validation_code` | `string`       | No       | Python code snippet to programmatically validate payload. Can define `validate(payload, config)` returning boolean `True` or `False`.                                  |
+| `prompt`          | `string`       | Yes      | Markdown template. Supports placeholder substitution using dot-notation (e.g., `{incident.summary}`). Use `{__raw__}` for a raw JSON payload string.                   |
+| `skills`          | `list[string]` | No       | List of skill command aliases (without leading `/`) that the agent should execute with the rendered prompt.                                                            |
+| `deliver`         | `string`       | Yes      | Destination platform for the response. Can be `log` (default) or any active platform adapter name (e.g., `google_chat`, `discord`).                                    |
+| `deliver_extra`   | `dict`         | No       | Extra configuration variables for the target delivery adapter (e.g., `chat_id`, `thread_id`). Values support placeholder rendering.                                    |

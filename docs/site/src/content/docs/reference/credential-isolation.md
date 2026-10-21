@@ -114,7 +114,8 @@ Pod-wide `automountServiceAccountToken` is `false` on every pod of today's stack
 - **Chat** — Slack and Google Chat adapters send credential-free payloads to Envoy; the credential runtime owns the platform tokens and performs the external API calls, enforcing user allowlists and payload limits. Under `mode: next`, a Slack-armed A2A gateway reads the Slack tokens as Secret-backed env itself and applies `allowedUsers` itself.
 - **PlatformAgent API** — the Service targets port 8643 on `agent-api-auth` in the gateway Pod, which validates the external bearer key and forwards to the agent API on loopback (port 8642) with a non-secret sentinel. The real key never reaches `platform-agent`.
 - **GitHub** — the broker obtains a Google OIDC identity token and calls [Minty](/kube-agents/deploy/token-minter/), which brokers a repository-scoped GitHub App installation token with a maximum one-hour lifetime. The App's private key stays in Cloud KMS.
-- **Pub/Sub platform adapter**: four subscription calls (read, pull, acknowledge, modifyAckDeadline) under `/v1/pubsub/gcp/`, chat role, confined to the subscriptions the operator renders from the AgentPlugin configs.
+- **Watchers** — the event watcher and the drift detector in the gateway Pod's `agent-api-auth` container present the `kubeagents-credential-proxy-watcher` audience for one GKE cluster read and the drift subscription's four Pub/Sub calls under `/v1/watcher/gcp/`, and for Kubernetes events and named reads under `/v1/k8s/`.
+- **Pub/Sub platform adapter** — four subscription calls (read, pull, acknowledge, modifyAckDeadline) under `/v1/pubsub/gcp/`, presented with the gateway's `kubeagents-credential-proxy-chat` audience and confined to the subscriptions the operator renders from the AgentPlugin configs.
 
 ## Guarantee and limitation
 

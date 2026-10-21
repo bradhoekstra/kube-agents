@@ -529,7 +529,7 @@ KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh apply
 - **Private Container Registry**: If your GKE clusters may only pull from an approved registry, see
   [Private container registry](#private-container-registry) below for the full recipe. Mirroring
   only the `kube-agents` images is not enough on its own: `image_registry` (or `install.sh`'s
-  `--registry-prefix`) covers the four images this project builds, and LiteLLM, fluent-bit, the
+  `--registry-prefix`) covers the first-party images this project builds, the two AgentPlugin images among them when their plugins are enabled, and LiteLLM, fluent-bit, the
   GitHub token minter and Hindsight need `third_party_image_registry` (or
   `--third-party-registry-prefix`) as well; cert-manager is separate (see the composition README).
 
