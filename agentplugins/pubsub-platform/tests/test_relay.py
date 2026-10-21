@@ -198,7 +198,8 @@ class ConnectTest(RelayTestCase):
         self.assertTrue(any(path == PULL_PATH for _, path, _, _ in self.broker.calls), self.broker.calls)
 
     def test_a_route_with_a_short_name_and_no_project_is_skipped_loudly(self):
-        os.environ.pop("GCP_PROJECT_ID", None)
+        for name in adapter_mod.PROJECT_ID_ENVS:
+            os.environ.pop(name, None)
         with self.assertLogs(LOGGER_NAME, logging.ERROR) as logs:
             ok = self.run_connect(connected_for=0.1)
         self.assertTrue(ok)
@@ -292,6 +293,35 @@ class PreflightTest(RelayTestCase):
         self.assertIn("get_subscription", lines[-1])
         self.assertIn("Continuing startup without verifying it", lines[-1])
         self.assertTrue(lines[-1].startswith("WARNING"))
+
+    def test_a_broker_that_is_down_is_named_as_unreachable_not_as_a_timeout(self):
+        self.broker.close()
+        ok, lines = self.check()
+        self.assertFalse(ok)
+        self.assertIn("Could not reach the credential broker's relay", lines[-1])
+        self.assertNotIn("Timed out", lines[-1])
+
+    def test_a_reconnect_does_not_leave_the_previous_pull_thread_running(self):
+        """The old thread sees its own generation's stop event, not the new one's."""
+        self.adapter._relay = None
+
+        async def session():
+            await self.adapter.connect()
+            first = list(self.adapter._pull_threads)
+            await self.adapter.disconnect()
+            await self.adapter.connect(is_reconnect=True)
+            second = list(self.adapter._pull_threads)
+            await asyncio.sleep(0.3)
+            await self.adapter.disconnect()
+            return first, second
+
+        first, second = asyncio.run(session())
+        self.assertEqual(len(first), 1)
+        self.assertEqual(len(second), 1)
+        self.assertIsNot(first[0], second[0])
+        for thread in first + second:
+            thread.join(2)
+            self.assertFalse(thread.is_alive(), f"{thread.name} outlived its disconnect")
 
     def test_a_refusal_by_the_broker_is_a_warning_naming_the_answer(self):
         self.broker.get_status = 403

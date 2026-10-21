@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import socket
 import threading
 import time
 import urllib.error
@@ -310,11 +311,31 @@ class PubSubAdapter(BasePlatformAdapter):
                     sub_path, time.monotonic() - started, exc,
                 )
             return False
-        except (TimeoutError, urllib.error.URLError, OSError) as exc:
+        except (TimeoutError, socket.timeout) as exc:
             logger.warning(
                 "PubSub: Timed out after %.1fs waiting on get_subscription for subscription '%s'"
                 " (bound %ss): %s. Continuing startup without verifying it.",
                 time.monotonic() - started, sub_path, PREFLIGHT_RPC_TIMEOUT_SECONDS, exc,
+            )
+            return False
+        except urllib.error.URLError as exc:
+            if isinstance(exc.reason, (TimeoutError, socket.timeout)):
+                logger.warning(
+                    "PubSub: Timed out after %.1fs waiting on get_subscription for subscription '%s'"
+                    " (bound %ss): %s. Continuing startup without verifying it.",
+                    time.monotonic() - started, sub_path, PREFLIGHT_RPC_TIMEOUT_SECONDS, exc,
+                )
+            else:
+                logger.warning(
+                    "PubSub: Could not reach the credential broker's relay to verify subscription '%s' (%.1fs): %s."
+                    " Continuing startup; pulls retry with back-off.",
+                    sub_path, time.monotonic() - started, exc.reason,
+                )
+            return False
+        except OSError as exc:
+            logger.warning(
+                "PubSub: Could not verify subscription '%s' (%.1fs): %s. Continuing startup without verifying it.",
+                sub_path, time.monotonic() - started, exc,
             )
             return False
         except Exception as exc:
@@ -349,34 +370,42 @@ class PubSubAdapter(BasePlatformAdapter):
         """Start the route's pull thread: pull through the relay, hand each message to the loop."""
         logger.info("PubSub: Subscribing to '%s' (route '%s')", subscription_path, name)
         thread = threading.Thread(
-            target=self._pull_loop, args=(name, sub_cfg, subscription_path, loop),
+            target=self._pull_loop, args=(name, sub_cfg, subscription_path, loop, self._relay, self._stop_pulling),
             name=f"pubsub-pull-{name}", daemon=True,
         )
         thread.start()
         self._pull_threads.append(thread)
 
-    def _pull_loop(self, route_name: str, sub_cfg: dict, subscription_path: str, loop: asyncio.AbstractEventLoop) -> None:
+    def _pull_loop(self, route_name: str, sub_cfg: dict, subscription_path: str, loop: asyncio.AbstractEventLoop,
+                   relay: PubsubRelay, stop: threading.Event) -> None:
         """Pull until disconnect; each message is processed on the event loop as the old callback was.
 
-        A failed pull backs off from PULL_BACKOFF_INITIAL_SECONDS to the ceiling and
-        logs what the relay said: a policy refusal names its rule, so a subscription the
-        operator did not render reads as that rather than as a silent idle.
+        The relay and the stop event are the thread's own arguments, not read off
+        the adapter: a reconnect replaces both on the instance, and a thread still
+        parked in a long poll from before it must see its own generation's stop
+        and end, not the new generation's cleared one and pull on beside the new
+        thread. A failed pull backs off from PULL_BACKOFF_INITIAL_SECONDS to the
+        ceiling and logs what the relay said: a policy refusal names its rule, so a
+        subscription the operator did not render reads as that rather than as a
+        silent idle.
         """
         backoff = PULL_BACKOFF_INITIAL_SECONDS
-        while not self._stop_pulling.is_set():
+        while not stop.is_set():
             try:
-                received = self._relay.pull(subscription_path)
+                received = relay.pull(subscription_path)
             except Exception as exc:
-                if self._stop_pulling.is_set():
+                if stop.is_set():
                     return
                 logger.warning("PubSub: pull on route '%s' failed (%s); retrying in %ss", route_name, exc, backoff)
-                self._stop_pulling.wait(backoff)
+                stop.wait(backoff)
                 backoff = min(backoff * 2, PULL_BACKOFF_MAX_SECONDS)
                 continue
             backoff = PULL_BACKOFF_INITIAL_SECONDS
+            if stop.is_set():
+                return
             for item in received:
                 try:
-                    message = RelayMessage(self._relay, subscription_path, item)
+                    message = RelayMessage(relay, subscription_path, item)
                 except Exception as exc:
                     logger.error("PubSub: a message on route '%s' could not be decoded and is left to redeliver: %s", route_name, exc)
                     continue
@@ -418,7 +447,9 @@ class PubSubAdapter(BasePlatformAdapter):
             self._set_fatal_error("relay_not_configured", f"{PUBSUB_RELAY_URL_ENV} not set", retryable=False)
             return False
         self._relay = PubsubRelay(relay_url, os.environ.get(CREDENTIAL_PROXY_TOKEN_FILE_ENV, "").strip())
-        self._stop_pulling.clear()
+        # A new event per generation; the previous one stays set for any thread
+        # still parked in a pull from before disconnect().
+        self._stop_pulling = threading.Event()
 
         project_id = self._get_project_id()
         loop = asyncio.get_running_loop()
