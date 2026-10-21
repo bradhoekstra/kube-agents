@@ -157,7 +157,12 @@ class FakeChat:
 
 
 def runs_path(workflow_id=STAGING["id"]):
-    return f"/repos/{REPO}/actions/workflows/{workflow_id}/runs?exclude_pull_requests=true&per_page={notifier.HISTORY_DEPTH}"
+    return f"/repos/{REPO}/actions/workflows/{workflow_id}/runs?branch=main&exclude_pull_requests=true&per_page={notifier.HISTORY_DEPTH}"
+
+
+def branch_run(number, run_id, conclusion="failure", status="completed"):
+    """A manual dispatch from a feature branch: not the pipeline's state."""
+    return dict(run_like(number, run_id, conclusion=conclusion, status=status), head_branch="feat/try-it")
 
 
 def jobs_path(run_id):
@@ -345,12 +350,18 @@ class JobReadingTest(unittest.TestCase):
 
 class RenderTest(unittest.TestCase):
     def test_the_stamps_round_trip(self):
-        body = body_with([1, 22, 333])
+        body = body_with([1, "22:2", 333])
         self.assertEqual(notifier.stamped_runs(body), {1, 22, 333})
+        self.assertEqual(notifier.stamped_attempts(body), {(1, 1), (22, 2), (333, 1)})
         self.assertEqual(notifier.stamped_stage(body), E2E_STAGE)
         self.assertEqual(notifier.stamped_runs(""), set())
-        self.assertEqual(notifier.stamped_runs(None), set())
+        self.assertEqual(notifier.stamped_attempts(None), set())
         self.assertIsNone(notifier.stamped_stage(body_with([1], stage=None)))
+
+    def test_a_rendered_body_stamps_the_attempt(self):
+        details = {"run": run_like(30, RUN_30["id"], conclusion="failure", attempt=2), "stage": None, "stage_url": None, "step": None, "failure": None, "candidate": {}}
+        body = notifier.render_body(STAGING["name"], STAGING["id"], details, [RUN_29, details["run"]])
+        self.assertEqual(notifier.stamped_attempts(body), {(RUN_29["id"], 1), (RUN_30["id"], 2)})
 
     def test_the_body_names_stage_candidate_failure_and_streak(self):
         details = {
@@ -581,11 +592,40 @@ class ReconcileTest(unittest.TestCase):
             notifier.reconcile(github.api(), STAGING, sender, dry_run=False, environ={}, now=stuck)
         self.assertNotIn("::warning::", out.getvalue())
 
-    def test_a_re_run_that_fails_again_is_already_recorded(self):
-        failed_again = run_like(30, RUN_30["id"], conclusion="failure", attempt=2)
-        github = staging_github(runs=runs_list(failed_again, *STAGING_RUNS["workflow_runs"][1:]), open_issues=[issue(4001, body_with([RUN_29["id"], RUN_30["id"]]))])
+    def test_the_same_attempt_seen_again_is_already_recorded(self):
+        github = staging_github(runs=runs_list(RUN_30, *STAGING_RUNS["workflow_runs"][1:]), open_issues=[issue(4001, body_with([RUN_29["id"], f"{RUN_30['id']}:1"]))])
         self.assertEqual(reconcile(github)[0], "nothing")
         self.assertEqual(github.writes, [])
+
+    def test_a_re_run_that_fails_again_is_a_new_attempt_and_rewrites_the_body(self):
+        """A second attempt can fail on another stage; the body says what
+        the pipeline is failing on now, and the stamp carries the attempt."""
+        failed_again = run_like(30, RUN_30["id"], conclusion="failure", attempt=2)
+        github = staging_github(runs=runs_list(failed_again, *STAGING_RUNS["workflow_runs"][1:]), open_issues=[issue(4001, body_with([RUN_29["id"], RUN_30["id"]]))])
+        github.responses[jobs_path(RUN_30["id"])] = jobs_with(STAGING_26_JOBS, **{EVAL_STAGE: "failure"})
+        self.assertEqual(reconcile(github)[0], "updated")
+        body = github.writes[0][2]["body"]
+        self.assertEqual(notifier.stamped_stage(body), EVAL_STAGE)
+        self.assertEqual(notifier.stamped_attempts(body), {(RUN_29["id"], 1), (RUN_30["id"], 2)})
+        self.assertIn("Still failing", github.writes[1][2]["body"])
+
+    def test_a_failing_dispatch_from_a_branch_opens_nothing(self):
+        github = staging_github(runs=runs_list(branch_run(31, 39600000000), *STAGING_RUNS["workflow_runs"][2:]))
+        chat = FakeChat()
+        self.assertEqual(reconcile(github, chat)[0], "nothing")
+        self.assertEqual(github.writes, [])
+        self.assertEqual(chat.posted, [])
+
+    def test_a_passing_dispatch_from_a_branch_closes_nothing(self):
+        github = staging_github(runs=runs_list(branch_run(31, 39600000000, conclusion="success"), *STAGING_RUNS["workflow_runs"]), open_issues=[issue(4001, body_with([RUN_29["id"], RUN_30["id"]]))])
+        chat = FakeChat()
+        self.assertEqual(reconcile(github, chat)[0], "nothing")
+        self.assertEqual(github.writes, [])
+        self.assertEqual(chat.posted, [])
+
+    def test_a_branch_dispatch_in_progress_does_not_silence_the_sweep(self):
+        github = staging_github(runs=runs_list(branch_run(31, 39600000000, conclusion=None, status="in_progress"), *STAGING_RUNS["workflow_runs"]))
+        self.assertEqual(reconcile(github)[0], "opened")
 
     def test_a_re_run_that_passes_is_the_recovery(self):
         """The failing run passing on its own candidate ends the streak, as
@@ -712,9 +752,16 @@ class MainTest(unittest.TestCase):
         self.assertIn("not watched", err.getvalue())
         self.assertEqual(github.writes, [])
 
+    def test_a_run_id_from_a_branch_is_declined(self):
+        github = FakeGitHub({f"/repos/{REPO}/actions/runs/6": {"id": 6, "name": STAGING["name"], "workflow_id": STAGING["id"], "head_branch": "feat/try-it"}})
+        with mock.patch("sys.stderr", new=io.StringIO()) as err:
+            self.assertEqual(notifier.main(["--run-id", "6"], environ={}, api=github.api()), 0)
+        self.assertIn("not a main run", err.getvalue())
+        self.assertEqual(github.writes, [])
+
     def test_a_run_id_reconciles_that_workflow(self):
         github = staging_github()
-        github.responses[f"/repos/{REPO}/actions/runs/{RUN_30['id']}"] = {"id": RUN_30["id"], "name": STAGING["name"], "workflow_id": STAGING["id"]}
+        github.responses[f"/repos/{REPO}/actions/runs/{RUN_30['id']}"] = {"id": RUN_30["id"], "name": STAGING["name"], "workflow_id": STAGING["id"], "head_branch": "main"}
         with mock.patch("sys.stderr", new=io.StringIO()):
             self.assertEqual(notifier.main(["--run-id", str(RUN_30["id"])], environ={}, api=github.api(), opener=FakeChat()), 0)
         self.assertEqual(github.writes[1][0], "POST")

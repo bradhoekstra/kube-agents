@@ -211,8 +211,20 @@ REUSABLE_JOB_SEPARATOR = " / "
 MARKER = "<!-- release-stage-broken workflow={workflow_id} -->"
 STAMP = "<!-- release-stage-broken runs={run_ids} -->"
 STAGE_STAMP = "<!-- release-stage-broken stage={stage} -->"
-_STAMP_RE = re.compile(r"<!-- release-stage-broken runs=([\d,]*) -->")
+# A stamped run is `<id>:<attempt>`, so a re-run that fails on another stage
+# is new evidence and rewrites the body; a bare `<id>` (the stamp's first
+# shape) reads as the first attempt.
+_STAMP_RE = re.compile(r"<!-- release-stage-broken runs=([\d,:]*) -->")
 _STAGE_STAMP_RE = re.compile(r"<!-- release-stage-broken stage=(.+?) -->")
+STAMP_ATTEMPT_SEPARATOR = ":"
+FIRST_ATTEMPT = 1
+
+# The branch whose runs are the pipeline's state. The three workflows are
+# dispatched on `main` by their schedulers; a dispatch from a feature branch
+# is someone trying a change, and reading it as the pipeline would open an
+# issue for a branch failure, close a real one on a branch pass, or silence
+# the sweep while a branch run is in progress.
+MAIN_BRANCH = "main"
 
 TITLE = "🔴 release pipeline stage broken: {workflow}"
 RUNBOOK = "`scripts/release/README.md`, \"Pipeline Cadence & Execution Flow\" (the \"When a stage fails\" bullet)"
@@ -448,11 +460,27 @@ def marker(workflow_id: int) -> str:
     return MARKER.format(workflow_id=workflow_id)
 
 
-def stamped_runs(body: str | None) -> set:
+def stamped_attempts(body: str | None) -> set:
+    """The `(run id, attempt)` pairs the body records; a bare id is its
+    first attempt."""
     match = _STAMP_RE.search(body or "")
     if not match or not match.group(1):
         return set()
-    return {int(item) for item in match.group(1).split(",") if item}
+    found = set()
+    for item in match.group(1).split(","):
+        if not item:
+            continue
+        run_id, _, attempt = item.partition(STAMP_ATTEMPT_SEPARATOR)
+        found.add((int(run_id), int(attempt) if attempt else FIRST_ATTEMPT))
+    return found
+
+
+def stamped_runs(body: str | None) -> set:
+    return {run_id for run_id, _ in stamped_attempts(body)}
+
+
+def attempt_of(run: dict) -> tuple:
+    return (run["id"], run.get("run_attempt") or FIRST_ATTEMPT)
 
 
 def stamped_stage(body: str | None) -> str | None:
@@ -498,7 +526,7 @@ def render_body(workflow_name: str, workflow_id: int, details: dict, streak: lis
     run = details["run"]
     lines = [
         marker(workflow_id),
-        STAMP.format(run_ids=",".join(str(each["id"]) for each in streak)),
+        STAMP.format(run_ids=",".join(f"{each['id']}{STAMP_ATTEMPT_SEPARATOR}{attempt_of(each)[1]}" for each in streak)),
     ]
     if details.get("stage"):
         lines.append(STAGE_STAMP.format(stage=details["stage"]))
@@ -590,12 +618,14 @@ class GitHubAPI(FlakyGitHubAPI):
         self.dry_run = dry_run
 
     def runs(self, workflow_id: int) -> list:
-        """The workflow's newest runs, every status: a run being re-run is
-        not completed, and leaving it out would make the run before it the
-        newest."""
-        query = urllib.parse.urlencode({"exclude_pull_requests": "true", "per_page": HISTORY_DEPTH})
+        """The workflow's newest runs on `main`, every status: a run being
+        re-run is not completed, and leaving it out would make the run
+        before it the newest. The branch is asked of the endpoint and checked
+        again on the answer, so a page that ignores the filter still cannot
+        put a branch dispatch in the history."""
+        query = urllib.parse.urlencode({"branch": MAIN_BRANCH, "exclude_pull_requests": "true", "per_page": HISTORY_DEPTH})
         batch = self.get(f"/repos/{self.repo}/actions/workflows/{workflow_id}/runs?{query}")
-        return (batch or {}).get("workflow_runs") or []
+        return [run for run in (batch or {}).get("workflow_runs") or [] if run.get("head_branch") == MAIN_BRANCH]
 
     def jobs(self, run_id: int) -> list:
         return self.get_object_pages(f"/repos/{self.repo}/actions/runs/{run_id}/jobs", "jobs")
@@ -751,8 +781,8 @@ def reconcile(api: GitHubAPI, workflow: dict, sender: Sender, dry_run: bool, env
 
     streak = decision["streak"]
     if issue is not None:
-        if current["id"] in stamped_runs(issue.get("body")):
-            log(f"{name}: #{issue['number']} already records run #{current['run_number']}")
+        if attempt_of(current) in stamped_attempts(issue.get("body")):
+            log(f"{name}: #{issue['number']} already records run #{current['run_number']} attempt {attempt_of(current)[1]}")
             return "nothing"
         details = run_details(api, current)
         api.update_issue(issue["number"], body=render_body(name, workflow_id, details, streak))
@@ -761,8 +791,8 @@ def reconcile(api: GitHubAPI, workflow: dict, sender: Sender, dry_run: bool, env
         return "updated"
 
     for closed in api.issues_for_workflow(workflow_id, ISSUE_CLOSED):
-        if current["id"] in stamped_runs(closed.get("body")):
-            log(f"{name}: run #{current['run_number']} is recorded on closed #{closed['number']}; someone dealt with it")
+        if attempt_of(current) in stamped_attempts(closed.get("body")):
+            log(f"{name}: run #{current['run_number']} attempt {attempt_of(current)[1]} is recorded on closed #{closed['number']}; someone dealt with it")
             return "nothing"
     details = run_details(api, current)
     api.ensure_label()
@@ -813,6 +843,9 @@ def main(argv=None, environ=os.environ, api: GitHubAPI | None = None, opener=Non
             run = api.run(args.run_id)
             if run.get("name") not in WATCHED_WORKFLOWS:
                 log(f"run {args.run_id} belongs to {run.get('name')!r}, which is not watched; nothing to do")
+                return 0
+            if run.get("head_branch") != MAIN_BRANCH:
+                log(f"run {args.run_id} is on {run.get('head_branch')!r}, not a {MAIN_BRANCH} run; nothing to do")
                 return 0
             targets = [{"id": run["workflow_id"], "name": run["name"]}]
         for workflow in targets:
