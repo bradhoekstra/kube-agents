@@ -652,8 +652,14 @@
                     "anyOf": [
                       {
                         "allOf": [
-                          { "contains": { "const": "all" } },
-                          { "minItems": 2 }
+                          {
+                            "contains": {
+                              "const": "all"
+                            }
+                          },
+                          {
+                            "minItems": 2
+                          }
                         ]
                       },
                       {
@@ -1196,6 +1202,10 @@
             },
             "clusterName": {
               "type": "string"
+            },
+            "applyTuning": {
+              "type": "boolean",
+              "description": "Merge the plugin's execution limits into platformAgent.harness.tuning. false keeps the install's own tuning."
             },
             "image": {
               "type": "object",

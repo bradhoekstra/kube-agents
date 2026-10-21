@@ -322,6 +322,10 @@ readonly PUBSUB_RELAY_READY_INTERVAL_SECONDS=5
 readonly PUBSUB_RELAY_ADAPTER_MARKER="connected through the credential broker relay"
 readonly PUBSUB_RELAY_BROKER_MARKER="platform pubsub forwarded"
 readonly PUBSUB_RELAY_ROUTE="gke_stockout_alerts"
+# The gateway container the adapter logs from, and how much of each log the
+# gate's failure dump shows.
+readonly PUBSUB_RELAY_GATEWAY_CONTAINER="platform-agent"
+readonly PUBSUB_RELAY_DIAG_LOG_LINES=200
 # The first change: the mode, and the maxSessions section 2b sizes for the
 # rendered bridge's workers, as one values document for one `helm upgrade`, so
 # the first render -- and so the first provision Job -- sees both. A printf
@@ -678,6 +682,9 @@ fi
 # pull-request path from this build (the `agent-plugins` step of
 # cloudbuild-ci.yaml), on the release-candidate path from the candidate's
 # published images. Section 7b gates on the adapter pulling through the broker.
+# The stockout investigator's own execution limits are not applied
+# (plugins.stockoutInvestigator.applyTuning=false): the eval agent keeps the
+# tuning it is graded under, and the plugin is here for its ingress alone.
 if [ -n "${RC_COMMIT_SHA:-}" ]; then
   # EVAL_MODE_NEXT=1 is accepted here: the release pipeline publishes the A2A
   # images and the bridge beside the others (REQUIRED_RELEASE_IMAGES, which
@@ -1447,14 +1454,10 @@ else
   # substitutions absent that step is a no-op and the build is the four-image
   # one above. Empty otherwise, so the command below is byte-for-byte what it
   # was.
-  # The two AgentPlugin images, on the pull-request path only: the
-  # release-candidate path installs the candidate's published ones (section
-  # 2a) and builds nothing here. Empty otherwise, for the same reason as the
-  # A2A pair below.
-  PLUGIN_IMAGE_SUBSTITUTIONS=""
-  if [ -z "${RC_COMMIT_SHA:-}" ]; then
-    PLUGIN_IMAGE_SUBSTITUTIONS=",_PUBSUB_PLATFORM_URI=${AR_REPO}/${PLUGIN_IMAGE_PUBSUB_PLATFORM}:${TAG},_STOCKOUT_INVESTIGATOR_URI=${AR_REPO}/${PLUGIN_IMAGE_STOCKOUT_INVESTIGATOR}:${TAG}"
-  fi
+  # The two AgentPlugin images. This branch is the pull-request path (the
+  # release-candidate path installs the candidate's published ones, section
+  # 2a, and skipped this section above), so they are always built here.
+  PLUGIN_IMAGE_SUBSTITUTIONS=",_PUBSUB_PLATFORM_URI=${AR_REPO}/${PLUGIN_IMAGE_PUBSUB_PLATFORM}:${TAG},_STOCKOUT_INVESTIGATOR_URI=${AR_REPO}/${PLUGIN_IMAGE_STOCKOUT_INVESTIGATOR}:${TAG}"
   A2A_BUILD_SUBSTITUTIONS=""
   if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
     A2A_BUILD_SUBSTITUTIONS=",_A2A_GATEWAY_URI=${A2A_GATEWAY_URI},_A2A_CALLOUT_URI=${A2A_CALLOUT_URI},_A2A_WORKER_URI=${A2A_WORKER_URI},_A2A_VERIFIER_URI=${A2A_VERIFIER_URI},_A2A_CONSOLE_URI=${A2A_CONSOLE_URI},_A2A_BRIDGE_URI=${A2A_BRIDGE_URI}"
@@ -1705,6 +1708,7 @@ for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
     --set "plugins.pubsubPlatform.enabled=true" \
     --set "plugins.stockoutInvestigator.enabled=true" \
     --set-string "plugins.stockoutInvestigator.clusterName=${CLUSTER_NAME}" \
+    --set "plugins.stockoutInvestigator.applyTuning=false" \
     ${A2A_OPERATOR_ENV_ARGS[@]+"${A2A_OPERATOR_ENV_ARGS[@]}"} \
     ${MODE_NEXT_ENV_ARGS[@]+"${MODE_NEXT_ENV_ARGS[@]}"} \
     --wait --timeout 15m 2>&1 | tee "${HELM_INSTALL_OUT}"
@@ -2427,7 +2431,7 @@ echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Verifying the Pub/Sub platform adap
 pubsub_relay_connected=false
 for _ in $(seq "${PUBSUB_RELAY_READY_ATTEMPTS}"); do
   # `grep -F ... >/dev/null`, not `-q`: see the drift-detector gate in 6.
-  if kubectl logs -n "${NAMESPACE}" "deployment/${AGENT_DEPLOYMENT_NAME}" -c platform-agent 2>/dev/null |
+  if kubectl logs -n "${NAMESPACE}" "deployment/${AGENT_DEPLOYMENT_NAME}" -c "${PUBSUB_RELAY_GATEWAY_CONTAINER}" 2>/dev/null |
     grep -F "${PUBSUB_RELAY_ADAPTER_MARKER}" >/dev/null &&
     kubectl logs -n "${NAMESPACE}" "deployment/${CREDENTIAL_PROXY_DEPLOYMENT_NAME}" 2>/dev/null |
     grep -F "${PUBSUB_RELAY_BROKER_MARKER}" >/dev/null; then
@@ -2441,8 +2445,8 @@ if [[ "${pubsub_relay_connected}" != "true" ]]; then
   echo "       (wanted '${PUBSUB_RELAY_ADAPTER_MARKER}' in the platform-agent container and"
   echo "        '${PUBSUB_RELAY_BROKER_MARKER}' in the credential proxy, for route ${PUBSUB_RELAY_ROUTE})"
   kubectl get agentplugins -n "${NAMESPACE}" -o wide || true
-  kubectl logs -n "${NAMESPACE}" "deployment/${AGENT_DEPLOYMENT_NAME}" -c platform-agent --tail=200 2>/dev/null | grep -i "pubsub" || true
-  kubectl logs -n "${NAMESPACE}" "deployment/${CREDENTIAL_PROXY_DEPLOYMENT_NAME}" --tail=100 2>/dev/null | grep -i "pubsub" || true
+  kubectl logs -n "${NAMESPACE}" "deployment/${AGENT_DEPLOYMENT_NAME}" -c "${PUBSUB_RELAY_GATEWAY_CONTAINER}" --tail="${PUBSUB_RELAY_DIAG_LOG_LINES}" 2>/dev/null | grep -i "pubsub" || true
+  kubectl logs -n "${NAMESPACE}" "deployment/${CREDENTIAL_PROXY_DEPLOYMENT_NAME}" --tail="${PUBSUB_RELAY_DIAG_LOG_LINES}" 2>/dev/null | grep -i "pubsub" || true
   exit 1
 fi
 echo "✓ Pub/Sub platform adapter pulls through the broker, verified in $((SECONDS - STEP_START))s"
