@@ -142,6 +142,11 @@ COMPLETION_QUANTILES: Tuple[float, float] = (0.5, 0.95)
 PROMETHEUS_LINE = re.compile(r'^(?P<name>[a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{(?P<labels>(?:[^"}]|"(?:[^"\\]|\\.)*")*)\})?\s+(?P<value>\S+)')
 PROMETHEUS_LABEL = re.compile(r'(?P<key>[a-zA-Z_][a-zA-Z0-9_]*)="(?P<value>(?:[^"\\]|\\.)*)"')
 LITELLM_MODEL_LINE = re.compile(r"^\s*model:\s*['\"]?(?P<model>[A-Za-z0-9_./:@+-]+)", re.MULTILINE)
+#: A model given as a resource path (``vertex_ai/projects/<id>/locations/<region>/endpoints/<n>``)
+#: names a project and a region between its first segment and its last; the block
+#: prints the provider and the last segment only, so neither reaches it and the
+#: audit does not refuse a block over a project the spec also names.
+MODEL_SEGMENT_SEPARATOR = "/"
 FEEDBACK_TEMPLATE: Tuple[str, ...] = (
     "feedback:",
     "  Rating: [ 👍 / 👎 / 😐 ]",
@@ -297,13 +302,18 @@ def histogram_quantiles(samples: Iterable[Sample], family: str, quantiles: Seque
 
 
 def model_from_litellm_config(config_yaml: Optional[str]) -> Optional[str]:
-    """The first provider-qualified model the gateway routes to, from its rendered config."""
+    """The first provider-qualified model the gateway routes to, as ``provider/name``.
+
+    A resource path keeps its provider and its last segment only: the segments
+    between them name a project and a region.
+    """
     if not config_yaml:
         return None
     for match in LITELLM_MODEL_LINE.finditer(config_yaml):
         model = match.group("model")
-        if "/" in model:
-            return model
+        if MODEL_SEGMENT_SEPARATOR in model:
+            provider, _, path = model.partition(MODEL_SEGMENT_SEPARATOR)
+            return f"{provider}{MODEL_SEGMENT_SEPARATOR}{path.rsplit(MODEL_SEGMENT_SEPARATOR, 1)[-1]}"
     return None
 
 

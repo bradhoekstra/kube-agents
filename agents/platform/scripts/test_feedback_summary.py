@@ -255,6 +255,18 @@ class ParsingTest(unittest.TestCase):
         self.assertEqual(fs.model_from_litellm_config(LITELLM_CONFIG_YAML), "vertex_ai/claude-opus-5")
         self.assertEqual(fs.model_from_litellm_config("  model: vertex_ai/claude-3-5-sonnet@20240620\n"), "vertex_ai/claude-3-5-sonnet@20240620")
 
+    def test_a_resource_path_model_prints_its_provider_and_last_segment_only(self):
+        config = (
+            "model_list:\n- model_name: x\n  litellm_params:\n"
+            "    model: vertex_ai/projects/acme-prod-123/locations/us-central1/endpoints/987\n"
+        )
+        model = fs.model_from_litellm_config(config)
+        self.assertEqual(model, "vertex_ai/987")
+        self.assertNotIn("acme-prod-123", model)
+        self.assertNotIn("us-central1", model)
+        self.assertEqual(fs.model_from_litellm_config("model: openrouter/anthropic/claude-sonnet-4\n"), "openrouter/claude-sonnet-4")
+        self.assertEqual(fs.model_from_litellm_config("model: vertex_ai/claude-opus-5\n"), "vertex_ai/claude-opus-5")
+
     def test_a_label_value_holding_a_brace_keeps_its_sample(self):
         samples = fs.parse_prometheus('litellm_input_tokens_metric_total{model="a}b",team="x\\"y"} 5\nlitellm_input_tokens_metric_total{model="c"} 2\n')
         self.assertEqual(fs.family_total(samples, fs.TOKEN_FAMILIES["in"]), 7.0)
