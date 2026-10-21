@@ -53,6 +53,12 @@ const (
 	//: conversation's worker.
 	usageSummaryAPITimeout = 10 * time.Second
 	serverVersionPath      = "/version"
+	//: The characters a block token is made of; the audit's boundary is the
+	//: complement, as the script's IDENTIFIER_BOUNDARY is.
+	usageSummaryTokenClass = `[A-Za-z0-9_.-]`
+	//: The window never drops below one day, so the label never reads "0 days"
+	//: on an install with a sub-day SessionTTL.
+	usageSummaryWindowFloor = hoursPerDay * time.Hour
 	//: The performance figures the script reads in-pod (tokens, spend,
 	//: latency) are not the gateway's to see; the block says where they are.
 	usageSummaryPerformanceNote   = "tokens, spend and latency are in scripts/feedback-summary.sh's block"
@@ -99,7 +105,8 @@ var usageSummaryStopwords = map[string]bool{"true": true, "false": true, "yes": 
 
 var (
 	usageSummaryNumeric    = regexp.MustCompile(`^[0-9][0-9._%:-]*$`)
-	usageSummaryToken      = regexp.MustCompile(`[A-Za-z0-9_.-]+`)
+	usageSummaryToken      = regexp.MustCompile(usageSummaryTokenClass + `+`)
+	usageSummaryBoundary   = `[^` + usageSummaryTokenClass[1:]
 	errUsageScanIncomplete = errors.New("the session record scan stopped before the end of the bucket")
 )
 
@@ -109,6 +116,28 @@ var usageSummaryFeedbackTemplate = []string{
 	"  What worked well:",
 	"  What failed or was slow:",
 }
+
+// usageSummaryTemplateTokens is the block's own vocabulary: the words of the
+// degraded render and of a full one (every bucket present, every interface the
+// operator can write), so that an install whose spec spells one of them is
+// not refused for a line the template prints anyway.
+var usageSummaryTemplateTokens = func() map[string]bool {
+	var interfaces []any
+	for _, word := range usageSummaryInterfaceWords {
+		interfaces = append(interfaces, word)
+	}
+	full := map[string]any{"status": map[string]any{"usage": map[string]any{"activeInterfaces": interfaces}}}
+	tokens := map[string]bool{}
+	for _, text := range []string{
+		renderUsageSummary(time.Unix(0, 0).UTC(), map[string]any{}, "", usageSummaryWindow, taskRollup{}, false),
+		renderUsageSummary(time.Unix(0, 0).UTC(), full, "", usageSummaryWindow, taskRollup{Total: 3, Ended: 1, Cancelled: 1, Active: 1}, true),
+	} {
+		for _, tok := range usageSummaryToken.FindAllString(text, -1) {
+			tokens[tok] = true
+		}
+	}
+	return tokens
+}()
 
 // usageSource is what the summary reads from the cluster: the PlatformAgent
 // resource as unstructured content, and the server version.
@@ -215,12 +244,16 @@ func rollupTasks(records []*SessionRecord, now time.Time, window time.Duration) 
 }
 
 // usageWindow is the roll-up's window: the script's fourteen days, or
-// SessionTTL when that is shorter, since records idle past it are gone.
+// SessionTTL when that is shorter, since records idle past it are gone;
+// never under a day.
 func usageWindow(sessionTTL time.Duration) time.Duration {
-	if sessionTTL > 0 && sessionTTL < usageSummaryWindow {
-		return sessionTTL
+	switch {
+	case sessionTTL <= 0 || sessionTTL >= usageSummaryWindow:
+		return usageSummaryWindow
+	case sessionTTL < usageSummaryWindowFloor:
+		return usageSummaryWindowFloor
 	}
-	return usageSummaryWindow
+	return sessionTTL
 }
 
 func windowDays(window time.Duration) int {
@@ -382,28 +415,6 @@ func usageIdentifiers(cr map[string]any) []string {
 	return ids
 }
 
-// usageSummaryTemplateTokens is the block's own vocabulary: the words of the
-// degraded render and of a full one (every bucket present, every interface the
-// operator can write), so that an install whose spec spells one of them is
-// not refused for a line the template prints anyway.
-var usageSummaryTemplateTokens = func() map[string]bool {
-	var interfaces []any
-	for _, word := range usageSummaryInterfaceWords {
-		interfaces = append(interfaces, word)
-	}
-	full := map[string]any{"status": map[string]any{"usage": map[string]any{"activeInterfaces": interfaces}}}
-	tokens := map[string]bool{}
-	for _, text := range []string{
-		renderUsageSummary(time.Unix(0, 0).UTC(), map[string]any{}, "", usageSummaryWindow, taskRollup{}, false),
-		renderUsageSummary(time.Unix(0, 0).UTC(), full, "", usageSummaryWindow, taskRollup{Total: 3, Ended: 1, Cancelled: 1, Active: 1}, true),
-	} {
-		for _, tok := range usageSummaryToken.FindAllString(text, -1) {
-			tokens[tok] = true
-		}
-	}
-	return tokens
-}()
-
 // auditUsageSummary returns the identifiers that appear in text as whole
 // tokens, skipping the template's own vocabulary (a cluster named "today" is
 // not told apart from the mode line, and is not refused for it).
@@ -413,7 +424,7 @@ func auditUsageSummary(text string, identifiers []string) []string {
 		if id == "" || usageSummaryTemplateTokens[id] {
 			continue
 		}
-		pattern := regexp.MustCompile(`(?:^|[^A-Za-z0-9_.-])` + regexp.QuoteMeta(id) + `(?:[^A-Za-z0-9_.-]|$)`)
+		pattern := regexp.MustCompile(`(?:^|` + usageSummaryBoundary + `)` + regexp.QuoteMeta(id) + `(?:` + usageSummaryBoundary + `|$)`)
 		if pattern.MatchString(text) {
 			leaked = append(leaked, id)
 		}
