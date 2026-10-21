@@ -8817,8 +8817,8 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     watcher_subscription: str = ""
     # The subscriptions the gateway's Pub/Sub platform adapter may reach through
     # `/v1/pubsub/gcp/`, each `projects/<p>/subscriptions/<s>`, as the operator
-    # rendered them from the AgentPlugin configs. Empty: no plugin configured a
-    # Pub/Sub platform and every call is refused.
+    # rendered them from the AgentPlugin configs. Empty: no plugin route the
+    # operator could qualify, and every call is refused.
     platform_pubsub_subscriptions: frozenset[str] = frozenset()
     # (project, location, cluster) -> (deadline, host, CA PEM or ""), for the
     # watcher's Kubernetes route. See `_watcher_cluster_endpoint`.
@@ -10145,8 +10145,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     def _log_watcher_request(self, label: str, request_id: str, target: str) -> None:
         """The pre-decision audit line, naming the caller, as the other credentialed routes write it.
 
-        The broker makes every watcher call on its own credential, so this line
-        is the record of which ServiceAccount presented the watcher token.
+        The broker makes every relayed Google call, the watcher family's and the
+        platform Pub/Sub family's, on its own credential, so this line is the
+        record of which ServiceAccount presented the token.
         """
         principal = self.principal
         LOGGER.info(
@@ -11291,8 +11292,9 @@ def platform_pubsub_subscriptions() -> frozenset[str]:
 
     `PLATFORM_PUBSUB_SUBSCRIPTIONS` is a comma-separated list of
     `projects/<p>/subscriptions/<s>`, rendered by the operator from the
-    AgentPlugin configs; unset or empty means no Pub/Sub platform is configured
-    and the relay refuses every call. An entry of any other shape is dropped
+    AgentPlugin configs; unset or empty means no plugin route the operator
+    could qualify, and the relay refuses every call. An entry of any other
+    shape is dropped
     with a warning rather than refusing the boot: the operator renders the
     list from user-authored AgentPlugin configs, and one typo in a route must
     not take the broker, and with it every other route, off the air. A dropped

@@ -37,9 +37,10 @@ const (
 	pubsubDerivedSubscriptionSuffix = "-sub"
 	// The plugin-status lines for a route the broker's set will not carry, and
 	// the bounds that keep them inside the CRD's condition-message cap: a path
-	// is the author's text with no length bound, and a spec can carry any
-	// number of routes (see hostPathDroppedEntryBudget for the failure an
-	// unbounded status message buys).
+	// and a route name are the author's text with no length bound, and a spec
+	// can carry any number of routes (see hostPathDroppedEntryBudget for the
+	// failure an unbounded status message buys). Every author-controlled
+	// operand of a line goes through pubsubRouteIssueOperand.
 	pubsubRouteIssuePathBudget      = 256
 	pubsubRouteIssueBudget          = 8
 	pubsubRouteIssueEllipsis        = "..."
@@ -132,12 +133,9 @@ func pubsubRouteIssues(agent *agentv1alpha1.PlatformAgent, plugin *agentv1alpha1
 		var issue string
 		switch {
 		case path == "":
-			issue = fmt.Sprintf(pubsubRouteNoProjectIssueFormat, name)
+			issue = fmt.Sprintf(pubsubRouteNoProjectIssueFormat, pubsubRouteIssueOperand(name))
 		case !pubsubSubscriptionPathPattern.MatchString(path):
-			if len(path) > pubsubRouteIssuePathBudget {
-				path = truncateToValidUTF8(path, pubsubRouteIssuePathBudget) + pubsubRouteIssueEllipsis
-			}
-			issue = fmt.Sprintf(pubsubRouteGrammarIssueFormat, name, path)
+			issue = fmt.Sprintf(pubsubRouteGrammarIssueFormat, pubsubRouteIssueOperand(name), pubsubRouteIssueOperand(path))
 		default:
 			continue
 		}
@@ -150,6 +148,14 @@ func pubsubRouteIssues(agent *agentv1alpha1.PlatformAgent, plugin *agentv1alpha1
 		issues = append(issues, fmt.Sprintf(pubsubRouteIssueOverflowFormat, refused-pubsubRouteIssueBudget))
 	}
 	return issues
+}
+
+// pubsubRouteIssueOperand is an author-written value cut to fit a status line.
+func pubsubRouteIssueOperand(value string) string {
+	if len(value) <= pubsubRouteIssuePathBudget {
+		return value
+	}
+	return truncateToValidUTF8(value, pubsubRouteIssuePathBudget) + pubsubRouteIssueEllipsis
 }
 
 // pubsubRelayProject is the project a short route name is qualified with, on

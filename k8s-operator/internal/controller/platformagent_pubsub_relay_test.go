@@ -244,6 +244,19 @@ func TestTheRouteIssuesStayInsideTheConditionMessageCap(t *testing.T) {
 	if !strings.Contains(issues[len(issues)-1], "22 more") {
 		t.Fatalf("the overflow line does not count the rest: %s", issues[len(issues)-1])
 	}
+	// The route name is the other author-written operand; a 33 KB key alone
+	// would otherwise carry the message past the cap.
+	named := pubsubPlugin("stockout", "platforms:\n  pubsub:\n    enabled: true\n    extra:\n      subscriptions:\n        "+
+		strings.Repeat("n", 33000)+":\n          subscription: projects/p/subscriptions/-x\n        "+
+		strings.Repeat("m", 33000)+":\n          subscription: short\n")
+	for _, issue := range pubsubRouteIssues(agentInProject(""), named) {
+		if len(issue) > 2*pubsubRouteIssuePathBudget+len(pubsubRouteGrammarIssueFormat)+2*len(pubsubRouteIssueEllipsis) {
+			t.Fatalf("a route name is not cut: %d bytes", len(issue))
+		}
+		if !strings.Contains(issue, pubsubRouteIssueEllipsis) {
+			t.Fatalf("an over-long route name is not marked as cut: %.120s", issue)
+		}
+	}
 }
 
 func TestTheManagedEnvPinsTheRelayURLWhenAPluginConfiguresPubsub(t *testing.T) {

@@ -293,9 +293,10 @@ class PubSubAdapter(BasePlatformAdapter):
     def _get_project_id(self) -> Optional[str]:
         """The project a short subscription name belongs to, from the gateway's environment.
 
-        The operator sets GCP_PROJECT_ID on the gateway from spec.harness.projectId.
-        Not a credential's default project: the gateway pod holds no Google credential,
-        so there is nothing for it to read a project from.
+        PUBSUB_RELAY_PROJECT is the operator's, the project it composed the broker's
+        set with, rendered after the plugin env merge; GCP_PROJECT_ID is the fallback a
+        plugin can override. Not a credential's default project: the gateway pod holds
+        no Google credential, so there is nothing for it to read a project from.
         """
         for name in PROJECT_ID_ENVS:
             value = os.environ.get(name, "").strip()
@@ -541,7 +542,7 @@ class PubSubAdapter(BasePlatformAdapter):
             self._warn_on_inert_config(name, sub_cfg)
             subscription_path = self._resolve_subscription_path(name, sub_cfg, project_id)
             if not subscription_path:
-                logger.error("PubSub: Route '%s' missing 'subscription' path", name)
+                logger.error("PubSub: Route '%s' skipped: it names no subscription this adapter can pull; the line above says why", name)
                 continue
             self._check_subscription_exists(subscription_path)
             self._subscribe_to_route(name, sub_cfg, subscription_path, loop)

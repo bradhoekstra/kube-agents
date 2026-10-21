@@ -221,12 +221,13 @@ class ConnectTest(RelayTestCase):
     def test_a_route_with_a_short_name_and_no_project_is_skipped_loudly(self):
         for name in adapter_mod.PROJECT_ID_ENVS:
             os.environ.pop(name, None)
-        with self.assertLogs(LOGGER_NAME, logging.ERROR) as logs:
+        with self.assertLogs(LOGGER_NAME, logging.WARNING) as logs:
             ok = self.run_connect(connected_for=0.1)
         self.assertTrue(ok)
         self.assertEqual(self.broker.calls, [])
         output = "\n".join(logs.output)
-        self.assertIn(f"Route '{ROUTE}' missing 'subscription' path", output)
+        self.assertIn(f"Route '{ROUTE}' skipped: it names no subscription this adapter can pull", output)
+        self.assertIn(f"Route '{ROUTE}' names a short subscription or topic and no project id is set", output)
         # The presubmit gate reads the connected line; a connect that started no
         # route must not print it.
         self.assertNotIn("connected through the credential broker relay", output)

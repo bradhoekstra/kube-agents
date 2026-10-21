@@ -322,8 +322,8 @@ def evaluate_pubsub(method: str, host: str, path: str, body: bytes, subscription
     """Allow or refuse one `/v1/pubsub/gcp/` call for the gateway's platform adapter.
 
     `subscriptions` is the set of `projects/<p>/subscriptions/<s>` the operator
-    rendered from the AgentPlugin configs; empty means no plugin configured a
-    Pub/Sub platform and every call is refused. Pub/Sub is the only host: the
+    rendered from the AgentPlugin configs; empty means no plugin route the
+    operator could qualify, and every call is refused. Pub/Sub is the only host: the
     adapter has no business with the GKE API.
     """
     if method not in (METHOD_GET, METHOD_POST):
