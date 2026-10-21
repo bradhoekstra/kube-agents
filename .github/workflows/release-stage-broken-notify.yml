@@ -66,9 +66,10 @@ concurrency:
 permissions: {}
 
 env:
-  # The Chat app's identity, space and workload-identity provider: the same
-  # values `ci-health.yml` declares, overridable by the same repository
-  # variables, so the two posters cannot drift apart.
+  # The Chat app's identity, space, mute switch and workload-identity
+  # provider: the same values `ci-health.yml` declares, so the two posters
+  # cannot drift apart. The first three take the same repository variables
+  # as overrides; the provider is a literal in both files.
   WIF_PROVIDER: projects/125393897113/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider
   CI_HEALTH_SA: ${{ vars.CI_HEALTH_SA || 'eval-dashboard-publisher@kube-agents-prow.iam.gserviceaccount.com' }}
   CI_HEALTH_CHAT_SPACE: ${{ vars.CI_HEALTH_CHAT_SPACE || 'spaces/AAQAlcuDUJI' }}
@@ -114,8 +115,12 @@ jobs:
           workload_identity_provider: ${{ env.WIF_PROVIDER }}
           service_account: ${{ env.CI_HEALTH_SA }}
 
+      # Best-effort like the step before it: a setup hiccup costs the Chat
+      # post, not the reconcile.
       - name: Set up Cloud SDK
+        id: gcloud
         if: steps.auth.outcome == 'success'
+        continue-on-error: true
         uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
 
       # The token goes to the script step alone, as a masked step output
@@ -124,7 +129,7 @@ jobs:
       # minted with it, as ci-health.yml does.
       - name: Mint a Chat token
         id: chat_token
-        if: steps.auth.outcome == 'success'
+        if: steps.gcloud.outcome == 'success'
         continue-on-error: true
         run: |
           token="$(gcloud auth print-access-token --scopes=https://www.googleapis.com/auth/chat.bot)"

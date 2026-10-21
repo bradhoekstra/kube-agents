@@ -42,7 +42,13 @@ REPO = "gke-labs/kube-agents"
 STAGING = {"id": 365450384, "name": "Staging: Promotion Pipeline"}
 STAGING_RUNS = json.loads((FIXTURES / "staging-runs.json").read_text())
 STAGING_JOBS = json.loads((FIXTURES / "staging-30-jobs.json").read_text())
+# Staging #26 (2026-10-17): a green night whose `continue-on-error` rollback
+# leg (step 3b) failed, which the API reports as a failed job inside a
+# successful run.
+STAGING_26_JOBS = json.loads((FIXTURES / "staging-26-jobs.json").read_text())
 GA_JOBS = json.loads((FIXTURES / "ga-10-jobs.json").read_text())
+ROLLBACK_LEG = "Step 3b - Roll Back to the Previous GA and Forward Again"
+EVAL_STAGE = "Step 5 - Await Release-Candidate Eval"
 RUN_30 = STAGING_RUNS["workflow_runs"][0]
 RUN_29 = STAGING_RUNS["workflow_runs"][1]
 STEP1_JOB = STAGING_JOBS["jobs"][0]["id"]
@@ -248,13 +254,39 @@ class LogReadingTest(unittest.TestCase):
         self.assertEqual(notifier.split_log_line("no stamp"), (None, "no stamp"))
 
 
+def jobs_with(jobs_document, **conclusions):
+    """A copy of a jobs document with the named jobs' conclusions changed."""
+    jobs = [dict(job) for job in jobs_document["jobs"]]
+    for job in jobs:
+        if job["name"] in conclusions:
+            job["conclusion"] = conclusions[job["name"]]
+    return {"total_count": len(jobs), "jobs": jobs}
+
+
 class JobReadingTest(unittest.TestCase):
-    def test_the_stage_is_the_first_failed_job_in_run_order(self):
+    def test_the_stage_is_the_only_failed_job_when_there_is_one(self):
         job = notifier.failing_job(STAGING_JOBS["jobs"])
         self.assertEqual(job["name"], E2E_STAGE)
         step = notifier.failing_step(job)
         self.assertEqual(step["name"], "Execute Blocking E2E Gate")
         self.assertEqual((step["started_at"], step["completed_at"]), ("2026-10-21T03:29:21Z", "2026-10-21T03:37:38Z"))
+
+    def test_the_stage_is_the_failing_job_that_completed_last_not_the_rollback_leg(self):
+        """Staging #26's shape with step 5 failing as well: the rollback leg
+        failed at 03:54 and is listed first, the eval wait failed at 05:09
+        and ended the run. The run stopped at the eval."""
+        jobs = jobs_with(STAGING_26_JOBS, **{EVAL_STAGE: "failure"})["jobs"]
+        self.assertEqual([job["name"] for job in jobs if job["conclusion"] == "failure"][0], ROLLBACK_LEG)
+        self.assertEqual(notifier.failing_job(jobs)["name"], EVAL_STAGE)
+
+    def test_a_failing_job_without_a_time_sorts_first_and_ties_keep_list_order(self):
+        jobs = [
+            {"name": "late", "conclusion": "failure", "completed_at": "2026-10-21T05:00:00Z"},
+            {"name": "untimed", "conclusion": "failure"},
+            {"name": "late-too", "conclusion": "failure", "completed_at": "2026-10-21T05:00:00Z"},
+        ]
+        self.assertEqual(notifier.failing_job(jobs)["name"], "late")
+        self.assertEqual(notifier.failing_job([{"name": "untimed", "conclusion": "failure"}])["name"], "untimed")
 
     def test_the_ga_publish_job_and_its_step(self):
         job = notifier.failing_job(GA_JOBS["jobs"])
@@ -408,14 +440,39 @@ class ReconcileTest(unittest.TestCase):
         self.assertIn("concluded skipped", err)
         self.assertIn("#4001 stays open", err)
 
-    def test_a_green_run_without_the_stage_at_all_is_no_recovery(self):
+    def test_a_green_run_without_the_stage_at_all_is_a_rename_and_closes_with_a_note(self):
+        """A job renamed between the failure and the recovery (the RC
+        pipeline's "Today mode" jobs became "Next mode") would otherwise
+        leave an issue nothing can ever close."""
         run_31 = run_like(31, 39600000000)
         github = staging_github(runs=runs_list(run_31, *STAGING_RUNS["workflow_runs"]), open_issues=[issue(4001, body_with([RUN_29["id"], RUN_30["id"]]))])
         github.responses[jobs_path(run_31["id"])] = {"total_count": 1, "jobs": [dict(GREEN_JOBS["jobs"][0])]}
-        outcome, err = reconcile(github)
-        self.assertEqual(outcome, "nothing")
-        self.assertEqual(github.writes, [])
-        self.assertIn("is not in it", err)
+        github.logs[1] = fixture("staging-30-step1.log")
+        self.assertEqual(reconcile(github)[0], "closed")
+        comment = github.writes[0][2]["body"]
+        self.assertIn(f"No job of this run is named `{E2E_STAGE}`", comment)
+        self.assertIn("renamed", comment)
+        self.assertEqual(github.writes[1][2], {"state": "closed"})
+
+    def test_a_green_run_with_a_failed_non_gating_job_still_closes(self):
+        """Staging #26 as the recovery: its rollback leg failed, its eval
+        wait passed. Whether the issue recorded the eval wait or (wrongly)
+        the rollback leg as the stage, the stage ran, and the run is green."""
+        for stage in (EVAL_STAGE, ROLLBACK_LEG):
+            with self.subTest(stage=stage):
+                run_31 = run_like(31, 39600000000)
+                github = staging_github(runs=runs_list(run_31, *STAGING_RUNS["workflow_runs"]), open_issues=[issue(4001, body_with([RUN_29["id"], RUN_30["id"]], stage=stage))])
+                github.responses[jobs_path(run_31["id"])] = STAGING_26_JOBS
+                self.assertEqual(reconcile(github)[0], "closed")
+                self.assertEqual(github.writes[1][2], {"state": "closed"})
+
+    def test_a_red_night_with_the_rollback_leg_and_the_eval_both_failed_names_the_eval(self):
+        github = staging_github()
+        github.responses[jobs_path(RUN_30["id"])] = jobs_with(STAGING_26_JOBS, **{EVAL_STAGE: "failure"})
+        self.assertEqual(reconcile(github)[0], "opened")
+        body = github.writes[1][2]["body"]
+        self.assertEqual(notifier.stamped_stage(body), EVAL_STAGE)
+        self.assertNotIn(f"stage={ROLLBACK_LEG}", body)
 
     def test_a_green_run_closes_an_issue_that_recorded_no_stage(self):
         """No stage on record means nothing to hold the close to."""
@@ -617,6 +674,18 @@ class WorkflowContractTest(unittest.TestCase):
         self.assertIn("scripts/release/notify_release_stage_broken.py", text)
         self.assertIn("GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}", text)
         self.assertTrue((_RELEASE / "notify_release_stage_broken.py").exists())
+
+    def test_every_chat_step_is_best_effort(self):
+        """A Chat fault costs the post, never the reconcile: the auth, the
+        SDK setup and the mint all continue on error, and the reconcile step
+        has no `if:` that could skip it."""
+        document, _ = self._document(NOTIFIER_WORKFLOW)
+        steps = {step.get("id") or step.get("name"): step for step in document["jobs"]["notify"]["steps"]}
+        for step_id in ("auth", "gcloud", "chat_token"):
+            self.assertTrue(steps[step_id].get("continue-on-error"), step_id)
+            self.assertIn("if", steps[step_id], step_id)
+        reconcile_step = steps["Reconcile the release pipelines' issues"]
+        self.assertNotIn("if", reconcile_step)
 
     def test_the_chat_variables_match_the_ci_health_poster(self):
         """One space, one identity: the env names and defaults are the

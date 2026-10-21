@@ -151,12 +151,20 @@ LABEL_EXISTS = 422
 # A run's status while it is queued, running, or being re-run; a run that
 # has said what it has to say is `completed`.
 COMPLETED = "completed"
+# The two issue states the reconciliation reads.
+ISSUE_OPEN = "open"
+ISSUE_CLOSED = "closed"
 # Job and step conclusions. A job cancelled by a timeout or by a sibling's
-# failure is where the reader looks when no job failed outright; a skipped
-# job in a green run is a stage that did not run, which is no recovery.
-JOB_SUCCESS = "success"
+# failure is where the reader looks when no job failed outright. In a green
+# run, a stage that concluded skipped or cancelled did not run, which is no
+# recovery; one that concluded anything else ran, failure included, since a
+# job that fails inside a green run is `continue-on-error` and not the gate
+# (the promotion pipeline's rollback leg is one).
 JOB_STOPPED_CONCLUSIONS = ("cancelled",)
+JOB_NOT_RUN_CONCLUSIONS = ("skipped", "cancelled")
 STEP_FAILED = "failure"
+# A job without a `completed_at` sorts before every job that has one.
+NO_TIME = ""
 # A job of a reusable workflow is listed as `<caller job> / <called job>`,
 # and the same stage is listed under the short name when the call itself
 # never expanded, so a stage is matched on either side of the separator.
@@ -277,11 +285,18 @@ def extract_first_failure(log_text: str, window: tuple | None = None) -> str | N
 
 
 def failing_job(jobs: list) -> dict | None:
-    """The job the run stopped at: the first that failed, else the first that
-    was cancelled, in the order the run lists them."""
-    for job in jobs:
-        if job.get("conclusion") in FAILING_CONCLUSIONS:
-            return job
+    """The job the run stopped at: of the jobs that failed, the one that
+    completed last, else the first that was cancelled in list order.
+
+    Last to complete, not first in the list: a `continue-on-error` job that
+    failed (the promotion pipeline's rollback leg) sits in the list beside
+    the gating stages and fails inside green runs too, while the failure
+    that ends a run is the one that finishes it. Ties and missing times
+    fall back to list order.
+    """
+    failed = [(job.get("completed_at") or NO_TIME, -index, job) for index, job in enumerate(jobs) if job.get("conclusion") in FAILING_CONCLUSIONS]
+    if failed:
+        return max(failed, key=lambda item: item[:2])[2]
     for job in jobs:
         if job.get("conclusion") in JOB_STOPPED_CONCLUSIONS:
             return job
@@ -464,9 +479,12 @@ def render_still_failing(details: dict) -> str:
     )
 
 
-def render_recovered(details: dict) -> str:
+def render_recovered(details: dict, note: str | None = None) -> str:
     run = details["run"]
-    return f"{run_link(run)} ({run_when(run)}) passed on candidate {candidate_text(details['candidate'])}. Closing."
+    text = f"{run_link(run)} ({run_when(run)}) passed on candidate {candidate_text(details['candidate'])}."
+    if note:
+        text += f" {note}"
+    return text + " Closing."
 
 
 def render_chat_broken(workflow_name: str, details: dict, number: int) -> str:
@@ -502,7 +520,14 @@ def render_chat_recovered(workflow_name: str, details: dict, number: int) -> str
 class GitHubAPI(FlakyGitHubAPI):
     """The flaky-check reporter's client (the retrying base client plus the
     two-hop job-log read and `run`), with the reads and writes this script
-    makes. Writes are printed and skipped under `dry_run`."""
+    makes. Writes are printed and skipped under `dry_run`.
+
+    The five issue methods below are the shape of the flaky-check and
+    broken-main reporters' own, which read their module's `LABEL`, label
+    colour and description and marker function directly; making those read
+    an attribute would rewrite all five in each sibling, so this client
+    carries its own copies with this label and marker.
+    """
 
     def __init__(self, repo: str, token: str, dry_run: bool = False, **kwargs):
         super().__init__(repo, token, user_agent=USER_AGENT, **kwargs)
@@ -579,27 +604,34 @@ def post(sender: Sender, text: str, dry_run: bool) -> None:
         log("posted to chat")
 
 
-def recovery_jobs(api: GitHubAPI, name: str, green: dict, issue: dict) -> list | None:
-    """The green run's jobs when it is the recovery the issue is waiting for,
-    else None with the reason logged: it must not be older than the newest
-    failing run the issue records, and the stage that failed must have run
-    and passed in it, not been skipped."""
+def recovery_jobs(api: GitHubAPI, name: str, green: dict, issue: dict) -> tuple:
+    """`(jobs, note)` when the green run is the recovery the issue is waiting
+    for, else `(None, None)` with the reason logged.
+
+    It must not be older than the newest failing run the issue records, and
+    the stage that failed must have run in it: a stage that concluded
+    skipped or cancelled holds the close, a stage that concluded anything
+    else ran (a failure inside a green run is a non-gating job), and a stage
+    no job of the green run answers to was renamed between the failure and
+    the recovery, which is a close with the note saying so rather than an
+    issue nothing can ever close.
+    """
     stamped = stamped_runs(issue.get("body"))
     if stamped and green["id"] < max(stamped):
         log(f"{name}: green run #{green['run_number']} is older than the failing run #{issue['number']} records; nothing")
-        return None
+        return None, None
     jobs = api.jobs(green["id"])
     stage = stamped_stage(issue.get("body"))
-    if stage:
-        job = job_named(jobs, stage)
-        conclusion = job.get("conclusion") if job else None
-        if conclusion != JOB_SUCCESS:
-            log(
-                f"{name}: run #{green['run_number']} passed but stage {stage!r} "
-                f"{'concluded ' + conclusion if conclusion else 'is not in it'}; #{issue['number']} stays open"
-            )
-            return None
-    return jobs
+    if not stage:
+        return jobs, None
+    job = job_named(jobs, stage)
+    if job is None:
+        return jobs, f"No job of this run is named `{stage}`, the stage that failed; the workflow has renamed it since."
+    conclusion = job.get("conclusion")
+    if conclusion in JOB_NOT_RUN_CONCLUSIONS or conclusion is None:
+        log(f"{name}: run #{green['run_number']} passed but stage {stage!r} concluded {conclusion}; #{issue['number']} stays open")
+        return None, None
+    return jobs, None
 
 
 def reconcile(api: GitHubAPI, workflow: dict, sender: Sender, dry_run: bool) -> str:
@@ -616,19 +648,19 @@ def reconcile(api: GitHubAPI, workflow: dict, sender: Sender, dry_run: bool) -> 
         log(f"{name}: no completed run has said anything yet")
         return "nothing"
     decision = decide(current, reporting_history(runs, current))
-    open_issues = api.issues_for_workflow(workflow_id, "open")
+    open_issues = api.issues_for_workflow(workflow_id, ISSUE_OPEN)
     issue = open_issues[0] if open_issues else None
 
     if decision["kind"] == "green":
         if issue is None:
             log(f"{name}: green (run #{current['run_number']}), no issue open")
             return "nothing"
-        jobs = recovery_jobs(api, name, current, issue)
+        jobs, note = recovery_jobs(api, name, current, issue)
         if jobs is None:
             return "nothing"
         details = run_details(api, current, with_failure=False, jobs=jobs)
-        api.comment(issue["number"], render_recovered(details))
-        api.update_issue(issue["number"], state="closed")
+        api.comment(issue["number"], render_recovered(details, note))
+        api.update_issue(issue["number"], state=ISSUE_CLOSED)
         log(f"{name}: run #{current['run_number']} passed; closed #{issue['number']}")
         post(sender, render_chat_recovered(name, details, issue["number"]), dry_run)
         return "closed"
@@ -644,7 +676,7 @@ def reconcile(api: GitHubAPI, workflow: dict, sender: Sender, dry_run: bool) -> 
         log(f"{name}: run #{current['run_number']} failed again; updated #{issue['number']}")
         return "updated"
 
-    for closed in api.issues_for_workflow(workflow_id, "closed"):
+    for closed in api.issues_for_workflow(workflow_id, ISSUE_CLOSED):
         if current["id"] in stamped_runs(closed.get("body")):
             log(f"{name}: run #{current['run_number']} is recorded on closed #{closed['number']}; someone dealt with it")
             return "nothing"

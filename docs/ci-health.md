@@ -1103,6 +1103,6 @@ The release-stage notifier (`.github/workflows/release-stage-broken-notify.yml`,
 the same app identity and variables when it opens or closes a
 `ci:release-stage-broken` issue for a failed run of a release pipeline
 ([`scripts/release/README.md`](../scripts/release/README.md), "Pipeline Cadence &
-Execution Flow", the "When a stage fails" bullet). It mints the app token only;
-the webhook alternative does not apply to it. `CI_HEALTH_MUTE=true` silences it
-too, and its issues still file.
+Execution Flow", the "When a stage fails" bullet). The workflow mints the app
+token and reads no webhook URL. `CI_HEALTH_MUTE=true` silences it too, and its
+issues still file.
