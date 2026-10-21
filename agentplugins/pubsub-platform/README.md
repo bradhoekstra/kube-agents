@@ -40,10 +40,11 @@ the credential broker's Pub/Sub relay; the site's
 [credential isolation](https://gke-labs.github.io/kube-agents/reference/credential-isolation/) page
 owns that boundary. What this plugin needs from an install: the operator sets `PUBSUB_RELAY_URL` on
 the gateway and the subscription set on the broker once at least one route names a subscription
-the operator can qualify (a full `projects/<project>/subscriptions/<name>` path, or a short name
-on an agent whose `spec.harness.projectId` is set). The install's identity needs
-`roles/pubsub.subscriber` and `roles/pubsub.viewer` on each subscription; the root installer and
-the stockout investigator's own installer grant both.
+the operator can qualify (a full `projects/<project>/subscriptions/<name>` path, or a short
+subscription or topic name on an agent whose `spec.harness.projectId` is set). The install's
+identity needs `roles/pubsub.subscriber` on each subscription to pull, and `roles/pubsub.viewer`
+for the read the adapter makes on connect, without which every connect logs a 403 on that read
+while pulls still work; the root installer and the stockout investigator's own installer grant both.
 
 ## Routes
 

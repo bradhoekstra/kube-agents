@@ -8,11 +8,6 @@ It also supports response routing, allowing the agent to post responses back to 
 
 The following diagram illustrates how the Pub/Sub plugin receives messages, processes them through the adapter, and routes agent responses back:
 
-![Pub/Sub Adapter Architecture & Message Flow](./pubsub-architecture.svg)
-
-<details>
-<summary>View Diagram Source</summary>
-
 ```mermaid
 graph TD
     A[GCP / Stack Logs / External Services] -->|Log Event / Message| B[Pub/Sub Topic]
@@ -33,11 +28,9 @@ graph TD
     J -->|cross-platform| L[Route response to target adapter e.g. GChat/Discord]
 ```
 
-</details>
-
 ## Key Features
 
-1. **Credential-free pulls**: The adapter runs in the gateway Pod, which holds no Google credential. It reads its subscriptions through the credential broker's Pub/Sub relay (`PUBSUB_RELAY_URL`), which the operator sets once at least one route names a subscription it can qualify, and the broker pulls on the install's identity, confined to those subscriptions. A subscription outside that set is refused by the broker and the adapter logs the refusal with its rule. On connect the adapter reads each subscription through the relay and logs clearly if it is missing; the read is announced before it runs and bounded at 30 seconds (`PREFLIGHT_RPC_TIMEOUT_SECONDS` in `adapter.py`), and a read that times out or errors logs a warning and startup continues. Topics and log sinks are not checked: the broker relays no topic or Logging read. The checked-in diagram above predates the relay; its source below shows the broker hop.
+1. **Credential-free pulls**: The adapter runs in the gateway Pod, which holds no Google credential. It reads its subscriptions through the credential broker's Pub/Sub relay (`PUBSUB_RELAY_URL`), which the operator sets once at least one route names a subscription it can qualify, and the broker pulls on the install's identity, confined to those subscriptions. A subscription outside that set is refused by the broker and the adapter logs the refusal with its rule. On connect the adapter reads each subscription through the relay and logs clearly if it is missing; the read is announced before it runs and bounded at 30 seconds (`PREFLIGHT_RPC_TIMEOUT_SECONDS` in `adapter.py`), and a read that times out or errors logs a warning and startup continues. Topics and log sinks are not checked: the broker relays no topic or Logging read.
 2. **Programmatic Payload Validation**: Allows setups to provide custom Python code (`validation_code`) to programmatically validate message payloads before spawning agent prompts.
 3. **Dynamic Prompt Rendering**: Supports template syntax (e.g. `{incident.summary}`) to format raw JSON message payloads into readable, context-rich prompts.
 4. **Skill Wrapping**: Directly routes incoming alerts to specific agent skills by mapping route paths to skill names (e.g. wrapping stockout alerts with `/gke-stockout-investigator`).
