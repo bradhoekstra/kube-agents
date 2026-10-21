@@ -57,8 +57,11 @@ PULL_BACKOFF_INITIAL_SECONDS = 2
 PULL_BACKOFF_MAX_SECONDS = 30
 # How long disconnect() waits for each pull thread to notice the stop flag.
 PULL_THREAD_JOIN_SECONDS = 5
-# The relay answer for a subscription that does not exist, as Pub/Sub gives it.
+# The relay answer for a subscription that does not exist, as Pub/Sub gives it,
+# and the status string Pub/Sub's error body carries then; the broker's own 404
+# for a route it does not serve carries no such body.
 HTTP_NOT_FOUND = 404
+GOOGLE_NOT_FOUND_STATUS = "NOT_FOUND"
 
 # Hermes asks every platform plugin whether its dependencies are present. This one
 # speaks HTTP to the broker with the standard library and needs nothing installed.
@@ -110,8 +113,21 @@ class RelayRefused(Exception):
         self.status = status
         self.code = str(fields.get("code") or "")
         self.rule = str(fields.get("rule") or "")
+        error = fields.get("error")
+        self._error_status = str(error.get("status") or "") if isinstance(error, dict) else ""
         detail = str(fields.get("error") or fields.get("message") or "")
         super().__init__(f"status={status} code={self.code or 'none'} rule={self.rule or 'none'} {detail}".rstrip())
+
+    @property
+    def upstream_not_found(self) -> bool:
+        """True for Pub/Sub's own NOT_FOUND, relayed; False for a 404 the broker answered itself.
+
+        The broker answers ``{"status": "not_found"}`` for a route it does not
+        serve, which a broker image older than this adapter does; Pub/Sub's
+        answer carries ``error.status == "NOT_FOUND"``. The two want different
+        operators: one creates a subscription, the other upgrades the broker.
+        """
+        return self.status == HTTP_NOT_FOUND and self._error_status == GOOGLE_NOT_FOUND_STATUS
 
 
 class PubsubRelay:
@@ -304,10 +320,16 @@ class PubSubAdapter(BasePlatformAdapter):
         try:
             self._relay.get_subscription(sub_path, timeout=PREFLIGHT_RPC_TIMEOUT_SECONDS)
         except RelayRefused as exc:
-            if exc.status == HTTP_NOT_FOUND:
+            if exc.upstream_not_found:
                 logger.warning(
                     "PubSub: Subscription '%s' is NOT present in GCP (%.1fs). Please ensure it is created prior to running.",
                     sub_path, time.monotonic() - started,
+                )
+            elif exc.status == HTTP_NOT_FOUND:
+                logger.warning(
+                    "PubSub: the credential broker has no %s route (%.1fs): the broker image predates this adapter;"
+                    " upgrade the broker. Continuing startup; pulls retry with back-off.",
+                    RELAY_PREFIX, time.monotonic() - started,
                 )
             else:
                 logger.warning(
@@ -450,6 +472,14 @@ class PubSubAdapter(BasePlatformAdapter):
             )
             self._set_fatal_error("relay_not_configured", f"{PUBSUB_RELAY_URL_ENV} not set", retryable=False)
             return False
+        # A reconnect that skipped disconnect() still ends the previous generation
+        # first: its event is set and its threads are waited for, so no two
+        # generations pull one route side by side.
+        if self._pull_threads:
+            self._stop_pulling.set()
+            previous, self._pull_threads = self._pull_threads, []
+            for thread in previous:
+                await asyncio.to_thread(thread.join, PULL_THREAD_JOIN_SECONDS)
         self._relay = PubsubRelay(relay_url, os.environ.get(CREDENTIAL_PROXY_TOKEN_FILE_ENV, "").strip())
         # A new event per generation; the previous one stays set for any thread
         # still parked in a pull from before disconnect().

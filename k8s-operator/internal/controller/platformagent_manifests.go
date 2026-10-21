@@ -599,7 +599,7 @@ func renderManagedEnv(agent *agentv1alpha1.PlatformAgent) string {
 	return renderManagedEnvForPlugins(agent, nil)
 }
 
-// renderManagedEnv pins the platform settings that decide whether the agent can reach
+// renderManagedEnvForPlugins pins the platform settings that decide whether the agent can reach
 // chat at all, for the ones that have no config.yaml equivalent.
 //
 // The config layer alone would not hold them. load_gateway_config applies the managed

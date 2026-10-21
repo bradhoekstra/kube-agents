@@ -350,7 +350,7 @@ func buildCredentialProxyDeployment(agent *agentv1alpha1.PlatformAgent, policyHa
 	return buildCredentialProxyDeploymentForPlugins(agent, policyHash, nil)
 }
 
-// buildCredentialProxyDeployment renders the standalone proxy pod.
+// buildCredentialProxyDeploymentForPlugins renders the standalone proxy pod.
 //
 // Recreate, not RollingUpdate. The Google Chat relay pulls from a Pub/Sub
 // subscription when the gateway fetches over this Service and keeps each
@@ -445,7 +445,7 @@ func buildCredentialProxyContainer(agent *agentv1alpha1.PlatformAgent) corev1.Co
 	return buildCredentialProxyContainerForPlugins(agent, nil)
 }
 
-// buildCredentialProxyContainer is the credential half of the old sidecar: Envoy
+// buildCredentialProxyContainerForPlugins is the credential half of the old sidecar: Envoy
 // and the credential runtime, with the chat relays the runtime hosts. The event
 // watcher and the agent API authenticator stay in the gateway pod, because both
 // talk to processes on that pod's loopback — see buildAgentAPIAuthSidecar.

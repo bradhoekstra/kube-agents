@@ -49,6 +49,7 @@ class FakeBroker:
         self.calls = []
         self.pulls = []
         self.get_status = 200
+        self.get_body = None
         self.get_delay = 0.0
         self.idle_delay = 0.05
         self.lock = threading.Lock()
@@ -76,7 +77,7 @@ class FakeBroker:
                 if broker.get_status == 200:
                     self._answer(200, {"name": SUB_PATH})
                 else:
-                    self._answer(broker.get_status, {"error": {"code": broker.get_status, "status": "NOT_FOUND"}})
+                    self._answer(broker.get_status, broker.get_body or {"error": {"code": broker.get_status, "status": "NOT_FOUND"}})
 
             def do_POST(self):  # noqa: N802
                 length = int(self.headers.get("Content-Length", "0"))
@@ -289,6 +290,15 @@ class PreflightTest(RelayTestCase):
         self.assertIn(f"Subscription '{SUB_PATH}' is NOT present in GCP", lines[-1])
         self.assertTrue(lines[-1].startswith("WARNING"))
 
+    def test_a_broker_without_the_route_is_named_as_such_not_as_a_missing_subscription(self):
+        """The broker's own 404 carries {"status": "not_found"}; Pub/Sub's carries error.status."""
+        self.broker.get_status = 404
+        self.broker.get_body = {"status": "not_found"}
+        ok, lines = self.check()
+        self.assertFalse(ok)
+        self.assertIn("the credential broker has no /v1/pubsub/gcp/ route", lines[-1])
+        self.assertNotIn("NOT present in GCP", lines[-1])
+
     def test_a_stalled_read_is_bounded_warned_and_survived(self):
         self.broker.get_delay = 0.5
         with mock.patch.object(adapter_mod, "PREFLIGHT_RPC_TIMEOUT_SECONDS", 0.1):
@@ -305,6 +315,25 @@ class PreflightTest(RelayTestCase):
         self.assertFalse(ok)
         self.assertIn("Could not reach the credential broker's relay", lines[-1])
         self.assertNotIn("Timed out", lines[-1])
+
+    def test_a_reconnect_without_a_disconnect_ends_the_previous_generation_first(self):
+        self.adapter._relay = None
+
+        async def session():
+            await self.adapter.connect()
+            first = list(self.adapter._pull_threads)
+            await self.adapter.connect(is_reconnect=True)
+            second = list(self.adapter._pull_threads)
+            await asyncio.sleep(0.3)
+            await self.adapter.disconnect()
+            return first, second
+
+        first, second = asyncio.run(session())
+        self.assertEqual((len(first), len(second)), (1, 1))
+        self.assertIsNot(first[0], second[0])
+        for thread in first + second:
+            thread.join(2)
+            self.assertFalse(thread.is_alive(), f"{thread.name} outlived the reconnect")
 
     def test_a_reconnect_does_not_leave_the_previous_pull_thread_running(self):
         """The old thread sees its own generation's stop event, not the new one's."""

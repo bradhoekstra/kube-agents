@@ -286,10 +286,6 @@ class K8sTest(unittest.TestCase):
                 self.assertRegex(decision.rule_id, r"^[a-z0-9]+(\.[a-z0-9-]+)+$")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 ALERTS = "projects/kagents-dev/subscriptions/gke-stockout-alerts-sub"
 OTHER = "projects/kagents-dev/subscriptions/second-route-sub"
 PLATFORM_SET = frozenset({ALERTS, OTHER})
@@ -355,3 +351,7 @@ class PlatformPubsubTest(unittest.TestCase):
         self.assertEqual(decision.rule_id, w.RULE_GCP_SUBSCRIPTION)
         self.assertEqual(decision.message, "The watcher relay reaches only the drift detector's configured subscription.")
         self.assertEqual(w.evaluate_gcp("GET", PUBSUB, "v1/" + SUB, b"", SUB).rule_id, "gcp.watcher.subscription-get")
+
+
+if __name__ == "__main__":
+    unittest.main()
