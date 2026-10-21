@@ -177,8 +177,13 @@
 {{- $traceLogPath := .Values.litellm.traceLogPath | default "/tmp/litellm_traces.jsonl" }}
 {{- $traceLogSource := "" }}
 {{- if $traceLogEnabled }}
-{{- if or (not (kindIs "string" $traceLogPath)) (not (regexMatch `^/tmp/[^\x00/]+(/[^\x00/]+)*$` $traceLogPath)) }}
-{{- fail (printf "litellm.traceLogPath %q must be a file path under /tmp/ (the gateway container runs with readOnlyRootFilesystem: true and only /tmp is writable)" $traceLogPath) }}
+{{- /*
+  Normalise, then compare: a path that clean rewrites (a `.` or `..`
+  component, a doubled or trailing slash) is refused as given, so no accepted
+  value resolves outside /tmp/ once the kernel resolves it.
+*/}}
+{{- if or (not (kindIs "string" $traceLogPath)) (ne (clean $traceLogPath) $traceLogPath) (not (hasPrefix "/tmp/" $traceLogPath)) (not (regexMatch `^/tmp/[^\x00/]+(/[^\x00/]+)*$` $traceLogPath)) }}
+{{- fail (printf "litellm.traceLogPath %q must be a normalised file path under /tmp/, with no . or .. component and no doubled or trailing slash (the gateway container runs with readOnlyRootFilesystem: true and only /tmp is writable)" $traceLogPath) }}
 {{- end }}
 {{- if empty $redactorSource }}
 {{- $redactorSource = .Files.Get "files/redactor.py" }}

@@ -503,13 +503,17 @@ litellm:
   # appended as one JSONL record to traceLogPath. IP literals are pseudonymised
   # by default; with redaction.enabled they follow redaction.ip instead ("off"
   # writes them verbatim, mask masks them, allowCidrs addresses pass through).
-  # The file rotates at 5 MiB
-  # across 3 backups (.1-.3, 20 MiB max total) under an flock on <path>.lock.
-  # Pass-through only: does not alter live requests or responses, and logs a
-  # once-per-path warning to stderr on I/O failure rather than breaking inference.
+  # The file rotates at 5 MiB across 3 backups (.1-.3) under an flock on
+  # <path>.lock; a record over 1 MiB keeps its metadata and drops messages,
+  # tools and response behind a truncated marker, so the trail holds at most
+  # 20 MiB. Each record is written in a worker thread, off the proxy's event
+  # loop. Pass-through only: does not alter live requests or responses, and
+  # logs a once-per-path warning to stderr on I/O failure rather than breaking
+  # inference.
   traceLogEnabled: false
-  # File path under /tmp/ where the trajectory log is written (the gateway
-  # container runs with readOnlyRootFilesystem: true and only /tmp is writable).
+  # Normalised file path under /tmp/ where the trajectory log is written: no
+  # . or .. component, no doubled or trailing slash (the gateway container runs
+  # with readOnlyRootFilesystem: true and only /tmp is writable).
   traceLogPath: "/tmp/litellm_traces.jsonl"
 
 # The Hindsight memory store: the API the agents call for long-term memory,

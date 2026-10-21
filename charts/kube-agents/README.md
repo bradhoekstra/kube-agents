@@ -284,8 +284,9 @@ the gateway: the ConfigMap gains `llm_trace_logger.py` and the shared
 `/app/redactor.py` beside `config.yaml`, registers
 `llm_trace_logger.proxy_handler_instance` under `litellm_settings.callbacks`, and sets
 `LITELLM_TRACE_LOG_PATH` (`litellm.traceLogPath`, default
-`"/tmp/litellm_traces.jsonl"`, which must be a file path under `/tmp/` because the
-gateway runs with `readOnlyRootFilesystem: true`) plus an optional `SESSION_KV_SALT`
+`"/tmp/litellm_traces.jsonl"`, which must be a normalised file path under `/tmp/`,
+with no `.` or `..` component, because the gateway runs with
+`readOnlyRootFilesystem: true`) plus an optional `SESSION_KV_SALT`
 from the credentials Secret. Every model request and response (model alias, custom
 LLM provider, messages, tool definitions, assistant responses, reasoning content,
 token usage, and latency) is redacted through `AuditRedactor` (credentials, Secret
@@ -294,8 +295,11 @@ data blocks, sensitive keys, emails, and IP literals, plus operator rules when
 the path. IP literals are pseudonymised by default; with `litellm.redaction.enabled`
 set, they follow `litellm.redaction.ip` instead: `"off"` writes them verbatim,
 `mask` masks them, and addresses in `allowCidrs` pass through. The trace file
-rotates at `5 MiB` across `3` backups (`.1`–`.3`, `20 MiB`
-total cap on the pod's `/tmp` `emptyDir`) under an `flock` on `<path>.lock`.
+rotates at `5 MiB` across `3` backups (`.1`–`.3`) under an `flock` on `<path>.lock`;
+a record over `1 MiB` keeps its metadata and drops `messages`, `tools` and
+`response` behind a `truncated` marker, so the trail on the pod's `/tmp` `emptyDir`
+holds at most `20 MiB`. Each record is serialised, redacted and written in a
+worker thread, off the proxy's event loop.
 Pass-through only: the logger never mutates live request or response payloads, and
 I/O failures log a once-per-path warning to stderr so inference never fails. Off by
 default, and the rendered default ConfigMap and rollout checksum are unchanged while

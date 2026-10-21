@@ -13,8 +13,12 @@ IP literals are pseudonymised by default; with that rule file they follow its
 `ip` block (`litellm.redaction.ip`) instead: `off` writes them verbatim, `mask`
 masks them, and addresses in `allowCidrs` pass through.
 The trace file rotates at `TRACE_FILE_MAX_BYTES` (5 MiB) across
-`TRACE_FILE_BACKUP_COUNT` (3) backups under an `flock` on `<path>.lock`,
-bounding disk use on the gateway pod's `/tmp` `emptyDir` to 20 MiB.
+`TRACE_FILE_BACKUP_COUNT` (3) backups under an `flock` on `<path>.lock`. A
+record over `TRACE_RECORD_MAX_BYTES` (1 MiB) keeps its metadata and drops
+`messages`, `tools` and `response` behind a `truncated` marker, so no file
+grows past its cap and the trail on the gateway pod's `/tmp` `emptyDir` holds
+at most 20 MiB. Each record is serialised, redacted and written in a worker
+thread (`asyncio.to_thread`), off the proxy's event loop.
 
 Designed to be registered in `litellm_settings.callbacks` alongside
 `litellm_thinking_replay_callback.proxy_handler_instance`. Never mutates the
@@ -24,6 +28,7 @@ stderr if a write fails rather than breaking inference.
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import fcntl
 import importlib.util
@@ -55,11 +60,23 @@ TRACE_LOG_PATH = os.environ.get(TRACE_LOG_PATH_ENV, DEFAULT_TRACE_LOG_PATH)
 REDACTION_CONFIG_PATH_ENV = "KUBE_AGENTS_REDACTION_CONFIG"
 REDACTOR_FILE_NAME = "redactor.py"
 REDACTOR_MODULE_NAME = "kube_agents_litellm_trace_redactor"
+# The name litellm_redaction_callback.py loads redactor.py under. That hook
+# precedes this one in litellm_settings.callbacks, so when both are on its
+# module is already in sys.modules and is reused here: one module, one
+# pseudonym salt, so a value the hook rewrote in the request and the same
+# value in the response carry the same token in one record.
+REDACTION_HOOK_MODULE_NAME = "kube_agents_litellm_redactor"
 
 # Match agents/chat/defaults/plugins/common/audit_sink.py's 5 MiB x 3 rotation
 # cap so the gateway pod's /tmp emptyDir holds at most 20 MiB of trace records.
 TRACE_FILE_MAX_BYTES = 5 * 1024 * 1024
 TRACE_FILE_BACKUP_COUNT = 3
+# One record never exceeds this: past it the payload fields are dropped and a
+# marker says so, which is what keeps every file under TRACE_FILE_MAX_BYTES
+# (rotation only decides when to rename; it cannot shrink a record).
+TRACE_RECORD_MAX_BYTES = 1 * 1024 * 1024
+TRACE_RECORD_PAYLOAD_FIELDS = ("messages", "tools", "response")
+TRUNCATED_FIELD = "truncated"
 TRACE_FILE_MODE = 0o600
 TRACE_LOCK_FILE_SUFFIX = ".lock"
 LOCK_WAIT_SECONDS = 1.5
@@ -85,7 +102,11 @@ def _configure_logger() -> None:
 
 
 def _load_redactor():
-    """Import the sibling redactor module by path, matching litellm_redaction_callback."""
+    """Reuse the redaction hook's redactor module when it is loaded; else import
+    the sibling file by path, as that hook does."""
+    existing = sys.modules.get(REDACTION_HOOK_MODULE_NAME)
+    if existing is not None and hasattr(existing, "AuditRedactor"):
+        return existing
     path = Path(__file__).resolve().with_name(REDACTOR_FILE_NAME)
     spec = importlib.util.spec_from_file_location(REDACTOR_MODULE_NAME, path)
     if spec is None or spec.loader is None:
@@ -138,6 +159,14 @@ def _safe_serialize(obj: Any) -> Any:
         except Exception:
             pass
     return str(obj)
+
+
+def _truncate_record(record: dict, size: int) -> dict:
+    """The record's metadata with its payload fields dropped and a marker that
+    names them and the size the whole record had."""
+    slim = {k: v for k, v in record.items() if k not in TRACE_RECORD_PAYLOAD_FIELDS}
+    slim[TRUNCATED_FIELD] = {"fields": list(TRACE_RECORD_PAYLOAD_FIELDS), "bytes": size}
+    return slim
 
 
 def _lock_file_path(path: Path) -> Path:
@@ -224,27 +253,36 @@ class PassThroughTrajectoryLogger(CustomLogger):
         self,
         max_bytes: int = TRACE_FILE_MAX_BYTES,
         backup_count: int = TRACE_FILE_BACKUP_COUNT,
+        record_max_bytes: int = TRACE_RECORD_MAX_BYTES,
     ) -> None:
         super().__init__()
         self.max_bytes = max_bytes
         self.backup_count = backup_count
+        self.record_max_bytes = record_max_bytes
 
+    # LiteLLM awaits these hooks on its event loop. Serialising, redacting and
+    # writing a record takes tens to hundreds of milliseconds on an agent-sized
+    # conversation, and the lock wait sleeps, so the whole of it runs in a
+    # worker thread and the loop keeps serving requests and probes meanwhile.
     async def async_log_success_event(
         self, kwargs: dict, response_obj: Any, start_time: Any, end_time: Any
     ) -> None:
-        self._write_record("success", kwargs, response_obj, start_time, end_time, error=None)
+        await asyncio.to_thread(
+            self._write_record, "success", kwargs, response_obj, start_time, end_time, None
+        )
 
     async def async_log_failure_event(
         self, kwargs: dict, response_obj: Any, start_time: Any, end_time: Any
     ) -> None:
         err = kwargs.get("exception") or kwargs.get("traceback_exception")
-        self._write_record(
+        await asyncio.to_thread(
+            self._write_record,
             "failure",
             kwargs,
             response_obj,
             start_time,
             end_time,
-            error=str(err) if err else "unknown",
+            str(err) if err else "unknown",
         )
 
     def _write_record(
@@ -287,6 +325,9 @@ class PassThroughTrajectoryLogger(CustomLogger):
                 "error": AuditRedactor.redact(error, rules) if error is not None else None,
             }
             line = json.dumps(record, ensure_ascii=False)
+            size = len(line.encode(_ENCODING))
+            if size > self.record_max_bytes:
+                line = json.dumps(_truncate_record(record, size), ensure_ascii=False)
             _append_line(
                 line,
                 Path(log_path),

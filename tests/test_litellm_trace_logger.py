@@ -36,7 +36,9 @@ import os
 import pathlib
 import shutil
 import subprocess
+import sys
 import tempfile
+import threading
 import unittest
 
 import yaml
@@ -219,6 +221,14 @@ class TestTraceLoggerChartRender(unittest.TestCase):
             "/var/log/litellm/audit.jsonl",
             "/tmp/",
             "/tmp",
+            # Components clean rewrites: accepted as written they would
+            # resolve outside /tmp or to /tmp itself.
+            "/tmp/../app/traces.jsonl",
+            "/tmp/.",
+            "/tmp/./traces.jsonl",
+            "/tmp/litellm/../traces.jsonl",
+            "/tmp/litellm/",
+            "/tmp//traces.jsonl",
         ):
             with self.subTest(path=bad_path):
                 proc = self._render(
@@ -385,6 +395,73 @@ class TestPassThroughTrajectoryLoggerUnit(unittest.TestCase):
         # Latest record is in the live file
         latest = json.loads(base.read_text(encoding="utf-8").strip())
         self.assertIn("turn-5-", latest["messages"][0]["content"])
+
+    def test_hooks_run_the_write_off_the_event_loop(self):
+        # LiteLLM awaits the hook on its loop: the record must be built and
+        # written in another thread, where no loop is running.
+        seen = {}
+        original = self.mod._append_line
+
+        def recording_append(line, path, **kw):
+            seen["thread"] = threading.get_ident()
+            try:
+                asyncio.get_running_loop()
+                seen["loop_running"] = True
+            except RuntimeError:
+                seen["loop_running"] = False
+            return original(line, path, **kw)
+
+        self.mod._append_line = recording_append
+        try:
+            logger = self.mod.PassThroughTrajectoryLogger()
+            asyncio.run(logger.async_log_success_event({"model": "m", "messages": []}, {}, None, None))
+            asyncio.run(logger.async_log_failure_event({"model": "m", "messages": []}, None, None, None))
+        finally:
+            self.mod._append_line = original
+        self.assertNotEqual(seen["thread"], threading.get_ident())
+        self.assertFalse(seen["loop_running"])
+        lines = pathlib.Path(self.log_path).read_text(encoding="utf-8").strip().splitlines()
+        self.assertEqual([json.loads(l)["status"] for l in lines], ["success", "failure"])
+
+    def test_oversize_record_keeps_metadata_and_drops_payload(self):
+        # Rotation cannot shrink a record, so the record cap is what keeps
+        # every file under max_bytes: an oversize record lands as its metadata
+        # plus a marker, and no file passes the cap.
+        logger = self.mod.PassThroughTrajectoryLogger(max_bytes=600, backup_count=3, record_max_bytes=300)
+        big = {"model": "model-default", "messages": [{"role": "user", "content": "x" * 2000}]}
+        asyncio.run(logger.async_log_success_event(big, {"choices": ["y" * 500]}, None, None))
+        base = pathlib.Path(self.log_path)
+        latest = json.loads(base.read_text(encoding="utf-8").strip())
+        self.assertEqual(latest["model_alias"], "model-default")
+        self.assertEqual(latest["status"], "success")
+        for field in ("messages", "tools", "response"):
+            self.assertNotIn(field, latest)
+        self.assertEqual(latest["truncated"]["fields"], ["messages", "tools", "response"])
+        self.assertGreater(latest["truncated"]["bytes"], 2500)
+        for _ in range(5):
+            asyncio.run(logger.async_log_success_event(big, {}, None, None))
+            asyncio.run(logger.async_log_success_event({"model": "m", "messages": [{"role": "user", "content": "short"}]}, {}, None, None))
+        for candidate in [base] + [base.with_name(f"{base.name}.{i}") for i in range(1, 4)]:
+            if candidate.exists():
+                self.assertLessEqual(candidate.stat().st_size, 600, candidate)
+
+    def test_reuses_the_redaction_hooks_redactor_module(self):
+        # With litellm.redaction.enabled on, the hook has already loaded
+        # redactor.py under its own name; the logger must share that module
+        # (and so its pseudonym salt) rather than execute the file again.
+        name = self.mod.REDACTION_HOOK_MODULE_NAME
+        spec = importlib.util.spec_from_file_location(name, _CHART_FILE.with_name("redactor.py"))
+        hook_module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = hook_module
+        try:
+            spec.loader.exec_module(hook_module)
+            fresh = _load_logger_module()
+            self.assertIs(fresh._redactor, hook_module)
+            self.assertIs(fresh.AuditRedactor, hook_module.AuditRedactor)
+        finally:
+            sys.modules.pop(name, None)
+        alone = _load_logger_module()
+        self.assertIsNot(alone._redactor, hook_module)
 
     def test_nested_trace_log_path_creates_parent_directory(self):
         # The chart admits /tmp/<dir>/<file> (test_custom_trace_log_path), and
