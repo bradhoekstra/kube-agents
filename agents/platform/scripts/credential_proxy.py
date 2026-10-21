@@ -1141,6 +1141,12 @@ ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # them holds the chat token and cannot present this one.
     (watcher_policy.WATCHER_GCP_PREFIX, (CALLER_ROLE_WATCHER,)),
     (watcher_policy.WATCHER_K8S_PREFIX, (CALLER_ROLE_WATCHER,)),
+    # The Pub/Sub platform adapter's four calls, on the subscriptions the
+    # AgentPlugins configure: the gateway's own, so the chat role, which is the
+    # token the Hermes container holds. Its own prefix rather than the
+    # watcher's with a second role: the two are confined to different
+    # subscription sets, and the prefix is what this table keys the role on.
+    (watcher_policy.PLATFORM_PUBSUB_PREFIX, (CALLER_ROLE_CHAT,)),
     ("/v1/github/", (CALLER_ROLE_SHELL,)),
     ("/v1/vcs/", (CALLER_ROLE_SHELL,)),
     ("/v1/workspace/", (CALLER_ROLE_SHELL,)),
@@ -8786,6 +8792,11 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     # one Pub/Sub target the watcher relay reaches. Empty: the detector is off
     # and every Pub/Sub call is refused.
     watcher_subscription: str = ""
+    # The subscriptions the gateway's Pub/Sub platform adapter may reach through
+    # `/v1/pubsub/gcp/`, each `projects/<p>/subscriptions/<s>`, as the operator
+    # rendered them from the AgentPlugin configs. Empty: no plugin configured a
+    # Pub/Sub platform and every call is refused.
+    platform_pubsub_subscriptions: frozenset[str] = frozenset()
     # (project, location, cluster) -> (deadline, host, CA PEM or ""), for the
     # watcher's Kubernetes route. See `_watcher_cluster_endpoint`.
     watcher_endpoints: dict[tuple[str, str, str], tuple[float, str, str]] = {}
@@ -8949,6 +8960,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         if self.path.startswith(watcher_policy.WATCHER_GCP_PREFIX):
             self._handle_watcher_gcp()
             return
+        if self.path.startswith(watcher_policy.PLATFORM_PUBSUB_PREFIX):
+            self._handle_platform_pubsub()
+            return
         if self.path.startswith(watcher_policy.WATCHER_K8S_PREFIX):
             self._handle_watcher_k8s()
             return
@@ -9030,6 +9044,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             return
         if self.path.startswith(watcher_policy.WATCHER_GCP_PREFIX):
             self._handle_watcher_gcp()
+            return
+        if self.path.startswith(watcher_policy.PLATFORM_PUBSUB_PREFIX):
+            self._handle_platform_pubsub()
             return
         if self.path.startswith(watcher_policy.WATCHER_K8S_PREFIX):
             # GET only; reaches the handler so the refusal names its rule.
@@ -9916,10 +9933,47 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         is the table; the forwarding is the Cloud API relay's, with a body for
         the Pub/Sub POSTs, and the status, Content-Type and body pass back.
         """
+        self._relay_google_call(
+            "watcher gcp",
+            watcher_policy.WATCHER_GCP_PREFIX,
+            lambda host, path, body: watcher_policy.evaluate_gcp(
+                self.command, host, path, body, self.watcher_subscription
+            ),
+        )
+
+    def _handle_platform_pubsub(self) -> None:
+        """`/v1/pubsub/gcp/<host>/<path>`: one Pub/Sub call for the gateway's platform adapter.
+
+        The adapter (agentplugins/pubsub-platform) used to pull its
+        subscriptions on the gateway pod's own Workload Identity, which the pod
+        no longer holds. `watcher_policy.evaluate_pubsub` is the table, pinned
+        to `platform_pubsub_subscriptions`; the forwarding is the watcher
+        family's, unchanged.
+        """
+        self._relay_google_call(
+            "platform pubsub",
+            watcher_policy.PLATFORM_PUBSUB_PREFIX,
+            lambda host, path, body: watcher_policy.evaluate_pubsub(
+                self.command, host, path, body, self.platform_pubsub_subscriptions
+            ),
+        )
+
+    def _relay_google_call(
+        self,
+        label: str,
+        prefix: str,
+        decide: Callable[[str, str, bytes], command_policy.Decision],
+    ) -> None:
+        """Forward one `<prefix><host>/<path>` Google call that `decide` allows.
+
+        `label` is the first word of every audit line, naming the family; the
+        caller's role was already checked against ROUTE_ROLES by the time this
+        runs, so `decide` is the second gate, on the target.
+        """
         request_id = str(uuid.uuid4())
         parts = urllib.parse.urlsplit(self.path)
-        host, _, path = parts.path[len(watcher_policy.WATCHER_GCP_PREFIX) :].partition("/")
-        self._log_watcher_request("watcher gcp", request_id, f"{host}/{path}")
+        host, _, path = parts.path[len(prefix) :].partition("/")
+        self._log_watcher_request(label, request_id, f"{host}/{path}")
         body = b""
         if self.command == watcher_policy.METHOD_POST:
             # The two answers /v1/exec and the MCP relay give: 400 for a length
@@ -9927,11 +9981,11 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             try:
                 length = int(self.headers.get("Content-Length", "0"))
             except ValueError:
-                LOGGER.warning("watcher gcp rejected request_id=%s reason=content-length", request_id)
+                LOGGER.warning("%s rejected request_id=%s reason=content-length", label, request_id)
                 self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid content length"})
                 return
             if length < 0 or length > self.max_request_bytes:
-                LOGGER.warning("watcher gcp rejected request_id=%s reason=content-length", request_id)
+                LOGGER.warning("%s rejected request_id=%s reason=content-length", label, request_id)
                 self._json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": "request body too large"})
                 return
             body = self.rfile.read(length)
@@ -9943,12 +9997,12 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             problem = (API_RELAY_BAD_QUERY, "the watcher relay forwards no query keys but alt and prettyPrint")
         if problem is not None:
             code, reason = problem
-            LOGGER.warning("watcher gcp rejected request_id=%s code=%s", request_id, code)
+            LOGGER.warning("%s rejected request_id=%s code=%s", label, request_id, code)
             self._json(HTTPStatus.BAD_REQUEST, {"error": reason, "code": code})
             return
-        decision = watcher_policy.evaluate_gcp(self.command, host, path, body, self.watcher_subscription)
+        decision = decide(host, path, body)
         if not decision.allowed:
-            LOGGER.warning("watcher gcp blocked request_id=%s rule=%s", request_id, decision.rule_id)
+            LOGGER.warning("%s blocked request_id=%s rule=%s", label, request_id, decision.rule_id)
             self._json(
                 HTTPStatus.FORBIDDEN,
                 {
@@ -9965,19 +10019,20 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 {"error": "Cloud API relay disabled", "code": "API_RELAY_DISABLED"},
             )
             return
-        authorization = self._relay_authorization("watcher gcp", request_id)
+        authorization = self._relay_authorization(label, request_id)
         if authorization is None:
             return
         target = f"/{path}?{parts.query}" if parts.query else f"/{path}"
         extra: dict[str, Any] = {}
         if self.command == watcher_policy.METHOD_POST:
             extra = {"body": body, "headers": (("Content-Type", WATCHER_GCP_CONTENT_TYPE),)}
-        upstream = self._relay_fetch("watcher gcp", request_id, host, target, authorization, **extra)
+        upstream = self._relay_fetch(label, request_id, host, target, authorization, **extra)
         if upstream is None:
             return
         if upstream.over_cap or HTTPStatus.MULTIPLE_CHOICES <= upstream.status < HTTPStatus.BAD_REQUEST:
             LOGGER.warning(
-                "watcher gcp upstream refused request_id=%s status=%d over_cap=%s",
+                "%s upstream refused request_id=%s status=%d over_cap=%s",
+                label,
                 request_id,
                 upstream.status,
                 upstream.over_cap,
@@ -9992,7 +10047,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             # Only the fields the watchers read; never masterAuth's client key.
             projected = watcher_policy.project_cluster(upstream.body)
             if projected is None:
-                LOGGER.warning("watcher gcp unparseable cluster request_id=%s", request_id)
+                LOGGER.warning("%s unparseable cluster request_id=%s", label, request_id)
                 self._json(
                     HTTPStatus.BAD_GATEWAY,
                     {"error": "the upstream answer could not be relayed", "code": "UPSTREAM_UNRELAYABLE"},
@@ -10000,7 +10055,8 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 return
             relayed = projected
         LOGGER.info(
-            "watcher gcp forwarded request_id=%s rule=%s status=%d bytes=%d",
+            "%s forwarded request_id=%s rule=%s status=%d bytes=%d",
+            label,
             request_id,
             decision.rule_id,
             upstream.status,
@@ -11200,6 +11256,38 @@ def chat_relay_subscriptions(project_id: str) -> tuple[str, str]:
     return chat_subscription, a2a_subscription
 
 
+PLATFORM_PUBSUB_SUBSCRIPTIONS_ENV = "PLATFORM_PUBSUB_SUBSCRIPTIONS"
+# One fully qualified subscription, the shape watcher_policy matches on the
+# wire; an entry that is not one would never match a call and would read as a
+# configured subscription that silently refuses everything.
+_QUALIFIED_SUBSCRIPTION = re.compile(
+    rf"projects/{watcher_policy.PUBSUB_PROJECT}/subscriptions/{watcher_policy.SUBSCRIPTION}"
+)
+
+
+def platform_pubsub_subscriptions() -> frozenset[str]:
+    """The subscriptions the platform Pub/Sub relay may reach, from the environment.
+
+    `PLATFORM_PUBSUB_SUBSCRIPTIONS` is a comma-separated list of
+    `projects/<p>/subscriptions/<s>`, rendered by the operator from the
+    AgentPlugin configs; unset or empty means no Pub/Sub platform is configured
+    and the relay refuses every call. An entry of any other shape refuses the
+    boot: it could only be a rendering bug, and a broker that started with it
+    would refuse the adapter's every pull while the variable read as set.
+    """
+    raw = os.getenv(PLATFORM_PUBSUB_SUBSCRIPTIONS_ENV, "")
+    entries = [entry.strip() for entry in raw.split(",")]
+    subscriptions = frozenset(entry for entry in entries if entry)
+    malformed = sorted(entry for entry in subscriptions if not _QUALIFIED_SUBSCRIPTION.fullmatch(entry))
+    if malformed:
+        raise RuntimeError(
+            f"{PLATFORM_PUBSUB_SUBSCRIPTIONS_ENV} holds {len(malformed)} entr"
+            f"{'y' if len(malformed) == 1 else 'ies'} that is not a "
+            "projects/<project>/subscriptions/<name> path"
+        )
+    return subscriptions
+
+
 def serve(args: argparse.Namespace) -> None:
     role = resolve_role()
     if role == "api-proxy":
@@ -11271,6 +11359,12 @@ def serve(args: argparse.Namespace) -> None:
     CredentialProxyHandler.api_relay = GoogleApiRelay()
     LOGGER.info("Cloud API relay enabled routes=%d", len(api_policy.API_READ_ROUTES))
     CredentialProxyHandler.watcher_subscription = os.getenv("WATCHER_PUBSUB_SUBSCRIPTION", "").strip()
+    CredentialProxyHandler.platform_pubsub_subscriptions = platform_pubsub_subscriptions()
+    if CredentialProxyHandler.platform_pubsub_subscriptions:
+        LOGGER.info(
+            "platform Pub/Sub relay enabled subscriptions=%d",
+            len(CredentialProxyHandler.platform_pubsub_subscriptions),
+        )
     CredentialProxyHandler.slack_max_request_bytes = int(
         os.getenv("SLACK_RELAY_MAX_REQUEST_BYTES", str(28 * 1024 * 1024))
     )
