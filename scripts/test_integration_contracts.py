@@ -78,9 +78,9 @@ RELEASE_STAGE_WATCHED_WORKFLOWS = (
 # substrings have to select, so a rename of any of them reds the test.
 RELEASE_STAGE_COMPENSATION_JOBS = (
     "Step 5 - Tear Down RC Environment",
-    "Next mode (non-gating) - Step 6 - Provision RC Environment",
-    "Next mode (non-gating) - Step 7 - Run E2E Tests",
-    "Next mode (non-gating) - Step 8 - Tear Down RC Environment",
+    "Today mode (non-gating) - Step 6 - Provision RC Environment",
+    "Today mode (non-gating) - Step 7 - Run E2E Tests",
+    "Today mode (non-gating) - Step 8 - Tear Down RC Environment",
     "Step 3b - Roll Back to the Previous GA and Forward Again",
     "Step 5b - Withdraw an Unsettled Nomination",
     "Step 7 - Tear Down Nightly Environment",
