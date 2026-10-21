@@ -141,15 +141,19 @@ jobs:
       # the logs back from the API rather than trusting any input for them.
       # `DRY_RUN` is the dispatch's boolean, which GitHub renders as the
       # string "true"; the schedule has no inputs and always writes.
-      # `RELEASE_STAGE_CHAT_EXPECTED` repeats the mint's condition: when it
-      # is true and the token is empty or the post fails, the script
-      # annotates the job with a warning, since this workflow is the only
-      # place a persistent mint failure would show; the issue files either
-      # way.
+      # `RELEASE_STAGE_ANNOTATE` turns a newest run stuck queued or running
+      # past the script's ceiling into a warning annotation on this job (the
+      # sweep is silent for that workflow until it completes); the script's
+      # unit tests run without it. `RELEASE_STAGE_CHAT_EXPECTED` repeats the
+      # mint's condition: when it is true and the token is empty or the post
+      # fails, the script annotates the same way, since this workflow is
+      # the only place a persistent mint failure would show; the issue files
+      # either way.
       - name: Reconcile the release pipelines' issues
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CI_HEALTH_CHAT_TOKEN: ${{ steps.chat_token.outputs.token }}
+          RELEASE_STAGE_ANNOTATE: "true"
           RELEASE_STAGE_CHAT_EXPECTED: ${{ github.ref == 'refs/heads/main' && env.CI_HEALTH_MUTE != 'true' && inputs.dry_run != true }}
           DRY_RUN: ${{ inputs.dry_run }}
           RUN_ID: ${{ inputs.run_id }}

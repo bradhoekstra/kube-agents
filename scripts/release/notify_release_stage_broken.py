@@ -87,6 +87,7 @@ import os
 import re
 import sys
 import urllib.parse
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # The shared helpers live one directory up: the broken-main notifier's
@@ -180,13 +181,25 @@ NO_TIME = ""
 # the workflow files, so a rename of those jobs reds the test.
 COMPENSATION_JOB_MARKERS = ("(non-gating)", "Roll Back", "Withdraw", "Tear Down")
 
-# Set by the workflow when the Chat token was meant to be minted (a write
-# on `main`, not muted): an unconfigured or failed post is then a warning
-# annotation on the job rather than a log line nobody reads, since this
-# workflow is the only place a persistent mint failure would show.
+# Two switches the workflow sets, each turning one log line into a warning
+# annotation on the job (the unit tests run without them, and their output
+# is echoed into a CI step where an unconditional annotation would land on
+# every pull request). `RELEASE_STAGE_ANNOTATE` is set on every workflow
+# run, for a newest run stuck past `STUCK_RUN_AFTER`; `RELEASE_STAGE_CHAT_EXPECTED`
+# only when the Chat token was meant to be minted (a write on `main`, not
+# muted), for an unconfigured or failed post, since this workflow is the
+# only place a persistent mint failure would show.
+ANNOTATE_ENV = "RELEASE_STAGE_ANNOTATE"
 CHAT_EXPECTED_ENV = "RELEASE_STAGE_CHAT_EXPECTED"
-CHAT_EXPECTED_VALUE = "true"
+SWITCH_ON = "true"
 WARNING_PREFIX = "::warning::"
+# A newest run that is still queued or in progress silences the sweep for
+# its workflow, by design; past this age it is stuck (an environment
+# approval nobody gave, a runner that never picked it up) and the sweep
+# says so. The longest watched pipeline is the promotion: a deploy and a
+# matrix of about two hours, then an eval wait of up to 330 minutes.
+STUCK_RUN_AFTER = timedelta(hours=8)
+RUN_TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 # A job of a reusable workflow is listed as `<caller job> / <called job>`,
 # and the same stage is listed under the short name when the call itself
 # never expanded, so a stage is matched on either side of the separator.
@@ -312,25 +325,36 @@ def is_compensation(job: dict) -> bool:
 
 
 def failing_job(jobs: list) -> dict | None:
-    """The job the run stopped at: of the gating jobs that failed, the one
-    that completed last; of the compensation jobs, the same, when nothing
-    else failed; else the first that was cancelled in list order.
+    """The job the run stopped at, in four ranks: a gating job that failed,
+    a gating job that was cancelled, a compensation job that failed, any
+    job that was cancelled; within a rank, the one that completed last.
 
     Last to complete, not first in the list: a `continue-on-error` job that
     failed sits in the list beside the gating stages and fails inside green
     runs too, while the failure that ends a run is the one that finishes
-    it. Compensation jobs last of all: a withdrawal or a teardown runs
-    because a stage failed and can fail after it, and is skipped on a green
-    night, so it is the stage only when it is the only failure. Ties and
-    missing times fall back to list order.
+    it. A gating job killed at its `timeout-minutes` can read `cancelled`
+    rather than `timed_out`, and still outranks a compensation job that
+    failed after it: a withdrawal or a teardown runs because a stage
+    stopped, and is skipped on a green night, so it is the stage only when
+    nothing else stopped. Ties and missing times fall back to list order.
     """
-    failed = [(job.get("completed_at") or NO_TIME, -index, job) for index, job in enumerate(jobs) if job.get("conclusion") in FAILING_CONCLUSIONS]
-    gating = [item for item in failed if not is_compensation(item[2])]
-    for candidates in (gating, failed):
-        if candidates:
-            return max(candidates, key=lambda item: item[:2])[2]
-    for job in jobs:
-        if job.get("conclusion") in JOB_STOPPED_CONCLUSIONS:
+
+    def ranked(conclusions, compensation):
+        found = [
+            (job.get("completed_at") or NO_TIME, -index, job)
+            for index, job in enumerate(jobs)
+            if job.get("conclusion") in conclusions and (compensation is None or is_compensation(job) is compensation)
+        ]
+        return max(found, key=lambda item: item[:2])[2] if found else None
+
+    for conclusions, compensation in (
+        (FAILING_CONCLUSIONS, False),
+        (JOB_STOPPED_CONCLUSIONS, False),
+        (FAILING_CONCLUSIONS, True),
+        (JOB_STOPPED_CONCLUSIONS, None),
+    ):
+        job = ranked(conclusions, compensation)
+        if job is not None:
             return job
     return None
 
@@ -625,13 +649,25 @@ class GitHubAPI(FlakyGitHubAPI):
 # --------------------------------------------------------------------------- #
 
 
-def warn(message: str, environ=os.environ) -> None:
-    """A log line that, when the workflow meant to post to Chat, is also a
-    warning annotation on the job. Stdout, where the runner reads workflow
-    commands."""
-    if environ.get(CHAT_EXPECTED_ENV) == CHAT_EXPECTED_VALUE:
+def warn(message: str, environ=os.environ, switch: str = ANNOTATE_ENV) -> None:
+    """A log line that, when the named switch is on, is also a warning
+    annotation on the job. Stdout, where the runner reads workflow commands.
+
+    The same four lines as `warn` in `notify_broken_main.py` and
+    `notify_flaky_check.py`, each gated on its own variable; extracting one
+    means editing both siblings, so this is a third copy, as the issue
+    methods on `GitHubAPI` are.
+    """
+    if environ.get(switch) == SWITCH_ON:
         print(f"{WARNING_PREFIX}{message}", flush=True)
     log(message)
+
+
+def run_age(run: dict, now: datetime) -> timedelta | None:
+    created = run.get("created_at")
+    if not created:
+        return None
+    return now - datetime.strptime(created, RUN_TIME_FORMAT).replace(tzinfo=timezone.utc)
 
 
 def post(sender: Sender, text: str, dry_run: bool, environ=os.environ) -> None:
@@ -639,12 +675,12 @@ def post(sender: Sender, text: str, dry_run: bool, environ=os.environ) -> None:
         log(f"dry-run: would post to chat ({sender.describe()}):\n{text}")
         return
     if not sender.configured:
-        warn(f"{NOT_CONFIGURED}; the issue is filed, the chat message is not", environ)
+        warn(f"{NOT_CONFIGURED}; the issue is filed, the chat message is not", environ, CHAT_EXPECTED_ENV)
         return
     if sender.send(text):
         log("posted to chat")
     else:
-        warn(f"chat post failed ({sender.describe()}); the issue is filed, the chat message is not", environ)
+        warn(f"chat post failed ({sender.describe()}); the issue is filed, the chat message is not", environ, CHAT_EXPECTED_ENV)
 
 
 def recovery_jobs(api: GitHubAPI, name: str, green: dict, issue: dict) -> tuple:
@@ -677,14 +713,19 @@ def recovery_jobs(api: GitHubAPI, name: str, green: dict, issue: dict) -> tuple:
     return jobs, None
 
 
-def reconcile(api: GitHubAPI, workflow: dict, sender: Sender, dry_run: bool, environ=os.environ) -> str:
+def reconcile(api: GitHubAPI, workflow: dict, sender: Sender, dry_run: bool, environ=os.environ, now: datetime | None = None) -> str:
     """Bring the workflow's issue into line with its newest reporting run.
     Returns a one-word outcome for the log and the tests."""
     name, workflow_id = workflow["name"], workflow["id"]
     runs = api.runs(workflow_id)
     newest = max(runs, key=lambda run: run["run_number"], default=None)
     if newest is not None and newest.get("status") != COMPLETED:
-        log(f"{name}: run #{newest['run_number']} is {newest.get('status')}; nothing this sweep")
+        age = run_age(newest, now or datetime.now(timezone.utc))
+        message = f"{name}: run #{newest['run_number']} is {newest.get('status')}; nothing this sweep"
+        if age is not None and age > STUCK_RUN_AFTER:
+            warn(f"{message} ({newest['html_url']} has been {newest.get('status')} for {age}, past {STUCK_RUN_AFTER}; the sweep is silent for this workflow until it completes)", environ)
+        else:
+            log(message)
         return "nothing"
     current = newest_reporting_run(runs)
     if current is None:
@@ -764,7 +805,7 @@ def main(argv=None, environ=os.environ, api: GitHubAPI | None = None, opener=Non
         api = GitHubAPI(args.repo, token, dry_run=args.dry_run)
     sender = Sender.from_env(environ, opener) if opener else Sender.from_env(environ)
     if not sender.configured:
-        warn(f"{NOT_CONFIGURED} ({SPACE_ENV}={'set' if environ.get(SPACE_ENV) else 'unset'}, {TOKEN_ENV}={'set' if environ.get(TOKEN_ENV) else 'unset'})", environ)
+        warn(f"{NOT_CONFIGURED} ({SPACE_ENV}={'set' if environ.get(SPACE_ENV) else 'unset'}, {TOKEN_ENV}={'set' if environ.get(TOKEN_ENV) else 'unset'})", environ, CHAT_EXPECTED_ENV)
     try:
         if args.sweep:
             targets = watched_workflows(api)

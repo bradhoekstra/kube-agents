@@ -24,6 +24,7 @@ import sys
 import tempfile
 import unittest
 import urllib.error
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -316,10 +317,22 @@ class JobReadingTest(unittest.TestCase):
         self.assertEqual(job["name"], "Publish GA Release")
         self.assertEqual(notifier.failing_step(job)["name"], "Verify Release Eligibility")
 
-    def test_a_cancelled_job_is_the_stage_only_when_none_failed(self):
-        jobs = [{"name": "a", "conclusion": "success"}, {"name": "b", "conclusion": "cancelled"}]
-        self.assertEqual(notifier.failing_job(jobs)["name"], "b")
+    def test_the_four_ranks_gating_failed_gating_cancelled_compensation_failed_any_cancelled(self):
+        """A gating job killed at its timeout can read `cancelled`, and
+        still outranks the compensation job that failed after it."""
+        gating_failed = {"name": "a", "conclusion": "failure", "completed_at": "2026-10-21T01:00:00Z"}
+        gating_cancelled = {"name": "b", "conclusion": "cancelled", "completed_at": "2026-10-21T02:00:00Z"}
+        compensation_failed = {"name": "Step 7 - Tear Down Nightly Environment", "conclusion": "failure", "completed_at": "2026-10-21T03:00:00Z"}
+        compensation_cancelled = {"name": "Step 5b - Withdraw an Unsettled Nomination", "conclusion": "cancelled", "completed_at": "2026-10-21T04:00:00Z"}
+        jobs = [compensation_cancelled, compensation_failed, gating_cancelled, gating_failed]
+        for expected in ("a", "b", "Step 7 - Tear Down Nightly Environment", "Step 5b - Withdraw an Unsettled Nomination"):
+            self.assertEqual(notifier.failing_job(jobs)["name"], expected)
+            jobs = [job for job in jobs if job["name"] != expected]
         self.assertIsNone(notifier.failing_job([{"name": "a", "conclusion": "success"}]))
+
+    def test_an_eval_wait_cancelled_at_its_timeout_outranks_the_withdrawal_that_failed_after_it(self):
+        jobs = jobs_with(STAGING_26_JOBS, completed={WITHDRAWAL: "2026-10-17T05:12:00Z"}, **{EVAL_STAGE: "cancelled", WITHDRAWAL: "failure"})["jobs"]
+        self.assertEqual(notifier.failing_job(jobs)["name"], EVAL_STAGE)
 
     def test_a_stage_is_found_across_the_reusable_workflow_separator(self):
         """A skipped call is listed under its short name, an expanded one
@@ -547,6 +560,27 @@ class ReconcileTest(unittest.TestCase):
         self.assertEqual(github.writes, [])
         self.assertIn("run #31 is queued", err)
 
+    def test_a_run_stuck_past_the_ceiling_is_a_warning_annotation_and_still_decides_nothing(self):
+        """A run waiting on an environment approval nobody gives would
+        otherwise silence the sweep for its workflow with no bound."""
+        queued = dict(run_like(31, 39600000000, conclusion=None, status="queued"), created_at="2026-10-21T02:00:00Z")
+        github = staging_github(runs=runs_list(queued, *STAGING_RUNS["workflow_runs"]))
+        annotate = {notifier.ANNOTATE_ENV: notifier.SWITCH_ON}
+        sender = notifier.Sender(space="spaces/AAA", token="t", opener=FakeChat())
+        fresh = datetime(2026, 10, 21, 3, 0, tzinfo=timezone.utc)
+        stuck = fresh + notifier.STUCK_RUN_AFTER + timedelta(minutes=1)
+        for now, annotated in ((fresh, False), (stuck, True)):
+            with self.subTest(now=now), mock.patch("sys.stderr", new=io.StringIO()) as err, mock.patch("sys.stdout", new=io.StringIO()) as out:
+                self.assertEqual(notifier.reconcile(github.api(), STAGING, sender, dry_run=False, environ=annotate, now=now), "nothing")
+                self.assertEqual(github.writes, [])
+                self.assertIn("run #31 is queued", err.getvalue())
+                self.assertEqual("::warning::" in out.getvalue(), annotated)
+                if annotated:
+                    self.assertIn(queued["html_url"], out.getvalue())
+        with mock.patch("sys.stderr", new=io.StringIO()), mock.patch("sys.stdout", new=io.StringIO()) as out:
+            notifier.reconcile(github.api(), STAGING, sender, dry_run=False, environ={}, now=stuck)
+        self.assertNotIn("::warning::", out.getvalue())
+
     def test_a_re_run_that_fails_again_is_already_recorded(self):
         failed_again = run_like(30, RUN_30["id"], conclusion="failure", attempt=2)
         github = staging_github(runs=runs_list(failed_again, *STAGING_RUNS["workflow_runs"][1:]), open_issues=[issue(4001, body_with([RUN_29["id"], RUN_30["id"]]))])
@@ -617,7 +651,7 @@ class ReconcileTest(unittest.TestCase):
     def test_a_chat_the_workflow_expected_and_could_not_send_is_a_warning_annotation(self):
         """A persistent mint failure would otherwise show nowhere: the issue
         files, the log line scrolls past, and no one hears from Chat."""
-        expected = {notifier.CHAT_EXPECTED_ENV: notifier.CHAT_EXPECTED_VALUE}
+        expected = {notifier.CHAT_EXPECTED_ENV: notifier.SWITCH_ON}
         github = staging_github()
         with mock.patch("sys.stderr", new=io.StringIO()), mock.patch("sys.stdout", new=io.StringIO()) as out:
             self.assertEqual(notifier.reconcile(github.api(), STAGING, notifier.Sender(opener=FakeChat()), dry_run=False, environ=expected), "opened")
@@ -745,6 +779,7 @@ class WorkflowContractTest(unittest.TestCase):
         reconcile_step = steps[RECONCILE_STEP]
         self.assertNotIn("if", reconcile_step)
         self.assertIn(notifier.CHAT_EXPECTED_ENV, reconcile_step["env"])
+        self.assertEqual(reconcile_step["env"][notifier.ANNOTATE_ENV], notifier.SWITCH_ON)
 
     def test_the_reconcile_step_maps_its_inputs_to_the_script_flags(self):
         """The step's `run:` block, lifted out of the YAML and run against a
