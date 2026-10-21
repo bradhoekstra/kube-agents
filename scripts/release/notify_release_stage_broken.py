@@ -157,6 +157,10 @@ COMPLETED = "completed"
 # The two issue states the reconciliation reads.
 ISSUE_OPEN = "open"
 ISSUE_CLOSED = "closed"
+# What GitHub records on an issue a person reopened. A green leaves such an
+# issue alone: reopening is a decision, and the sweep would otherwise close it
+# again every fifteen minutes with a fresh "passed" comment and Chat post.
+REOPENED = "reopened"
 # Job and step conclusions. A job cancelled by a timeout or by a sibling's
 # failure is where the reader looks when no job failed outright. In a green
 # run, a stage that concluded skipped or cancelled did not run, which is no
@@ -214,7 +218,10 @@ STAGE_STAMP = "<!-- release-stage-broken stage={stage} -->"
 # A stamped run is `<id>:<attempt>`, so a re-run that fails on another stage
 # is new evidence and rewrites the body; a bare `<id>` (the stamp's first
 # shape) reads as the first attempt.
-_STAMP_RE = re.compile(r"<!-- release-stage-broken runs=([\d,:]*) -->")
+# A stamp is `<run id>[:<attempt>]` entries joined by commas and nothing else;
+# a hand-edited stamp that does not fit reads as no stamp rather than as a
+# ValueError out of the whole sweep.
+_STAMP_RE = re.compile(r"<!-- release-stage-broken runs=((?:\d+(?::\d+)?(?:,\d+(?::\d+)?)*)?) -->")
 _STAGE_STAMP_RE = re.compile(r"<!-- release-stage-broken stage=(.+?) -->")
 STAMP_ATTEMPT_SEPARATOR = ":"
 FIRST_ATTEMPT = 1
@@ -500,11 +507,17 @@ def run_when(run: dict) -> str:
     return created.replace("T", " ")[:WHEN_LENGTH] + WHEN_SUFFIX
 
 
+def _inline(text: str) -> str:
+    """Log-derived text inside a code span in a table cell. A backtick would
+    close the span and a `|` would split the cell, so neither survives."""
+    return text.replace("`", "'").replace("|", "\\|")
+
+
 def failure_text(details: dict) -> str:
     if details.get("failure"):
-        return f"`{details['failure']}`"
+        return f"`{_inline(details['failure'])}`"
     if details.get("step"):
-        return f"step `{details['step']}` failed; the log has no failure line this reads"
+        return f"step `{_inline(details['step'])}` failed; the log has no failure line this reads"
     return "no failure line found; read the run"
 
 
@@ -694,10 +707,13 @@ def warn(message: str, environ=os.environ, switch: str = ANNOTATE_ENV) -> None:
 
 
 def run_age(run: dict, now: datetime) -> timedelta | None:
-    created = run.get("created_at")
-    if not created:
+    """How long the run's latest attempt has been going. `run_started_at`
+    moves on a re-run and `created_at` does not, so a morning re-run of last
+    night's failure is young, not stuck."""
+    started = run.get("run_started_at") or run.get("created_at")
+    if not started:
         return None
-    return now - datetime.strptime(created, RUN_TIME_FORMAT).replace(tzinfo=timezone.utc)
+    return now - datetime.strptime(started, RUN_TIME_FORMAT).replace(tzinfo=timezone.utc)
 
 
 def post(sender: Sender, text: str, dry_run: bool, environ=os.environ) -> None:
@@ -769,6 +785,9 @@ def reconcile(api: GitHubAPI, workflow: dict, sender: Sender, dry_run: bool, env
         if issue is None:
             log(f"{name}: green (run #{current['run_number']}), no issue open")
             return "nothing"
+        if issue.get("state_reason") == REOPENED:
+            log(f"{name}: green (run #{current['run_number']}), but a person reopened #{issue['number']}; leaving it open")
+            return "nothing"
         jobs, note = recovery_jobs(api, name, current, issue)
         if jobs is None:
             return "nothing"
@@ -785,8 +804,11 @@ def reconcile(api: GitHubAPI, workflow: dict, sender: Sender, dry_run: bool, env
             log(f"{name}: #{issue['number']} already records run #{current['run_number']} attempt {attempt_of(current)[1]}")
             return "nothing"
         details = run_details(api, current)
-        api.update_issue(issue["number"], body=render_body(name, workflow_id, details, streak))
+        # Comment first: the body rewrite stamps the attempt, and a comment
+        # that failed after it would never be retried, since the next sweep
+        # finds the attempt already recorded and writes nothing.
         api.comment(issue["number"], render_still_failing(details))
+        api.update_issue(issue["number"], body=render_body(name, workflow_id, details, streak))
         log(f"{name}: run #{current['run_number']} failed again; updated #{issue['number']}")
         return "updated"
 

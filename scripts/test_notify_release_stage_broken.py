@@ -302,7 +302,7 @@ class JobReadingTest(unittest.TestCase):
         self.assertEqual(notifier.failing_job(jobs)["name"], EVAL_STAGE)
 
     def test_a_compensation_job_is_the_stage_when_nothing_else_failed(self):
-        jobs = jobs_with(STAGING_26_JOBS, ROLLBACK_LEG="success", **{WITHDRAWAL: "failure"})["jobs"]
+        jobs = jobs_with(STAGING_26_JOBS, **{ROLLBACK_LEG: "success", WITHDRAWAL: "failure"})["jobs"]
         self.assertEqual(notifier.failing_job(jobs)["name"], WITHDRAWAL)
         self.assertTrue(notifier.is_compensation({"name": "Next mode (non-gating) - Step 7 - Run E2E Tests"}))
         self.assertTrue(notifier.is_compensation({"name": "Step 7 - Tear Down Nightly Environment"}))
@@ -379,6 +379,11 @@ class RenderTest(unittest.TestCase):
         for expected in (E2E_STAGE, "Execute Blocking E2E Gate", "rc_1_abc", "a" * 40, "FAILED tests/e2e/x.py::test_y", RUN_30["html_url"], "[#29]", "[#30]", "2026-10-21 02:36 UTC"):
             self.assertIn(expected, body)
 
+    def test_log_text_cannot_break_the_code_span_or_the_table_cell(self):
+        text = notifier.failure_text({"failure": "FAILED t.py::test_x - assert 'a | b' == `c`"})
+        self.assertEqual(text, "`FAILED t.py::test_x - assert 'a \\| b' == 'c'`")
+        self.assertIn("step 'a \\| b'", notifier.failure_text({"step": "a | b"}).replace("`", "'"))
+
     def test_an_unknown_candidate_and_stage_are_said_not_omitted(self):
         details = {"run": RUN_30, "stage": None, "stage_url": None, "step": None, "failure": None, "candidate": {}}
         body = notifier.render_body(STAGING["name"], STAGING["id"], details, [RUN_30])
@@ -447,9 +452,11 @@ class ReconcileTest(unittest.TestCase):
         github = staging_github(open_issues=[issue(4001, body_with([RUN_29["id"]]))])
         chat = FakeChat()
         self.assertEqual(reconcile(github, chat)[0], "updated")
-        self.assertEqual([(w[0], w[1]) for w in github.writes], [("PATCH", f"/repos/{REPO}/issues/4001"), ("POST", f"/repos/{REPO}/issues/4001/comments")])
-        self.assertEqual(notifier.stamped_runs(github.writes[0][2]["body"]), {RUN_29["id"], RUN_30["id"]})
-        comment = github.writes[1][2]["body"]
+        # The comment lands before the body rewrite that stamps the attempt:
+        # a comment lost after the stamp would never be retried.
+        self.assertEqual([(w[0], w[1]) for w in github.writes], [("POST", f"/repos/{REPO}/issues/4001/comments"), ("PATCH", f"/repos/{REPO}/issues/4001")])
+        self.assertEqual(notifier.stamped_runs(github.writes[1][2]["body"]), {RUN_29["id"], RUN_30["id"]})
+        comment = github.writes[0][2]["body"]
         self.assertIn("Still failing", comment)
         self.assertIn("[#30]", comment)
         self.assertIn("rc_2610210024_8dc552a_validated", comment)
@@ -470,6 +477,20 @@ class ReconcileTest(unittest.TestCase):
         self.assertIn("passes again", chat.posted[0])
         self.assertIn("Closed #4001", chat.posted[0])
         self.assertIn("rc_2610210024_8dc552a_validated", chat.posted[0])
+
+    def test_a_green_run_leaves_an_issue_a_person_reopened_alone(self):
+        """Reopening is a decision; the sweep must not close it again every
+        fifteen minutes with a fresh comment and Chat post."""
+        run_31 = run_like(31, 39600000000)
+        reopened = dict(issue(4001, body_with([RUN_29["id"], RUN_30["id"]])), state_reason=notifier.REOPENED)
+        github = staging_github(runs=runs_list(run_31, *STAGING_RUNS["workflow_runs"]), open_issues=[reopened])
+        github.responses[jobs_path(run_31["id"])] = GREEN_JOBS
+        chat = FakeChat()
+        with mock.patch("sys.stderr", new=io.StringIO()) as err:
+            self.assertEqual(notifier.reconcile(github.api(), STAGING, notifier.Sender(space="spaces/AAA", token="t", opener=chat), dry_run=False), "nothing")
+        self.assertEqual(github.writes, [])
+        self.assertEqual(chat.posted, [])
+        self.assertIn("reopened #4001", err.getvalue())
 
     def test_a_green_run_whose_stage_was_skipped_is_no_recovery(self):
         """`release-publish.yml` under `schedule_gate=dry-run`, a promotion
@@ -592,6 +613,21 @@ class ReconcileTest(unittest.TestCase):
             notifier.reconcile(github.api(), STAGING, sender, dry_run=False, environ={}, now=stuck)
         self.assertNotIn("::warning::", out.getvalue())
 
+    def test_a_stuck_run_is_aged_from_its_latest_attempt_not_its_dispatch(self):
+        """A re-run keeps the run's `created_at`; `run_started_at` moves."""
+        now = datetime(2026, 10, 21, 9, 0, tzinfo=timezone.utc)
+        rerun = {"created_at": "2026-10-20T22:00:00Z", "run_started_at": "2026-10-21T08:30:00Z"}
+        self.assertEqual(notifier.run_age(rerun, now), timedelta(minutes=30))
+        self.assertEqual(notifier.run_age({"created_at": "2026-10-20T22:00:00Z"}, now), timedelta(hours=11))
+        self.assertIsNone(notifier.run_age({}, now))
+
+    def test_a_stamp_a_person_edited_reads_as_no_stamp_not_as_an_error(self):
+        for stamp in ("1::2", ":2", "1:2:3", ":", "1,,2", "x1"):
+            with self.subTest(stamp=stamp):
+                self.assertEqual(notifier.stamped_attempts(f"<!-- release-stage-broken runs={stamp} -->"), set())
+        self.assertEqual(notifier.stamped_attempts("<!-- release-stage-broken runs=1,2:3 -->"), {(1, 1), (2, 3)})
+        self.assertEqual(notifier.stamped_attempts("<!-- release-stage-broken runs= -->"), set())
+
     def test_the_same_attempt_seen_again_is_already_recorded(self):
         github = staging_github(runs=runs_list(RUN_30, *STAGING_RUNS["workflow_runs"][1:]), open_issues=[issue(4001, body_with([RUN_29["id"], f"{RUN_30['id']}:1"]))])
         self.assertEqual(reconcile(github)[0], "nothing")
@@ -604,10 +640,10 @@ class ReconcileTest(unittest.TestCase):
         github = staging_github(runs=runs_list(failed_again, *STAGING_RUNS["workflow_runs"][1:]), open_issues=[issue(4001, body_with([RUN_29["id"], RUN_30["id"]]))])
         github.responses[jobs_path(RUN_30["id"])] = jobs_with(STAGING_26_JOBS, **{EVAL_STAGE: "failure"})
         self.assertEqual(reconcile(github)[0], "updated")
-        body = github.writes[0][2]["body"]
+        self.assertIn("Still failing", github.writes[0][2]["body"])
+        body = github.writes[1][2]["body"]
         self.assertEqual(notifier.stamped_stage(body), EVAL_STAGE)
         self.assertEqual(notifier.stamped_attempts(body), {(RUN_29["id"], 1), (RUN_30["id"], 2)})
-        self.assertIn("Still failing", github.writes[1][2]["body"])
 
     def test_a_failing_dispatch_from_a_branch_opens_nothing(self):
         github = staging_github(runs=runs_list(branch_run(31, 39600000000), *STAGING_RUNS["workflow_runs"][2:]))
