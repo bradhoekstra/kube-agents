@@ -147,8 +147,17 @@ func platformPubsubEnv(subscriptions []string) []corev1.EnvVar {
 	}}
 }
 
-// pubsubRelayEnabled says whether the gateway gets the relay URL: exactly when
-// the broker gets a non-empty set, so the two cannot disagree.
-func pubsubRelayEnabled(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin) bool {
-	return len(pluginPubsubSubscriptions(agent, agentPlugins)) > 0
+// pubsubRelayURL is the gateway's relay URL: the broker's base URL exactly when
+// the broker gets a non-empty set, so the two cannot disagree, and empty
+// otherwise. Empty rather than absent, on every render: the operator is the
+// only writer of the name only while it emits it, and an AgentPlugin's spec.env
+// is copied onto the gateway verbatim. A plugin whose route the operator
+// refused (a path outside the grammar) could otherwise supply the URL itself
+// and have the adapter present the gateway's token to whatever it named. The
+// adapter treats an empty value as "no relay" and does not connect.
+func pubsubRelayURL(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin) string {
+	if len(pluginPubsubSubscriptions(agent, agentPlugins)) == 0 {
+		return ""
+	}
+	return credentialProxyBaseURL(agent)
 }

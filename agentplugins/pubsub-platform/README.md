@@ -38,13 +38,16 @@ when the work it produces belongs elsewhere.
 The adapter runs in the gateway Pod, which holds no Google credential of its own, and pulls through
 the credential broker's Pub/Sub relay; the site's
 [credential isolation](https://gke-labs.github.io/kube-agents/reference/credential-isolation/) page
-owns that boundary. What this plugin needs from an install: the operator sets `PUBSUB_RELAY_URL` on
-the gateway and the subscription set on the broker once at least one route names a subscription
+owns that boundary. What this plugin needs from an install: the operator fills `PUBSUB_RELAY_URL`
+on the gateway and the subscription set on the broker once at least one route names a subscription
 the operator can qualify (a full `projects/<project>/subscriptions/<name>` path, or a short
-subscription or topic name on an agent whose `spec.harness.projectId` is set). The install's
+subscription or topic name on an agent whose `spec.harness.projectId` is set); with no such route
+the variable is rendered empty and the adapter does not connect. The install's
 identity needs `roles/pubsub.subscriber` on each subscription to pull, and `roles/pubsub.viewer`
 for the read the adapter makes on connect, without which every connect logs a 403 on that read
-while pulls still work; the root installer and the stockout investigator's own installer grant both.
+while pulls still work. The root installer and the stockout investigator's own installer grant
+both on the stockout subscription only; whoever creates another route's subscription grants the
+same pair on it.
 
 ## Routes
 

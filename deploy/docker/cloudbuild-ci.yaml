@@ -247,8 +247,8 @@ steps:
   # the inspect below, which fails the build if that tag is not in this daemon
   # rather than letting the builder resolve it from the registry, where the
   # same tag from an earlier run of the same commit could stand in. A step of
-  # its own rather than a tail on the a2a step, so the four images above are
-  # not held behind the platform build; it also waits for a2a so its builder
+  # its own rather than a tail on the a2a step, so the images above are not
+  # held behind the platform build; it also waits for a2a so its builder
   # stage finds the Go module download layer already in the daemon. The
   # `images:` list pushes the platform image once every step is done, so the
   # bridge's base is in the registry before the deploy pulls either.

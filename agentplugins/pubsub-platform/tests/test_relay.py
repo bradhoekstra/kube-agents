@@ -52,6 +52,9 @@ class FakeBroker:
         self.get_body = None
         self.get_delay = 0.0
         self.idle_delay = 0.05
+        # When set, a scripted pull is answered only once this event is set: a
+        # pull parked at the broker past the adapter's stop.
+        self.pull_hold = None
         self.lock = threading.Lock()
         broker = self
 
@@ -93,6 +96,8 @@ class FakeBroker:
                         self._answer(script, {"status": "blocked", "code": "SECURITY_POLICY_BLOCKED",
                                               "rule": "gcp.pubsub.subscription", "message": "refused"})
                     else:
+                        if broker.pull_hold is not None:
+                            broker.pull_hold.wait(5)
                         self._answer(200, {"receivedMessages": script})
                 else:
                     self._answer(200, {})
@@ -246,6 +251,25 @@ class ConnectTest(RelayTestCase):
         time.sleep(0.3)
         self.assertEqual(len(self.broker.calls), before, "a pull arrived after disconnect")
         self.assertEqual(self.adapter._pull_threads, [])
+
+    def test_a_pull_that_returns_after_the_stop_hands_its_messages_back(self):
+        """A batch a stopped generation receives is nacked, not processed or held to the deadline."""
+        self.broker.pull_hold = threading.Event()
+        self.broker.pulls = [[{"ackId": "late-1", "message": {"data": "e30=", "messageId": "m1"}}]]
+        with mock.patch.object(adapter_mod, "PULL_THREAD_JOIN_SECONDS", 0.1):
+            async def session():
+                await self.adapter.connect()
+                self.broker.wait_for(lambda calls: any(c[1].endswith(":pull") for c in calls))
+                await self.adapter.disconnect()
+            with self.assertLogs(LOGGER_NAME, logging.WARNING) as logs:
+                asyncio.run(session())
+                self.broker.pull_hold.set()
+                calls = self.broker.wait_for(lambda calls: any(c[1].endswith(":modifyAckDeadline") for c in calls))
+        nacks = [c for c in calls if c[1].endswith(":modifyAckDeadline")]
+        self.assertEqual([c[3] for c in nacks], [{"ackIds": ["late-1"], "ackDeadlineSeconds": 0}])
+        self.assertFalse([c for c in calls if c[1].endswith(":acknowledge")])
+        self.assertEqual(self.processed, [])
+        self.assertIn("returned them for redelivery", "\n".join(logs.output))
 
     def test_a_message_that_cannot_be_decoded_is_left_to_redeliver(self):
         bad = {"ackId": "ack-bad", "message": {"messageId": "m-bad", "data": "%%%not-base64%%%"}}

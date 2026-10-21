@@ -282,8 +282,6 @@ class PubSubAdapter(BasePlatformAdapter):
             value = os.environ.get(name, "").strip()
             if value:
                 return value
-        logger.warning("PubSub: no project id in %s; routes must name their subscription as projects/<project>/subscriptions/<name>",
-                       "/".join(PROJECT_ID_ENVS))
         return None
 
     def _parse_topic_config(self, sub_cfg: dict, project_id: str, name: str) -> Optional[tuple]:
@@ -390,6 +388,8 @@ class PubSubAdapter(BasePlatformAdapter):
         if sub_input.startswith("projects/"):
             return sub_input
         if not project_id:
+            logger.warning("PubSub: Route '%s' names a short subscription or topic and no project id is set in %s; "
+                           "name it as projects/<project>/subscriptions/<name>", name, "/".join(PROJECT_ID_ENVS))
             return None
         topic_info = self._parse_topic_config(sub_cfg, project_id, name)
         try:
@@ -434,6 +434,12 @@ class PubSubAdapter(BasePlatformAdapter):
                 continue
             backoff = PULL_BACKOFF_INITIAL_SECONDS
             if stop.is_set():
+                # A pull parked at the broker outlives the join a reconnect or a
+                # disconnect waits for; what it brings back belongs to the next
+                # generation, so hand it straight back rather than hold it to the
+                # ack deadline.
+                if received:
+                    self._return_to_subscription(route_name, subscription_path, relay, received)
                 return
             if not received:
                 stop.wait(PULL_IDLE_INTERVAL_SECONDS)
@@ -445,6 +451,17 @@ class PubSubAdapter(BasePlatformAdapter):
                     logger.error("PubSub: a message on route '%s' could not be decoded and is left to redeliver: %s", route_name, exc)
                     continue
                 self._schedule(route_name, sub_cfg, message, loop)
+
+    def _return_to_subscription(self, route_name: str, subscription_path: str, relay: "PubsubRelay",
+                                received: List[dict]) -> None:
+        ack_ids = [item.get("ackId") for item in received if item.get("ackId")]
+        try:
+            relay.nack(subscription_path, ack_ids)
+            logger.warning("PubSub: route '%s' stopped with %d message(s) in hand; returned them for redelivery",
+                           route_name, len(ack_ids))
+        except Exception as exc:
+            logger.warning("PubSub: route '%s' stopped with %d message(s) in hand and could not return them (%s); "
+                           "they redeliver at the ack deadline", route_name, len(ack_ids), exc)
 
     def _schedule(self, route_name: str, cfg: dict, message: Any, loop: asyncio.AbstractEventLoop) -> None:
         logger.warning("PubSub: Callback entry received message on route '%s', msg_id=%s", route_name, getattr(message, 'message_id', 'unknown'))
@@ -482,8 +499,10 @@ class PubSubAdapter(BasePlatformAdapter):
             self._set_fatal_error("relay_not_configured", f"{PUBSUB_RELAY_URL_ENV} not set", retryable=False)
             return False
         # A reconnect that skipped disconnect() still ends the previous generation
-        # first: its event is set and its threads are waited for, so no two
-        # generations pull one route side by side.
+        # first: its event is set and its threads are waited for, so no new pull
+        # starts beside the new generation's. A thread still parked in a long poll
+        # at the broker outlives the join; it returns what that poll delivers to
+        # the subscription (the stop path in _pull_loop) instead of processing it.
         if self._pull_threads:
             self._stop_pulling.set()
             previous, self._pull_threads = self._pull_threads, []

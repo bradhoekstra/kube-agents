@@ -754,13 +754,12 @@ func renderManagedEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agentPlugins
 
 	// The Pub/Sub platform adapter's relay URL, on the same terms as the chat
 	// relays below: pinned so the agent cannot write its own and pull from
-	// somewhere else, and only when a plugin configures a Pub/Sub platform.
+	// somewhere else. Pinned on every render, empty when no plugin configures a
+	// Pub/Sub platform, so the agent cannot supply one either (pubsubRelayURL).
 	// Before the integration guard: a Pub/Sub platform needs no chat
 	// integration. Not a "platform" for the gateway-wide allowlist pair below,
 	// which is about chat users.
-	if pubsubRelayEnabled(agent, agentPlugins) {
-		add(pubsubRelayURLEnvVar, credentialProxyBaseURL(agent))
-	}
+	add(pubsubRelayURLEnvVar, pubsubRelayURL(agent, agentPlugins))
 
 	integration := agent.Spec.Integration
 	if integration == nil {
@@ -3003,18 +3002,6 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		}
 	}
 
-	// The Pub/Sub platform adapter's relay, when an AgentPlugin configures a
-	// Pub/Sub platform, whatever the chat integration: exactly when the broker
-	// is told the subscription set (buildCredentialProxyEnvForPlugins), so the
-	// two cannot disagree. Pinned in the managed .env too
-	// (renderManagedEnvForPlugins).
-	if pubsubRelayEnabled(agent, agentPlugins) {
-		envVars = append(envVars, corev1.EnvVar{
-			Name:  pubsubRelayURLEnvVar,
-			Value: credentialProxyBaseURL(agent),
-		})
-	}
-
 	if replicas > 1 {
 		envVars = append(envVars,
 			corev1.EnvVar{
@@ -3208,6 +3195,18 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	envVars = append(envVars, corev1.EnvVar{
 		Name:  mcpRelayURLEnvVar,
 		Value: mcpRelayURL(agent),
+	})
+	// The Pub/Sub platform adapter's relay, whatever the chat integration:
+	// the broker's URL exactly when the broker is told the subscription set
+	// (buildCredentialProxyEnvForPlugins), so the two cannot disagree, and
+	// empty otherwise. Unconditional and after the plugin merge for the reason
+	// the MCP relay URL above is: a name the operator never emits leaves an
+	// AgentPlugin's spec.env as the only writer, and this one names where the
+	// adapter presents the token above. Pinned in the managed .env too
+	// (renderManagedEnvForPlugins).
+	envVars = append(envVars, corev1.EnvVar{
+		Name:  pubsubRelayURLEnvVar,
+		Value: pubsubRelayURL(agent, agentPlugins),
 	})
 	// The A2A bus, under `next` only: the address, and the name this container
 	// authenticates as. There is no password here since A5. The credential is

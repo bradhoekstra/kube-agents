@@ -237,7 +237,7 @@ readonly SANDBOX_SSH_KEY_COMMENT="kube-agents-ci-eval"
 #     is built;
 #   - step 4 also builds the A2A gateway, auth callout, worker and console
 #     images from a2a/Dockerfile.* (the pull request's own builds, the same
-#     way the four images above are; the operator would derive these same
+#     way the images above are; the operator would derive these same
 #     references from its own image, and step 5 names them anyway so the
 #     deploy's inputs are explicit) and the Hermes bridge sidecar image, FROM
 #     the platform-agent image of the same build; on the release-candidate
@@ -1451,9 +1451,8 @@ else
   # Under EVAL_MODE_NEXT=1 the same build also produces the four first-party
   # A2A images and the Hermes bridge sidecar, in its `a2a` and `a2a-bridge`
   # steps, at the references named at the top of this step; with the
-  # substitutions absent that step is a no-op and the build is the four-image
-  # one above. Empty otherwise, so the command below is byte-for-byte what it
-  # was.
+  # substitutions absent that step is a no-op and the build is the one above.
+  # Empty otherwise, so the command below is byte-for-byte what it was.
   # The two AgentPlugin images. This branch is the pull-request path (the
   # release-candidate path installs the candidate's published ones, section
   # 2a, and skipped this section above), so they are always built here.

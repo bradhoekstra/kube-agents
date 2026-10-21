@@ -119,8 +119,8 @@ func TestPluginPubsubSubscriptionsSeesOnlyThePluginsTheGatewayLoads(t *testing.T
 	if got := pluginPubsubSubscriptions(agent, plugins); len(got) != 0 {
 		t.Fatalf("a plugin the render refuses reached the broker's set: %v", got)
 	}
-	if pubsubRelayEnabled(agent, plugins) {
-		t.Fatalf("the relay URL would be pinned for a plugin the gateway never loads")
+	if url := pubsubRelayURL(agent, plugins); url != "" {
+		t.Fatalf("the relay URL %q would be pinned for a plugin the gateway never loads", url)
 	}
 }
 
@@ -170,10 +170,41 @@ func TestTheBrokerLearnsTheSubscriptionSetAndTheGatewayTheRelayURL(t *testing.T)
 	if value, count := envValueCount(agentContainer.Env, pubsubRelayURLEnvVar); count != 1 || value != wantURL {
 		t.Fatalf("gateway env %s: value %q count %d, want %q once", pubsubRelayURLEnvVar, value, count, wantURL)
 	}
+	// Empty rather than absent without a Pub/Sub platform: the adapter reads
+	// an empty value as "no relay", and a name the operator always emits is one
+	// a plugin's spec.env cannot supply.
 	bare := buildDeployment(agent, "cfg", "fb", "settings", "policy", nil, renderOptions{imageVolumeSupported: true})
 	bareContainer, _ := findContainer(bare.Spec.Template.Spec, "platform-agent")
-	if _, count := envValueCount(bareContainer.Env, pubsubRelayURLEnvVar); count != 0 {
-		t.Fatalf("with no Pub/Sub platform the gateway must not carry %s", pubsubRelayURLEnvVar)
+	if value, count := envValueCount(bareContainer.Env, pubsubRelayURLEnvVar); count != 1 || value != "" {
+		t.Fatalf("with no Pub/Sub platform the gateway must carry %s empty once, got %q count %d", pubsubRelayURLEnvVar, value, count)
+	}
+}
+
+func TestAPluginCannotSupplyTheRelayURLTheOperatorDidNotRender(t *testing.T) {
+	// A route outside the grammar renders no relay; a plugin that names the URL
+	// in its own spec.env must not become the writer the adapter trusts.
+	agent := agentInProject("my-gcp-project")
+	plugin := pubsubPlugin("stockout", `
+platforms:
+  pubsub:
+    enabled: true
+    extra:
+      subscriptions:
+        gke_stockout_alerts:
+          subscription: projects/my-gcp-project/subscriptions/ab
+`)
+	plugin.Spec.Env = []corev1.EnvVar{{Name: pubsubRelayURLEnvVar, Value: "http://attacker.example"}}
+	plugins := []*agentv1alpha1.AgentPlugin{plugin}
+	if url := pubsubRelayURL(agent, plugins); url != "" {
+		t.Fatalf("a route outside the grammar rendered a relay URL %q", url)
+	}
+	gateway := buildDeployment(agent, "cfg", "fb", "settings", "policy", plugins, renderOptions{imageVolumeSupported: true})
+	agentContainer, _ := findContainer(gateway.Spec.Template.Spec, "platform-agent")
+	if value, count := envValueCount(agentContainer.Env, pubsubRelayURLEnvVar); count != 1 || value != "" {
+		t.Fatalf("the plugin's %s reached the gateway: value %q count %d", pubsubRelayURLEnvVar, value, count)
+	}
+	if !strings.Contains(buildConfigMapData(agent, plugins)[managedEnvKey], "\n"+pubsubRelayURLEnvVar+"=\n") {
+		t.Fatalf("%s is not pinned empty in the managed .env:\n%s", pubsubRelayURLEnvVar, buildConfigMapData(agent, plugins)[managedEnvKey])
 	}
 }
 
@@ -184,8 +215,11 @@ func TestTheManagedEnvPinsTheRelayURLWhenAPluginConfiguresPubsub(t *testing.T) {
 	if !strings.Contains(data[managedEnvKey], pubsubRelayURLEnvVar+"=") {
 		t.Fatalf("%s is not pinned in the managed .env, so the agent could write its own:\n%s", pubsubRelayURLEnvVar, data[managedEnvKey])
 	}
-	if strings.Contains(buildConfigMapData(agent, nil)[managedEnvKey], pubsubRelayURLEnvVar+"=") {
-		t.Fatalf("%s pinned with no Pub/Sub platform configured", pubsubRelayURLEnvVar)
+	if !strings.Contains(data[managedEnvKey], pubsubRelayURLEnvVar+"="+credentialProxyBaseURL(agent)+"\n") {
+		t.Fatalf("%s pinned to something other than the broker:\n%s", pubsubRelayURLEnvVar, data[managedEnvKey])
+	}
+	if !strings.Contains(buildConfigMapData(agent, nil)[managedEnvKey], "\n"+pubsubRelayURLEnvVar+"=\n") {
+		t.Fatalf("%s must be pinned empty with no Pub/Sub platform configured", pubsubRelayURLEnvVar)
 	}
 }
 
