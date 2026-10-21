@@ -433,7 +433,10 @@ class PubSubAdapter(BasePlatformAdapter):
             self._subscribe_to_route(name, sub_cfg, subscription_path, loop)
             started += 1
 
-        logger.info("PubSub: connected through the credential broker relay at %s for %d route(s)", relay_url, started)
+        # WARNING, not INFO: the gateway runs without -v, so INFO never reaches its log, and
+        # this line is what an operator (and the presubmit's deploy gate) reads to know the
+        # adapter is pulling through the broker rather than failing quietly.
+        logger.warning("PubSub: connected through the credential broker relay at %s for %d route(s)", relay_url, started)
         self._mark_connected()
         return True
 
