@@ -166,6 +166,33 @@ steps:
       - "k8s-operator/Dockerfile"
       - "k8s-operator"
 
+  # The two AgentPlugin images the presubmit deploys so the Pub/Sub platform
+  # adapter and the stockout investigator run from this tree: a busybox layer
+  # carrying the plugin's files each, seconds to build. Empty URIs make the
+  # step a no-op, the a2a convention below; hack/ci-deploy.sh sets both on the
+  # pull-request path and none on the release-candidate path, which installs
+  # the candidate's published plugin images instead.
+  - id: agent-plugins
+    name: "gcr.io/cloud-builders/docker"
+    waitFor: ["-"]
+    env:
+      - "DOCKER_BUILDKIT=1"
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        set -euo pipefail
+        if [ -z "$_PUBSUB_PLATFORM_URI" ]; then
+          echo "agent-plugins: _PUBSUB_PLATFORM_URI is empty; the plugin images are not built"
+          exit 0
+        fi
+        for spec in "pubsub-platform:$_PUBSUB_PLATFORM_URI" "gke-stockout-investigator:$_STOCKOUT_INVESTIGATOR_URI"; do
+          plugin="$${spec%%:*}"
+          uri="$${spec#*:}"
+          docker build --platform linux/amd64 -t "$$uri" -f "agentplugins/$$plugin/Dockerfile" "agentplugins/$$plugin"
+          docker push "$$uri"
+        done
+
   # The next stack's five first-party images (a2a/Dockerfile.gateway,
   # .authcallout, .worker, .verifier, .console), built only when hack/ci-deploy.sh
   # runs under EVAL_MODE_NEXT=1 and passes their URIs. With the substitutions at their
@@ -284,6 +311,10 @@ substitutions:
   # _A2A_GATEWAY_URI alone, so they are set as a set or not at all.
   _A2A_GATEWAY_URI: ""
   _A2A_CALLOUT_URI: ""
+  # Empty means the agent-plugins step is a no-op; hack/ci-deploy.sh sets the
+  # pair together on the pull-request path. The step gates on the first.
+  _PUBSUB_PLATFORM_URI: ""
+  _STOCKOUT_INVESTIGATOR_URI: ""
   _A2A_WORKER_URI: ""
   _A2A_VERIFIER_URI: ""
   _A2A_CONSOLE_URI: ""

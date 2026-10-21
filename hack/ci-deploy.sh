@@ -606,6 +606,19 @@ else
 fi
 TAG_COMMIT="${TAG_COMMIT:-${CI_IMAGE_TAG_NO_COMMIT}}"
 TAG="${CI_IMAGE_TAG_PREFIX}${PULL_NUMBER:-${CI_IMAGE_TAG_NO_PULL}}-${TAG_COMMIT:0:${CI_IMAGE_TAG_SHA_CHARS}}"
+# The two AgentPlugin images, under the names docker-publish-*.yml and
+# scripts/release/common.sh publish them by.
+PLUGIN_IMAGE_PUBSUB_PLATFORM="pubsub-platform"
+PLUGIN_IMAGE_STOCKOUT_INVESTIGATOR="gke-stockout-investigator"
+# Section 7b: the Pub/Sub platform adapter must pull through the credential
+# broker. The adapter logs the first line when it connects; the broker logs
+# the second for every relayed pull. The route is the stockout investigator's
+# (agentplugins/gke-stockout-investigator/templates/agentplugin.yaml).
+PUBSUB_RELAY_READY_ATTEMPTS=24
+PUBSUB_RELAY_READY_INTERVAL_SECONDS=5
+PUBSUB_RELAY_ADAPTER_MARKER="connected through the credential broker relay"
+PUBSUB_RELAY_BROKER_MARKER="platform pubsub forwarded"
+PUBSUB_RELAY_ROUTE="gke_stockout_alerts"
 if [ -n "${BUILD_ID:-}" ]; then
   TAG="${TAG}-${BUILD_ID}"
 fi
@@ -656,8 +669,12 @@ fi
 # rewriting the trailing path element and keeping the tag
 # (resolveCredentialProxyImage in k8s-operator/internal/controller/
 # platformagent_manifests.go), so it follows whichever repository the agent uses
-# without being named here. Both plugin images default to enabled=false and are
-# not rendered on either path.
+# without being named here. The two AgentPlugin images (pubsub-platform and
+# gke-stockout-investigator) are rendered on both paths, so the Pub/Sub platform
+# adapter runs in the gateway of every install the presubmit tests: on the
+# pull-request path from this build (the `agent-plugins` step of
+# cloudbuild-ci.yaml), on the release-candidate path from the candidate's
+# published images. Section 7b gates on the adapter pulling through the broker.
 if [ -n "${RC_COMMIT_SHA:-}" ]; then
   # EVAL_MODE_NEXT=1 is accepted here: the release pipeline publishes the A2A
   # images and the bridge beside the others (REQUIRED_RELEASE_IMAGES, which
@@ -711,7 +728,11 @@ if [ -n "${RC_COMMIT_SHA:-}" ]; then
     --set-string "operator.image.tag=${TAG}"
     --set-string "platformAgent.deployment.image.tag=${TAG}"
     --set-string "agentSandbox.image.tag=${TAG}"
+    --set-string "plugins.pubsubPlatform.image.tag=${TAG}"
+    --set-string "plugins.stockoutInvestigator.image.tag=${TAG}"
   )
+  # The candidate's published plugin images; nothing to build here.
+  PLUGIN_IMAGE_SUBSTITUTIONS=""
   DEPLOY_SOURCE="release candidate ${RC_COMMIT_SHA:0:7} from ${RC_REGISTRY_PREFIX}"
 else
   IMAGE_ARGS=(
@@ -721,7 +742,12 @@ else
     --set-string "platformAgent.deployment.image.tag=${TAG}"
     --set-string "agentSandbox.image.repository=${AR_REPO}/agent-sandbox"
     --set-string "agentSandbox.image.tag=${TAG}"
+    --set-string "plugins.pubsubPlatform.image.repository=${AR_REPO}/${PLUGIN_IMAGE_PUBSUB_PLATFORM}"
+    --set-string "plugins.pubsubPlatform.image.tag=${TAG}"
+    --set-string "plugins.stockoutInvestigator.image.repository=${AR_REPO}/${PLUGIN_IMAGE_STOCKOUT_INVESTIGATOR}"
+    --set-string "plugins.stockoutInvestigator.image.tag=${TAG}"
   )
+  PLUGIN_IMAGE_SUBSTITUTIONS=",_PUBSUB_PLATFORM_URI=${AR_REPO}/${PLUGIN_IMAGE_PUBSUB_PLATFORM}:${TAG},_STOCKOUT_INVESTIGATOR_URI=${AR_REPO}/${PLUGIN_IMAGE_STOCKOUT_INVESTIGATOR}:${TAG}"
   DEPLOY_SOURCE="PR #${PULL_NUMBER:-local} build (${TAG})"
 fi
 
@@ -1445,7 +1471,7 @@ else
   CLOUD_BUILD_ID=""
   CLOUD_BUILD_LOG_URL=""
   CLOUD_BUILD_SUBMIT_OUT="$(with_deadline "${BUILD_SUBMIT_TIMEOUT_SECONDS}" gcloud builds submit --async --config="deploy/docker/cloudbuild-ci.yaml" \
-    --substitutions="_PLATFORM_URI=${AR_REPO}/platform-agent:${TAG},_PROXY_URI=${AR_REPO}/credential-proxy:${TAG},_SANDBOX_URI=${AR_REPO}/agent-sandbox:${TAG},_OPERATOR_URI=${AR_REPO}/kube-agents-operator:${TAG},_CACHE_IMAGE=${CACHE_IMAGE},_BUILDCACHE_IMAGE=${BUILDCACHE_IMAGE},_PROXY_BUILDCACHE_IMAGE=${PROXY_BUILDCACHE_IMAGE},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG},_KUBE_AGENTS_VERSION=${TAG},_REQUIRE_CACHE=${REQUIRE_CACHE:-false}${A2A_BUILD_SUBSTITUTIONS}" \
+    --substitutions="_PLATFORM_URI=${AR_REPO}/platform-agent:${TAG},_PROXY_URI=${AR_REPO}/credential-proxy:${TAG},_SANDBOX_URI=${AR_REPO}/agent-sandbox:${TAG},_OPERATOR_URI=${AR_REPO}/kube-agents-operator:${TAG}${PLUGIN_IMAGE_SUBSTITUTIONS},_CACHE_IMAGE=${CACHE_IMAGE},_BUILDCACHE_IMAGE=${BUILDCACHE_IMAGE},_PROXY_BUILDCACHE_IMAGE=${PROXY_BUILDCACHE_IMAGE},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG},_KUBE_AGENTS_VERSION=${TAG},_REQUIRE_CACHE=${REQUIRE_CACHE:-false}${A2A_BUILD_SUBSTITUTIONS}" \
     --project="${PROJECT_ID}" "${BUILD_WORKER_ARGS[@]}" --quiet --format="value(id,logUrl)" .)" || {
     echo "ERROR: gcloud builds submit exited $? before returning a build id (deadline ${BUILD_SUBMIT_TIMEOUT_SECONDS}s)" >&2
     exit 1
@@ -1668,6 +1694,9 @@ for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
     --set-string "platformAgent.deployment.env[1].value=${EVAL_ALERT_DAILY_LIMIT_DRIFT}" \
     --set "platformAgent.harness.driftDetector.enabled=true" \
     --set-string "platformAgent.harness.driftDetector.subscription=${EVAL_DRIFT_SUBSCRIPTION}" \
+    --set "plugins.pubsubPlatform.enabled=true" \
+    --set "plugins.stockoutInvestigator.enabled=true" \
+    --set-string "plugins.stockoutInvestigator.clusterName=${CLUSTER_NAME}" \
     ${A2A_OPERATOR_ENV_ARGS[@]+"${A2A_OPERATOR_ENV_ARGS[@]}"} \
     ${MODE_NEXT_ENV_ARGS[@]+"${MODE_NEXT_ENV_ARGS[@]}"} \
     --wait --timeout 15m 2>&1 | tee "${HELM_INSTALL_OUT}"
@@ -2371,6 +2400,44 @@ else
   kubectl get pods,svc -n "${NAMESPACE}" || true
   exit 1
 fi
+
+# ─── 7b. The Pub/Sub platform adapter pulls through the broker ───────────────
+# The gateway Pod holds no Google credential, so the adapter's one path to a
+# subscription is the broker's `/v1/pubsub/gcp/` relay, confined to the
+# subscriptions the operator rendered from the AgentPlugin configs. This gate
+# proves the whole chain on a real install: the plugin loads, the operator
+# wired the relay URL and the subscription set, the broker admits the
+# gateway's token on the route, and a pull reaches Pub/Sub on the broker's
+# credential. It does not prove delivery: the pool projects carry no stockout
+# topic, so Pub/Sub answers the pull with a 404 and the adapter logs a retry;
+# the staging promotion's E2E suite, on an install that has the topic, is
+# where a published alert is seen through. What this gate did catch is the
+# failure that reached staging unnoticed: an adapter that pulls on a
+# credential the gateway no longer holds never logs either marker.
+STEP_START=$SECONDS
+echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Verifying the Pub/Sub platform adapter pulls through the broker ==="
+pubsub_relay_connected=false
+for _ in $(seq "${PUBSUB_RELAY_READY_ATTEMPTS}"); do
+  # `grep -F ... >/dev/null`, not `-q`: see the drift-detector gate in 6.
+  if kubectl logs -n "${NAMESPACE}" deployment/platform-agent-gateway -c platform-agent 2>/dev/null |
+    grep -F "${PUBSUB_RELAY_ADAPTER_MARKER}" >/dev/null &&
+    kubectl logs -n "${NAMESPACE}" deployment/platform-agent-credential-proxy 2>/dev/null |
+    grep -F "${PUBSUB_RELAY_BROKER_MARKER}" >/dev/null; then
+    pubsub_relay_connected=true
+    break
+  fi
+  sleep "${PUBSUB_RELAY_READY_INTERVAL_SECONDS}"
+done
+if [[ "${pubsub_relay_connected}" != "true" ]]; then
+  echo "ERROR: the Pub/Sub platform adapter did not pull through the credential broker on this install"
+  echo "       (wanted '${PUBSUB_RELAY_ADAPTER_MARKER}' in the platform-agent container and"
+  echo "        '${PUBSUB_RELAY_BROKER_MARKER}' in the credential proxy, for route ${PUBSUB_RELAY_ROUTE})"
+  kubectl get agentplugins -n "${NAMESPACE}" -o wide || true
+  kubectl logs -n "${NAMESPACE}" deployment/platform-agent-gateway -c platform-agent --tail=200 2>/dev/null | grep -i "pubsub" || true
+  kubectl logs -n "${NAMESPACE}" deployment/platform-agent-credential-proxy --tail=100 2>/dev/null | grep -i "pubsub" || true
+  exit 1
+fi
+echo "✓ Pub/Sub platform adapter pulls through the broker, verified in $((SECONDS - STEP_START))s"
 
 TOTAL_DURATION=$((SECONDS - START_TIME))
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Deployment Ready in Namespace: ${NAMESPACE} (Total Duration: ${TOTAL_DURATION}s) ==="
