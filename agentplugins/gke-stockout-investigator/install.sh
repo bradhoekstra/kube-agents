@@ -259,6 +259,14 @@ gcloud pubsub subscriptions add-iam-policy-binding "$SUBSCRIPTION" \
     --role="roles/pubsub.subscriber" \
     --project="$PROJECT_ID" --quiet >/dev/null
 
+# Viewer too: the adapter reads the subscription once on connect (pubsub.subscriptions.get),
+# which subscriber does not carry. Without it every connect logs a 403 on that read while
+# pulls still work. The root installer's composition grants the same pair.
+gcloud pubsub subscriptions add-iam-policy-binding "$SUBSCRIPTION" \
+    --member="serviceAccount:${GSA_EMAIL}" \
+    --role="roles/pubsub.viewer" \
+    --project="$PROJECT_ID" --quiet >/dev/null
+
 # 4b: Skill Command Permission Analysis:
 # Skill SKILL.md executes:
 #   - `gcloud compute regions describe ...`

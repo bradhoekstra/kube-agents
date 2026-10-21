@@ -35,13 +35,15 @@ when the work it produces belongs elsewhere.
 
 ## How it reaches Pub/Sub
 
-The adapter runs in the gateway Pod, which holds no Google credential of its own. It pulls through
-the credential broker's Pub/Sub relay: the operator sets `PUBSUB_RELAY_URL` on the gateway and the
-list of subscriptions the plugins configure on the broker, and the broker pulls, acknowledges and
-reads those subscriptions on the install's identity and nothing else. A route whose subscription
-the operator did not render is refused by the broker, and the adapter logs the refusal with the
-rule that made it. The install's identity needs `roles/pubsub.subscriber` and `roles/pubsub.viewer`
-on each subscription; the root installer grants both for the stockout investigator's.
+The adapter runs in the gateway Pod, which holds no Google credential of its own, and pulls through
+the credential broker's Pub/Sub relay; the site's
+[credential isolation](https://gke-labs.github.io/kube-agents/reference/credential-isolation/) page
+owns that boundary. What this plugin needs from an install: the operator sets `PUBSUB_RELAY_URL` on
+the gateway and the subscription set on the broker once at least one route names a subscription
+the operator can qualify (a full `projects/<project>/subscriptions/<name>` path, or a short name
+on an agent whose `spec.harness.projectId` is set). The install's identity needs
+`roles/pubsub.subscriber` and `roles/pubsub.viewer` on each subscription; the root installer and
+the stockout investigator's own installer grant both.
 
 ## Routes
 
@@ -82,17 +84,11 @@ plainly:
   nothing to refuse. Pairing the two is logged as a warning at startup rather than left to
   read like a guarantee.
 
-**The startup sink presence check is currently disabled, so `sink` is recorded but not
-read.** It is the only thing `sink` was ever used for. The check needs
-`google-cloud-logging`, which the agent image does not carry; supplying it means either
-adding it to the image or enabling Hermes' lazy installs, and that decision is pending.
-Running the check without the library just logs
-`Could not verify Log Sink … cannot import name 'logging'` on every connect, which is the
-same false alarm the configured-name fix removed.
-
-Keep setting `sink` to the name your installer created — it cannot be derived, because the
-sink belongs to whoever set the route up, and it is plumbed end to end so that re-enabling
-the check is a one-line change in the adapter rather than a reinstall.
+**There is no startup sink presence check, so `sink` is recorded but not read.** The adapter
+reaches Google only through the credential broker's Pub/Sub relay, which forwards no Logging
+API call, so a check of the sink would need a broker route of its own, not a library. Keep
+setting `sink` to the name your installer created — it cannot be derived, because the sink
+belongs to whoever set the route up — so that a check added later has the name to read.
 
 `DISABLE_PUBSUB_DEDUP=true` in the pod switches off both dedup and the threshold gate. It
 is invisible from the CRs and survives reconciles, so check for it before concluding that
