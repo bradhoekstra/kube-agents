@@ -1803,6 +1803,15 @@ SLACK_REMOVE_ALLOWLIST = frozenset({"reactions.remove"})
 # `chat.delete?x` and `chat.delete.` would pass it -- and slack_sdk joins the
 # string into the URL, where the fragment is dropped and the query ignored.
 SLACK_METHOD_SHAPE = re.compile(r"[A-Za-z][A-Za-z0-9]*(?:\.[A-Za-z][A-Za-z0-9]*)+")
+# The subscriptions the platform Pub/Sub relay may reach, as the operator renders
+# them from the AgentPlugin configs; read by platform_pubsub_subscriptions().
+PLATFORM_PUBSUB_SUBSCRIPTIONS_ENV = "PLATFORM_PUBSUB_SUBSCRIPTIONS"
+# One fully qualified subscription, the shape watcher_policy matches on the
+# wire; an entry that is not one would never match a call and would read as a
+# configured subscription that silently refuses everything.
+_QUALIFIED_SUBSCRIPTION = re.compile(
+    rf"projects/{watcher_policy.PUBSUB_PROJECT}/subscriptions/{watcher_policy.SUBSCRIPTION}"
+)
 # The IAM permission a Pub/Sub pull spends on the subscription. A refused pull
 # names it in the log when the error's own ErrorInfo did not, so the line says
 # what to grant rather than only that something was refused.
@@ -11256,15 +11265,6 @@ def chat_relay_subscriptions(project_id: str) -> tuple[str, str]:
             "split its deliveries; arm one relay instance per install"
         )
     return chat_subscription, a2a_subscription
-
-
-PLATFORM_PUBSUB_SUBSCRIPTIONS_ENV = "PLATFORM_PUBSUB_SUBSCRIPTIONS"
-# One fully qualified subscription, the shape watcher_policy matches on the
-# wire; an entry that is not one would never match a call and would read as a
-# configured subscription that silently refuses everything.
-_QUALIFIED_SUBSCRIPTION = re.compile(
-    rf"projects/{watcher_policy.PUBSUB_PROJECT}/subscriptions/{watcher_policy.SUBSCRIPTION}"
-)
 
 
 def platform_pubsub_subscriptions() -> frozenset[str]:

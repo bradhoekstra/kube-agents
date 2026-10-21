@@ -110,6 +110,20 @@ platforms:
 	}
 }
 
+func TestPluginPubsubSubscriptionsSeesOnlyThePluginsTheGatewayLoads(t *testing.T) {
+	// A hyphenated name fails the render's plugin-name rule: the plugin is set
+	// Degraded and kept out of config.yaml and the pod env. Its routes must not
+	// reach the broker either.
+	agent := agentInProject("my-gcp-project")
+	plugins := []*agentv1alpha1.AgentPlugin{pubsubPlugin("stockout-investigator", stockoutPluginConfig)}
+	if got := pluginPubsubSubscriptions(agent, plugins); len(got) != 0 {
+		t.Fatalf("a plugin the render refuses reached the broker's set: %v", got)
+	}
+	if pubsubRelayEnabled(agent, plugins) {
+		t.Fatalf("the relay URL would be pinned for a plugin the gateway never loads")
+	}
+}
+
 func TestPluginPubsubSubscriptionsWithoutAProjectKeepsOnlyFullPaths(t *testing.T) {
 	agent := agentInProject("")
 	plugins := []*agentv1alpha1.AgentPlugin{pubsubPlugin("stockout", stockoutPluginConfig), pubsubPlugin("full", `

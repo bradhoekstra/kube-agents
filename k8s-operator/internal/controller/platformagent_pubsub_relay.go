@@ -51,6 +51,11 @@ var pubsubSubscriptionPathPattern = regexp.MustCompile(
 // nothing: the adapter logs and skips the same route, and the broker's refusal
 // of an unlisted subscription is the loud signal if the two ever disagree.
 func pluginPubsubSubscriptions(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin) []string {
+	// The same plugins the gateway loads: a plugin the render refuses (an
+	// invalid name, a built-in collision) must not reach the broker's set
+	// either, or the broker admits a subscription no adapter route exists for
+	// and the gateway's env and its managed pin disagree.
+	agentPlugins = filterValidAgentPlugins(agentPlugins)
 	if len(agentPlugins) == 0 {
 		return nil
 	}
