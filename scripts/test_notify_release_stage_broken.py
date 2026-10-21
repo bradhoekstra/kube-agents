@@ -415,6 +415,9 @@ class RenderTest(unittest.TestCase):
         self.assertIn("🔴", broken)
         self.assertIn("Staging: Promotion Pipeline", broken)
         self.assertIn("Step 3: FAILED t::x", broken)
+        marked = notifier.render_chat_broken(STAGING["name"], dict(details, failure="##[error]Expected *one* replica, got `two` ~now~ _x_ test_a_b"), 4001)
+        self.assertIn("Expected ∗one∗ replica, got 'two' ∼now∼ ‗x‗ test_a_b", marked)
+        self.assertNotIn("*one*", marked)
         self.assertIn("rc_1_abc (aaaaaaa)", broken)
         self.assertIn("#4001", broken)
         self.assertIn(RUN_30["html_url"], broken)
@@ -783,9 +786,46 @@ class ReconcileTest(unittest.TestCase):
         github.opener = flaky
         self.assertEqual(reconcile(github)[0], "opened")
 
+    def _three_watched(self):
+        """The three watched workflows, two with no runs yet."""
+        workflows = [{"id": index + 1, "name": name} for index, name in enumerate(notifier.WATCHED_WORKFLOWS)]
+        responses = {f"/repos/{REPO}/actions/workflows?per_page=100&page=1": {"total_count": 3, "workflows": workflows}}
+        for workflow in workflows[1:]:
+            responses[runs_path(workflow["id"])] = {"total_count": 0, "workflow_runs": []}
+        return workflows, FakeGitHub(responses)
+
+    def test_one_pipelines_incident_does_not_stop_the_others_and_is_a_warning_not_a_red(self):
+        """A 5xx past the client's retries on one pipeline's runs read: the
+        other two are reconciled, the job stays green, and the warning
+        annotation says which one waits for the next sweep."""
+        workflows, github = self._three_watched()
+        real = github.opener
+
+        def down(request):
+            if request.full_url.endswith(runs_path(workflows[0]["id"])):
+                raise urllib.error.HTTPError(request.full_url, 502, "bad gateway", {}, None)
+            return real(request)
+
+        github.opener = down
+        with mock.patch("sys.stderr", new=io.StringIO()) as err, mock.patch("sys.stdout", new=io.StringIO()) as out:
+            code = notifier.main(["--sweep"], environ={notifier.ANNOTATE_ENV: notifier.SWITCH_ON}, api=github.api())
+        self.assertEqual(code, 0)
+        for workflow in workflows[1:]:
+            self.assertIn(f"{workflow['name']}: nothing", err.getvalue())
+        self.assertIn(f"::warning::Reconciling {workflows[0]['name']} failed", out.getvalue())
+
+    def test_a_refusal_on_one_pipeline_reds_the_run_after_the_others_are_reconciled(self):
+        workflows, github = self._three_watched()  # the first workflow's runs path is unanswered: a 404
+        with mock.patch("sys.stderr", new=io.StringIO()) as err:
+            code = notifier.main(["--sweep"], environ={}, api=github.api())
+        self.assertEqual(code, 1)
+        for workflow in workflows[1:]:
+            self.assertIn(f"{workflow['name']}: nothing", err.getvalue())
+        self.assertIn(f"GitHub refused a request while reconciling {workflows[0]['name']}", err.getvalue())
+
     def test_a_read_the_api_refuses_writes_nothing_and_reds_the_run(self):
-        """A 404 on the runs list is not retried; the sweep writes nothing and
-        exits 1 so the job is red. (The retried 502 is the test above.)"""
+        """A 404 on the workflows list is not retried; the sweep writes nothing
+        and exits 1 so the job is red. (The retried 502 is the test above.)"""
         github = FakeGitHub({})
         with mock.patch("sys.stderr", new=io.StringIO()):
             code = notifier.main(["--sweep"], environ={}, api=github.api())

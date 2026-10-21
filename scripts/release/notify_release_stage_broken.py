@@ -98,7 +98,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from eval_dashboard.post_health import SPACE_ENV, TOKEN_ENV, Sender  # noqa: E402
-from github_api import log  # noqa: E402
+from github_api import is_refusal, log  # noqa: E402
 from notify_broken_main import FAILING_CONCLUSIONS, decide, newest_reporting_run, reporting_history  # noqa: E402
 from notify_flaky_check import GitHubAPI as FlakyGitHubAPI  # noqa: E402
 
@@ -176,7 +176,7 @@ NO_TIME = ""
 # the watched workflows: the promotion pipeline's rollback leg (`Roll
 # Back`, `continue-on-error`), its withdrawal of an unsettled nomination
 # (`Withdraw`, `always()`) and its teardown (`Tear Down`, `!cancelled()`),
-# the RC pipeline's teardown and its `(non-gating)` next-mode legs. The
+# the RC pipeline's teardown and its `(non-gating)` legs. The
 # jobs API carries neither `if:` nor `continue-on-error`, so the names are
 # the only handle. Such a job fails after the gating failure (a withdrawal
 # runs because step 5 did not settle) or inside green runs, and is skipped
@@ -266,6 +266,11 @@ _FAILURE_LINE_RES = (
 )
 
 CHAT_BROKEN = "🔴 *Release pipeline: {workflow} failed* — {stage}: {failure}"
+# Chat parses the text for paired `*`, `_`, `~` and backticks; a failure line
+# is a log line, so each is replaced by a look-alike that Chat does not parse.
+CHAT_FORMATTING = {"*": "∗", "~": "∼", "`": "'"}
+CHAT_UNDERSCORE_PAIR_RE = re.compile(r"(?<!\w)_|_(?!\w)")
+CHAT_UNDERSCORE_LOOKALIKE = "‗"
 CHAT_BROKEN_DETAIL = "Candidate {candidate}. Tracking #{number}."
 CHAT_RECOVERED = "🟢 *Release pipeline: {workflow} passes again* — run #{run_number} on candidate {candidate}. Closed #{number}."
 NOT_CONFIGURED = "chat not configured: set CI_HEALTH_CHAT_SPACE and CI_HEALTH_CHAT_TOKEN; nothing posted"
@@ -584,11 +589,18 @@ def render_recovered(details: dict, note: str | None = None) -> str:
     return text + " Closing."
 
 
+def chat_plain(text: str) -> str:
+    """Log-derived text in a Chat message: nothing in it toggles formatting."""
+    for char, lookalike in CHAT_FORMATTING.items():
+        text = text.replace(char, lookalike)
+    return CHAT_UNDERSCORE_PAIR_RE.sub(CHAT_UNDERSCORE_LOOKALIKE, text)
+
+
 def render_chat_broken(workflow_name: str, details: dict, number: int) -> str:
     run = details["run"]
     failure = details.get("failure") or (f"step `{details['step']}` failed" if details.get("step") else "see the run")
     lines = [
-        CHAT_BROKEN.format(workflow=workflow_name, stage=details.get("stage") or STAGE_UNKNOWN, failure=failure),
+        CHAT_BROKEN.format(workflow=workflow_name, stage=details.get("stage") or STAGE_UNKNOWN, failure=chat_plain(failure)),
         CHAT_BROKEN_DETAIL.format(candidate=candidate_short(details["candidate"]), number=number),
         run["html_url"],
     ]
@@ -870,16 +882,36 @@ def main(argv=None, environ=os.environ, api: GitHubAPI | None = None, opener=Non
                 log(f"run {args.run_id} is on {run.get('head_branch')!r}, not a {MAIN_BRANCH} run; nothing to do")
                 return 0
             targets = [{"id": run["workflow_id"], "name": run["name"]}]
-        for workflow in targets:
+    except (RuntimeError, OSError) as exc:
+        # Nothing can be reconciled without the targets. A missing name or a
+        # request GitHub refused is ours to fix and reds the job; a read that
+        # failed past the client's retries is an incident, logged and
+        # annotated, and the next sweep is fifteen minutes away.
+        log(f"error: {exc}")
+        if isinstance(exc, RuntimeError) or is_refusal(exc):
+            return 1
+        warn(f"{exc}; nothing reconciled this sweep, the next one retries", environ)
+        return 0
+    failed, broken = [], []
+    for workflow in targets:
+        # One workflow's failure, read or write, must not stop the rest:
+        # `scripts/notify_broken_main.py` sweeps the same way, for the same
+        # reasons. `urllib.error.HTTPError` and `URLError` are `OSError`s.
+        try:
             outcome = reconcile(api, workflow, sender, args.dry_run, environ)
             log(f"{workflow['name']}: {outcome}")
-    except (RuntimeError, OSError) as exc:
-        # `urllib.error.HTTPError` and `URLError` are `OSError`s: a read that
-        # failed past the client's retries writes nothing, and the next
-        # sweep is fifteen minutes away.
-        log(f"error: {exc}")
-        return 1
-    return 0
+        except Exception as exc:  # noqa: BLE001 - every failure is logged and classified below
+            log(f"{workflow['name']}: {type(exc).__name__}: {exc}")
+            (broken if is_refusal(exc) else failed).append(workflow["name"])
+    if failed:
+        # Annotated, not a red: an API incident that outlasts the client's
+        # retries would otherwise red the schedule every fifteen minutes and
+        # mail the cron line's last editor each time, for a fault nobody here
+        # can fix. The next sweep retries.
+        warn(f"Reconciling {', '.join(failed)} failed; the rest were reconciled, and the next sweep retries", environ)
+    if broken:
+        log(f"GitHub refused a request while reconciling {', '.join(broken)}; that is a fault in this repository")
+    return 1 if broken else 0
 
 
 if __name__ == "__main__":

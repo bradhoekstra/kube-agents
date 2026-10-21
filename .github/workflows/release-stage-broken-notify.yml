@@ -51,7 +51,7 @@ on:
         type: boolean
         default: true
       run_id:
-        description: One completed run of a watched workflow to reconcile instead of sweeping every watched pipeline
+        description: A completed run of a watched workflow; the script reconciles that workflow against its newest main run, instead of sweeping every watched pipeline
         type: string
         default: ""
 
