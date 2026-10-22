@@ -36,12 +36,20 @@ describe("fencedBlock", () => {
     expect(fencedBlock("```\n```")).toBeNull();
     expect(fencedBlock("```\n\n```")).toBeNull();
     expect(fencedBlock("```\r\n\r\n```")).toBeNull();
+    expect(fencedBlock("```\n \n\t\n```")).toBeNull();
   });
 
-  it("skips a language tag, keeps an inline triple backtick, and drops a CRLF tail", () => {
+  it("reads fences by line: an inline triple backtick does not open, an indented or tagged line closes or not", () => {
+    expect(fencedBlock("use ```kubectl``` now\nthen:\n```\nblock\n```")).toBe("block");
+    expect(fencedBlock("```\nL1\n  ```")).toBe("L1");
+    expect(fencedBlock("```\nL1\n```yaml\nL2\n```")).toBe("L1\n```yaml\nL2");
+    expect(fencedBlock("```\nL1\n``` ")).toBe("L1");
+  });
+
+  it("skips a language tag, keeps an inline triple backtick, and joins CRLF lines with LF", () => {
     expect(fencedBlock("```text\nL1\n```")).toBe("L1");
     expect(fencedBlock("```\na ``` b\nc\n```")).toBe("a ``` b\nc");
-    expect(fencedBlock("```\r\nL1\r\nL2\r\n```")).toBe("L1\r\nL2");
+    expect(fencedBlock("```\r\nL1\r\nL2\r\n```")).toBe("L1\nL2");
   });
 });
 

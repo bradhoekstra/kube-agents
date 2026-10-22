@@ -27,7 +27,12 @@ const FOLLOW_SLACK_PX = 10;
  * pastes into a report. The clipboard needs a user gesture, so the copy is
  * the click, never the arrival of the notice.
  */
-const FENCE = "```";
+// A fence opens on a line that starts with three backticks after at most three spaces (a language tag may follow) and
+// closes on a line that is three backticks and nothing else, the CommonMark shape; an inline triple backtick is a
+// code span, as the gateway's own Slack renderer reads it.
+const LINE_BREAK_RE = /\r?\n/;
+const FENCE_OPEN_RE = /^ {0,3}```/;
+const FENCE_CLOSE_RE = /^ {0,3}```\s*$/;
 const COPY_LABEL = "copy";
 const COPIED_LABEL = "copied";
 const COPY_FAILED_LABEL = "copy failed";
@@ -40,14 +45,13 @@ const COPIED_RESET_MS = 2000;
  * must start a line, so a triple backtick inside the body does not end it.
  */
 export function fencedBlock(text: string): string | null {
-  const open = text.indexOf(FENCE);
+  const lines = text.split(LINE_BREAK_RE);
+  const open = lines.findIndex((line) => FENCE_OPEN_RE.test(line));
   if (open < 0) return null;
-  const bodyStart = text.indexOf("\n", open);
-  if (bodyStart < 0) return null;
-  const close = text.indexOf("\n" + FENCE, bodyStart);
-  if (close <= bodyStart) return null;
-  const body = text.slice(bodyStart + 1, close).replace(/\r$/, "");
-  return body === "" ? null : body;
+  const close = lines.findIndex((line, i) => i > open && FENCE_CLOSE_RE.test(line));
+  if (close < 0) return null;
+  const body = lines.slice(open + 1, close).join("\n");
+  return body.trim() === "" ? null : body;
 }
 
 const GLYPH: Record<ChatEntry["kind"], string> = {
