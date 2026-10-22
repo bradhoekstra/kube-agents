@@ -131,6 +131,10 @@ HERMES_STATE_DB_FILENAME = "state.db"
 # `tool_call`, `tool_result`, `reply`) and card text field whenever
 # `AuditRedactor` cannot be loaded or structural recursion exceeds Python's limit.
 WORKER_STEP_WITHHELD = "[withheld: redactor unavailable]"
+# The title the dispatcher gives a triage gateway session, and the prefix the
+# pre-kanban read requires of a session before it serves it: one spelling, or
+# a change to the dispatcher silently hides every live triage from the feed.
+TRIAGE_SESSION_TITLE_PREFIX = "Triage "
 PRE_KANBAN_STATUS_IN_PROGRESS = "in_progress"
 PRE_KANBAN_STATUS_COMPLETED = "completed"
 PRE_KANBAN_STATUS_FAILED = "failed"
@@ -1883,7 +1887,7 @@ def _create_gateway_session(api_url: str, session_id: str, headers: Dict[str, st
     try:
         req = urllib.request.Request(
             f"{api_url}/api/sessions",
-            data=json.dumps({"session_id": session_id, "title": f"Triage {session_id}"}).encode("utf-8"),
+            data=json.dumps({"session_id": session_id, "title": f"{TRIAGE_SESSION_TITLE_PREFIX}{session_id}"}).encode("utf-8"),
             headers=headers,
             method="POST"
         )
@@ -5396,11 +5400,13 @@ def list_session_tasks(session_id: str, limit: int = FEED_TASKS_DEFAULT_LIMIT) -
     `steps_truncated` from the worker's Hermes session (`state.db`).
 
     When an intercepted event session has no kanban card yet, a sibling
-    `routing` object (`profile = "default"`) is returned beside `tasks: []`
-    from the default profile's `state.db` (`status = "in_progress"` while the
-    front-door routing turn is active, or terminal `"completed"` / `"failed"`
-    once `sessions.ended_at` is set or the routing turn ages past
-    `PRE_KANBAN_STALE_AFTER_SECONDS` without filing a card).
+    `routing` object (`profile = "default"`) is returned beside `tasks: []`,
+    from the ledger row alone (`live_steps: []`) until the gateway session
+    exists, and from the default profile's `state.db` after that
+    (`status = "in_progress"` while the front-door routing turn is active, or
+    terminal `"completed"` / `"failed"` once `sessions.ended_at` is set for
+    this turn or the turn ages past `PRE_KANBAN_STALE_AFTER_SECONDS` without
+    filing a card).
     """
     limit = _clamp_limit(limit, FEED_TASKS_MAX_LIMIT)
     result = _read_kanban(lambda conn: _session_task_rows(conn, session_id, limit))
@@ -6267,6 +6273,42 @@ def _timestamp_epoch_seconds(value: Any) -> Optional[float]:
         return None
 
 
+def _routing_object(
+    *,
+    title: str,
+    session_id: str,
+    status: str,
+    created_at: Any,
+    completed_at: Any,
+    updated_at: Any,
+    summary: Optional[str] = None,
+    result: Optional[str] = None,
+    error: Optional[str] = None,
+    live_steps: Optional[list] = None,
+    steps_truncated: bool = False,
+    routing_error: Optional[str] = None,
+) -> Dict[str, Any]:
+    """The one shape of the sibling `routing` object, whichever source built it."""
+    routing: Dict[str, Any] = {
+        "title": title,
+        "profile": DEFAULT_PROFILE,
+        "status": status,
+        "session_id": session_id,
+        "created_at": created_at,
+        "started_at": created_at,
+        "completed_at": completed_at,
+        "updated_at": updated_at,
+        "summary": summary,
+        "result": result,
+        "error": error,
+        "live_steps": live_steps if live_steps is not None else [],
+        "steps_truncated": steps_truncated,
+    }
+    if routing_error is not None:
+        routing["routing_error"] = routing_error
+    return routing
+
+
 def _read_pre_kanban_session_task(session_id: str) -> Optional[Dict[str, Any]]:
     """Read the front-door routing turn from `default` profile `state.db` before `kanban_create` runs.
 
@@ -6297,7 +6339,7 @@ def _read_pre_kanban_session_task(session_id: str) -> Optional[Dict[str, Any]]:
     steps: list[Dict[str, Any]] = []
     rows_clipped = False
     latest_raw_reply: Optional[str] = None
-    title = _scrub_worker_step_text("reply", f"Triage {session_id}")
+    title = _scrub_worker_step_text("reply", f"{TRIAGE_SESSION_TITLE_PREFIX}{session_id}")
     created_at: Any = None
     ended_at: Any = None
     has_session = False
@@ -6318,7 +6360,7 @@ def _read_pre_kanban_session_task(session_id: str) -> Optional[Dict[str, Any]]:
                         has_session = True
                         if "title" in sess_cols:
                             raw_title = str(srow["title"] or "")
-                            if not raw_title.startswith("Triage "):
+                            if not raw_title.startswith(TRIAGE_SESSION_TITLE_PREFIX):
                                 return None
                             title = _scrub_worker_step_text("reply", raw_title)
                         created_at = srow["started_at"]
@@ -6369,7 +6411,7 @@ def _read_pre_kanban_session_task(session_id: str) -> Optional[Dict[str, Any]]:
             steps = []
             rows_clipped = False
             latest_raw_reply = None
-            title = _scrub_worker_step_text("reply", f"Triage {session_id}")
+            title = _scrub_worker_step_text("reply", f"{TRIAGE_SESSION_TITLE_PREFIX}{session_id}")
             created_at = None
             ended_at = None
             has_session = False
@@ -6379,46 +6421,29 @@ def _read_pre_kanban_session_task(session_id: str) -> Optional[Dict[str, Any]]:
             ledger_epoch is not None
             and (time.time() - ledger_epoch) > PRE_KANBAN_STALE_AFTER_SECONDS
         ):
-            failed_routing: Dict[str, Any] = {
-                "title": title,
-                "profile": DEFAULT_PROFILE,
-                "status": PRE_KANBAN_STATUS_FAILED,
-                "session_id": session_id,
-                "created_at": ledger_epoch,
-                "started_at": ledger_epoch,
-                "completed_at": ledger_epoch,
-                "updated_at": ledger_epoch,
-                "summary": None,
-                "result": None,
-                "error": PRE_KANBAN_STALE_ERROR,
-                "live_steps": [],
-                "steps_truncated": False,
-            }
-            if state_db_error is not None:
-                failed_routing["routing_error"] = state_db_error
-            return failed_routing
+            return _routing_object(
+                title=title,
+                session_id=session_id,
+                status=PRE_KANBAN_STATUS_FAILED,
+                created_at=ledger_epoch,
+                completed_at=ledger_epoch,
+                updated_at=ledger_epoch,
+                error=PRE_KANBAN_STALE_ERROR,
+                routing_error=state_db_error,
+            )
         # The ledger row is the dispatch; the gateway session follows it (the
         # chat alert posts first, and a gateway outage delays it further), so
         # a young row with no session yet is a turn in progress, not an
         # unknown id. Whether state.db was readable only decides routing_error.
-        young_routing: Dict[str, Any] = {
-            "title": title,
-            "profile": DEFAULT_PROFILE,
-            "status": PRE_KANBAN_STATUS_IN_PROGRESS,
-            "session_id": session_id,
-            "created_at": ledger_epoch,
-            "started_at": ledger_epoch,
-            "completed_at": None,
-            "updated_at": ledger_epoch,
-            "summary": None,
-            "result": None,
-            "error": None,
-            "live_steps": [],
-            "steps_truncated": False,
-        }
-        if state_db_error is not None:
-            young_routing["routing_error"] = state_db_error
-        return young_routing
+        return _routing_object(
+            title=title,
+            session_id=session_id,
+            status=PRE_KANBAN_STATUS_IN_PROGRESS,
+            created_at=ledger_epoch,
+            completed_at=None,
+            updated_at=ledger_epoch,
+            routing_error=state_db_error,
+        )
     steps_truncated = rows_clipped or len(steps) > SESSION_TASK_LIVE_STEPS_MAX
     if len(steps) > SESSION_TASK_LIVE_STEPS_MAX:
         steps = steps[-SESSION_TASK_LIVE_STEPS_MAX:]
@@ -6433,17 +6458,21 @@ def _read_pre_kanban_session_task(session_id: str) -> Optional[Dict[str, Any]]:
     result: Optional[str] = None
     error: Optional[str] = None
 
-    has_ended = ended_at is not None and str(ended_at).strip() != ""
     # The turn started at the later of the two clocks: the ledger row is the
     # newer one on a reused session (its started_at is the first turn's), and
     # sessions.started_at is the newer one when the dispatch queued behind
     # the thread pool. Either alone misreports the other case.
-    _turn_clocks = [
+    turn_clocks = [
         e
         for e in (_timestamp_epoch_seconds(ledger_created_at), _timestamp_epoch_seconds(created_at))
         if e is not None
     ]
-    turn_start_epoch = max(_turn_clocks) if _turn_clocks else _timestamp_epoch_seconds(updated_at)
+    turn_start_epoch = max(turn_clocks) if turn_clocks else _timestamp_epoch_seconds(updated_at)
+    # sessions.ended_at ends this turn only when it is not older than the turn:
+    # on a reused session it is the first turn's end, which Hermes stamped
+    # before this dispatch, and the new turn is live.
+    ended_epoch = _timestamp_epoch_seconds(ended_at) if ended_at is not None and str(ended_at).strip() != "" else None
+    has_ended = ended_epoch is not None and (turn_start_epoch is None or ended_epoch >= turn_start_epoch)
     is_stale = (
         not has_ended
         and turn_start_epoch is not None
@@ -6463,21 +6492,19 @@ def _read_pre_kanban_session_task(session_id: str) -> Optional[Dict[str, Any]]:
             status = PRE_KANBAN_STATUS_FAILED
             error = PRE_KANBAN_STALE_ERROR
 
-    return {
-        "title": title,
-        "profile": DEFAULT_PROFILE,
-        "status": status,
-        "session_id": session_id,
-        "created_at": created_at,
-        "started_at": created_at,
-        "completed_at": completed_at,
-        "updated_at": completed_at if completed_at is not None else updated_at,
-        "summary": summary,
-        "result": result,
-        "error": error,
-        "live_steps": live_steps,
-        "steps_truncated": steps_truncated,
-    }
+    return _routing_object(
+        title=title,
+        session_id=session_id,
+        status=status,
+        created_at=created_at,
+        completed_at=completed_at,
+        updated_at=completed_at if completed_at is not None else updated_at,
+        summary=summary,
+        result=result,
+        error=error,
+        live_steps=live_steps,
+        steps_truncated=steps_truncated,
+    )
 
 
 class _WorkerStepReader:
