@@ -5538,6 +5538,13 @@ _SENSITIVE_KEY_SUFFIXES = (
     "id_ed25519",
     "id_ecdsa",
 )
+# A key that is a file name (`tls.crt`, `cert.pem`) opens ordinary diagnostic
+# lines: `kubectl describe secret` rows (`tls.crt:  1679 bytes`), `openssl
+# verify` (`cert.pem: OK`), `file` (`cert.pem: PEM certificate`), `grep -n`
+# (`cert.pem:1:-----BEGIN`). The value there is a count, a line number or a
+# short word, never key material, so the name alone does not mask it.
+_FILE_NAME_KEY_SUFFIXES = (".key", ".pem", ".crt", ".p12", ".pfx")
+_FILE_KEY_BENIGN_VALUE_RE = re.compile(r"^(?:\d+(?:[:.]\S*)?|[A-Za-z]{1,16})$")
 _BASE64_SECRET_VALUE_RE = re.compile(r"^[A-Za-z0-9+/]{4,}={0,2}$")
 _INLINE_JSON_OBJECT_RE = re.compile(r"\{[^{}]+\}")
 _SECRET_READ_COMMAND_RE = re.compile(
@@ -5694,9 +5701,10 @@ def _blank_named_values(redactor: Any, text: str) -> str:
 
     def _mask_colon_kv(match: "re.Match[str]") -> str:
         key = match.group("key")
-        if _named_value_is_sensitive(redactor, key) and redactor._is_credential_value(
-            _unquote_token(match.group("val"))
-        ):
+        unquoted = _unquote_token(match.group("val"))
+        if key.lower().endswith(_FILE_NAME_KEY_SUFFIXES) and _FILE_KEY_BENIGN_VALUE_RE.match(unquoted):
+            return match.group(0)
+        if _named_value_is_sensitive(redactor, key) and redactor._is_credential_value(unquoted):
             return f"{match.group('prefix')}{key}{match.group('sep')}{_REDACTED_SECRET_MARKER}"
         return match.group(0)
 

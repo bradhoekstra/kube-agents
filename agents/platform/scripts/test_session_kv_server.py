@@ -6649,6 +6649,9 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
                         f"automountServiceAccountToken: false\n"
                         f"file1:1:-----BEGIN RSA PRIVATE KEY-----\n"
                         f"file2_second_match.pem:1:-----BEGIN RSA PRIVATE KEY-----\n"
+                        f"tls.crt:  1679 bytes\n"
+                        f"cert.pem: OK\n"
+                        f"cert.pem: PEM certificate\n"
                         f"Note: check the cluster credentials: deployment-controller mounts them.\n"
                         f'{{"apiVersion":"v1","kind":"Secret","data":{{"pw":"{cut_json_b64}"'
                     ),
@@ -6866,7 +6869,10 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
             "vector",
             "Done",
             "web1",
-            "file2_second_match.pem",
+            "file2_second_match.pem:1:-----BEGIN",
+            "tls.crt:  1679 bytes",
+            "cert.pem: OK",
+            "cert.pem: PEM certificate",
             "kept_plain_value",
             "/etc/creds/mounted-path",
             "deployment-controller mounts them",
