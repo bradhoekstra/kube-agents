@@ -135,6 +135,10 @@ WORKER_STEP_WITHHELD = "[withheld: redactor unavailable]"
 # pre-kanban read requires of a session before it serves it: one spelling, or
 # a change to the dispatcher silently hides every live triage from the feed.
 TRIAGE_SESSION_TITLE_PREFIX = "Triage "
+# The ledger's sub-second clock for dispatched_at. CURRENT_TIMESTAMP floors
+# to the second, and Hermes stamps its rows as floats, so a floored dispatch
+# would claim the previous turn's last second on a reused session.
+LEDGER_NOW_SQL = "strftime('%Y-%m-%d %H:%M:%f', 'now')"
 PRE_KANBAN_STATUS_IN_PROGRESS = "in_progress"
 PRE_KANBAN_STATUS_COMPLETED = "completed"
 PRE_KANBAN_STATUS_FAILED = "failed"
@@ -946,10 +950,12 @@ def init_db() -> None:
                 ("backlog", f"backlog INTEGER NOT NULL DEFAULT {DRIFT_BACKLOG_NONE}"),
                 ("principal", "principal TEXT NOT NULL DEFAULT ''"),
                 ("payload", "payload TEXT NOT NULL DEFAULT ''"),
-                # When the row's turn was dispatched: the insert for an event
-                # row, the carding UPDATE for a drift-backlog row. created_at
-                # is the row's arrival, which for a backlog row can precede
-                # its dispatch by the digest's whole wait. NULL on rows from
+                # When the row's turn was dispatched: stamped by the dispatcher
+                # as it creates the gateway session, on every path, and by the
+                # carding of a drift-backlog row. created_at is the row's
+                # arrival, which precedes the dispatch by the background queue
+                # for an event row and by the digest's whole wait for a backlog
+                # row. Sub-second, as Hermes's clocks are. NULL on rows from
                 # before the column, which read as created_at.
                 ("dispatched_at", "dispatched_at TEXT"),
             ):
@@ -1163,8 +1169,8 @@ def record_intercepted_event(
                 cursor = conn.execute(
                     "INSERT INTO intercepted_events "
                     "(cluster, namespace, workload, object_uid, object_kind, reason, message, severity, "
-                    "occurrences, notified, session_id, dispatched_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                    "occurrences, notified, session_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         cluster,
                         namespace,
@@ -1183,6 +1189,29 @@ def record_intercepted_event(
     except Exception as exc:
         logger.error(f"Failed to record intercepted event for {namespace}/{workload}: {exc}")
     return None
+
+
+def mark_dispatched(event_row_id: Optional[int]) -> None:
+    """Stamp a ledger row's `dispatched_at`: the moment its turn is dispatched.
+
+    Called by the dispatcher right before it creates the gateway session, on
+    every path, so the pre-kanban read ages a turn from its dispatch rather
+    than from the row's arrival (the background queue for an event row, the
+    digest's wait for a drift-backlog row). Sub-second, as Hermes's own
+    clocks are, so the previous turn's last second is not this turn's.
+    Best-effort, as the other ledger corrections are.
+    """
+    if not event_row_id:
+        return
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+            with conn:
+                conn.execute(
+                    f"UPDATE intercepted_events SET dispatched_at = {LEDGER_NOW_SQL} WHERE id = ?",
+                    (int(event_row_id),),
+                )
+    except Exception as exc:
+        logger.error(f"Failed to stamp the dispatch for ledger row {event_row_id}: {exc}")
 
 
 def mark_delivery_failed(event_row_id: Optional[int], detail: str) -> None:
@@ -2898,7 +2927,10 @@ def trigger_agent_troubleshooter(
 
     # 4. Instantiate the session in Platform Gateway. It lands on the default
     #    profile — the front door — which delegates it to the failing cluster's
-    #    own agent; see _build_agent_query.
+    #    own agent; see _build_agent_query. The ledger row is stamped
+    #    dispatched here, not at its insert: the queue and the chat post sit
+    #    between the two, and the pre-kanban read ages the turn from this.
+    mark_dispatched(event_row_id)
     session_created = _create_gateway_session(api_url, session_id, headers)
     if not session_created:
         logger.error(f"Aborting troubleshooting trigger: session creation failed for {session_id}")
@@ -4537,7 +4569,7 @@ def _card_drift_backlog_minorities(rows: Sequence[Dict[str, Any]]) -> list[Dict[
                 with conn:
                     conn.execute(
                         "UPDATE intercepted_events SET backlog = ?, notified = 1, session_id = ?, "
-                        "dispatched_at = CURRENT_TIMESTAMP WHERE id = ?",
+                        f"dispatched_at = {LEDGER_NOW_SQL} WHERE id = ?",
                         (DRIFT_BACKLOG_CARDED, session_id, row["id"]),
                     )
         except sqlite3.Error as exc:
@@ -6473,7 +6505,19 @@ def _read_pre_kanban_session_task(session_id: str) -> Optional[Dict[str, Any]]:
     steps_truncated = rows_clipped or len(steps) > SESSION_TASK_LIVE_STEPS_MAX
     if len(steps) > SESSION_TASK_LIVE_STEPS_MAX:
         steps = steps[-SESSION_TASK_LIVE_STEPS_MAX:]
-    updated_at = steps[-1].get("at") if steps else created_at
+    # The turn started at the later of the two clocks: the ledger row is the
+    # newer one on a reused session (its started_at is the first turn's), and
+    # sessions.started_at is the newer one when the dispatch queued behind
+    # the thread pool. Either alone misreports the other case. The object
+    # reports this clock as its start, not the first turn's.
+    turn_clocks = [
+        e
+        for e in (_timestamp_epoch_seconds(ledger_created_at), _timestamp_epoch_seconds(created_at))
+        if e is not None
+    ]
+    turn_start_epoch = max(turn_clocks) if turn_clocks else None
+    turn_started_at: Any = turn_start_epoch if turn_start_epoch is not None else created_at
+    updated_at = steps[-1].get("at") if steps else turn_started_at
     reply_step = next((s for s in reversed(steps) if s.get("kind") == "reply"), None)
     reply_summary = reply_step.get("preview") if reply_step else None
     live_steps = steps
@@ -6484,16 +6528,8 @@ def _read_pre_kanban_session_task(session_id: str) -> Optional[Dict[str, Any]]:
     result: Optional[str] = None
     error: Optional[str] = None
 
-    # The turn started at the later of the two clocks: the ledger row is the
-    # newer one on a reused session (its started_at is the first turn's), and
-    # sessions.started_at is the newer one when the dispatch queued behind
-    # the thread pool. Either alone misreports the other case.
-    turn_clocks = [
-        e
-        for e in (_timestamp_epoch_seconds(ledger_created_at), _timestamp_epoch_seconds(created_at))
-        if e is not None
-    ]
-    turn_start_epoch = max(turn_clocks) if turn_clocks else _timestamp_epoch_seconds(updated_at)
+    if turn_start_epoch is None:
+        turn_start_epoch = _timestamp_epoch_seconds(updated_at)
     # sessions.ended_at ends this turn only when it is not older than the turn:
     # on a reused session it is the first turn's end, which Hermes stamped
     # before this dispatch, and the new turn is live.
@@ -6505,7 +6541,7 @@ def _read_pre_kanban_session_task(session_id: str) -> Optional[Dict[str, Any]]:
         and (time.time() - turn_start_epoch) > PRE_KANBAN_STALE_AFTER_SECONDS
     )
     if has_ended or is_stale:
-        completed_at = ended_at if has_ended else (updated_at if updated_at is not None else created_at)
+        completed_at = ended_at if has_ended else (updated_at if updated_at is not None else turn_started_at)
         if reply_step is not None:
             status = PRE_KANBAN_STATUS_COMPLETED
             summary = reply_summary
@@ -6522,7 +6558,7 @@ def _read_pre_kanban_session_task(session_id: str) -> Optional[Dict[str, Any]]:
         title=title,
         session_id=session_id,
         status=status,
-        created_at=created_at,
+        created_at=turn_started_at,
         completed_at=completed_at,
         updated_at=completed_at if completed_at is not None else updated_at,
         summary=summary,

@@ -7594,6 +7594,10 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
                     self.assertIsNone(routing["error"])
                 if name.startswith("reused-prior-reply"):
                     self.assertEqual([s["kind"] for s in routing["live_steps"]], ["thinking"])
+                if name.startswith("reused-"):
+                    # The object's clocks are this turn's, not the first turn's.
+                    self.assertAlmostEqual(routing["started_at"], now - 5.0, delta=1.5)
+                    self.assertAlmostEqual(routing["created_at"], now - 5.0, delta=1.5)
 
     def test_pre_kanban_dispatch_time_not_row_age_decides_the_ledger_only_verdict(self):
         # A drift-backlog row is carded long after it arrived: created_at is
@@ -7603,20 +7607,44 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
 
         now = time.time()
         old_ts = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(now - 1200.0))
-        self._record_ledger_session("k8s-evt-carded-late")
+        carded_late_id = self._record_ledger_session("k8s-evt-carded-late")
         self._record_ledger_session("k8s-evt-dispatched-late")
+        self._record_ledger_session("k8s-evt-queued")
         with sqlite3.connect(self.kv_db_path) as conn:
-            conn.execute("UPDATE intercepted_events SET created_at = ? WHERE session_id = 'k8s-evt-carded-late'", (old_ts,))
+            conn.execute(
+                "UPDATE intercepted_events SET created_at = ? WHERE session_id IN ('k8s-evt-carded-late', 'k8s-evt-queued')",
+                (old_ts,),
+            )
             conn.execute(
                 "UPDATE intercepted_events SET created_at = ?, dispatched_at = ? WHERE session_id = 'k8s-evt-dispatched-late'",
                 (old_ts, old_ts),
             )
+        # A row from before the column, never stamped, reads as its arrival.
+        self.assertEqual(self.client.get("/v1/sessions/k8s-evt-carded-late/tasks").json()["routing"]["status"], "failed")
+        # The dispatcher's stamp, as it runs right before the gateway session is created.
+        session_kv_server.mark_dispatched(carded_late_id)
+        with sqlite3.connect(self.kv_db_path) as conn:
+            stamp = conn.execute(
+                "SELECT dispatched_at FROM intercepted_events WHERE session_id = 'k8s-evt-carded-late'"
+            ).fetchone()[0]
+        self.assertIn(".", stamp, "the dispatch stamp carries fractions of a second")
         late = self.client.get("/v1/sessions/k8s-evt-carded-late/tasks").json()["routing"]
         self.assertEqual(late["status"], "in_progress")
         self.assertAlmostEqual(late["created_at"], now, delta=5.0)
         dead = self.client.get("/v1/sessions/k8s-evt-dispatched-late/tasks").json()["routing"]
         self.assertEqual(dead["status"], "failed")
         self.assertEqual(dead["error"], session_kv_server.PRE_KANBAN_STALE_ERROR)
+        # A turn whose dispatch queued for twenty minutes and then started: the
+        # session's own start is the later clock, so it is live, and the object
+        # reports that start rather than the row's arrival.
+        self._write_profile_store(
+            "default",
+            [("k8s-evt-queued", "user", "A Kubernetes Warning event needs triage...", None, None, now - 3.0, None)],
+            sessions=[("k8s-evt-queued", "Triage queued", now - 3.0, None)],
+        )
+        queued = self.client.get("/v1/sessions/k8s-evt-queued/tasks").json()["routing"]
+        self.assertEqual(queued["status"], "in_progress")
+        self.assertEqual(queued["started_at"], now - 3.0)
 
     def test_pre_kanban_ended_or_stale_session_reports_terminal_status(self):
         import sqlite3
@@ -9347,6 +9375,9 @@ class TestDriftBacklog(unittest.TestCase):
         self.assertEqual(row["backlog"], session_kv_server.DRIFT_BACKLOG_CARDED)
         self.assertEqual(row["notified"], 1)
         self.assertTrue(row["session_id"])
+        # The carding is the dispatch the pre-kanban verdict reads, sub-second.
+        self.assertTrue(row["dispatched_at"], "the carding UPDATE must stamp the dispatch time the pre-kanban verdict reads")
+        self.assertIn(".", row["dispatched_at"])
         deadline = time.monotonic() + 5
         while not self.trigger.called and time.monotonic() < deadline:
             time.sleep(0.01)
