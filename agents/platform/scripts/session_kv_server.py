@@ -4540,7 +4540,7 @@ def submit_cron_report(request_data: Dict[str, Any]) -> Dict[str, str]:
         if _failure_already_posted(profile, job_id, failure.reason):
             # Posted once already, with no clean run since: the channel knows.
             if failure_run:
-                _mark_run_posted(profile, job_id, failure_run)
+                _mark_run_posted(profile, audit_job, failure_run)
             logger.info(f"Relay for {profile}/{job_id}: the same failure was posted already; not posting it again")
             return {
                 "status": CRON_REPORT_SUPPRESSED,
@@ -4570,7 +4570,8 @@ def submit_cron_report(request_data: Dict[str, Any]) -> Dict[str, str]:
     if error:
         raise HTTPException(status_code=502, detail=f"chat relay failed: {error}")
     if audit_run or failure_run:
-        _mark_run_posted(profile, job_id, audit_run or failure_run)
+        # Keyed by the same string `audit_chat_report` reads it back under.
+        _mark_run_posted(profile, audit_job, audit_run or failure_run)
     if failure is not None:
         _record_failure_posted(profile, job_id, failure.reason)
     # 200, because the report is in the channel and the run did its job. `relay`

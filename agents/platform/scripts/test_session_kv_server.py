@@ -4096,9 +4096,9 @@ class TestAuditChatReport(unittest.TestCase):
         with sqlite3.connect(temp_db_path) as conn:
             return [row[0] for row in conn.execute("SELECT report FROM incidents")]
 
-    def notice(self):
+    def notice(self, job="compliance-audit"):
         return session_kv_server.AUDIT_NOT_FINISHED_NOTICE.format(
-            label="Security & RBAC Posture Audit", job="compliance-audit"
+            label="Security & RBAC Posture Audit", job=job
         )
 
     def test_finishs_report_is_posted_and_stored_in_place_of_the_final_message(self):
@@ -4173,6 +4173,25 @@ class TestAuditChatReport(unittest.TestCase):
         self.assertEqual(response.json()["status"], session_kv_server.CRON_REPORT_SUPPRESSED)
         self.assertEqual(sent, [])
         self.assertEqual(session_kv_server._last_posted_run("platform", "compliance-audit"), "20261015T062000.000000Z")
+
+    def test_a_finished_record_is_checked_under_the_rosters_copy_of_the_job_id(self):
+        # The failure branch asks whether this run wrote the record using the
+        # string the image roster handed back. Under the request's id there is
+        # no record, and the failure line would post in place of the report.
+        self.leave([self.REPORT], job="roster-copy")
+        with patch.object(session_kv_server, "_delivering_run_start", return_value=time.time() - 60):
+            _, sent = self.post(report=self.FAILURE, failure=True, roster_job="roster-copy")
+        self.assertEqual(sent, [self.REPORT])
+
+    def test_a_failed_runs_record_is_marked_posted_under_the_rosters_copy_of_the_job_id(self):
+        # The failure line marks the record's run posted under the roster's
+        # string, and the next delivery reads it back under the same string.
+        # Under the request's id the run would read as "", nothing would be
+        # marked, and the second post would post the report.
+        self.leave([self.REPORT], job="roster-copy")
+        self.post(report=self.FAILURE, failure=True, roster_job="roster-copy")
+        _, sent = self.post(roster_job="roster-copy")
+        self.assertEqual(sent, [self.notice(job="roster-copy")])
 
     def test_the_delivering_run_start_reads_only_running_rows(self):
         import gitops_workspace
