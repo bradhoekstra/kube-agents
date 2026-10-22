@@ -55,6 +55,7 @@ GA_JOBS = json.loads((FIXTURES / "ga-10-jobs.json").read_text())
 ROLLBACK_LEG = "Step 3b - Roll Back to the Previous GA and Forward Again"
 EVAL_STAGE = "Step 5 - Await Release-Candidate Eval"
 WITHDRAWAL = "Step 5b - Withdraw an Unsettled Nomination"
+TEARDOWN = "Step 7 - Tear Down Nightly Environment / teardown-environment"
 RECONCILE_STEP = "Reconcile the release pipelines' issues"
 RUN_30 = STAGING_RUNS["workflow_runs"][0]
 RUN_29 = STAGING_RUNS["workflow_runs"][1]
@@ -287,10 +288,11 @@ class JobReadingTest(unittest.TestCase):
         self.assertEqual((step["started_at"], step["completed_at"]), ("2026-10-21T03:29:21Z", "2026-10-21T03:37:38Z"))
 
     def test_the_stage_is_the_failing_job_that_completed_last_not_the_rollback_leg(self):
-        """Staging #26's shape with step 5 failing as well: the rollback leg
-        failed at 03:54 and is listed first, the eval wait failed at 05:09
-        and ended the run. The run stopped at the eval."""
-        jobs = jobs_with(STAGING_26_JOBS, **{EVAL_STAGE: "failure"})["jobs"]
+        """Staging #26's shape with step 5 failing as well, unsettled (its
+        withdrawal ran): the rollback leg failed at 03:54 and is listed
+        first, the eval wait failed at 05:09 and ended the run. The run
+        stopped at the eval."""
+        jobs = jobs_with(STAGING_26_JOBS, completed={WITHDRAWAL: "2026-10-17T05:12:00Z"}, **{EVAL_STAGE: "failure", WITHDRAWAL: "success"})["jobs"]
         self.assertEqual([job["name"] for job in jobs if job["conclusion"] == "failure"][0], ROLLBACK_LEG)
         self.assertEqual(notifier.failing_job(jobs)["name"], EVAL_STAGE)
 
@@ -300,6 +302,34 @@ class JobReadingTest(unittest.TestCase):
         would hold the issue for good. The stage is the eval wait."""
         jobs = jobs_with(STAGING_26_JOBS, completed={WITHDRAWAL: "2026-10-17T05:12:00Z"}, **{EVAL_STAGE: "failure", WITHDRAWAL: "failure"})["jobs"]
         self.assertEqual(notifier.failing_job(jobs)["name"], EVAL_STAGE)
+
+    def test_a_red_verdict_is_the_eval_failed_with_its_withdrawal_skipped(self):
+        """Step 5 fails on a RED verdict and on no verdict alike, and the
+        jobs API carries no outputs; step 5b runs only when the verdict did
+        not settle. A failed eval with the withdrawal skipped is a RED. The
+        withdrawal having run, in any conclusion, is not; nor an eval
+        cancelled at its timeout, nor a green night, nor a gating job that
+        failed beside it. The rollback leg failing beside it still is."""
+        red = jobs_with(STAGING_26_JOBS, **{EVAL_STAGE: "failure"})["jobs"]
+        self.assertEqual(next(job["conclusion"] for job in red if job["name"] == ROLLBACK_LEG), "failure")
+        self.assertTrue(notifier.red_verdict_night(red))
+        for conclusions in (
+            {EVAL_STAGE: "failure", WITHDRAWAL: "success"},
+            {EVAL_STAGE: "failure", WITHDRAWAL: "failure"},
+            {EVAL_STAGE: "cancelled"},
+            {},
+            {EVAL_STAGE: "failure", "Step 6 - Create Staging Tag": "failure"},
+            {EVAL_STAGE: "failure", TEARDOWN: "failure"},
+        ):
+            self.assertFalse(notifier.red_verdict_night(jobs_with(STAGING_26_JOBS, **conclusions)["jobs"]), conclusions)
+
+    def test_a_teardown_that_failed_beside_a_red_verdict_is_the_stage(self):
+        """Step 7 reds a green night, so it reds a RED one; the eval wait
+        that failed on the verdict is passed over, and the teardown is named."""
+        jobs = jobs_with(STAGING_26_JOBS, **{EVAL_STAGE: "failure", TEARDOWN: "failure"})["jobs"]
+        self.assertTrue(notifier.settled_red_verdict(jobs))
+        self.assertEqual(notifier.failing_job(jobs)["name"], TEARDOWN)
+        self.assertEqual(notifier.failing_job(jobs_with(STAGING_26_JOBS, **{EVAL_STAGE: "failure", WITHDRAWAL: "success"})["jobs"])["name"], EVAL_STAGE)
 
     def test_a_compensation_job_is_the_stage_when_nothing_else_failed(self):
         jobs = jobs_with(STAGING_26_JOBS, **{ROLLBACK_LEG: "success", WITHDRAWAL: "failure"})["jobs"]
@@ -569,12 +599,56 @@ class ReconcileTest(unittest.TestCase):
         self.assertEqual(notifier.stamped_stage(github.writes[1][2]["body"]), EVAL_STAGE)
 
     def test_a_red_night_with_the_rollback_leg_and_the_eval_both_failed_names_the_eval(self):
+        """The eval did not settle (its withdrawal ran), so the night is a
+        stage failure, and the stage is the eval, not the rollback leg."""
         github = staging_github()
-        github.responses[jobs_path(RUN_30["id"])] = jobs_with(STAGING_26_JOBS, **{EVAL_STAGE: "failure"})
+        github.responses[jobs_path(RUN_30["id"])] = jobs_with(STAGING_26_JOBS, completed={WITHDRAWAL: "2026-10-17T05:12:00Z"}, **{EVAL_STAGE: "failure", WITHDRAWAL: "success"})
         self.assertEqual(reconcile(github)[0], "opened")
         body = github.writes[1][2]["body"]
         self.assertEqual(notifier.stamped_stage(body), EVAL_STAGE)
         self.assertNotIn(f"stage={ROLLBACK_LEG}", body)
+
+    def test_a_red_verdict_night_opens_nothing_and_posts_nothing(self):
+        """Step 5 failed and step 5b was skipped: the eval answered RED. The
+        gate rejected the candidate, which is no stage failure, so the night
+        reads as green: no issue, no Chat post. The rollback leg that failed
+        beside it counts for nothing, as on a green night."""
+        run_31 = run_like(31, 39600000000, conclusion="failure")
+        github = staging_github(runs=runs_list(run_31, *STAGING_RUNS["workflow_runs"][2:]))
+        github.responses[jobs_path(run_31["id"])] = jobs_with(STAGING_26_JOBS, **{EVAL_STAGE: "failure"})
+        chat = FakeChat()
+        self.assertEqual(reconcile(github, chat)[0], "nothing")
+        self.assertEqual(github.writes, [])
+        self.assertEqual(chat.posted, [])
+
+    def test_a_red_verdict_night_closes_an_issue_whose_stage_ran_and_says_what_the_run_was_red_on(self):
+        run_31 = run_like(31, 39600000000, conclusion="failure")
+        github = staging_github(runs=runs_list(run_31, *STAGING_RUNS["workflow_runs"]), open_issues=[issue(4001, body_with([RUN_29["id"], RUN_30["id"]]))])
+        github.responses[jobs_path(run_31["id"])] = jobs_with(STAGING_26_JOBS, **{EVAL_STAGE: "failure"})
+        chat = FakeChat()
+        self.assertEqual(reconcile(github, chat)[0], "closed")
+        comment = github.writes[0][2]["body"]
+        self.assertIn("rejected by its RED verdict", comment)
+        self.assertNotIn("passed on candidate", comment)
+        self.assertEqual(len(github.writes), 2)
+        self.assertEqual(len(chat.posted), 1)
+        self.assertIn("rejected by the eval's RED verdict", chat.posted[0])
+        self.assertNotIn("passes again", chat.posted[0])
+
+    def test_a_red_verdict_night_whose_teardown_failed_opens_an_issue_on_the_teardown(self):
+        run_31 = run_like(31, 39600000000, conclusion="failure")
+        github = staging_github(runs=runs_list(run_31, *STAGING_RUNS["workflow_runs"][2:]))
+        github.responses[jobs_path(run_31["id"])] = jobs_with(STAGING_26_JOBS, **{EVAL_STAGE: "failure", TEARDOWN: "failure"})
+        self.assertEqual(reconcile(github)[0], "opened")
+        self.assertEqual(notifier.stamped_stage(github.writes[1][2]["body"]), TEARDOWN)
+
+    def test_a_red_verdict_night_closes_an_issue_stamped_on_the_eval(self):
+        """An issue opened because the eval never settled: a RED is the eval
+        answering, so the stage ran, and the issue closes."""
+        run_31 = run_like(31, 39600000000, conclusion="failure")
+        github = staging_github(runs=runs_list(run_31, *STAGING_RUNS["workflow_runs"]), open_issues=[issue(4001, body_with([RUN_29["id"], RUN_30["id"]], stage=EVAL_STAGE))])
+        github.responses[jobs_path(run_31["id"])] = jobs_with(STAGING_26_JOBS, **{EVAL_STAGE: "failure"})
+        self.assertEqual(reconcile(github)[0], "closed")
 
     def test_a_green_run_closes_an_issue_that_recorded_no_stage(self):
         """No stage on record means nothing to hold the close to."""
@@ -657,7 +731,7 @@ class ReconcileTest(unittest.TestCase):
         the pipeline is failing on now, and the stamp carries the attempt."""
         failed_again = run_like(30, RUN_30["id"], conclusion="failure", attempt=2)
         github = staging_github(runs=runs_list(failed_again, *STAGING_RUNS["workflow_runs"][1:]), open_issues=[issue(4001, body_with([RUN_29["id"], RUN_30["id"]]))])
-        github.responses[jobs_path(RUN_30["id"])] = jobs_with(STAGING_26_JOBS, **{EVAL_STAGE: "failure"})
+        github.responses[jobs_path(RUN_30["id"])] = jobs_with(STAGING_26_JOBS, completed={WITHDRAWAL: "2026-10-17T05:12:00Z"}, **{EVAL_STAGE: "failure", WITHDRAWAL: "success"})
         self.assertEqual(reconcile(github)[0], "updated")
         self.assertIn("Still failing", github.writes[0][2]["body"])
         body = github.writes[1][2]["body"]

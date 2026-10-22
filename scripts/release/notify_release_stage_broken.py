@@ -107,9 +107,10 @@ from notify_flaky_check import GitHubAPI as FlakyGitHubAPI  # noqa: E402
 # tuple to the workflow files, and `test_integration_contracts.py` holds it to
 # `RELEASE_STAGE_WATCHED_WORKFLOWS`, the roster of release stages that have to
 # be watched.
+EVAL_PIPELINE = "Staging: Promotion Pipeline"
 WATCHED_WORKFLOWS = (
     "RC: Release Pipeline",
-    "Staging: Promotion Pipeline",
+    EVAL_PIPELINE,
     "Release & Publish (GA)",
 )
 
@@ -183,7 +184,22 @@ NO_TIME = ""
 # on an ordinary green night, so naming it as the stage would hold the
 # issue open for good. `test_integration_contracts.py` pins this tuple to
 # the workflow files, so a rename of those jobs reds the test.
-COMPENSATION_JOB_MARKERS = ("(non-gating)", "Roll Back", "Withdraw", "Tear Down")
+ROLLBACK_LEG_MARKER = "Roll Back"
+WITHDRAWAL_JOB_MARKER = "Withdraw"
+COMPENSATION_JOB_MARKERS = ("(non-gating)", ROLLBACK_LEG_MARKER, WITHDRAWAL_JOB_MARKER, "Tear Down")
+# The promotion pipeline's (`EVAL_PIPELINE`) eval wait (step 5), by name
+# substring. It fails on a RED verdict and on no verdict alike,
+# and the jobs API carries no job outputs, so the withdrawal is what tells
+# the two apart: its `if:` runs it only when step 5 did not settle, and a
+# settled RED leaves it skipped. A RED is the eval rejecting the candidate,
+# which is the gate working and a row in the eval dashboard's Brief, not a
+# stage failure; a night red on it alone is read as a green night
+# (gke-labs/kube-agents#1978). The rollback leg is the one job that fails
+# inside green runs (`continue-on-error`), so it is the one failure that
+# counts for nothing beside the verdict; a teardown that failed reds a
+# green night and reds a RED one.
+EVAL_WAIT_JOB_MARKER = "Await Release-Candidate Eval"
+JOB_SKIPPED = "skipped"
 
 # Two switches the workflow sets, each turning one log line into a warning
 # annotation on the job (the unit tests run without them, and their output
@@ -273,6 +289,12 @@ CHAT_UNDERSCORE_PAIR_RE = re.compile(r"(?<!\w)_|_(?!\w)")
 CHAT_UNDERSCORE_LOOKALIKE = "‗"
 CHAT_BROKEN_DETAIL = "Candidate {candidate}. Tracking #{number}."
 CHAT_RECOVERED = "🟢 *Release pipeline: {workflow} passes again* — run #{run_number} on candidate {candidate}. Closed #{number}."
+CHAT_RECOVERED_RED_VERDICT = "🟢 *Release pipeline: {workflow} stages pass again* — run #{run_number} was rejected by the eval's RED verdict on candidate {candidate}, not by a stage. Closed #{number}."
+# How the closing comment describes the run that closed the issue: an
+# ordinary green run, or a night red on the eval's RED verdict alone, whose
+# stages all ran and passed up to a verdict on the candidate.
+RECOVERED_PASSED = "passed on candidate {candidate}"
+RECOVERED_RED_VERDICT = "ran every stage before the release-candidate eval and was rejected by its RED verdict on candidate {candidate}, a judgement on the candidate and not a stage failure"
 NOT_CONFIGURED = "chat not configured: set CI_HEALTH_CHAT_SPACE and CI_HEALTH_CHAT_TOKEN; nothing posted"
 
 
@@ -348,6 +370,34 @@ def is_compensation(job: dict) -> bool:
     return any(marker in name for marker in COMPENSATION_JOB_MARKERS)
 
 
+def is_eval_wait(job: dict) -> bool:
+    return EVAL_WAIT_JOB_MARKER in (job.get("name") or "")
+
+
+def settled_red_verdict(jobs: list) -> bool:
+    """True when the eval wait failed and its withdrawal was skipped: the
+    verdict settled, and a failed step 5 with a settled verdict is a RED."""
+    eval_failed = any(is_eval_wait(job) and job.get("conclusion") in FAILING_CONCLUSIONS for job in jobs)
+    withdrawal_skipped = any(WITHDRAWAL_JOB_MARKER in (job.get("name") or "") and job.get("conclusion") == JOB_SKIPPED for job in jobs)
+    return eval_failed and withdrawal_skipped
+
+
+def red_verdict_night(jobs: list) -> bool:
+    """True when the run is red on a settled RED verdict and nothing else:
+    no job other than the eval wait failed or stopped, the rollback leg
+    excepted, since it fails inside green runs too. A teardown that failed
+    beside the verdict makes the night a stage failure, as it would a green
+    one, and `failing_job` names it."""
+    if not settled_red_verdict(jobs):
+        return False
+    return not any(
+        (job.get("conclusion") in FAILING_CONCLUSIONS or job.get("conclusion") in JOB_STOPPED_CONCLUSIONS)
+        and not is_eval_wait(job)
+        and ROLLBACK_LEG_MARKER not in (job.get("name") or "")
+        for job in jobs
+    )
+
+
 def failing_job(jobs: list) -> dict | None:
     """The job the run stopped at, in four ranks: a gating job that failed,
     a gating job that was cancelled, a compensation job that failed, any
@@ -361,7 +411,11 @@ def failing_job(jobs: list) -> dict | None:
     failed after it: a withdrawal or a teardown runs because a stage
     stopped, and is skipped on a green night, so it is the stage only when
     nothing else stopped. Ties and missing times fall back to list order.
+    An eval wait that failed on a settled RED verdict is not a failure at
+    all, and is passed over for whatever else stopped the run.
     """
+    if settled_red_verdict(jobs):
+        jobs = [job for job in jobs if not is_eval_wait(job)]
 
     def ranked(conclusions, compensation):
         found = [
@@ -581,9 +635,9 @@ def render_still_failing(details: dict) -> str:
     )
 
 
-def render_recovered(details: dict, note: str | None = None) -> str:
+def render_recovered(details: dict, note: str | None = None, outcome: str = RECOVERED_PASSED) -> str:
     run = details["run"]
-    text = f"{run_link(run)} ({run_when(run)}) passed on candidate {candidate_text(details['candidate'])}."
+    text = f"{run_link(run)} ({run_when(run)}) {outcome.format(candidate=candidate_text(details['candidate']))}."
     if note:
         text += f" {note}"
     return text + " Closing."
@@ -607,10 +661,10 @@ def render_chat_broken(workflow_name: str, details: dict, number: int) -> str:
     return "\n".join(lines)
 
 
-def render_chat_recovered(workflow_name: str, details: dict, number: int) -> str:
+def render_chat_recovered(workflow_name: str, details: dict, number: int, template: str = CHAT_RECOVERED) -> str:
     run = details["run"]
     lines = [
-        CHAT_RECOVERED.format(
+        template.format(
             workflow=workflow_name,
             run_number=run["run_number"],
             candidate=candidate_short(details["candidate"]),
@@ -741,7 +795,7 @@ def post(sender: Sender, text: str, dry_run: bool, environ=os.environ) -> None:
         warn(f"chat post failed ({sender.describe()}); the issue is filed, the chat message is not", environ, CHAT_EXPECTED_ENV)
 
 
-def recovery_jobs(api: GitHubAPI, name: str, green: dict, issue: dict) -> tuple:
+def recovery_jobs(api: GitHubAPI, name: str, green: dict, issue: dict, jobs: list | None = None) -> tuple:
     """`(jobs, note)` when the green run is the recovery the issue is waiting
     for, else `(None, None)` with the reason logged.
 
@@ -757,7 +811,7 @@ def recovery_jobs(api: GitHubAPI, name: str, green: dict, issue: dict) -> tuple:
     if stamped and green["id"] < max(stamped):
         log(f"{name}: green run #{green['run_number']} is older than the failing run #{issue['number']} records; nothing")
         return None, None
-    jobs = api.jobs(green["id"])
+    jobs = api.jobs(green["id"]) if jobs is None else jobs
     stage = stamped_stage(issue.get("body"))
     if not stage:
         return jobs, None
@@ -793,21 +847,29 @@ def reconcile(api: GitHubAPI, workflow: dict, sender: Sender, dry_run: bool, env
     open_issues = api.issues_for_workflow(workflow_id, ISSUE_OPEN)
     issue = open_issues[0] if open_issues else None
 
-    if decision["kind"] == "green":
+    # The promotion pipeline's red run has its jobs read once here, for the
+    # RED-verdict question and then for the issue. Every other red run's are
+    # read when the issue needs them; a green run's only when one is open.
+    jobs = api.jobs(current["id"]) if decision["kind"] != "green" and name == EVAL_PIPELINE else None
+    red_verdict = jobs is not None and red_verdict_night(jobs)
+    if red_verdict:
+        log(f"{name}: run #{current['run_number']} is red on the eval's RED verdict alone; the gate rejected the candidate, which is no stage failure")
+
+    if decision["kind"] == "green" or red_verdict:
         if issue is None:
             log(f"{name}: green (run #{current['run_number']}), no issue open")
             return "nothing"
         if issue.get("state_reason") == REOPENED:
             log(f"{name}: green (run #{current['run_number']}), but a person reopened #{issue['number']}; leaving it open")
             return "nothing"
-        jobs, note = recovery_jobs(api, name, current, issue)
+        jobs, note = recovery_jobs(api, name, current, issue, jobs)
         if jobs is None:
             return "nothing"
         details = run_details(api, current, with_failure=False, jobs=jobs)
-        api.comment(issue["number"], render_recovered(details, note))
+        api.comment(issue["number"], render_recovered(details, note, RECOVERED_RED_VERDICT if red_verdict else RECOVERED_PASSED))
         api.update_issue(issue["number"], state=ISSUE_CLOSED)
         log(f"{name}: run #{current['run_number']} passed; closed #{issue['number']}")
-        post(sender, render_chat_recovered(name, details, issue["number"]), dry_run, environ)
+        post(sender, render_chat_recovered(name, details, issue["number"], CHAT_RECOVERED_RED_VERDICT if red_verdict else CHAT_RECOVERED), dry_run, environ)
         return "closed"
 
     streak = decision["streak"]
@@ -815,7 +877,7 @@ def reconcile(api: GitHubAPI, workflow: dict, sender: Sender, dry_run: bool, env
         if attempt_of(current) in stamped_attempts(issue.get("body")):
             log(f"{name}: #{issue['number']} already records run #{current['run_number']} attempt {attempt_of(current)[1]}")
             return "nothing"
-        details = run_details(api, current)
+        details = run_details(api, current, jobs=jobs)
         # Comment first: the body rewrite stamps the attempt, and a comment
         # that failed after it would never be retried, since the next sweep
         # finds the attempt already recorded and writes nothing.
@@ -828,7 +890,7 @@ def reconcile(api: GitHubAPI, workflow: dict, sender: Sender, dry_run: bool, env
         if attempt_of(current) in stamped_attempts(closed.get("body")):
             log(f"{name}: run #{current['run_number']} attempt {attempt_of(current)[1]} is recorded on closed #{closed['number']}; someone dealt with it")
             return "nothing"
-    details = run_details(api, current)
+    details = run_details(api, current, jobs=jobs)
     api.ensure_label()
     created = api.create_issue(render_title(name), render_body(name, workflow_id, details, streak))
     log(f"{name}: run #{current['run_number']} failed; opened #{created['number']}")

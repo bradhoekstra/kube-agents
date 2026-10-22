@@ -760,6 +760,24 @@ class WorkflowNameJoinTest(unittest.TestCase):
             "watched release workflows that match no workflow name (renamed?): " + ", ".join(missing),
         )
 
+    def test_the_release_stage_notifier_finds_the_eval_wait_and_its_withdrawal(self):
+        """The notifier reads a promotion night red on the eval's RED verdict
+        alone as green, by job name: the eval wait failed and the withdrawal
+        was skipped, which the withdrawal's `if:` makes mean a settled
+        verdict. A rename of either job, or a withdrawal that no longer keys
+        on `settled`, would leave every RED night filing an issue again, with
+        every unit test green on the recorded names."""
+        notifier = _release_stage_notifier()
+        documents = self._workflows()
+        promotion = [document for document in documents.values() if document.get("name") == notifier.EVAL_PIPELINE]
+        self.assertEqual(len(promotion), 1, f"no workflow named {notifier.EVAL_PIPELINE!r}")
+        jobs = (promotion[0].get("jobs") or {}).values()
+        eval_waits = [job for job in jobs if notifier.EVAL_WAIT_JOB_MARKER in (job.get("name") or "")]
+        withdrawals = [job for job in jobs if notifier.WITHDRAWAL_JOB_MARKER in (job.get("name") or "")]
+        self.assertEqual(len(eval_waits), 1, "EVAL_WAIT_JOB_MARKER selects no job, or more than one, in the promotion pipeline")
+        self.assertEqual(len(withdrawals), 1, "WITHDRAWAL_JOB_MARKER selects no job, or more than one, in the promotion pipeline")
+        self.assertIn("settled != 'true'", str(withdrawals[0].get("if", "")), "the withdrawal no longer keys on the verdict having settled")
+
     def test_the_release_stage_notifier_knows_every_compensation_job(self):
         """The jobs API carries neither `if:` nor `continue-on-error`, so the
         notifier tells a compensation job (a withdrawal that runs because the
