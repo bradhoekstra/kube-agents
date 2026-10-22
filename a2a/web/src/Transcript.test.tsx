@@ -34,6 +34,8 @@ describe("fencedBlock", () => {
     expect(fencedBlock("```\nopen only")).toBeNull();
     expect(fencedBlock("```\nL1 ```")).toBeNull();
     expect(fencedBlock("```\n```")).toBeNull();
+    expect(fencedBlock("```\n\n```")).toBeNull();
+    expect(fencedBlock("```\r\n\r\n```")).toBeNull();
   });
 
   it("skips a language tag, keeps an inline triple backtick, and drops a CRLF tail", () => {

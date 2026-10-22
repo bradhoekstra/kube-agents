@@ -46,7 +46,8 @@ export function fencedBlock(text: string): string | null {
   if (bodyStart < 0) return null;
   const close = text.indexOf("\n" + FENCE, bodyStart);
   if (close <= bodyStart) return null;
-  return text.slice(bodyStart + 1, close).replace(/\r$/, "");
+  const body = text.slice(bodyStart + 1, close).replace(/\r$/, "");
+  return body === "" ? null : body;
 }
 
 const GLYPH: Record<ChatEntry["kind"], string> = {
