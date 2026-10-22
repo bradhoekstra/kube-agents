@@ -6948,6 +6948,40 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
         self.assertLess(elapsed, 1.0, f"regex took {elapsed:.2f}s, expected < 1s")
         self.assertEqual(cleaned, crafted_line)
 
+    def test_secret_read_command_detector_covers_every_output_form(self):
+        # The detector keys on "get secret" plus any output shaping or pipe,
+        # not on an enumerated list of formatters an agent may not pick.
+        withheld = [
+            "kubectl get secret db -o jsonpath='{.data.password}' | base64 -d",
+            "kubectl get secret db -o=go-template='{{.data.password}}'",
+            "kubectl get secret db --output=go-template='{{index .data \"password\"}}'",
+            "kubectl get secret db -o json | jq -r '.data.password | @base64d'",
+            "kubectl get secret db -o yaml | yq -r '.data.password | @base64d'",
+            "kubectl -n prod get secrets db --template '{{.data.token}}'",
+            "kubectl get secret db -ojson",
+        ]
+        served = [
+            "kubectl get secrets -n kube-system",
+            "kubectl describe secret db",
+            "kubectl get pods -o json | jq '.items[].metadata.name'",
+        ]
+        for cmd in withheld:
+            with self.subTest(cmd=cmd):
+                self.assertTrue(session_kv_server._is_secret_read_tool_call(json.dumps({"command": cmd})))
+        for cmd in served:
+            with self.subTest(cmd=cmd):
+                self.assertFalse(session_kv_server._is_secret_read_tool_call(json.dumps({"command": cmd})))
+
+    def test_string_data_object_in_prose_is_scrubbed(self):
+        # The secret-block fast path used to test for a lowercase "data" and
+        # let a bare {"stringData": {...}} object in prose through untouched.
+        redactor = session_kv_server._get_audit_redactor()
+        self.assertIsNotNone(redactor)
+        text = 'patched with kubectl patch secret db -p \'{"stringData":{"conn":"host=db user=app password=hunter2","license":"L-0042-ZZ"}}\''
+        out = session_kv_server._scrub_worker_step_text("reply", text)
+        self.assertNotIn("hunter2", out)
+        self.assertNotIn("L-0042-ZZ", out)
+
     def test_secret_read_result_is_withheld_when_store_pairs_by_tool_call_id(self):
         secret_val = "paired-secret-hunter2-value"
         read_args = json.dumps({"command": "kubectl get secret db -o jsonpath='{.data.password}' | base64 -d"})

@@ -5553,9 +5553,15 @@ _SENSITIVE_KEY_SUFFIXES = (
 )
 _BASE64_SECRET_VALUE_RE = re.compile(r"^[A-Za-z0-9+/]{4,}={0,2}$")
 _INLINE_JSON_OBJECT_RE = re.compile(r"\{[^{}]+\}")
+# A `kubectl get secret` whose output is shaped (`-o`/`--output`/`--template`,
+# in any spelling: `-o json`, `-o=go-template=...`, `--output=yaml`) or piped
+# anywhere (`| jq`, `| yq`, `| base64`) can print a value; the formatter is
+# not enumerated because the agent writes the command and a form the list
+# does not name would land as the value alone, which no key rule recognises.
+# A bare list (`kubectl get secrets -n ns`) prints names and ages only.
 _SECRET_READ_COMMAND_RE = re.compile(
     r"(?i)(?:"
-    r"\bkubectl\b[^\r\n]*\bget\s+secrets?\b[^\r\n]*(?:-o\s*(?:jsonpath|go-template|custom-columns)|\|\s*base64\b)"
+    r"\bkubectl\b[^\r\n]*\bget\s+secrets?\b[^\r\n]*(?:(?:^|\s)(?:-o(?:[=\s]|[a-z]|$)|--output(?:[=\s]|$)|--template(?:[=\s]|$))|\|)"
     r"|\bjsonpath\s*=\s*['\"]?[^'\"]*\.(?:data|stringData)\b"
     r"|\bgcloud\s+secrets\s+versions\s+access\b"
     r"|\baws\s+secretsmanager\s+get-secret-value\b"
@@ -5566,7 +5572,9 @@ _SECRET_READ_COMMAND_RE = re.compile(
 
 
 def _scrub_secret_blocks(redactor: Any, text: str) -> str:
-    if "data" not in text:
+    # `stringData` carries its only "data" capitalised; the fast path must
+    # let it through to the block rules below.
+    if "data" not in text and "Data" not in text:
         return text
     lines = text.split("\n")
     block: Optional[int] = None
