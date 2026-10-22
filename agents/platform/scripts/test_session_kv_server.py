@@ -6971,11 +6971,23 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
             "kubectl \\\n  get secret db -o custom-columns=:.data.password",
             "kubectl get secret db \\\n  -o json | jq -r '.data.password | @base64d'",
             "cat \\\n  /var/run/secrets/kubernetes.io/serviceaccount/token",
+            # `-o` with the format attached through a quote or a variable
+            "kubectl get secret db -o'go-template={{.data.password}}'",
+            'kubectl get secret db -o"custom-columns=:.data.password"',
+            "kubectl get secret db -o$FMT",
+            "kubectl get secret db -owide",
+            # a global flag or a release track before the subcommand
+            "gcloud --project=prod secrets versions access latest --secret=db",
+            "gcloud beta secrets versions access latest --secret=db",
+            "aws --region us-east-1 secretsmanager get-secret-value --secret-id db --query SecretString --output text",
         ]
         served = [
             "kubectl get secrets -n kube-system",
             "kubectl describe secret db",
             "kubectl get pods -o json | jq '.items[].metadata.name'",
+            "kubectl get secrets -n kube-system --show-labels",
+            "gcloud secrets list --project=prod",
+            "aws secretsmanager list-secrets --region us-east-1",
         ]
         for cmd in withheld:
             with self.subTest(cmd=cmd):
@@ -6983,6 +6995,30 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
         for cmd in served:
             with self.subTest(cmd=cmd):
                 self.assertFalse(session_kv_server._is_secret_read_tool_call(json.dumps({"command": cmd})))
+
+    def test_cli_credential_rules_read_a_backslash_continued_command(self):
+        # The CLI rules (`-u user:pass`, `-p pass`, `--password pass`) are
+        # line-bounded; a continuation used to split the flag from its value.
+        pw = "hunter2"
+        for cmd in (
+            f"curl \\\n  -u admin:{pw} \\\n  https://registry/",
+            f"mysql -h db \\\n  -p {pw}",
+            f"docker login --password \\\n  {pw}",
+        ):
+            with self.subTest(cmd=cmd):
+                out = session_kv_server._scrub_worker_step_text("tool_call", json.dumps({"command": cmd}))
+                self.assertNotIn(pw, out)
+                self.assertIn("[REDACTED_SECRET]", out)
+                self.assertIn("https://registry/" if "curl" in cmd else "-h db" if "mysql" in cmd else "docker login", out)
+                bare = session_kv_server._scrub_worker_step_text("tool_call", cmd)
+                self.assertNotIn(pw, bare)
+        # The fold is scoped to command text: a markdown hard break in a reply
+        # and a backslash-newline inside a tool result stay as written.
+        hard_break = "first line \\\nsecond line"
+        self.assertEqual(session_kv_server._scrub_worker_step_text("reply", hard_break), hard_break)
+        self.assertEqual(session_kv_server._scrub_worker_step_text("tool_result", hard_break), hard_break)
+        other_arg = json.dumps({"path": "a \\\n  b", "command": "ls"})
+        self.assertEqual(session_kv_server._scrub_worker_step_text("tool_call", other_arg), other_arg)
 
     def test_string_data_object_in_prose_is_scrubbed(self):
         # The secret-block fast path used to test for a lowercase "data" and
@@ -7056,6 +7092,42 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
         self.assertTrue(body["steps_truncated"])
         self.assertEqual(len(body["steps"]), 1)
         self.assertEqual(body["steps"][0]["preview"], "Final visible reply")
+
+    def test_clipped_window_head_tool_result_is_withheld_when_its_call_is_clipped(self):
+        # The secret-read `tool_call` row is the newest row the window drops and
+        # its `tool` row is the oldest row the window keeps: nothing in the
+        # window vouches for that result, so it is withheld.
+        secret_val = "clipped-head-secret-hunter2-value"
+        read_args = json.dumps({"command": "kubectl get secret db -o jsonpath='{.data.password}' | base64 -d"})
+        window = session_kv_server.TASK_DETAIL_MAX_STEPS * session_kv_server.TASK_STEP_ROW_MULTIPLIER
+        rows: list[tuple] = [
+            ("sess-clip", "user", "work kanban task t_d1c3323e", None, None, 1.0, None, None),
+            (
+                "sess-clip",
+                "assistant",
+                None,
+                None,
+                [{"id": "c-clipped", "function": {"name": "terminal", "arguments": read_args}}],
+                2.0,
+                None,
+                None,
+            ),
+            ("sess-clip", "tool", f"{secret_val}\n", "terminal", None, 3.0, None, "c-clipped"),
+        ]
+        for idx in range(window - 2):
+            rows.append(("sess-clip", "user", f"user-turn-{idx}", None, None, float(10 + idx), None, None))
+        rows.append(("sess-clip", "assistant", "Final visible reply", None, None, 999.0, None, None))
+        self._write_profile_store("platform", rows, with_tool_call_id=True)
+
+        body = self.client.get("/v1/tasks/t_d1c3323e").json()
+        self.assertTrue(body["steps_truncated"])
+        self.assertEqual(
+            [(s["kind"], s["preview"]) for s in body["steps"]],
+            [("tool_result", session_kv_server.WORKER_STEP_WITHHELD), ("reply", "Final visible reply")],
+        )
+        self.assertNotIn(secret_val, json.dumps(body))
+        listing = self.client.get("/v1/sessions/k8s-evt-1/tasks").json()["tasks"][0]
+        self.assertNotIn(secret_val, json.dumps(listing))
 
     def test_session_tasks_reuses_single_profile_connection_across_multiple_cards(self):
         import sqlite3

@@ -5404,10 +5404,6 @@ def list_tasks(since: int = 0, limit: int = FEED_TASKS_DEFAULT_LIMIT, assignee: 
     return {**result, "board": True} if result is not None else _empty_task_feed()
 
 
-def _like_escape(value: str) -> str:
-    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-
-
 def _profile_state_db(data_root: Path, profile: str) -> Optional[Path]:
     """Return the read-only `state.db` path for `profile` under `data_root`."""
     home = _profile_home(profile or DEFAULT_PROFILE, data_root)
@@ -5561,20 +5557,29 @@ _INLINE_JSON_OBJECT_RE = re.compile(r"\{[^{}]+\}")
 # key rule recognises. kubectl takes its flags in any position, so the two
 # conditions are lookaheads from `kubectl`, not a token order: `get` with
 # `secret` somewhere after it on the same unpiped segment, and a flag or a
-# pipe anywhere on the line. A bare list (`kubectl get secrets -n ns`) prints
-# names and ages only; a ConfigMap whose name contains `secret` is withheld
-# too, which is the safe direction.
+# pipe anywhere on the line. A whitespace-led `-o` counts whatever follows
+# it (`-ojson`, `-o'go-template=...'`, `-o"..."`, `-o$FMT`): kubectl reads
+# the attached text as the format, and a quote or a variable is the shell's
+# to resolve. A bare list (`kubectl get secrets -n ns`) prints names and ages
+# only; a ConfigMap whose name contains `secret` is withheld too, which is
+# the safe direction. gcloud and aws take global flags and a release track
+# before the subcommand (`gcloud --project=p beta secrets versions access`,
+# `aws --region r secretsmanager get-secret-value`), so those two match the
+# subcommand anywhere on the same unpiped segment after the binary.
 # A shell joins a backslash-newline before it parses, so the detector folds
 # the continuation (and the indentation after it) to one space first; every
 # alternative below is line-bounded and would otherwise see two commands.
 _SHELL_CONTINUATION_RE = re.compile(r"\\\r?\n[ \t]*")
+# The tool-call argument keys that carry a shell command, in the order
+# `_is_secret_read_tool_call` and `_scrub_worker_step_text` read them.
+_COMMAND_ARG_KEYS = ("command", "cmd")
 _SECRET_READ_COMMAND_RE = re.compile(
     r"(?i)(?:"
     r"\bkubectl\b(?=[^\r\n]*\bget\b[^\r\n|]*\bsecrets?\b)"
-    r"(?=[^\r\n]*(?:(?:^|\s)(?:-o(?:[=\s]|[a-z]|$)|--output(?:[=\s]|$)|--template(?:[=\s]|$))|\|))"
+    r"(?=[^\r\n]*(?:(?:^|\s)(?:-o|--output(?:[=\s]|$)|--template(?:[=\s]|$))|\|))"
     r"|\bjsonpath\s*=\s*['\"]?[^'\"]*\.(?:data|stringData)\b"
-    r"|\bgcloud\s+secrets\s+versions\s+access\b"
-    r"|\baws\s+secretsmanager\s+get-secret-value\b"
+    r"|\bgcloud\b[^\r\n|;&]*\bsecrets\s+versions\s+access\b"
+    r"|\baws\b[^\r\n|;&]*\bsecretsmanager\s+get-secret-value\b"
     r"|\bvault\s+(?:kv\s+get|read)\b"
     r"|\b(?:cat|head|tail|less|more|base64)\b[^\r\n]*/(?:var/run/secrets|etc/kubernetes/pki|etc/ssl/private|\.ssh/id_)[^\r\n]*"
     r")"
@@ -5916,6 +5921,17 @@ def _scrub_worker_step_text(kind: str, text: str) -> str:
         return WORKER_STEP_WITHHELD
     try:
         parsed = _as_json_structure(text)
+        if kind == "tool_call":
+            # Fold a shell line continuation once, here, so every line-bounded
+            # CLI rule below (`-u user:pass`, `-p pass`, `--password pass`)
+            # reads the command the shell would run; `_as_json_structure`
+            # returns a fresh object, so the fold does not touch the row.
+            if isinstance(parsed, dict):
+                for arg_key in _COMMAND_ARG_KEYS:
+                    if isinstance(parsed.get(arg_key), str):
+                        parsed[arg_key] = _SHELL_CONTINUATION_RE.sub(" ", parsed[arg_key])
+            elif parsed is None:
+                text = _SHELL_CONTINUATION_RE.sub(" ", text)
         if parsed is not None:
             return json.dumps(
                 _supplement_redact(redactor, redactor.redact(parsed), is_tool_result=(kind == "tool_result"))
@@ -5959,7 +5975,7 @@ def _parse_tool_calls(raw: Any) -> list[Dict[str, Any]]:
 def _is_secret_read_tool_call(raw_args: Any) -> bool:
     parsed = _as_json_structure(raw_args) if isinstance(raw_args, str) else raw_args
     if isinstance(parsed, dict):
-        cmd = parsed.get("command") or parsed.get("cmd") or ""
+        cmd = next((parsed.get(k) for k in _COMMAND_ARG_KEYS if parsed.get(k)), "")
         if isinstance(cmd, str) and _SECRET_READ_COMMAND_RE.search(_SHELL_CONTINUATION_RE.sub(" ", cmd)):
             return True
     elif isinstance(raw_args, str) and _SECRET_READ_COMMAND_RE.search(_SHELL_CONTINUATION_RE.sub(" ", raw_args)):
@@ -6023,10 +6039,16 @@ def _extract_steps_from_conn(
         msg_rows = msg_rows[:window_size]
     steps: list[Dict[str, Any]] = []
     pending_withhold: list[tuple[Optional[str], bool]] = []
+    # A clipped window can open on a `tool` row whose `tool_call` is one of
+    # the rows the window dropped; nothing in the window can then say whether
+    # that call was a secret read, so every `tool` row before the window's
+    # first `assistant` row is withheld rather than served unvouched.
+    head_unpaired = rows_clipped
     for m in reversed(msg_rows):
         role = m["role"]
         ts = m["timestamp"]
         if role == "assistant":
+            head_unpaired = False
             reasoning = str(m["reasoning"] or "").strip()
             if reasoning:
                 steps.append(
@@ -6059,7 +6081,7 @@ def _extract_steps_from_conn(
         elif role == "tool":
             res_text = _decode_hermes_content(m["content"])
             row_tc_id = m["tool_call_id"] if isinstance(m["tool_call_id"], str) and m["tool_call_id"] else None
-            withhold_result = False
+            withhold_result = head_unpaired
             matched_id = False
             if row_tc_id is not None:
                 for idx, (cid, flag) in enumerate(pending_withhold):
