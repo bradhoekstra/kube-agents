@@ -81,9 +81,12 @@ TRACE_FILE_MODE = 0o600
 TRACE_LOCK_FILE_SUFFIX = ".lock"
 _OPEN_FLAGS = os.O_WRONLY | os.O_APPEND | os.O_CREAT
 _ENCODING = "utf-8"
-# An error string is clipped before the record is measured, so the record cap
-# cannot be defeated by a field the cap does not drop.
+# Every free-form string the caller chooses (the model alias, the provider,
+# the api_base, the reasoning effort, the error) is clipped before the record
+# is measured, so no field the cap does not drop can carry a record past it.
 ERROR_MAX_CHARS = 4096
+METADATA_MAX_CHARS = 512
+LATENCY_DECIMALS = 2
 UNKNOWN_ERROR = "unknown"
 STATUS_SUCCESS = "success"
 STATUS_FAILURE = "failure"
@@ -132,7 +135,6 @@ def _load_redactor():
 _configure_logger()
 _redactor = _load_redactor()
 AuditRedactor = _redactor.AuditRedactor
-RedactionRule = _redactor.RedactionRule
 
 
 def _resolve_redaction_rules() -> List[Any]:
@@ -171,6 +173,13 @@ def _safe_serialize(obj: Any) -> Any:
         except Exception:
             pass
     return str(obj)
+
+
+def _clip(value: Any, limit: int = METADATA_MAX_CHARS) -> Any:
+    """A string cut to limit characters; anything else as it is."""
+    if isinstance(value, str) and len(value) > limit:
+        return value[:limit]
+    return value
 
 
 def _truncate_record(record: dict, size: int) -> dict:
@@ -251,6 +260,11 @@ def _append_line(
     backup_count: int = TRACE_FILE_BACKUP_COUNT,
 ) -> None:
     data = (line + "\n").encode(_ENCODING)
+    if len(data) > max_bytes:
+        # The cause-level bound: rotation renames, it cannot shrink, so a line
+        # that would carry a file past its cap is never written. The caller's
+        # once-per-path warning records it.
+        raise ValueError(f"a {len(data)}-byte record exceeds the {max_bytes}-byte file cap and was not written")
     lock_path = _lock_file_path(path)
     os.makedirs(lock_path.parent, exist_ok=True)
     lock_fd = os.open(lock_path, _OPEN_FLAGS, TRACE_FILE_MODE)
@@ -330,7 +344,7 @@ class PassThroughTrajectoryLogger(CustomLogger):
             latency_ms = None
             if start_time and end_time:
                 try:
-                    latency_ms = round((end_time - start_time).total_seconds() * MS_PER_SECOND, 2)
+                    latency_ms = round((end_time - start_time).total_seconds() * MS_PER_SECOND, LATENCY_DECIMALS)
                 except Exception:
                     latency_ms = None
 
@@ -343,15 +357,15 @@ class PassThroughTrajectoryLogger(CustomLogger):
             record = {
                 "timestamp": dt.datetime.now(dt.timezone.utc).strftime(TIMESTAMP_FORMAT),
                 "status": status,
-                "model_alias": kwargs.get("model"),
-                "custom_llm_provider": litellm_params.get("custom_llm_provider"),
-                "api_base": AuditRedactor.redact(raw_api_base, rules),
-                "reasoning_effort": optional_params.get("reasoning_effort"),
+                "model_alias": _clip(kwargs.get("model")),
+                "custom_llm_provider": _clip(litellm_params.get("custom_llm_provider")),
+                "api_base": _clip(AuditRedactor.redact(raw_api_base, rules)),
+                "reasoning_effort": _clip(optional_params.get("reasoning_effort")),
                 "latency_ms": latency_ms,
                 "messages": AuditRedactor.redact(raw_messages, rules),
                 "tools": AuditRedactor.redact(raw_tools, rules),
                 "response": AuditRedactor.redact(raw_resp, rules),
-                "error": AuditRedactor.redact(error, rules) if error is not None else None,
+                "error": _clip(AuditRedactor.redact(error, rules), ERROR_MAX_CHARS) if error is not None else None,
             }
             line = json.dumps(record, ensure_ascii=False)
             size = len(line.encode(_ENCODING))
@@ -359,8 +373,8 @@ class PassThroughTrajectoryLogger(CustomLogger):
                 slim = _truncate_record(record, size)
                 line = json.dumps(slim, ensure_ascii=False)
                 if len(line.encode(_ENCODING)) > self.record_max_bytes:
-                    # Only a metadata field can still be over: the error is the
-                    # one with a free-form value, so it goes too.
+                    # Every free-form field is clipped, so only a tiny cap can
+                    # still be over; the error is the largest and goes too.
                     slim["error"] = None
                     line = json.dumps(slim, ensure_ascii=False)
             _append_line(

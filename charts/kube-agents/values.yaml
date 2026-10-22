@@ -507,8 +507,9 @@ litellm:
   # writes them verbatim, mask masks them, allowCidrs addresses pass through).
   # The file rotates at 5 MiB across 3 backups (.1-.3) under an flock on
   # <path>.lock; a record over 1 MiB keeps its metadata and drops messages,
-  # tools and response behind a truncated marker, so the trail holds at most
-  # 20 MiB. Each record is written on one writer thread, off the proxy's
+  # tools and response behind a truncated marker, caller-chosen strings are
+  # clipped, and a line that would still pass the file cap is refused, so the
+  # trail holds at most 20 MiB. Each record is written on one writer thread, off the proxy's
   # event loop. Pass-through only: does not alter live requests or responses, and
   # logs a once-per-path warning to stderr on I/O failure rather than breaking
   # inference.

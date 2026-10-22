@@ -376,8 +376,10 @@ class TestPassThroughTrajectoryLoggerUnit(unittest.TestCase):
         self.assertRegex(logged_assistant, r"\[ip:[0-9a-f]{12}\]")
 
     def test_rotation_caps_files_at_max_bytes_and_backup_count(self):
-        # Set max_bytes small enough that each record triggers a rotation once non-empty
-        logger = self.mod.PassThroughTrajectoryLogger(max_bytes=200, backup_count=3)
+        # One record (about 370 bytes) fits the cap; a second does not, so
+        # every record after the first rotates the file. The cap is above the
+        # record because the append refuses a line over the file cap.
+        logger = self.mod.PassThroughTrajectoryLogger(max_bytes=600, backup_count=3)
         for idx in range(6):
             kwargs = {
                 "model": "model-default",
@@ -444,6 +446,44 @@ class TestPassThroughTrajectoryLoggerUnit(unittest.TestCase):
         for candidate in [base] + [base.with_name(f"{base.name}.{i}") for i in range(1, 4)]:
             if candidate.exists():
                 self.assertLessEqual(candidate.stat().st_size, 600, candidate)
+
+    def test_caller_chosen_metadata_cannot_carry_a_record_past_the_file_cap(self):
+        # A 6 MiB model name from any same-namespace pod used to land whole.
+        # Now every caller-chosen string is clipped, and a line over the file
+        # cap is refused rather than written.
+        logger = self.mod.PassThroughTrajectoryLogger(max_bytes=4096, backup_count=3, record_max_bytes=2048)
+        kwargs = {"model": "A" * 6_000_000, "messages": [], "optional_params": {"reasoning_effort": "B" * 100_000},
+                  "exception": RuntimeError("no such model")}
+        asyncio.run(logger.async_log_failure_event(kwargs, None, None, None))
+        base = pathlib.Path(self.log_path)
+        latest = json.loads(base.read_text(encoding="utf-8").strip())
+        self.assertEqual(len(latest["model_alias"]), self.mod.METADATA_MAX_CHARS)
+        self.assertEqual(len(latest["reasoning_effort"]), self.mod.METADATA_MAX_CHARS)
+        self.assertLessEqual(base.stat().st_size, 4096)
+        # And the append itself refuses a line over the file cap, whatever built it.
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        self.mod.logger.addHandler(handler)
+        try:
+            original = self.mod._truncate_record
+            self.mod._truncate_record = lambda record, size: {"blob": "C" * 5000}
+            try:
+                asyncio.run(logger.async_log_failure_event(dict(kwargs, exception=RuntimeError("x" * 5000)), None, None, None))
+            finally:
+                self.mod._truncate_record = original
+        finally:
+            self.mod.logger.removeHandler(handler)
+        self.assertIn("exceeds the 4096-byte file cap", stream.getvalue())
+        for candidate in [base] + [base.with_name(f"{base.name}.{i}") for i in range(1, 4)]:
+            if candidate.exists():
+                self.assertLessEqual(candidate.stat().st_size, 4096, candidate)
+
+    def test_error_is_clipped_to_the_named_length(self):
+        logger = self.mod.PassThroughTrajectoryLogger()
+        kwargs = {"model": "m", "messages": [], "exception": RuntimeError("e" * 10000)}
+        asyncio.run(logger.async_log_failure_event(kwargs, None, None, None))
+        latest = json.loads(pathlib.Path(self.log_path).read_text(encoding="utf-8").strip())
+        self.assertEqual(len(latest["error"]), self.mod.ERROR_MAX_CHARS)
 
     def test_oversize_error_is_clipped_and_the_cap_holds_without_payload(self):
         # The cap must hold whatever field is large: a long error is clipped
