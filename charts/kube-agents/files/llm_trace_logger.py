@@ -311,7 +311,10 @@ class PassThroughTrajectoryLogger(CustomLogger):
             response_obj,
             start_time,
             end_time,
-            str(err)[:ERROR_MAX_CHARS] if err else UNKNOWN_ERROR,
+            # The whole text goes to the writer: it is redacted there first
+            # and clipped after, so a credential at the clip is not cut into a
+            # fragment the patterns do not match.
+            str(err) if err else UNKNOWN_ERROR,
         )
 
     async def _submit(

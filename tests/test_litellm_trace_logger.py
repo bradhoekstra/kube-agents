@@ -478,6 +478,19 @@ class TestPassThroughTrajectoryLoggerUnit(unittest.TestCase):
             if candidate.exists():
                 self.assertLessEqual(candidate.stat().st_size, 4096, candidate)
 
+    def test_error_is_redacted_before_it_is_clipped(self):
+        # A token that begins just before the clip must be redacted whole,
+        # not cut into a prefix the patterns no longer match.
+        logger = self.mod.PassThroughTrajectoryLogger()
+        token = _YA29_SHAPED_VALUE
+        text = "x" * (self.mod.ERROR_MAX_CHARS - 10) + " " + token + " tail"
+        kwargs = {"model": "m", "messages": [], "exception": RuntimeError(text)}
+        asyncio.run(logger.async_log_failure_event(kwargs, None, None, None))
+        latest = json.loads(pathlib.Path(self.log_path).read_text(encoding="utf-8").strip())
+        self.assertNotIn("ya29.", latest["error"])
+        self.assertIn("[REDACTED", latest["error"])
+        self.assertLessEqual(len(latest["error"]), self.mod.ERROR_MAX_CHARS)
+
     def test_error_is_clipped_to_the_named_length(self):
         logger = self.mod.PassThroughTrajectoryLogger()
         kwargs = {"model": "m", "messages": [], "exception": RuntimeError("e" * 10000)}
