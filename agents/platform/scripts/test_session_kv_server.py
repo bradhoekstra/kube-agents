@@ -6959,6 +6959,13 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
             "kubectl get secret db -o yaml | yq -r '.data.password | @base64d'",
             "kubectl -n prod get secrets db --template '{{.data.token}}'",
             "kubectl get secret db -ojson",
+            # flags between the verb and the resource, or before the verb
+            "kubectl get -n prod secret db -o go-template='{{.data.password}}' | base64 -d",
+            "kubectl get --namespace prod secret db -o yaml",
+            "kubectl get -o go-template='{{.data.password}}' secret db",
+            "kubectl -n ns -o go-template='{{.data.password}}' get secret db",
+            "kubectl --template='{{index .data \"password\"}}' get secret db",
+            "kubectl get -o json secret db",
         ]
         served = [
             "kubectl get secrets -n kube-system",

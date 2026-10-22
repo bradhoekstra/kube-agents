@@ -5553,15 +5553,21 @@ _SENSITIVE_KEY_SUFFIXES = (
 )
 _BASE64_SECRET_VALUE_RE = re.compile(r"^[A-Za-z0-9+/]{4,}={0,2}$")
 _INLINE_JSON_OBJECT_RE = re.compile(r"\{[^{}]+\}")
-# A `kubectl get secret` whose output is shaped (`-o`/`--output`/`--template`,
-# in any spelling: `-o json`, `-o=go-template=...`, `--output=yaml`) or piped
-# anywhere (`| jq`, `| yq`, `| base64`) can print a value; the formatter is
-# not enumerated because the agent writes the command and a form the list
-# does not name would land as the value alone, which no key rule recognises.
-# A bare list (`kubectl get secrets -n ns`) prints names and ages only.
+# A `kubectl get` of a secret whose output is shaped (`-o`/`--output`/
+# `--template`, in any spelling: `-o json`, `-o=go-template=...`,
+# `--output=yaml`) or piped anywhere (`| jq`, `| yq`, `| base64`) can print a
+# value; the formatter is not enumerated because the agent writes the command
+# and a form the list does not name would land as the value alone, which no
+# key rule recognises. kubectl takes its flags in any position, so the two
+# conditions are lookaheads from `kubectl`, not a token order: `get` with
+# `secret` somewhere after it on the same unpiped segment, and a flag or a
+# pipe anywhere on the line. A bare list (`kubectl get secrets -n ns`) prints
+# names and ages only; a ConfigMap whose name contains `secret` is withheld
+# too, which is the safe direction.
 _SECRET_READ_COMMAND_RE = re.compile(
     r"(?i)(?:"
-    r"\bkubectl\b[^\r\n]*\bget\s+secrets?\b[^\r\n]*(?:(?:^|\s)(?:-o(?:[=\s]|[a-z]|$)|--output(?:[=\s]|$)|--template(?:[=\s]|$))|\|)"
+    r"\bkubectl\b(?=[^\r\n]*\bget\b[^\r\n|]*\bsecrets?\b)"
+    r"(?=[^\r\n]*(?:(?:^|\s)(?:-o(?:[=\s]|[a-z]|$)|--output(?:[=\s]|$)|--template(?:[=\s]|$))|\|))"
     r"|\bjsonpath\s*=\s*['\"]?[^'\"]*\.(?:data|stringData)\b"
     r"|\bgcloud\s+secrets\s+versions\s+access\b"
     r"|\baws\s+secretsmanager\s+get-secret-value\b"
