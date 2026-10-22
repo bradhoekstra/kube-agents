@@ -6282,9 +6282,12 @@ def _read_pre_kanban_session_task(session_id: str) -> Optional[Dict[str, Any]]:
     `PRE_KANBAN_STALE_AFTER_SECONDS`, returns a terminal status (`completed`
     when the front door produced a reply, or `failed` when a routing turn ended,
     timed out, or failed to open a gateway session) instead of staying
-    `in_progress` or returning `tasks: []` alone. When `<agent_home>/state.db`
-    exists but raises `sqlite3.Error`, falls back to the ledger-backed object
-    with `live_steps: []` and `routing_error` naming the read error.
+    `in_progress` or returning `tasks: []` alone. A dispatched row whose
+    gateway session is not yet in `state.db` (the dispatch is queued, or the
+    gateway is down) is `in_progress` from the ledger row alone, with
+    `live_steps: []`; when `<agent_home>/state.db` exists but raises
+    `sqlite3.Error`, the same ledger-backed object carries `routing_error`
+    naming the read error.
     """
     ledger_created_at = _is_intercepted_event_session(session_id)
     if ledger_created_at is None:
@@ -6394,24 +6397,28 @@ def _read_pre_kanban_session_task(session_id: str) -> Optional[Dict[str, Any]]:
             if state_db_error is not None:
                 failed_routing["routing_error"] = state_db_error
             return failed_routing
+        # The ledger row is the dispatch; the gateway session follows it (the
+        # chat alert posts first, and a gateway outage delays it further), so
+        # a young row with no session yet is a turn in progress, not an
+        # unknown id. Whether state.db was readable only decides routing_error.
+        young_routing: Dict[str, Any] = {
+            "title": title,
+            "profile": DEFAULT_PROFILE,
+            "status": PRE_KANBAN_STATUS_IN_PROGRESS,
+            "session_id": session_id,
+            "created_at": ledger_epoch,
+            "started_at": ledger_epoch,
+            "completed_at": None,
+            "updated_at": ledger_epoch,
+            "summary": None,
+            "result": None,
+            "error": None,
+            "live_steps": [],
+            "steps_truncated": False,
+        }
         if state_db_error is not None:
-            return {
-                "title": title,
-                "profile": DEFAULT_PROFILE,
-                "status": PRE_KANBAN_STATUS_IN_PROGRESS,
-                "session_id": session_id,
-                "created_at": ledger_epoch,
-                "started_at": ledger_epoch,
-                "completed_at": None,
-                "updated_at": ledger_epoch,
-                "summary": None,
-                "result": None,
-                "error": None,
-                "routing_error": state_db_error,
-                "live_steps": [],
-                "steps_truncated": False,
-            }
-        return None
+            young_routing["routing_error"] = state_db_error
+        return young_routing
     steps_truncated = rows_clipped or len(steps) > SESSION_TASK_LIVE_STEPS_MAX
     if len(steps) > SESSION_TASK_LIVE_STEPS_MAX:
         steps = steps[-SESSION_TASK_LIVE_STEPS_MAX:]
@@ -6427,11 +6434,16 @@ def _read_pre_kanban_session_task(session_id: str) -> Optional[Dict[str, Any]]:
     error: Optional[str] = None
 
     has_ended = ended_at is not None and str(ended_at).strip() != ""
-    turn_start_epoch = (
-        _timestamp_epoch_seconds(ledger_created_at)
-        or _timestamp_epoch_seconds(created_at)
-        or _timestamp_epoch_seconds(updated_at)
-    )
+    # The turn started at the later of the two clocks: the ledger row is the
+    # newer one on a reused session (its started_at is the first turn's), and
+    # sessions.started_at is the newer one when the dispatch queued behind
+    # the thread pool. Either alone misreports the other case.
+    _turn_clocks = [
+        e
+        for e in (_timestamp_epoch_seconds(ledger_created_at), _timestamp_epoch_seconds(created_at))
+        if e is not None
+    ]
+    turn_start_epoch = max(_turn_clocks) if _turn_clocks else _timestamp_epoch_seconds(updated_at)
     is_stale = (
         not has_ended
         and turn_start_epoch is not None

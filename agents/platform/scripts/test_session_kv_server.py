@@ -7519,6 +7519,58 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
         self.assertEqual(unknown_resp.json()["tasks"], [])
         self.assertNotIn("routing", unknown_resp.json())
 
+    def test_pre_kanban_status_matrix(self):
+        """Every cell of has_ended x reply x stale, plus the two clock cases, as one table."""
+        import sqlite3
+
+        now = time.time()
+        prompt = "A Kubernetes Warning event needs triage..."
+        old_ts = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(now - 1200.0))
+        cells = [
+            # name, ledger_old, started_at, ended_at, reply_at, think_at, want_status, want_completed_at
+            ("ended-reply", False, now - 30.0, now - 4.0, now - 5.0, None, "completed", now - 4.0),
+            ("ended-noreply", False, now - 10.0, now - 5.0, None, now - 6.0, "failed", now - 5.0),
+            ("stale-reply", True, now - 1200.0, None, now - 1100.0, None, "completed", now - 1100.0),
+            ("stale-noreply", True, now - 1200.0, None, None, now - 10.0, "failed", now - 10.0),
+            ("live-reply", False, now - 30.0, None, now - 5.0, None, "in_progress", None),
+            ("live-noreply", False, now - 30.0, None, None, now - 5.0, "in_progress", None),
+            # The dispatch queued: the ledger row is old, the session young. The
+            # later clock is the turn's start, so this is live, not failed.
+            ("delayed-dispatch", True, now - 100.0, None, None, now - 50.0, "in_progress", None),
+            # A reused (409) session: the session is old, the ledger row young.
+            ("reused-session", False, now - 1200.0, None, None, now - 2.0, "in_progress", None),
+        ]
+        rows: list[tuple] = []
+        sessions: list[tuple] = []
+        for name, ledger_old, started_at, ended_at, reply_at, think_at, _, _ in cells:
+            sid = f"k8s-evt-matrix-{name}"
+            self._record_ledger_session(sid)
+            if ledger_old:
+                with sqlite3.connect(self.kv_db_path) as conn:
+                    conn.execute("UPDATE intercepted_events SET created_at = ? WHERE session_id = ?", (old_ts, sid))
+            sessions.append((sid, f"Triage {name}", started_at, ended_at))
+            rows.append((sid, "user", prompt, None, None, started_at, None))
+            if think_at is not None:
+                rows.append((sid, "assistant", None, None, None, think_at, "Routing..."))
+            if reply_at is not None:
+                rows.append((sid, "assistant", f"Routed {name} by prose.", None, None, reply_at, "Done."))
+        self._write_profile_store("default", rows, sessions=sessions)
+
+        for name, _, _, _, reply_at, _, want_status, want_completed_at in cells:
+            with self.subTest(cell=name):
+                routing = self.client.get(f"/v1/sessions/k8s-evt-matrix-{name}/tasks").json()["routing"]
+                self.assertEqual(routing["status"], want_status)
+                self.assertEqual(routing["completed_at"], want_completed_at)
+                if want_status == "completed":
+                    self.assertEqual(routing["result"], f"Routed {name} by prose.")
+                    self.assertIsNone(routing["error"])
+                elif want_status == "failed":
+                    self.assertIsNone(routing["result"])
+                    self.assertEqual(routing["error"], session_kv_server.PRE_KANBAN_STALE_ERROR)
+                else:
+                    self.assertIsNone(routing["result"])
+                    self.assertIsNone(routing["error"])
+
     def test_pre_kanban_ended_or_stale_session_reports_terminal_status(self):
         import sqlite3
 
@@ -7681,10 +7733,19 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
         self.assertEqual(never_started_task["error"], session_kv_server.PRE_KANBAN_STALE_ERROR)
 
         # A freshly dispatched ledger row whose gateway session has not yet been
-        # written to `state.db` returns `tasks: []` with no `routing` key.
+        # written to `state.db` is a turn in progress from the ledger row alone:
+        # the dispatch is queued or the gateway is down, and the contract says
+        # the object appears for every dispatched session.
         fresh_body = self.client.get("/v1/sessions/k8s-evt-fresh/tasks").json()
         self.assertEqual(fresh_body["tasks"], [])
-        self.assertNotIn("routing", fresh_body)
+        fresh_routing = fresh_body["routing"]
+        self.assertEqual(fresh_routing["status"], "in_progress")
+        self.assertEqual(fresh_routing["profile"], "default")
+        self.assertEqual(fresh_routing["live_steps"], [])
+        self.assertIsNone(fresh_routing["completed_at"])
+        self.assertNotIn("routing_error", fresh_routing)
+        self.assertIsInstance(fresh_routing["created_at"], float)
+        self.assertAlmostEqual(fresh_routing["created_at"], now, delta=5.0)
 
         # When `<agent_home>/state.db` exists and raises `sqlite3.Error`,
         # `_read_pre_kanban_session_task` falls back to the ledger-backed object
