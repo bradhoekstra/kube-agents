@@ -3839,6 +3839,35 @@ class TestAuditChatReport(unittest.TestCase):
             ["/cron/executions.db", "/profiles/platform/cron/executions.db"],
         )
 
+    def test_a_ledger_root_of_dot_still_resolves(self):
+        # An agent home of "." (`agent_home` returns it for PLATFORM_AGENT_HOME=.)
+        # resolves against the working directory, as the open would.
+        import gitops_workspace
+        import sqlite3
+        from datetime import datetime
+
+        cron = os.path.join(self.scratch, "profiles", "platform", "cron")
+        os.makedirs(cron)
+        with sqlite3.connect(os.path.join(cron, "executions.db")) as conn, conn:
+            conn.execute("CREATE TABLE executions (job_id TEXT, status TEXT, started_at TEXT)")
+            conn.execute("INSERT INTO executions VALUES ('compliance-audit', 'running', '2026-10-16T06:20:00+00:00')")
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(self.scratch)
+        with patch.object(gitops_workspace, "agent_home", return_value="."):
+            started = session_kv_server._delivering_run_start("platform", "compliance-audit")
+        self.assertEqual(started, datetime.fromisoformat("2026-10-16T06:20:00+00:00").timestamp())
+
+    def test_a_scratch_root_of_dot_still_reads_the_record(self):
+        # FLEET_AUDIT_SCRATCH_DIR=. resolves against the working directory, as
+        # the open would; the record there is read.
+        self.leave([self.REPORT])
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(self.scratch)
+        with patch.object(session_kv_server, "FLEET_AUDIT_SCRATCH_DIR", "."):
+            record = session_kv_server._read_chat_report_record("compliance-audit")
+        self.assertIsNotNone(record)
+        self.assertEqual(record["run"], "20261015T062000.000000Z")
+
     def test_a_scratch_root_of_slash_still_reads_the_record(self):
         # FLEET_AUDIT_SCRATCH_DIR=/ is a root that already ends in a separator;
         # the record under it is opened, not reported as leaving the root.

@@ -3531,9 +3531,10 @@ def _read_chat_report_record(job_id: str) -> dict | None:
     nothing about whether the run finished.
     """
     # `job_id` is caller-supplied, and a record is only ever under the scratch
-    # directory: a path that leaves it names no record. normpath followed by
-    # startswith is the containment check CodeQL recognises (py/path-injection).
-    root = os.path.normpath(FLEET_AUDIT_SCRATCH_DIR)
+    # directory: a path that leaves it names no record. abspath (a relative
+    # root resolves against the working directory, as the open would) followed
+    # by startswith is the containment check CodeQL recognises (py/path-injection).
+    root = os.path.abspath(FLEET_AUDIT_SCRATCH_DIR)
     path = os.path.normpath(os.path.join(root, CHAT_REPORT_FILE.format(audit=job_id)))
     prefix = root if root.endswith(os.sep) else root + os.sep  # a root of "/" already ends in one
     if not path.startswith(prefix):
@@ -3615,9 +3616,10 @@ def _delivering_run_start(profile: str, job_id: str) -> float | None:
 
     # `profile` is caller-supplied, and a ledger is only ever under the agent
     # home (the default profile) or the profiles directory (the rest): a path
-    # that leaves its root is no ledger. normpath followed by startswith is the
-    # containment check CodeQL recognises (py/path-injection).
-    home = os.path.normpath(agent_home())
+    # that leaves its root is no ledger. abspath (a relative home resolves
+    # against the working directory, as the open would) followed by startswith
+    # is the containment check CodeQL recognises (py/path-injection).
+    home = os.path.abspath(agent_home())
     if profile == DEFAULT_PROFILE:
         root, base = home, home
     else:
