@@ -332,14 +332,14 @@ type usageHarness struct {
 	// the one from the release before this: everything but the blocked counter
 	// served. Each strips its own field alone, so a test can tell which record
 	// held a patch back.
-	pruningGauges   bool
-	pruningMerged   bool
-	pruningChat     bool
-	pruningBlocked  bool
-	pruningFailures bool
-	pruningHuman    bool
-	pruningErrored  bool
-	pruningKanban   bool
+	pruningGauges     bool
+	pruningMerged     bool
+	pruningChat       bool
+	pruningBlocked    bool
+	pruningFailures   bool
+	pruningHuman      bool
+	pruningErrored    bool
+	pruningBackground bool
 }
 
 func newUsageHarness(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...client.Object) *usageHarness {
@@ -353,8 +353,8 @@ func newUsageHarness(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...c
 			// the echo, so the store is stripped with a second patch the poller
 			// never sees, and the echo the poller reads is stripped the same way.
 			pa, isAgent := obj.(*agentv1alpha1.PlatformAgent)
-			if err == nil && isAgent && (h.pruning || h.pruningGauges || h.pruningMerged || h.pruningChat || h.pruningBlocked || h.pruningFailures || h.pruningHuman || h.pruningErrored || h.pruningKanban) {
-				strip := `{"status":{"usage":{"clustersRegistered":null,"clustersMonitored":null,"remediationsMergedTotal":null,"chatMessagesInboundTotal":null,"toolExecutionsBlockedTotal":null,"brokerFailuresTotal":null,"lastHumanActiveTime":null,"chatTurnsErroredTotal":null,"kanbanTasksGaveUpTotal":null}}}`
+			if err == nil && isAgent && (h.pruning || h.pruningGauges || h.pruningMerged || h.pruningChat || h.pruningBlocked || h.pruningFailures || h.pruningHuman || h.pruningErrored || h.pruningBackground) {
+				strip := `{"status":{"usage":{"clustersRegistered":null,"clustersMonitored":null,"remediationsMergedTotal":null,"chatMessagesInboundTotal":null,"toolExecutionsBlockedTotal":null,"brokerFailuresTotal":null,"lastHumanActiveTime":null,"chatTurnsErroredTotal":null,"backgroundTasksGaveUpTotal":null}}}`
 				if h.pruningMerged {
 					strip = `{"status":{"usage":{"remediationsMergedTotal":null}}}`
 				}
@@ -373,8 +373,8 @@ func newUsageHarness(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...c
 				if h.pruningErrored {
 					strip = `{"status":{"usage":{"chatTurnsErroredTotal":null}}}`
 				}
-				if h.pruningKanban {
-					strip = `{"status":{"usage":{"kanbanTasksGaveUpTotal":null}}}`
+				if h.pruningBackground {
+					strip = `{"status":{"usage":{"backgroundTasksGaveUpTotal":null}}}`
 				}
 				if h.pruning {
 					strip = `{"status":{"usage":null}}`
@@ -407,8 +407,8 @@ func newUsageHarness(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...c
 			if isAgent && (h.pruningGauges || h.pruningErrored) {
 				pa.Status.Usage.ChatTurnsErroredTotal = 0
 			}
-			if isAgent && (h.pruningGauges || h.pruningKanban) {
-				pa.Status.Usage.KanbanTasksGaveUpTotal = 0
+			if isAgent && (h.pruningGauges || h.pruningBackground) {
+				pa.Status.Usage.BackgroundTasksGaveUpTotal = 0
 			}
 			return err
 		},
@@ -703,7 +703,7 @@ func TestUsagePoller_RepairsAStatusBehindTheConfigMap(t *testing.T) {
 		Version:       usageDocumentVersion,
 		AgentUID:      usageTestAgentUID,
 		FirstRecorded: metav1.NewTime(usageClock(1)),
-		Totals:        map[string]int64{usageCounterToolExecutions: 10, usageCounterEventsIngested: 4, usageCounterRemediationsProposed: 0, usageCounterRemediationsMerged: 0, usageCounterChatMessagesInbound: 0, usageCounterSessionsTriage: 0, usageCounterSessionsChat: 0, usageCounterToolExecutionsBlocked: 0, usageCounterBrokerFailures: 0, usageCounterChatTurnsErrored: 0, usageCounterKanbanGaveUp: 0},
+		Totals:        map[string]int64{usageCounterToolExecutions: 10, usageCounterEventsIngested: 4, usageCounterRemediationsProposed: 0, usageCounterRemediationsMerged: 0, usageCounterChatMessagesInbound: 0, usageCounterSessionsTriage: 0, usageCounterSessionsChat: 0, usageCounterToolExecutionsBlocked: 0, usageCounterBrokerFailures: 0, usageCounterChatTurnsErrored: 0, usageCounterBackgroundTasksGaveUp: 0},
 		LastMoved:     &moved,
 		Pods: map[string]*usagePodEntry{
 			usagePodEntryKey("gw-a", usageCounterEventsIngested):            {Name: "agent-gateway-aaa", PodUID: "gw-a", Counter: usageCounterEventsIngested, Sample: 4, Marker: moved},
@@ -716,7 +716,7 @@ func TestUsagePoller_RepairsAStatusBehindTheConfigMap(t *testing.T) {
 			usagePodEntryKey("broker-b", usageCounterToolExecutionsBlocked): {Name: "agent-credential-proxy-bbb", PodUID: "broker-b", Counter: usageCounterToolExecutionsBlocked, Sample: 0, Marker: moved},
 			usagePodEntryKey("broker-b", usageCounterBrokerFailures):        {Name: "agent-credential-proxy-bbb", PodUID: "broker-b", Counter: usageCounterBrokerFailures, Sample: 0, Marker: moved},
 			usagePodEntryKey("gw-a", usageCounterChatTurnsErrored):          {Name: "agent-gateway-aaa", PodUID: "gw-a", Counter: usageCounterChatTurnsErrored, Sample: 0, Marker: moved},
-			usagePodEntryKey("gw-a", usageCounterKanbanGaveUp):              {Name: "agent-gateway-aaa", PodUID: "gw-a", Counter: usageCounterKanbanGaveUp, Sample: 0, Marker: moved},
+			usagePodEntryKey("gw-a", usageCounterBackgroundTasksGaveUp):     {Name: "agent-gateway-aaa", PodUID: "gw-a", Counter: usageCounterBackgroundTasksGaveUp, Sample: 0, Marker: moved},
 		},
 	})
 	h.stub.set(gatewayAddr(), 4, nil)
@@ -1961,56 +1961,56 @@ func TestUsagePoller_AChatServingCRDWithoutTheErroredCounterKeepsTheOthersFlowin
 	}
 }
 
-// The board's gave_up cards count into kanbanTasksGaveUpTotal from the chat
+// The board's gave_up cards count into backgroundTasksGaveUpTotal from the chat
 // listener and nowhere else, and a card giving up is not activity.
-func TestUsagePoller_KanbanGaveUpCount(t *testing.T) {
+func TestUsagePoller_BackgroundTasksGaveUpCount(t *testing.T) {
 	created := usageClock(0).Add(-time.Hour)
 	h := newUsageHarness(t, usageTestAgent(created), usageDefaultObjects(created)...)
 	h.stub.set(gatewayAddr(), 0, nil)
 	h.stub.set(brokerAddr(), 0, nil)
 	h.stub.set(chatAddr(), 0, ptr.To(1.0))
-	h.stub.setSample(chatAddr(), usageCounterKanbanGaveUp, 1)
+	h.stub.setSample(chatAddr(), usageCounterBackgroundTasksGaveUp, 1)
 	h.poll(5)
-	h.stub.setSample(chatAddr(), usageCounterKanbanGaveUp, 4)
+	h.stub.setSample(chatAddr(), usageCounterBackgroundTasksGaveUp, 4)
 	h.poll(10)
 	status := h.status()
-	if status.KanbanTasksGaveUpTotal != 3 || status.ChatMessagesInboundTotal != 0 || status.ToolExecutionsTotal != 0 {
+	if status.BackgroundTasksGaveUpTotal != 3 || status.ChatMessagesInboundTotal != 0 || status.ToolExecutionsTotal != 0 {
 		t.Fatalf("after three cards gave up: %+v, want 3 and nothing else", status)
 	}
 	if status.LastActiveTime != nil {
 		t.Fatalf("a card giving up moved lastActiveTime: %v", status.LastActiveTime)
 	}
-	if doc := h.document(); doc.Totals[usageCounterKanbanGaveUp] != 3 {
+	if doc := h.document(); doc.Totals[usageCounterBackgroundTasksGaveUp] != 3 {
 		t.Fatalf("document totals = %v, want 3", doc.Totals)
 	}
 }
 
-// A served CRD from the release before this one prunes kanbanTasksGaveUpTotal
+// A served CRD from the release before this one prunes backgroundTasksGaveUpTotal
 // alone: its absence is recorded against it, the others keep landing, and a
 // poll with it alone behind does not re-patch while the record is fresh.
-func TestUsagePoller_AChatServingCRDWithoutTheKanbanCounterKeepsTheOthersFlowing(t *testing.T) {
+func TestUsagePoller_AChatServingCRDWithoutTheBackgroundTasksCounterKeepsTheOthersFlowing(t *testing.T) {
 	created := usageClock(0).Add(-time.Hour)
 	agent := usageTestAgent(created)
 	h := newUsageHarness(t, agent, usageDefaultObjects(created)...)
-	h.pruningKanban = true
+	h.pruningBackground = true
 	h.stub.set(gatewayAddr(), 0, nil)
 	h.stub.set(chatAddr(), 1, ptr.To(1.0))
 	h.stub.set(brokerAddr(), 10, nil)
-	h.stub.setSample(chatAddr(), usageCounterKanbanGaveUp, 1)
+	h.stub.setSample(chatAddr(), usageCounterBackgroundTasksGaveUp, 1)
 	h.poll(5)
 	h.stub.set(chatAddr(), 3, ptr.To(1.0))
-	h.stub.setSample(chatAddr(), usageCounterKanbanGaveUp, 2)
+	h.stub.setSample(chatAddr(), usageCounterBackgroundTasksGaveUp, 2)
 	h.poll(10)
-	if status := h.status(); status.ChatMessagesInboundTotal != 2 || status.KanbanTasksGaveUpTotal != 0 {
-		t.Fatalf("after a message and a card: %+v, want 2 messages and no kanban counter", status)
+	if status := h.status(); status.ChatMessagesInboundTotal != 2 || status.BackgroundTasksGaveUpTotal != 0 {
+		t.Fatalf("after a message and a card: %+v, want 2 messages and no background-tasks counter", status)
 	}
-	if h.p.newerFieldPruned(agent, usageCounterChatMessagesInbound) || !h.p.newerFieldPruned(agent, usageCounterKanbanGaveUp) {
-		t.Fatal("the kanban counter's absence was not recorded against it alone")
+	if h.p.newerFieldPruned(agent, usageCounterChatMessagesInbound) || !h.p.newerFieldPruned(agent, usageCounterBackgroundTasksGaveUp) {
+		t.Fatal("the background-tasks counter's absence was not recorded against it alone")
 	}
 	patches := h.patches
 	h.poll(12)
 	if h.patches != patches {
-		t.Fatal("a poll with the kanban counter alone behind re-patched the status while its record was fresh")
+		t.Fatal("a poll with the background-tasks counter alone behind re-patched the status while its record was fresh")
 	}
 	h.stub.set(chatAddr(), 5, ptr.To(1.0))
 	h.poll(14)
@@ -2018,7 +2018,7 @@ func TestUsagePoller_AChatServingCRDWithoutTheKanbanCounterKeepsTheOthersFlowing
 		t.Fatalf("a message waited on the kanban counter's record: %d, want 4", got)
 	}
 	if h.r.usageStatusPruned(agent) {
-		t.Fatal("the kanban counter's absence was recorded as the counters' pruning")
+		t.Fatal("the background-tasks counter's absence was recorded as the counters' pruning")
 	}
 }
 

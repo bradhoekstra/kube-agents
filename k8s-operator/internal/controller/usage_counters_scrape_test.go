@@ -356,7 +356,7 @@ func TestPodUsageSource_ReadsTheSessionsFamiliesIntoTheChatSessions(t *testing.T
 	if err != nil {
 		t.Fatalf("Scrape of the chat listener: %v", err)
 	}
-	if reading.Samples[usageCounterChatMessagesInbound] != 9 || reading.Samples[usageCounterSessionsChat] != 3 || reading.Samples[usageCounterChatTurnsErrored] != 3 || reading.Samples[usageCounterKanbanGaveUp] != 2 {
+	if reading.Samples[usageCounterChatMessagesInbound] != 9 || reading.Samples[usageCounterSessionsChat] != 3 || reading.Samples[usageCounterChatTurnsErrored] != 3 || reading.Samples[usageCounterBackgroundTasksGaveUp] != 2 {
 		t.Fatalf("chat samples = %v, want 9 messages, 3 sessions, 3 turns errored and 2 cards given up", reading.Samples)
 	}
 	a2a := strings.Join([]string{
@@ -384,7 +384,7 @@ func TestPodUsageSource_ReadsTheSessionsFamiliesIntoTheChatSessions(t *testing.T
 	if reading.Samples[usageCounterChatTurnsErrored] != 4 {
 		t.Fatalf("a2a samples = %v, want 4 turns errored (2 + 1 failed, 1 rejected)", reading.Samples)
 	}
-	if _, asked := reading.Samples[usageCounterKanbanGaveUp]; asked {
+	if _, asked := reading.Samples[usageCounterBackgroundTasksGaveUp]; asked {
 		t.Fatalf("the A2A gateway was asked for the board's counter it never serves: %v", reading.Samples)
 	}
 	if reading.Samples[usageCounterChatMessagesInbound] != 5 || reading.Samples[usageCounterSessionsChat] != 5 {

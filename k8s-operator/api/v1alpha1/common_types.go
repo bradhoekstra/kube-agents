@@ -2298,7 +2298,7 @@ type AgentUsageStatus struct {
 	// started the turn already did.
 	// +optional
 	ChatTurnsErroredTotal int64 `json:"chatTurnsErroredTotal,omitempty"`
-	// KanbanTasksGaveUpTotal is the cumulative count of background cards on
+	// BackgroundTasksGaveUpTotal is the cumulative count of background cards on
 	// the agent's board whose breaker tripped: cards that exhausted their
 	// attempts and gave up, whether a cluster event or a chat ask started
 	// them. Hermes parks such a card as blocked and records a gave_up event
@@ -2312,7 +2312,7 @@ type AgentUsageStatus struct {
 	// monotonic the same way as ToolExecutionsTotal. Does not move
 	// LastActiveTime: a card giving up is not the agent at work.
 	// +optional
-	KanbanTasksGaveUpTotal int64 `json:"kanbanTasksGaveUpTotal,omitempty"`
+	BackgroundTasksGaveUpTotal int64 `json:"backgroundTasksGaveUpTotal,omitempty"`
 
 	// ClustersRegistered is the number of clusters the event watcher built a
 	// client for at its last start: the management cluster and the Cluster
@@ -2359,7 +2359,7 @@ type AgentUsageStatus struct {
 	// LastActiveTime is the time of the last poll in which a counter above
 	// moved: a brokered command ran or was refused, a proposal was opened or
 	// merged, a chat message reached the gateway, or an event was accepted
-	// for triage; BrokerFailuresTotal, ChatTurnsErroredTotal and KanbanTasksGaveUpTotal
+	// for triage; BrokerFailuresTotal, ChatTurnsErroredTotal and BackgroundTasksGaveUpTotal
 	// alone leave it where it was.
 	// Scheduled maintenance jobs that run brokered commands move it too --
 	// the Controller Stall Watch cron runs some every 30 minutes by default

@@ -111,7 +111,7 @@ const (
 
 // UsageCounterPoller produces status.usage's toolExecutionsTotal,
 // eventsIngestedTotal, remediationsProposedTotal, remediationsMergedTotal,
-// chatMessagesInboundTotal, sessionsTotal, toolExecutionsBlockedTotal, brokerFailuresTotal, chatTurnsErroredTotal, kanbanTasksGaveUpTotal and lastActiveTime on every
+// chatMessagesInboundTotal, sessionsTotal, toolExecutionsBlockedTotal, brokerFailuresTotal, chatTurnsErroredTotal, backgroundTasksGaveUpTotal and lastActiveTime on every
 // PlatformAgent, and the two cluster gauges, from the broker's, the
 // watcher's, the chat plugin's and the A2A gateway's metrics listeners, as a
 // manager Runnable on the leader, off the reconcile path. docs/designs/usage-counters-producer.md is
@@ -138,7 +138,7 @@ type UsageCounterPoller struct {
 	streaks map[usageStreakKey]*usageScrapeStreak
 	// prunedNewerFields records, per CR and per newer field -- the cluster
 	// gauges as one, remediationsMergedTotal, chatMessagesInboundTotal,
-	// toolExecutionsBlockedTotal brokerFailuresTotal, chatTurnsErroredTotal and kanbanTasksGaveUpTotal -- the last poll in which that
+	// toolExecutionsBlockedTotal brokerFailuresTotal, chatTurnsErroredTotal and backgroundTasksGaveUpTotal -- the last poll in which that
 	// field was written and came back absent: a served CRD at a previous
 	// schema, which has the first-schema counters (every CRD with status.usage
 	// has carried remediationsProposedTotal and sessionsTotal) and not every
@@ -906,14 +906,14 @@ func usageDocumentInvalid(doc *usageDocument, cm *corev1.ConfigMap, agent *agent
 // poll refuses, re-seeding the CR, and adding nothing, on every poll.
 func usageStatusSeed(agent *agentv1alpha1.PlatformAgent, now time.Time) usageSeed {
 	seed := usageSeed{Totals: map[string]int64{
-		usageCounterToolExecutions:       usageStatusFloor(agent.Status.Usage.ToolExecutionsTotal),
-		usageCounterEventsIngested:       usageStatusFloor(agent.Status.Usage.EventsIngestedTotal),
-		usageCounterRemediationsProposed: usageStatusFloor(agent.Status.Usage.RemediationsProposedTotal),
-		usageCounterRemediationsMerged:   usageStatusFloor(agent.Status.Usage.RemediationsMergedTotal),
-		usageCounterChatMessagesInbound:  usageStatusFloor(agent.Status.Usage.ChatMessagesInboundTotal),
-		usageCounterBrokerFailures:       usageStatusFloor(agent.Status.Usage.BrokerFailuresTotal),
-		usageCounterChatTurnsErrored:     usageStatusFloor(agent.Status.Usage.ChatTurnsErroredTotal),
-		usageCounterKanbanGaveUp:         usageStatusFloor(agent.Status.Usage.KanbanTasksGaveUpTotal),
+		usageCounterToolExecutions:        usageStatusFloor(agent.Status.Usage.ToolExecutionsTotal),
+		usageCounterEventsIngested:        usageStatusFloor(agent.Status.Usage.EventsIngestedTotal),
+		usageCounterRemediationsProposed:  usageStatusFloor(agent.Status.Usage.RemediationsProposedTotal),
+		usageCounterRemediationsMerged:    usageStatusFloor(agent.Status.Usage.RemediationsMergedTotal),
+		usageCounterChatMessagesInbound:   usageStatusFloor(agent.Status.Usage.ChatMessagesInboundTotal),
+		usageCounterBrokerFailures:        usageStatusFloor(agent.Status.Usage.BrokerFailuresTotal),
+		usageCounterChatTurnsErrored:      usageStatusFloor(agent.Status.Usage.ChatTurnsErroredTotal),
+		usageCounterBackgroundTasksGaveUp: usageStatusFloor(agent.Status.Usage.BackgroundTasksGaveUpTotal),
 		// One status value for two halves: it seeds the chat half, and the
 		// read-back bound holds the pair's sum to it (usageDocumentInvalid).
 		usageCounterSessionsTriage:        0,
@@ -1071,14 +1071,14 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	chat := doc.Totals[usageCounterChatMessagesInbound]
 	failures := doc.Totals[usageCounterBrokerFailures]
 	errored := doc.Totals[usageCounterChatTurnsErrored]
-	kanban := doc.Totals[usageCounterKanbanGaveUp]
+	background := doc.Totals[usageCounterBackgroundTasksGaveUp]
 	sessions := usageSessionsTotal(doc.Totals)
 	blocked := doc.Totals[usageCounterToolExecutionsBlocked]
 	usage := &agent.Status.Usage
 	wantRegistered, wantMonitored := usageGaugeFields(gauges)
 	// The first-schema counters are in every served CRD that has status.usage;
 	// the gauges, the merged counter, the chat counter, the blocked counter and
-	// the failures counter, the errored counter and the kanban counter arrived later, each at its own release, and a CRD at a previous schema prunes some or all of
+	// the failures counter, the errored counter and the background-tasks counter arrived later, each at its own release, and a CRD at a previous schema prunes some or all of
 	// them, so a difference in one of them alone waits while that field's
 	// record is fresh rather than re-patching every poll, and the others keep
 	// landing.
@@ -1088,14 +1088,14 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	blockedPruned := p.newerFieldPruned(agent, usageCounterToolExecutionsBlocked)
 	failuresPruned := p.newerFieldPruned(agent, usageCounterBrokerFailures)
 	erroredPruned := p.newerFieldPruned(agent, usageCounterChatTurnsErrored)
-	kanbanPruned := p.newerFieldPruned(agent, usageCounterKanbanGaveUp)
+	backgroundPruned := p.newerFieldPruned(agent, usageCounterBackgroundTasksGaveUp)
 	humanPruned := p.newerFieldPruned(agent, usageNewerFieldLastHumanActive)
 	humanBehind := !humanPruned && doc.LastHumanMoved != nil && (usage.LastHumanActiveTime == nil || !usage.LastHumanActiveTime.Equal(doc.LastHumanMoved))
 	gaugesMoved := gaugesKnown && !gaugesPruned &&
 		(!usageGaugeEqual(usage.ClustersRegistered, wantRegistered) || !usageGaugeEqual(usage.ClustersMonitored, wantMonitored))
 	newerBehind := (!mergedPruned && usage.RemediationsMergedTotal < merged) || (!chatPruned && usage.ChatMessagesInboundTotal < chat) ||
 		(!blockedPruned && usage.ToolExecutionsBlockedTotal < blocked) || (!failuresPruned && usage.BrokerFailuresTotal < failures) ||
-		(!erroredPruned && usage.ChatTurnsErroredTotal < errored) || (!kanbanPruned && usage.KanbanTasksGaveUpTotal < kanban)
+		(!erroredPruned && usage.ChatTurnsErroredTotal < errored) || (!backgroundPruned && usage.BackgroundTasksGaveUpTotal < background)
 	// sessionsTotal is in the first schema beside the first three counters
 	// (every CRD with status.usage has carried it), so it has no record of
 	// its own: a served CRD prunes it only with status.usage whole.
@@ -1112,7 +1112,7 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	usage.ChatMessagesInboundTotal = chat
 	usage.BrokerFailuresTotal = failures
 	usage.ChatTurnsErroredTotal = errored
-	usage.KanbanTasksGaveUpTotal = kanban
+	usage.BackgroundTasksGaveUpTotal = background
 	usage.SessionsTotal = sessions
 	usage.ToolExecutionsBlockedTotal = blocked
 	if doc.LastMoved != nil {
@@ -1160,8 +1160,8 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	if errored > 0 {
 		p.noteNewerFieldEcho(ctx, agent, usageCounterChatTurnsErrored, agent.Status.Usage.ChatTurnsErroredTotal == errored)
 	}
-	if kanban > 0 {
-		p.noteNewerFieldEcho(ctx, agent, usageCounterKanbanGaveUp, agent.Status.Usage.KanbanTasksGaveUpTotal == kanban)
+	if background > 0 {
+		p.noteNewerFieldEcho(ctx, agent, usageCounterBackgroundTasksGaveUp, agent.Status.Usage.BackgroundTasksGaveUpTotal == background)
 	}
 	return nil
 }

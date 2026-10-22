@@ -51,7 +51,7 @@ CHAT_SESSIONS_METRIC = "kubeagents_chat_sessions_total"
 # provider 429 or 5xx, a connection error, the gateway timeout) and the
 # provider-authentication failure.
 CHAT_TURNS_ERRORED_METRIC = "kubeagents_chat_turns_errored_total"
-# The series the operator reads status.usage.kanbanTasksGaveUpTotal from
+# The series the operator reads status.usage.backgroundTasksGaveUpTotal from
 # (usage_counters_scrape.go's kanbanGaveUpSeries): background cards whose
 # breaker tripped since the listener started, read off Hermes' board at scrape
 # time. Hermes parks such a card in status blocked and appends a gave_up
