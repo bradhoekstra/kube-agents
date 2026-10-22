@@ -3535,7 +3535,8 @@ def _read_chat_report_record(job_id: str) -> dict | None:
     # startswith is the containment check CodeQL recognises (py/path-injection).
     root = os.path.normpath(FLEET_AUDIT_SCRATCH_DIR)
     path = os.path.normpath(os.path.join(root, CHAT_REPORT_FILE.format(audit=job_id)))
-    if not path.startswith(root + os.sep):
+    prefix = root if root.endswith(os.sep) else root + os.sep  # a root of "/" already ends in one
+    if not path.startswith(prefix):
         logger.warning(f"Relay for {job_id}: chat report path leaves {root}")
         return None
     try:
@@ -3623,7 +3624,8 @@ def _delivering_run_start(profile: str, job_id: str) -> float | None:
         root = os.path.join(home, PROFILES_DIR)
         base = os.path.join(root, profile)
     path = os.path.normpath(os.path.join(base, *RUN_LEDGER))
-    if not path.startswith(root + os.sep):
+    prefix = root if root.endswith(os.sep) else root + os.sep  # a root of "/" already ends in one
+    if not path.startswith(prefix):
         return None
     if not os.path.exists(path):
         return None

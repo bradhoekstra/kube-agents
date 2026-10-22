@@ -3825,6 +3825,29 @@ class TestAuditChatReport(unittest.TestCase):
             self.assertIsNone(session_kv_server._delivering_run_start("../..", "compliance-audit"))
             self.assertIsNotNone(session_kv_server._delivering_run_start("default", "compliance-audit"))
 
+    def test_a_ledger_root_of_slash_still_resolves(self):
+        # An agent home of "/" (`agent_home` returns it for PLATFORM_AGENT_HOME=/)
+        # is a root that already ends in a separator; its ledger is still read.
+        import gitops_workspace
+
+        with patch.object(gitops_workspace, "agent_home", return_value="/"), \
+             patch("os.path.exists", wraps=os.path.exists) as exists:
+            session_kv_server._delivering_run_start("default", "compliance-audit")
+            session_kv_server._delivering_run_start("platform", "compliance-audit")
+        self.assertEqual(
+            [call.args[0] for call in exists.call_args_list],
+            ["/cron/executions.db", "/profiles/platform/cron/executions.db"],
+        )
+
+    def test_a_scratch_root_of_slash_still_reads_the_record(self):
+        # FLEET_AUDIT_SCRATCH_DIR=/ is a root that already ends in a separator;
+        # the record under it is opened, not reported as leaving the root.
+        with patch.object(session_kv_server, "FLEET_AUDIT_SCRATCH_DIR", "/"), \
+             patch("builtins.open", wraps=open) as opened:
+            self.assertIsNone(session_kv_server._read_chat_report_record("compliance-audit"))
+        self.assertEqual(opened.call_count, 1)
+        self.assertEqual(opened.call_args.args[0], "/chat_report_compliance-audit.json")
+
     def test_a_job_id_that_leaves_the_scratch_directory_reads_no_record(self):
         # The record is read only from under the scratch directory; a job id
         # that climbs out of it is no record, even when a file is there. The
