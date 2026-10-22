@@ -23,6 +23,7 @@ counts as KILLED: the recorded gap moved, which is exactly the signal wanted.
 Usage:
     python3 hack/conformance-mutations.py            # every mutation
     python3 hack/conformance-mutations.py --list
+    python3 hack/conformance-mutations.py --summary  # counts, nothing run
     python3 hack/conformance-mutations.py -k C1      # substring filter on the id
 
 The tree must be clean. It edits tracked files in place and restores them, so a
@@ -57,8 +58,7 @@ class Mutation:
     #: True for a mutation that must NOT be caught. A suite that goes red on a
     #: harmless change is a suite people learn to override, so a no-op edit is
     #: run as a control on the harness itself: SURVIVED is the pass for these
-    #: and KILLED is the failure. Three today: B1-denylist-rule, A3-fastpath-redundant
-    #: and B1-gke-mcp-overlay-copy-redundant.
+    #: and KILLED is the failure. `--summary` names the current ones.
     must_survive: bool = False
 
 
@@ -839,6 +839,17 @@ Mutation(
         "do-not-merge check, so a held pull request is enqueued anyway",
     ),
     Mutation(
+        "B2-enqueue-retry-skips-labels",
+        "scripts/merge_gate.py",
+        ('    queued = pull["auto_merge"] or pull["queue_entry"] is not None\n',
+         '    queued = pull["auto_merge"] or pull["queue_entry"] is not None\n'
+         '    if pull.get("retry") and not queued:\n'
+         '        return ENABLE\n'),
+        "test_B2_the_enqueue_sweep_assents_only_on_both_human_labels",
+        "put a pull request back on its retry before the label test, since it "
+        "was approved when it entered, so one that lost lgtm is enqueued anyway",
+    ),
+    Mutation(
         "B2-app-token-grants-pull-requests",
         ".github/workflows/rc-create-tag.yml",
         ("          permission-contents: write\n",
@@ -1325,6 +1336,14 @@ Mutation(
          'safe_hint = log_hint if log_hint else "unknown"'),
         "test_D1_a_log_hint_cannot_forge_a_record",
         "log the hint raw, which is the state the sanitiser was added to fix",
+    ),
+    Mutation(
+        "D1-cluster-profile-unaudited",
+        "agents/cluster/config.yaml",
+        ("    - hermes_otel\n    - tool_call_audit\n", "    - hermes_otel\n"),
+        "test_D1_every_profile_records_its_tool_calls",
+        "trim the Cluster Agent template's plugin list back to otel alone, the "
+        "state the template shipped in",
     ),
     Mutation(
         "D1-platform-role-reaches-secrets",
@@ -2452,13 +2471,37 @@ def _git_clean() -> bool:
     ).stdout.strip()
 
 
-def main() -> int:
+def summary(mutations: list[Mutation]) -> str:
+    """The counts a reader wants from the mutation table, computed (#3553).
+
+    The README used to restate them by hand, so every pull request that added
+    a mutation rewrote the same line and conflicted with every other one. What
+    a run measures (killed, noisy) is true only of the commit it ran on, and
+    belongs to the pull request that ran it.
+    """
+    controls = [m.id for m in mutations if m.must_survive]
+    return (
+        f"{len(mutations)} mutations, {len(controls)} must_survive control(s): "
+        f"{', '.join(controls) or 'none'}.\n"
+        f"A full run's last line counts the other {len(mutations) - len(controls)}: "
+        f"killed + noisy + survived + stale. A control that passes, SURVIVED (expected), "
+        f"is none of those; one that goes red (OVERSHOT) counts as survived, and one "
+        f"whose anchor moved counts as stale."
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--list", action="store_true")
+    parser.add_argument("--summary", action="store_true",
+                        help="print the mutation and must_survive counts; runs nothing")
     parser.add_argument("-k", "--filter", default="")
-    arguments = parser.parse_args()
+    arguments = parser.parse_args(argv)
 
     selected = [m for m in MUTATIONS if arguments.filter in m.id]
+    if arguments.summary:
+        print(summary(selected))
+        return 0
     if arguments.list:
         for mutation in selected:
             print(f"{mutation.id:38} {mutation.path}")

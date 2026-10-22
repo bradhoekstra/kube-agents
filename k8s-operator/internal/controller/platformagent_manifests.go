@@ -104,10 +104,12 @@ const (
 	// records today, so turning an emitter on for a profile needs no change here.
 	fluentBitAuditTailPath = fluentBitDataMount + "/logs/" + auditFileName + "," +
 		fluentBitDataMount + "/profiles/*/logs/" + auditFileName
-	// agentDataStorageSize sizes the agent's own /opt/data claim, and through
-	// shell_sandbox_manifests.go the sandbox's claim at the same path.
+	// agentDataStorageSize is the default size of the agent's own /opt/data
+	// claim and, through shell_sandbox_manifests.go, of the sandbox's claim at
+	// the same path. spec.storage.size overrides it; ResolveDataStorageSize is
+	// the one place that decides, and every reader of the size calls it.
 	//
-	// The two are one constant on purpose. sandbox_mirror.py copies a subset of
+	// The two claims share one value on purpose. sandbox_mirror.py copies a subset of
 	// the agent's volume into the sandbox's on upgrade, so destination >= source
 	// makes the copy fit by construction and there is nothing left for a byte
 	// budget to decide. Sized apart, the sandbox was 5Gi against the agent's
@@ -118,9 +120,9 @@ const (
 	// Every cluster in scope gets a scaffolded profile under /opt/data/profiles,
 	// and at 10Gi a 209-cluster scope filled the volume in under two hours; the
 	// board's SQLite then failed every write while the CR stayed Ready. On an
-	// existing install growDataClaim widens both claims to this size, online,
-	// where the StorageClass allows expansion. A spec field and a full-volume
-	// condition are the lasting fix.
+	// existing install growDataClaim widens both claims to the resolved size,
+	// online, where the StorageClass allows expansion. install.defaults.env and
+	// the Terraform variable carry the same default, and a test pins them equal.
 	agentDataStorageSize = "50Gi"
 	credentialProxyPort  = 8765
 	// The Chat consumers' broker env: the project id both carry, the legacy
@@ -1004,9 +1006,12 @@ const (
 	scopeFileName   = "scope.json"
 
 	// scopeFileEnvKey tells cluster_agent_reconcile.py where the declaration is, and
-	// the platform MCP server's fleet_scope tool (fleet_scope_targets.py), which reads
-	// it when no reconcile snapshot answers that a boundary is in force. Two readers,
-	// by design; a third code site naming this key is a review comment.
+	// fleet_scope_targets.py, which reads it when no reconcile snapshot answers that a
+	// boundary is in force, for the platform MCP server's fleet_scope tool, the
+	// upgrade-readiness-watch, upgrade-readiness-weekly-review and sa-role-watch
+	// jobs and the onboarding inventory scan (bootstrap_scan_gate.py). Two modules
+	// spell the key, by design; other code reads it only through their constants, and
+	// a third spelling is a review comment.
 	scopeFileEnvKey = "KUBEAGENTS_SCOPE_FILE"
 	// reconcileProjectEnvKey is the reconcile's management-project override, pinned
 	// empty in the managed .env (see renderManagedEnv) so the agent cannot write it.
@@ -1720,6 +1725,9 @@ func buildGitopsStateConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.Confi
 			if host := resolved.GitHubHost(); host != agentv1alpha1.DefaultGitHubHost {
 				data[gitopsStateGitHubHostKey] = host
 			}
+			if repo, ok := declaredGitOpsRepo(agent); ok && repo != "" {
+				data[gitopsStateGitOpsRepoKey] = repo
+			}
 			for key, entries := range map[string][]agentv1alpha1.ManagedRepoEntry{
 				gitopsStateManagedReposKey: managed,
 				gitopsStateContextReposKey: seedEntries(resolved.Accepted(agentv1alpha1.RepositoryRoleContext)),
@@ -2174,11 +2182,23 @@ func buildPVC(agent *agentv1alpha1.PlatformAgent) *corev1.PersistentVolumeClaim 
 			StorageClassName: storageClassName,
 			Resources: corev1.VolumeResourceRequirements{
 				Requests: corev1.ResourceList{
-					corev1.ResourceStorage: resource.MustParse(agentDataStorageSize),
+					corev1.ResourceStorage: ResolveDataStorageSize(agent),
 				},
 			},
 		},
 	}
+}
+
+// ResolveDataStorageSize is the size of the agent's data claim and of the
+// sandbox's data claim: spec.storage.size when it is set and above zero, and
+// agentDataStorageSize otherwise. The admission webhook refuses a value of zero
+// or less, but the chart ships the webhook off; the fallback keeps such a CR on
+// the default rather than on a claim the API server refuses to create.
+func ResolveDataStorageSize(agent *agentv1alpha1.PlatformAgent) resource.Quantity {
+	if storage := agent.Spec.Storage; storage != nil && storage.Size != nil && storage.Size.Sign() > 0 {
+		return storage.Size.DeepCopy()
+	}
+	return resource.MustParse(agentDataStorageSize)
 }
 
 func buildSystemPVC(agent *agentv1alpha1.PlatformAgent) *corev1.PersistentVolumeClaim {
@@ -3012,7 +3032,7 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		if a2aAgentSurface(agent) {
 			kept := extEnvs[:0]
 			for _, e := range extEnvs {
-				if e.Name == "NATS_URL" || e.Name == a2aBusUserEnv ||
+				if e.Name == "NATS_URL" || e.Name == a2aNATSCAFileEnv || e.Name == a2aNATSTLSServerNameEnv || e.Name == a2aBusUserEnv ||
 					e.Name == a2aBusTokenFileEnv ||
 					e.Name == "NATS_USER" || e.Name == "NATS_PASSWORD" {
 					continue
@@ -3187,8 +3207,9 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// container at all — the SensitiveEnvVars membership is what turns the
 	// attempt into a webhook rejection instead of a silent no-op.
 	//
-	// Nothing here is Optional any more and nothing needs to be, which is the
-	// one thing the token makes simpler: the skew branch of a2aAgentSurface
+	// Nothing here is Optional, which is the one thing the token makes
+	// simpler (the bus CA bundle volume further down is, for the skew branch's
+	// sake, and says why): the skew branch of a2aAgentSurface
 	// used to need Optional on the SecretKeyRef so a today-lineage install that
 	// hit skew would not roll the pod into CreateContainerConfigError against a
 	// Secret that had never existed. A projected token volume has no such
@@ -3197,10 +3218,13 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// inert env vars and a mount.
 	if a2aAgentSurface(agent) {
 		envVars = append(envVars,
+			// The same URL every other client is handed: tls://, on the
+			// Service name the bus certificate carries.
 			corev1.EnvVar{
 				Name:  "NATS_URL",
-				Value: fmt.Sprintf("nats://%s.%s.svc:4222", a2aNATSName(agent), agent.Namespace),
+				Value: a2aNATSClientURL(agent),
 			},
+			a2aNATSCAFileEnvVar(),
 			corev1.EnvVar{
 				Name:  a2aBusUserEnv,
 				Value: a2aAgentBusUser,
@@ -3346,6 +3370,9 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// exactly that reason — see bridgeIdentity.
 	if a2aAgentSurface(agent) {
 		mountIntoContainer(containers, "platform-agent", a2aBusTokenVolumeMount())
+		// The bus CA, which, unlike the token, the bridge sidecar inherits
+		// from this container: trusting the bus is not an identity.
+		mountIntoContainer(containers, "platform-agent", a2aNATSCABundleMount())
 	}
 	// The bridge, rendered from the finished agent container (every mount
 	// above included, the bus token then dropped) when the CR declares none
@@ -3407,6 +3434,13 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	volumes = append(volumes, buildWatcherTokenVolume())
 	if a2aAgentSurface(agent) {
 		volumes = append(volumes, a2aBusTokenVolumeSource())
+		// Optional here and only here: a2aAgentSurface also holds on the skew
+		// branch, where the bus, and so the bundle, may never have been
+		// rendered, and a required ConfigMap volume would hold the agent pod
+		// in ContainerCreating for a bus it cannot use anyway.
+		ca := a2aNATSCABundleVolume(agent)
+		ca.ConfigMap.Optional = ptr.To(true)
+		volumes = append(volumes, ca)
 	}
 	if len(sidecarVolumes) > 0 {
 		volumes = append(volumes, sidecarVolumes...)
