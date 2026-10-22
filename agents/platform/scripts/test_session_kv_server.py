@@ -7450,6 +7450,16 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
         session_kv_server.mark_delivery_failed(undelivered_id, "all enabled chat platforms failed")
         headless_id = self._record_ledger_session("k8s-evt-headless-pre")
         session_kv_server.mark_delivery_headless(headless_id)
+        # The dispatcher writes the ledger row before the gateway session exists;
+        # these rows are dispatched a minute before the session rows below.
+        import sqlite3
+
+        with sqlite3.connect(self.kv_db_path) as conn:
+            conn.execute(
+                "UPDATE intercepted_events SET created_at = ?, dispatched_at = ? "
+                "WHERE session_id IN ('k8s-evt-pre', 'k8s-evt-undelivered', 'k8s-evt-headless-pre')",
+                (time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(now - 60.0)),) * 2,
+            )
         self._write_profile_store(
             "default",
             [
@@ -7540,10 +7550,16 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
             # later clock is the turn's start, so this is live, not failed.
             ("delayed-dispatch", now - 1200.0, now - 100.0, None, None, now - 50.0, "in_progress", None),
             # A reused (409) session: the session is old, the ledger row young.
-            ("reused-session", None, now - 1200.0, None, None, now - 2.0, "in_progress", None),
+            ("reused-session", now - 5.0, now - 1200.0, None, None, now - 2.0, "in_progress", None),
             # A reused session whose first turn Hermes closed: that ended_at is
             # older than this dispatch and does not end the new turn.
-            ("reused-ended", None, now - 1200.0, now - 1100.0, None, now - 2.0, "in_progress", None),
+            ("reused-ended", now - 5.0, now - 1200.0, now - 1100.0, None, now - 2.0, "in_progress", None),
+            # A reused session whose first turn replied in prose: that reply is
+            # the previous turn's. The new turn aborted without one: failed.
+            ("reused-prior-reply-ended", now - 5.0, now - 1200.0, now - 1.0, now - 1150.0, now - 2.0, "failed", now - 1.0),
+            # The same prior reply with the new turn still running: in progress,
+            # and the old reply is not among this turn's live steps.
+            ("reused-prior-reply-live", now - 5.0, now - 1200.0, None, now - 1150.0, now - 2.0, "in_progress", None),
         ]
         rows: list[tuple] = []
         sessions: list[tuple] = []
@@ -7553,7 +7569,7 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
             if ledger_at is not None:
                 ledger_ts = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ledger_at))
                 with sqlite3.connect(self.kv_db_path) as conn:
-                    conn.execute("UPDATE intercepted_events SET created_at = ? WHERE session_id = ?", (ledger_ts, sid))
+                    conn.execute("UPDATE intercepted_events SET created_at = ?, dispatched_at = ? WHERE session_id = ?", (ledger_ts, ledger_ts, sid))
             sessions.append((sid, f"Triage {name}", started_at, ended_at))
             rows.append((sid, "user", prompt, None, None, started_at, None))
             if think_at is not None:
@@ -7576,6 +7592,31 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
                 else:
                     self.assertIsNone(routing["result"])
                     self.assertIsNone(routing["error"])
+                if name.startswith("reused-prior-reply"):
+                    self.assertEqual([s["kind"] for s in routing["live_steps"]], ["thinking"])
+
+    def test_pre_kanban_dispatch_time_not_row_age_decides_the_ledger_only_verdict(self):
+        # A drift-backlog row is carded long after it arrived: created_at is
+        # old, dispatched_at is now. With no gateway session yet the read must
+        # say in_progress, not failed; an old dispatch with no session is failed.
+        import sqlite3
+
+        now = time.time()
+        old_ts = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(now - 1200.0))
+        self._record_ledger_session("k8s-evt-carded-late")
+        self._record_ledger_session("k8s-evt-dispatched-late")
+        with sqlite3.connect(self.kv_db_path) as conn:
+            conn.execute("UPDATE intercepted_events SET created_at = ? WHERE session_id = 'k8s-evt-carded-late'", (old_ts,))
+            conn.execute(
+                "UPDATE intercepted_events SET created_at = ?, dispatched_at = ? WHERE session_id = 'k8s-evt-dispatched-late'",
+                (old_ts, old_ts),
+            )
+        late = self.client.get("/v1/sessions/k8s-evt-carded-late/tasks").json()["routing"]
+        self.assertEqual(late["status"], "in_progress")
+        self.assertAlmostEqual(late["created_at"], now, delta=5.0)
+        dead = self.client.get("/v1/sessions/k8s-evt-dispatched-late/tasks").json()["routing"]
+        self.assertEqual(dead["status"], "failed")
+        self.assertEqual(dead["error"], session_kv_server.PRE_KANBAN_STALE_ERROR)
 
     def test_pre_kanban_ended_or_stale_session_reports_terminal_status(self):
         import sqlite3
@@ -7593,18 +7634,18 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
         long_mcp_ts = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(now - 360.0))
         with sqlite3.connect(self.kv_db_path) as conn:
             conn.execute(
-                "UPDATE intercepted_events SET created_at = ? WHERE session_id IN ('k8s-evt-never-started', 'k8s-evt-stale')",
-                (sqlite_text_ts,),
+                "UPDATE intercepted_events SET created_at = ?, dispatched_at = ? WHERE session_id IN ('k8s-evt-never-started', 'k8s-evt-stale')",
+                (sqlite_text_ts, sqlite_text_ts),
             )
             conn.execute(
-                "UPDATE intercepted_events SET created_at = ? WHERE session_id = 'k8s-evt-long-mcp'",
-                (long_mcp_ts,),
+                "UPDATE intercepted_events SET created_at = ?, dispatched_at = ? WHERE session_id = 'k8s-evt-long-mcp'",
+                (long_mcp_ts, long_mcp_ts),
             )
             # The ledger row precedes its own turn's session: without this the
             # ended sessions below would carry an ended_at older than the row.
             conn.execute(
-                "UPDATE intercepted_events SET created_at = ? WHERE session_id IN ('k8s-evt-ended', 'k8s-evt-ended-no-reply')",
-                (time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(now - 60.0)),),
+                "UPDATE intercepted_events SET created_at = ?, dispatched_at = ? WHERE session_id IN ('k8s-evt-ended', 'k8s-evt-ended-no-reply', 'k8s-evt-reused', 'k8s-evt-row-clipped')",
+                (time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(now - 60.0)),) * 2,
             )
         # A later non-dispatched (`notified = 0, delivery_error = ''`) row under the
         # same session_id must not advance `turn_start_epoch` or un-stale `k8s-evt-stale`.

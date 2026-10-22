@@ -946,6 +946,12 @@ def init_db() -> None:
                 ("backlog", f"backlog INTEGER NOT NULL DEFAULT {DRIFT_BACKLOG_NONE}"),
                 ("principal", "principal TEXT NOT NULL DEFAULT ''"),
                 ("payload", "payload TEXT NOT NULL DEFAULT ''"),
+                # When the row's turn was dispatched: the insert for an event
+                # row, the carding UPDATE for a drift-backlog row. created_at
+                # is the row's arrival, which for a backlog row can precede
+                # its dispatch by the digest's whole wait. NULL on rows from
+                # before the column, which read as created_at.
+                ("dispatched_at", "dispatched_at TEXT"),
             ):
                 if column in ledger_columns:
                     continue
@@ -1157,8 +1163,8 @@ def record_intercepted_event(
                 cursor = conn.execute(
                     "INSERT INTO intercepted_events "
                     "(cluster, namespace, workload, object_uid, object_kind, reason, message, severity, "
-                    "occurrences, notified, session_id) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "occurrences, notified, session_id, dispatched_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
                     (
                         cluster,
                         namespace,
@@ -4530,7 +4536,8 @@ def _card_drift_backlog_minorities(rows: Sequence[Dict[str, Any]]) -> list[Dict[
             with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
                 with conn:
                     conn.execute(
-                        "UPDATE intercepted_events SET backlog = ?, notified = 1, session_id = ? WHERE id = ?",
+                        "UPDATE intercepted_events SET backlog = ?, notified = 1, session_id = ?, "
+                        "dispatched_at = CURRENT_TIMESTAMP WHERE id = ?",
                         (DRIFT_BACKLOG_CARDED, session_id, row["id"]),
                     )
         except sqlite3.Error as exc:
@@ -6228,7 +6235,8 @@ def _session_first_order_key(
 
 
 def _is_intercepted_event_session(session_id: str) -> Optional[Any]:
-    """Return the ledger row's `created_at` when `session_id` was admitted and
+    """Return the ledger row's dispatch time (`dispatched_at`, or `created_at`
+    for a row written before that column) when `session_id` was admitted and
     dispatched (`notified >= 1` or `delivery_error != ''`), or `None` when no
     dispatched row exists."""
     if not session_id or not os.path.isfile(SESSION_KV_DB_PATH):
@@ -6236,12 +6244,12 @@ def _is_intercepted_event_session(session_id: str) -> Optional[Any]:
     try:
         with closing(_read_only(SESSION_KV_DB_PATH)) as conn:
             row = conn.execute(
-                "SELECT created_at FROM intercepted_events "
+                "SELECT COALESCE(dispatched_at, created_at) AS dispatched_at FROM intercepted_events "
                 "WHERE session_id = ? AND (notified >= 1 OR COALESCE(delivery_error, '') != '') "
                 "ORDER BY id DESC LIMIT 1",
                 (session_id,),
             ).fetchone()
-            return (row["created_at"] or "") if row is not None else None
+            return (row["dispatched_at"] or "") if row is not None else None
     except sqlite3.Error:
         return None
 
@@ -6271,6 +6279,14 @@ def _timestamp_epoch_seconds(value: Any) -> Optional[float]:
         return dt.timestamp()
     except ValueError:
         return None
+
+
+def _before_turn(at: Any, turn_floor: Optional[float]) -> bool:
+    """True when a row's timestamp is older than this turn's start."""
+    if turn_floor is None or at is None:
+        return False
+    epoch = _timestamp_epoch_seconds(at)
+    return epoch is not None and epoch < turn_floor
 
 
 def _routing_object(
@@ -6365,6 +6381,15 @@ def _read_pre_kanban_session_task(session_id: str) -> Optional[Dict[str, Any]]:
                             title = _scrub_worker_step_text("reply", raw_title)
                         created_at = srow["started_at"]
                         ended_at = srow["ended_at"]
+                # This turn's rows start at the later of the dispatch and the
+                # session's start (the reused-session rule); a reply or step
+                # older than that is the previous turn's and is not this one's.
+                turn_floor_clocks = [
+                    e
+                    for e in (_timestamp_epoch_seconds(ledger_created_at), _timestamp_epoch_seconds(created_at))
+                    if e is not None
+                ]
+                turn_floor = max(turn_floor_clocks) if turn_floor_clocks else None
                 msg_cols = {r[1] for r in sconn.execute("PRAGMA table_info(messages)")}
                 if {"session_id", "role", "content"}.issubset(msg_cols):
                     first_user = sconn.execute(
@@ -6377,12 +6402,15 @@ def _read_pre_kanban_session_task(session_id: str) -> Optional[Dict[str, Any]]:
                             return None
                     active_clause = " AND COALESCE(active, 1) = 1" if "active" in msg_cols else ""
                     tcalls_col = "tool_calls" if "tool_calls" in msg_cols else "NULL AS tool_calls"
+                    ts_col = "timestamp" if "timestamp" in msg_cols else "NULL AS timestamp"
                     for r in sconn.execute(
-                        f"SELECT content, {tcalls_col} FROM messages "
+                        f"SELECT content, {tcalls_col}, {ts_col} FROM messages "
                         f"WHERE session_id = ? AND role = 'assistant'{active_clause} "
                         f"ORDER BY id DESC LIMIT ?",
                         (session_id, window_size),
                     ):
+                        if _before_turn(r["timestamp"], turn_floor):
+                            break
                         if not _parse_tool_calls(r["tool_calls"]):
                             cand = _decode_hermes_content(r["content"]).strip()
                             if cand:
@@ -6397,6 +6425,7 @@ def _read_pre_kanban_session_task(session_id: str) -> Optional[Dict[str, Any]]:
                     raise_on_error=True,
                 )
                 has_session = has_session or bool(steps)
+                steps = [s for s in steps if not _before_turn(s.get("at"), turn_floor)]
                 if (not has_session or created_at is None) and "session_id" in msg_cols:
                     mrow = sconn.execute(
                         "SELECT timestamp FROM messages WHERE session_id = ? ORDER BY id ASC LIMIT 1",
@@ -6407,13 +6436,10 @@ def _read_pre_kanban_session_task(session_id: str) -> Optional[Dict[str, Any]]:
                         if created_at is None:
                             created_at = mrow["timestamp"]
         except sqlite3.Error as exc:
+            # Nothing read from state.db is used past here: has_session=False
+            # takes the ledger-only branch, which carries routing_error.
             state_db_error = _scrub_worker_step_text("reply", str(exc))
-            steps = []
-            rows_clipped = False
-            latest_raw_reply = None
             title = _scrub_worker_step_text("reply", f"{TRIAGE_SESSION_TITLE_PREFIX}{session_id}")
-            created_at = None
-            ended_at = None
             has_session = False
     if not has_session:
         ledger_epoch = _timestamp_epoch_seconds(ledger_created_at)
