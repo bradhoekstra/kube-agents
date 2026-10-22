@@ -6527,6 +6527,10 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
         custom_b64 = "c2VjcmV0MTIzNDU2"
         multi_item_b64 = "bXVsdGktc2VjcmV0LWJ5dGVzLTEyMzQ1Ng=="
         cut_json_b64 = "Y3V0LXNlY3JldC12YWw="
+        # A `grep -n` body line of a key file: a line number, then key material.
+        grep_body_b64 = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7"
+        # A `.key` key that is not a file: an all-digit value is still a credential.
+        short_api_key = "1234567890123456"
         bare_secret_val = "bare-decoded-secret-hunter2-value"
         long_ssh_b64 = base64.b64encode(("OPENSSH-KEY-" + ("K" * 1200)).encode("utf-8")).decode("ascii")
         long_pem_body = "MIIEpAIBAAKCAQEA" + ("P" * 1800)
@@ -6652,6 +6656,9 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
                         f"tls.crt:  1679 bytes\n"
                         f"cert.pem: OK\n"
                         f"cert.pem: PEM certificate\n"
+                        f"cert.pem:28:-----END CERTIFICATE-----\n"
+                        f"tls.key:2:{grep_body_b64}\n"
+                        f"api.key: {short_api_key}\n"
                         f"Note: check the cluster credentials: deployment-controller mounts them.\n"
                         f'{{"apiVersion":"v1","kind":"Secret","data":{{"pw":"{cut_json_b64}"'
                     ),
@@ -6852,6 +6859,8 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
             multi_item_b64,
             cut_json_b64,
             bare_secret_val,
+            grep_body_b64,
+            short_api_key,
             long_ssh_b64[:32],
             long_pem_body[:32],
             unterminated_pem_body[:32],
@@ -6870,6 +6879,7 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
             "Done",
             "web1",
             "file2_second_match.pem:1:-----BEGIN",
+            "cert.pem:28:-----END",
             "tls.crt:  1679 bytes",
             "cert.pem: OK",
             "cert.pem: PEM certificate",

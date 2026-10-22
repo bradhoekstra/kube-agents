@@ -5158,7 +5158,7 @@ def get_alert_quota(day: str = "") -> Dict[str, Any]:
 # dispatcher state rather than activity, and a new column upstream does not
 # reach a caller until it is named here. Worker step text (`thinking`,
 # `tool_call`, `tool_result`, `reply`) is scrubbed through `AuditRedactor` (and
-# `tool_call`/`tool_result` text is withheld if the redactor cannot be loaded)
+# every step kind and every card text field is withheld if the redactor cannot be loaded)
 # before leaving the pod; callers that render text fields still treat them as
 # untrusted text.
 # --------------------------------------------------------------------------
@@ -5525,12 +5525,25 @@ _SUPPLEMENT_ENV_YAML_PATTERNS = (
     ),
 )
 _KEY_DATA_WORDS = ({"key", "data"}, {"certificate", "data"})
+# A key that is a file name (`tls.crt`, `cert.pem`) opens ordinary diagnostic
+# lines: `kubectl describe secret` rows (`tls.crt:  1679 bytes`), `openssl
+# verify` (`cert.pem: OK`), `file` (`cert.pem: PEM certificate`), `grep -n`
+# (`cert.pem:1:-----BEGIN`, `cert.pem:28:-----END`). The value there is a
+# byte count followed by the word `bytes`, a line number with at most a PEM
+# marker after it, or one of the words those tools print, never key
+# material, so the name alone does not mask it. A `grep -n` body line
+# (`tls.key:2:MIIEvQ...`), a bare number (`api.key: 1234567890123456`) and a
+# describe row of a non-file key (`token:  1234 bytes`) stay masked: the
+# first two can be a credential, the third is over-masking that is safe.
+_FILE_NAME_KEY_SUFFIXES = (".key", ".pem", ".crt", ".p12", ".pfx")
+_FILE_KEY_LINE_NUMBER_RE = re.compile(r"^\d+:(?:-----[A-Za-z]*)?$")
+_FILE_KEY_BYTE_COUNT_RE = re.compile(r"^\d+$")
+_FILE_KEY_BYTES_WORD_RE = re.compile(r"^[ \t]+bytes\b")
+_FILE_KEY_BENIGN_WORDS = frozenset(
+    {"ok", "pem", "openssh", "data", "ascii", "certificate", "verification", "error", "cannot", "unable", "bytes"}
+)
 _SENSITIVE_KEY_SUFFIXES = (
-    ".key",
-    ".pem",
-    ".crt",
-    ".p12",
-    ".pfx",
+    *_FILE_NAME_KEY_SUFFIXES,
     ".dockercfg",
     ".dockerconfigjson",
     "privatekey",
@@ -5538,13 +5551,6 @@ _SENSITIVE_KEY_SUFFIXES = (
     "id_ed25519",
     "id_ecdsa",
 )
-# A key that is a file name (`tls.crt`, `cert.pem`) opens ordinary diagnostic
-# lines: `kubectl describe secret` rows (`tls.crt:  1679 bytes`), `openssl
-# verify` (`cert.pem: OK`), `file` (`cert.pem: PEM certificate`), `grep -n`
-# (`cert.pem:1:-----BEGIN`). The value there is a count, a line number or a
-# short word, never key material, so the name alone does not mask it.
-_FILE_NAME_KEY_SUFFIXES = (".key", ".pem", ".crt", ".p12", ".pfx")
-_FILE_KEY_BENIGN_VALUE_RE = re.compile(r"^(?:\d+(?:[:.]\S*)?|[A-Za-z]{1,16})$")
 _BASE64_SECRET_VALUE_RE = re.compile(r"^[A-Za-z0-9+/]{4,}={0,2}$")
 _INLINE_JSON_OBJECT_RE = re.compile(r"\{[^{}]+\}")
 _SECRET_READ_COMMAND_RE = re.compile(
@@ -5686,6 +5692,17 @@ def _scrub_supplement_env_pairs(redactor: Any, text: str) -> str:
     return text
 
 
+def _file_key_value_is_benign(value: str, tail: str) -> bool:
+    """True for what a file-named key holds on a diagnostic line and never as
+    key material: a line number, a byte count that the word `bytes` follows
+    (tail is the text after the value), or one of the words the tools print."""
+    if _FILE_KEY_LINE_NUMBER_RE.match(value):
+        return True
+    if _FILE_KEY_BYTE_COUNT_RE.match(value):
+        return bool(_FILE_KEY_BYTES_WORD_RE.match(tail))
+    return value.lower() in _FILE_KEY_BENIGN_WORDS
+
+
 def _blank_named_values(redactor: Any, text: str) -> str:
     def _mask_block(match: "re.Match[str]") -> str:
         if not _named_value_is_sensitive(redactor, match.group("key")):
@@ -5702,7 +5719,9 @@ def _blank_named_values(redactor: Any, text: str) -> str:
     def _mask_colon_kv(match: "re.Match[str]") -> str:
         key = match.group("key")
         unquoted = _unquote_token(match.group("val"))
-        if key.lower().endswith(_FILE_NAME_KEY_SUFFIXES) and _FILE_KEY_BENIGN_VALUE_RE.match(unquoted):
+        if key.lower().endswith(_FILE_NAME_KEY_SUFFIXES) and _file_key_value_is_benign(
+            unquoted, match.string[match.end() :]
+        ):
             return match.group(0)
         if _named_value_is_sensitive(redactor, key) and redactor._is_credential_value(unquoted):
             return f"{match.group('prefix')}{key}{match.group('sep')}{_REDACTED_SECRET_MARKER}"
