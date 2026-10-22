@@ -3808,6 +3808,46 @@ class TestAuditChatReport(unittest.TestCase):
             started = session_kv_server._delivering_run_start("platform", "compliance-audit")
         self.assertEqual(started, datetime(2026, 10, 16, 6, 20, tzinfo=timezone.utc).timestamp())
 
+    def test_the_delivering_run_start_stays_under_the_profiles_directory(self):
+        # A profile that climbs out of `profiles/` reaches no ledger, even one
+        # that exists where the climb lands.
+        import gitops_workspace
+        import sqlite3
+
+        cron = os.path.join(self.scratch, "cron")
+        os.makedirs(cron)
+        os.makedirs(os.path.join(self.scratch, "profiles"))  # so `profiles/..` resolves on disk
+        with sqlite3.connect(os.path.join(cron, "executions.db")) as conn, conn:
+            conn.execute("CREATE TABLE executions (job_id TEXT, status TEXT, started_at TEXT)")
+            conn.execute("INSERT INTO executions VALUES ('compliance-audit', 'running', '2026-10-16T06:20:00+00:00')")
+        with patch.object(gitops_workspace, "agent_home", return_value=self.scratch):
+            self.assertIsNone(session_kv_server._delivering_run_start("..", "compliance-audit"))
+            self.assertIsNone(session_kv_server._delivering_run_start("../..", "compliance-audit"))
+            self.assertIsNotNone(session_kv_server._delivering_run_start("default", "compliance-audit"))
+
+    def test_a_job_id_that_leaves_the_scratch_directory_reads_no_record(self):
+        # The record is read only from under the scratch directory; a job id
+        # that climbs out of it is no record, even when a file is there. The
+        # climb needs a segment after the `chat_report_` prefix, so `x/../..`,
+        # and the directory it climbs through has to exist for the OS to follow it.
+        os.makedirs(os.path.join(self.scratch, "chat_report_x"))
+        outside = os.path.join(os.path.dirname(self.scratch), f"{os.path.basename(self.scratch)}-outside.json")
+        with open(outside, "w", encoding="utf-8") as handle:
+            json.dump({"audit": "x", "run": "r", "parts": []}, handle)
+        self.addCleanup(os.remove, outside)
+        self.leave([self.REPORT])
+        with patch("builtins.open", wraps=open) as opened:
+            self.assertIsNone(
+                session_kv_server._read_chat_report_record(f"x/../../{os.path.basename(self.scratch)}-outside")
+            )
+            self.assertIsNone(session_kv_server._read_chat_report_record("x/../../../etc/passwd"))
+            self.assertEqual(opened.call_count, 0)
+            record = session_kv_server._read_chat_report_record("compliance-audit")
+        self.assertEqual(record["run"], "20261015T062000.000000Z")
+        self.assertEqual(
+            opened.call_args.args[0], os.path.join(self.scratch, "chat_report_compliance-audit.json")
+        )
+
     def test_the_flag_without_the_scheduler_leg_changes_nothing(self):
         self.leave([])
         _, sent = self.post(report=self.FAILURE, failure=True, scheduler=False)
@@ -6987,7 +7027,9 @@ class TestCardStop(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         body = response.json()
         self.assertEqual(len(body["stopped"]), 4)
-        self.assertTrue(any("database is locked" in error for error in body["errors"]))
+        # The body names the error's class; its message stays in the server log.
+        self.assertTrue(any(error == "the late-pid sweep: OperationalError" for error in body["errors"]))
+        self.assertFalse(any("database is locked" in error for error in body["errors"]))
 
     def test_a_rescan_read_error_is_reported_not_a_503(self):
         import sqlite3
