@@ -258,7 +258,9 @@ deterministically, with the environment, usage and feedback sections `scripts/fe
 prints from a workstation (epic #3426's share surface; the script adds the model, the performance
 figures and recent task rows): environment (tag, mode, Kubernetes version, install age,
 readiness, active interfaces), the `status.usage` counters, a roll-up of the gateway's own
-task records, and the feedback template. The roll-up splits by what a `TaskRef` holds: the
+task records, and the feedback template. That roll-up is labelled `chat turns`, not `tasks`:
+the script's `tasks` line counts kanban cards, and two pastes from one install must not
+disagree under one label. The roll-up splits by what a `TaskRef` holds: the
 record's `ActiveTask` names the running task, `Canceled` marks a published cancel, and the
 rest ended (the ordinary relay path writes no end marker; `TerminalObserved` is the heal
 path's dedupe flag, not an outcome), so its buckets are `ended`, `cancelled`, `active` where

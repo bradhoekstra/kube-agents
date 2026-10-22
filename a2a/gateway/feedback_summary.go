@@ -22,10 +22,11 @@ import (
 // "/feedback summary" (docs/designs/chat-feedback-command.md, part 7; issue
 // #3428): the gateway posts the install's usage and feedback summary itself,
 // deterministically, so a person in a restricted network can paste one block
-// into an email or a chat message after reading it. Same block as
+// into an email or a chat message after reading it. The same sections as
 // scripts/feedback-summary.sh prints from a workstation, from what the
 // gateway can see: the PlatformAgent resource (one read-only grant on its
-// Role) and its own task records. No model is in the loop, and the block
+// Role) and its own task records, which count chat turns, not the kanban
+// cards the script's tasks line counts; the line is labelled for that. No model is in the loop, and the block
 // names no cluster, project, namespace, task or person: the audit below
 // refuses a block that does.
 
@@ -61,20 +62,24 @@ const (
 	//: The performance figures the script reads in-pod (tokens, spend,
 	//: latency) are not the gateway's to see; the block says where they are.
 	usageSummaryPerformanceNote   = "tokens, spend and latency are in scripts/feedback-summary.sh's block"
-	usageSummaryUnavailableNotice = "⚠️ The usage summary is unavailable: the PlatformAgent resource could not be read. From a workstation, scripts/feedback-summary.sh prints the same block."
-	usageSummaryRefusedNotice     = "⚠️ The usage summary was not posted: the block would have named an identifier of this install. From a workstation, scripts/feedback-summary.sh prints it with the same check."
-	usageSummaryFence             = "```"
-	usageSummaryUnavailable       = "unavailable"
-	usageSummaryUnknown           = "unknown"
-	usageSummaryNever             = "never"
-	usageSummaryNone              = "none"
-	usageSummaryDefaultMode       = "today"
-	usageSummaryReadyCondition    = "Ready"
-	usageSummaryMinIdentifier     = 3
-	usageSummaryDateLayout        = "2006-01-02"
-	platformAgentGroup            = "kubeagents.x-k8s.io"
-	platformAgentVersion          = "v1alpha1"
-	platformAgentResource         = "platformagents"
+	usageSummaryUnavailableNotice = "⚠️ The usage summary is unavailable: the PlatformAgent resource could not be read. From a workstation, scripts/feedback-summary.sh prints the workstation block."
+	usageSummaryRefusedNotice     = "⚠️ The usage summary was not posted: the block would have named an identifier of this install. From a workstation, scripts/feedback-summary.sh prints the workstation block with the same check."
+	//: What the roll-up counts. The script's line with the same window counts
+	//: kanban cards; this one counts the gateway's task records, one per chat
+	//: turn, so the label says so and a reader of both pastes is not misled.
+	usageSummaryTurnsLabel     = "chat turns"
+	usageSummaryFence          = "```"
+	usageSummaryUnavailable    = "unavailable"
+	usageSummaryUnknown        = "unknown"
+	usageSummaryNever          = "never"
+	usageSummaryNone           = "none"
+	usageSummaryDefaultMode    = "today"
+	usageSummaryReadyCondition = "Ready"
+	usageSummaryMinIdentifier  = 3
+	usageSummaryDateLayout     = "2006-01-02"
+	platformAgentGroup         = "kubeagents.x-k8s.io"
+	platformAgentVersion       = "v1alpha1"
+	platformAgentResource      = "platformagents"
 	//: The gateway's Deployment is <agent>-a2a-gateway (the operator's
 	//: a2aGatewayName); the resource name is what precedes the suffix.
 	a2aGatewayNameSuffix = "-a2a-gateway"
@@ -357,7 +362,7 @@ func renderUsageSummary(now time.Time, cr map[string]any, serverVersion string, 
 	lines = append(lines, "performance: "+usageSummaryPerformanceNote)
 	days := windowDays(window)
 	if !haveTasks {
-		lines = append(lines, fmt.Sprintf("tasks (%d days): %s", days, usageSummaryUnavailable))
+		lines = append(lines, fmt.Sprintf("%s (%d days): %s", usageSummaryTurnsLabel, days, usageSummaryUnavailable))
 	} else {
 		var parts []string
 		for _, bucket := range []struct {
@@ -368,7 +373,7 @@ func renderUsageSummary(now time.Time, cr map[string]any, serverVersion string, 
 				parts = append(parts, fmt.Sprintf("%s %d", bucket.name, bucket.n))
 			}
 		}
-		line := fmt.Sprintf("tasks (%d days): %d", days, tasks.Total)
+		line := fmt.Sprintf("%s (%d days): %d", usageSummaryTurnsLabel, days, tasks.Total)
 		if len(parts) > 0 {
 			line += " (" + strings.Join(parts, ", ") + ")"
 		}

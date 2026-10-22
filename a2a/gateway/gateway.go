@@ -49,7 +49,8 @@ var feedbackCommandNotice = fmt.Sprintf(`📝 To report a problem with kube-agen
 • Open an issue: %s
 • Or use the feedback form, which needs no account: %s
 A report needs a one-line summary, the kind (Bug, Feature request, Question or Other) and what happened. A submission becomes a public issue, so keep cluster names, project ids and anything read from a Secret out of it.
-To have it written up and filed for you, send `+"`/feedback <what happened>`"+` — I'll show you the exact text and ask before anything is filed.`,
+To have it written up and filed for you, send `+"`/feedback <what happened>`"+` — I'll show you the exact text and ask before anything is filed.
+For a usage summary of this install you can paste into a report, send `+"`/feedback summary`"+`.`,
 	chattext.FeedbackTrackerURL, chattext.FeedbackFormURL)
 
 // nothingRunningNotice answers a "stop" in a conversation with no active

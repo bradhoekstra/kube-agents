@@ -127,7 +127,7 @@ func TestRenderUsageSummaryHasTheScriptsShapeAndNoIdentifier(t *testing.T) {
 		"  installed: 19 days; ready: true", "  interfaces: googlechat, slack",
 		"  toolExecutionsTotal: 19127", "  sessionsTotal: 7", "  remediationsMergedTotal: 1",
 		"  lastActive: 2026-10-21T11:34:06Z",
-		"tasks (14 days): 6 (ended 3, cancelled 2, active 1)",
+		"chat turns (14 days): 6 (ended 3, cancelled 2, active 1)",
 		"performance: " + usageSummaryPerformanceNote,
 		"  Rating:", "  What worked well:", "  What failed or was slow:",
 	} {
@@ -147,7 +147,7 @@ func TestRenderUsageSummaryHasTheScriptsShapeAndNoIdentifier(t *testing.T) {
 
 func TestRenderUsageSummaryDegradesWhenSourcesAreMissing(t *testing.T) {
 	text := renderUsageSummary(summaryNow, map[string]any{}, "", 7*24*time.Hour, taskRollup{}, false)
-	for _, want := range []string{"  version: unknown", "  mode: today", "  kubernetes: unavailable", "  installed: unknown; ready: unknown", "  interfaces: none", "  toolExecutionsTotal: 0", "  lastActive: never", "tasks (7 days): unavailable"} {
+	for _, want := range []string{"  version: unknown", "  mode: today", "  kubernetes: unavailable", "  installed: unknown; ready: unknown", "  interfaces: none", "  toolExecutionsTotal: 0", "  lastActive: never", "chat turns (7 days): unavailable"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("block lacks %q:\n%s", want, text)
 		}
@@ -285,7 +285,7 @@ func TestFeedbackSummaryPostsTheBlockAndStartsNoTask(t *testing.T) {
 	}
 	// The tasks line is the live scan of the rig's bucket under the rig's
 	// SessionTTL, which this turn added nothing to.
-	if line := fmt.Sprintf("tasks (%d days): 0", windowDays(usageWindow(r.g.cfg.SessionTTL))); !postedContaining(r, line)() {
+	if line := fmt.Sprintf("chat turns (%d days): 0", windowDays(usageWindow(r.g.cfg.SessionTTL))); !postedContaining(r, line)() {
 		t.Fatalf("the block must carry %q from the record scan", line)
 	}
 	if postedContaining(r, "prod-eu-1")() || postedContaining(r, "kubeagents-system")() {
@@ -296,6 +296,14 @@ func TestFeedbackSummaryPostsTheBlockAndStartsNoTask(t *testing.T) {
 	}
 	if rec, _ := r.g.reg.Get(context.Background(), conv); rec != nil && rec.ActiveTask != nil {
 		t.Fatalf("/feedback summary left an active task: %+v", rec.ActiveTask)
+	}
+}
+
+// TestBareFeedbackNoticeNamesTheSummary: the bare notice is the one place in
+// chat that lists what /feedback does, so it names the summary form.
+func TestBareFeedbackNoticeNamesTheSummary(t *testing.T) {
+	if !strings.Contains(feedbackCommandNotice, "/feedback summary") {
+		t.Fatalf("the bare /feedback notice does not name /feedback summary:\n%s", feedbackCommandNotice)
 	}
 }
 
