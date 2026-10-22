@@ -6927,16 +6927,49 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
 
     def test_line_start_auth_scheme_pair_masks_the_token_not_only_the_scheme(self):
         opaque = "3f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c"
-        for line in (
-            f"Authorization: Bearer {opaque}",
-            f"auth: Bearer {opaque}",
-            f"token: Bearer {opaque}",
-            f"AUTH_HEADER=Bearer {opaque}",
+        # Under twelve characters, or with a character outside the bearer
+        # alphabet, the redactor's own bearer rule skips the token.
+        short = "s3cr3t"
+        tilde = "s3cr3t~tok"
+        for key in ("Authorization: ", "auth: ", "token: ", "AUTH_HEADER="):
+            for token in (opaque, short, tilde):
+                line = f"{key}Bearer {token}"
+                with self.subTest(line=line):
+                    cleaned = session_kv_server._scrub_worker_step_text("tool_result", line)
+                    self.assertNotIn(token, cleaned)
+                    self.assertIn("[REDACTED_SECRET]", cleaned)
+        # A key that names no credential keeps a scheme-shaped value.
+        benign = "content-type: Bearer s3cr3t"
+        self.assertEqual(session_kv_server._scrub_worker_step_text("tool_result", benign), benign)
+
+    def test_cli_segment_rules_read_past_an_operator_inside_a_quoted_argument(self):
+        # `_CLI_USERPASS_FLAG_RE` and `_CLI_SHORT_P_RE` end a command's segment
+        # at `&`, `;` or `|`; inside a quoted argument those are data.
+        for cmd, cred, kept in (
+            (
+                'curl "https://grafana/api/search?query=x&type=dash-db" -u admin:prom-operator',
+                "prom-operator",
+                "query=x&type=dash-db",
+            ),
+            (
+                'mongosh "mongodb+srv://cluster0.example.net/app?retryWrites=true&w=majority" -u app -p hunter2',
+                "hunter2",
+                "retryWrites=true&w=majority",
+            ),
+            ('mysql -e "select 1 | 2" -p hunter2', "hunter2", "select 1 | 2"),
+            ("mysql -e 'select 1' -p 'hunter2 x' && echo done", "hunter2", "&& echo done"),
         ):
-            with self.subTest(line=line):
-                cleaned = session_kv_server._scrub_worker_step_text("tool_result", line)
-                self.assertNotIn(opaque, cleaned)
-                self.assertIn("[REDACTED_SECRET]", cleaned)
+            with self.subTest(cmd=cmd):
+                out = session_kv_server._scrub_worker_step_text("tool_call", json.dumps({"command": cmd}))
+                self.assertNotIn(cred, out)
+                self.assertIn("[REDACTED_SECRET]", out)
+                self.assertIn(kept, out)
+        # An operator outside quotes still ends the segment: each command's own `-u` is masked.
+        chained = "curl -u admin:pw-one-11 http://a && curl -u root:pw-two-22 http://b"
+        out = session_kv_server._scrub_worker_step_text("tool_call", json.dumps({"command": chained}))
+        self.assertNotIn("pw-one-11", out)
+        self.assertNotIn("pw-two-22", out)
+        self.assertIn("http://a && curl -u root:", out)
 
     def test_cli_short_p_re_linear_scan_on_crafted_line(self):
         import time
@@ -6980,6 +7013,13 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
             "gcloud --project=prod secrets versions access latest --secret=db",
             "gcloud beta secrets versions access latest --secret=db",
             "aws --region us-east-1 secretsmanager get-secret-value --secret-id db --query SecretString --output text",
+            # other stores, and a file read under a secret-named directory
+            "aws --region us-east-1 ssm get-parameter --name /prod/db --with-decryption",
+            "az keyvault secret show --vault-name kv --name db",
+            "sops -d secrets.enc.yaml",
+            "sops --decrypt secrets.enc.yaml",
+            "kubectl exec deploy/api -- cat /etc/db-creds/password",
+            "kubectl exec -n prod api-0 -- head -c 64 /var/secrets/token",
         ]
         served = [
             "kubectl get secrets -n kube-system",
@@ -6988,6 +7028,10 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
             "kubectl get secrets -n kube-system --show-labels",
             "gcloud secrets list --project=prod",
             "aws secretsmanager list-secrets --region us-east-1",
+            "aws ssm describe-parameters",
+            "az keyvault secret list --vault-name kv",
+            "kubectl exec deploy/api -- cat /opt/data/report.txt",
+            "kubectl exec deploy/secrets-api -- cat /opt/data/report.txt",
         ]
         for cmd in withheld:
             with self.subTest(cmd=cmd):
@@ -7126,8 +7170,49 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
             [("tool_result", session_kv_server.WORKER_STEP_WITHHELD), ("reply", "Final visible reply")],
         )
         self.assertNotIn(secret_val, json.dumps(body))
+        # The listing reads a smaller window that drops this `tool` row outright;
+        # the listing-window case is the next test.
+
+    def test_clipped_listing_window_head_tool_result_is_withheld(self):
+        # The same shape sized to the listing's window: the detail read, with
+        # its larger window, sees the call and withholds by pairing; the
+        # listing sees only the result and withholds it as unpaired.
+        secret_val = "listing-head-secret-hunter2-value"
+        read_args = json.dumps({"command": "kubectl get secret db -o jsonpath='{.data.password}' | base64 -d"})
+        window = session_kv_server.SESSION_TASK_LIVE_STEPS_MAX * session_kv_server.TASK_STEP_ROW_MULTIPLIER
+        rows: list[tuple] = [
+            ("sess-list", "user", "work kanban task t_d1c3323e", None, None, 1.0, None, None),
+            (
+                "sess-list",
+                "assistant",
+                None,
+                None,
+                [{"id": "c-clipped", "function": {"name": "terminal", "arguments": read_args}}],
+                2.0,
+                None,
+                None,
+            ),
+            ("sess-list", "tool", f"{secret_val}\n", "terminal", None, 3.0, None, "c-clipped"),
+        ]
+        for idx in range(window - 2):
+            rows.append(("sess-list", "user", f"user-turn-{idx}", None, None, float(10 + idx), None, None))
+        rows.append(("sess-list", "assistant", "Final visible reply", None, None, 999.0, None, None))
+        self._write_profile_store("platform", rows, with_tool_call_id=True)
+
         listing = self.client.get("/v1/sessions/k8s-evt-1/tasks").json()["tasks"][0]
+        self.assertTrue(listing["steps_truncated"])
+        self.assertEqual(
+            [(s["kind"], s["preview"]) for s in listing["live_steps"]],
+            [("tool_result", session_kv_server.WORKER_STEP_WITHHELD), ("reply", "Final visible reply")],
+        )
         self.assertNotIn(secret_val, json.dumps(listing))
+        body = self.client.get("/v1/tasks/t_d1c3323e").json()
+        self.assertFalse(body["steps_truncated"])
+        self.assertEqual(
+            [s["preview"] for s in body["steps"] if s["kind"] == "tool_result"],
+            [session_kv_server.WORKER_STEP_WITHHELD],
+        )
+        self.assertNotIn(secret_val, json.dumps(body))
 
     def test_session_tasks_reuses_single_profile_connection_across_multiple_cards(self):
         import sqlite3

@@ -23,7 +23,7 @@ import urllib.error
 import urllib.request
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, NamedTuple, Optional, Sequence
+from typing import Any, Callable, Dict, NamedTuple, Optional, Sequence
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout, wait as futures_wait
 from contextlib import ExitStack, closing
 from pathlib import Path
@@ -5485,8 +5485,28 @@ _CLI_SHORT_P_RE = re.compile(
     r"[^\r\n;|&]{0,512}?\s-(?:p|a)[ \t=]*)"
     r"(?P<val>\"(?:[^\"\\\r\n]|\\.)*\"|'[^'\r\n]*'|[^\s\"']+)"
 )
+# The two rules above end a command's segment at `;`, `|` or `&`, but a
+# shell operator inside a quoted argument (`?query=x&type=dash-db`,
+# `-e "select 1 | 2"`) is data. `_sub_shell_segments` therefore finds the
+# segment on a copy of the text whose quoted interiors are blanked to spaces
+# (same length, so every offset holds) and reads the flag and its value out
+# of the original at that span. A quote that does not close on its own line
+# is left as written, which is how a shell would reject it.
+_SHELL_QUOTE_CHARS = ("'", '"')
+_SHELL_QUOTE_BLANK_CHAR = " "
+_SHELL_QUOTED_SPAN_RE = re.compile(r"'[^'\r\n]*'|\"(?:[^\"\\\r\n]|\\[^\r\n])*\"")
+# A scheme-led value (`Bearer <token>`) after any credential-named key, with
+# `:` or `=` as the separator: the redactor's own bearer rule needs twelve
+# token characters from its alphabet, so a short or `~`-bearing token after
+# `auth:`, `token:` or `AUTH_HEADER=` would otherwise outlive the marker.
+# The redactor runs first and, for a key its own key rule knows (`token:`),
+# masks the scheme word as the value; the marker it leaves there counts as
+# the scheme so the token after it is still taken.
 _AUTH_SCHEME_HEADER_RE = re.compile(
-    r"(?i)(?P<prefix>[\"']?\bauthorization[\"']?[ \t]*:[ \t]*(?:bearer|basic|token|apikey|api-key|digest|negotiate|aws4-hmac-sha256|mutual)[ \t]+)"
+    r"(?i)(?P<prefix>[\"']?\b(?P<key>[\w.\-]+)[\"']?[ \t]*[:=][ \t]*"
+    r"(?:bearer|basic|token|apikey|api-key|digest|negotiate|aws4-hmac-sha256|mutual|"
+    + re.escape(_REDACTED_SECRET_MARKER)
+    + r")[ \t]+)"
     r"(?P<val>[^\s\"',}{\[\]\\]+)"
 )
 _TEXT_COLON_KV_RE = re.compile(
@@ -5580,8 +5600,15 @@ _SECRET_READ_COMMAND_RE = re.compile(
     r"|\bjsonpath\s*=\s*['\"]?[^'\"]*\.(?:data|stringData)\b"
     r"|\bgcloud\b[^\r\n|;&]*\bsecrets\s+versions\s+access\b"
     r"|\baws\b[^\r\n|;&]*\bsecretsmanager\s+get-secret-value\b"
+    r"|\baws\b[^\r\n|;&]*\bssm\s+get-parameters?\b"
+    r"|\baz\b[^\r\n|;&]*\bkeyvault\s+secret\s+show\b"
     r"|\bvault\s+(?:kv\s+get|read)\b"
-    r"|\b(?:cat|head|tail|less|more|base64)\b[^\r\n]*/(?:var/run/secrets|etc/kubernetes/pki|etc/ssl/private|\.ssh/id_)[^\r\n]*"
+    r"|\bsops\s+(?:-d|--decrypt|decrypt)\b"
+    # A file read (also after `kubectl exec ... --`) under a well-known secret
+    # mount, or under a directory component that is, or ends in `-`,
+    # `secret(s)`, `creds` or `credentials` (`/etc/db-creds/password`).
+    r"|\b(?:cat|head|tail|less|more|base64)\b[^\r\n]*/"
+    r"(?:var/run/secrets|etc/kubernetes/pki|etc/ssl/private|\.ssh/id_|(?:[^\s/]*-)?(?:secrets?|creds|credentials)/)[^\r\n]*"
     r")"
 )
 
@@ -5662,6 +5689,34 @@ def _named_value_is_sensitive(redactor: Any, name: str) -> bool:
         or any(w <= words for w in _KEY_DATA_WORDS)
         or name.lower().endswith(_SENSITIVE_KEY_SUFFIXES)
     )
+
+
+def _blank_quoted_spans(text: str) -> str:
+    """Return `text` with the interior of every single- or double-quoted span
+    replaced by spaces, keeping the quotes and the length."""
+    if not any(q in text for q in _SHELL_QUOTE_CHARS):
+        return text
+    return _SHELL_QUOTED_SPAN_RE.sub(
+        lambda m: m.group(0)[0] + _SHELL_QUOTE_BLANK_CHAR * (len(m.group(0)) - 2) + m.group(0)[-1], text
+    )
+
+
+def _sub_shell_segments(
+    segment_re: "re.Pattern[str]",
+    text: str,
+    mask: "Callable[[re.Match[str], str], str]",
+) -> str:
+    """Find each `segment_re` match on the quote-blanked copy of `text` and
+    replace that span of the original with `mask(match, text)`."""
+    blanked = _blank_quoted_spans(text)
+    out: list[str] = []
+    pos = 0
+    for match in segment_re.finditer(blanked):
+        out.append(text[pos : match.start()])
+        out.append(mask(match, text))
+        pos = match.end()
+    out.append(text[pos:])
+    return "".join(out)
 
 
 def _unquote_token(raw: str) -> str:
@@ -5774,11 +5829,15 @@ def _blank_named_values(redactor: Any, text: str) -> str:
             return f"{match.group('prefix')}{flag}{match.group('sep')}{_REDACTED_SECRET_MARKER}"
         return match.group(0)
 
-    def _mask_short_p(match: "re.Match[str]") -> str:
-        unquoted = _unquote_token(match.group("val"))
+    def _mask_short_p(match: "re.Match[str]", source: str) -> str:
+        # `match` comes from the quote-blanked copy; the value is read from `source`.
+        unquoted = _unquote_token(source[match.start("val") : match.end("val")])
         if unquoted.startswith("-") or not redactor._is_credential_value(unquoted):
-            return match.group(0)
-        return f"{match.group('prefix')}{_REDACTED_SECRET_MARKER}"
+            return source[match.start() : match.end()]
+        return f"{source[match.start() : match.start('val')]}{_REDACTED_SECRET_MARKER}"
+
+    def _mask_userpass_segment(match: "re.Match[str]", source: str) -> str:
+        return _CLI_USERPASS_ARG_RE.sub(_mask_userpass, source[match.start() : match.end()])
 
     def _mask_userpass(match: "re.Match[str]") -> str:
         quote = match.group("quote") or ""
@@ -5790,7 +5849,7 @@ def _blank_named_values(redactor: Any, text: str) -> str:
 
     def _mask_auth_scheme(match: "re.Match[str]") -> str:
         val = _unquote_token(match.group("val"))
-        if not redactor._is_credential_value(val):
+        if not _named_value_is_sensitive(redactor, match.group("key")) or not redactor._is_credential_value(val):
             return match.group(0)
         return f"{match.group('prefix')}{_REDACTED_SECRET_MARKER}"
 
@@ -5798,8 +5857,8 @@ def _blank_named_values(redactor: Any, text: str) -> str:
     text = _SUPPLEMENT_BLOCK_SCALAR_RE.sub(_mask_block, text)
     text = _AUTH_SCHEME_HEADER_RE.sub(_mask_auth_scheme, text)
     text = _CLI_LONG_FLAG_RE.sub(_mask_long_flag, text)
-    text = _CLI_USERPASS_FLAG_RE.sub(lambda seg: _CLI_USERPASS_ARG_RE.sub(_mask_userpass, seg.group(0)), text)
-    text = _CLI_SHORT_P_RE.sub(_mask_short_p, text)
+    text = _sub_shell_segments(_CLI_USERPASS_FLAG_RE, text, _mask_userpass_segment)
+    text = _sub_shell_segments(_CLI_SHORT_P_RE, text, _mask_short_p)
     text = _TEXT_COLON_KV_RE.sub(_mask_colon_kv, text)
     text = _QUOTED_COLON_KV_RE.sub(_mask_colon_kv, text)
     return _TEXT_EQUALS_KV_RE.sub(_mask_equals_kv, text)
