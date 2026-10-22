@@ -316,6 +316,23 @@ platforms:
 	}
 }
 
+func TestAPluginRouteCannotNameTheDriftDetectorsSubscription(t *testing.T) {
+	// A second consumer on the detector's subscription would pull and ack
+	// drift events the detector never sees; the set leaves it out and the
+	// plugin's status says so.
+	agent := agentInProject("my-gcp-project")
+	drift := watcherPubsubSubscription(agent)
+	plugin := pubsubPlugin("stockout", "platforms:\n  pubsub:\n    enabled: true\n    extra:\n      subscriptions:\n        drift:\n          subscription: "+drift+"\n        alerts:\n          subscription: gke-stockout-alerts-sub\n")
+	got := pluginPubsubSubscriptions(agent, []*agentv1alpha1.AgentPlugin{plugin})
+	if len(got) != 1 || got[0] != "projects/my-gcp-project/subscriptions/gke-stockout-alerts-sub" {
+		t.Fatalf("the detector's subscription reached the broker's set: %v", got)
+	}
+	issues := pubsubRouteIssues(agent, plugin)
+	if len(issues) != 1 || !strings.Contains(issues[0], "drift detector's subscription") {
+		t.Fatalf("the refused route is not on the plugin's status: %v", issues)
+	}
+}
+
 func TestTheReservedListNamesThePlatformPubsubSubscriptions(t *testing.T) {
 	merged := mergeCredentialProxyEnv(nil, []corev1.EnvVar{
 		{Name: platformPubsubSubscriptionsEnvVar, Value: "projects/p/subscriptions/theirs"},

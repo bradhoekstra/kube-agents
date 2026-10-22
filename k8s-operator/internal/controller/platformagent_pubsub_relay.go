@@ -47,9 +47,13 @@ const (
 	pubsubRouteIssueOverflowFormat  = "%d more Pub/Sub route(s) are left out of the broker's set for the same reasons."
 	pubsubRouteNoProjectIssueFormat = "Pub/Sub route %s names a short subscription or topic and spec.harness.projectId is empty, so the broker relays nothing for it; name it as projects/<project>/subscriptions/<name> or set the project."
 	pubsubRouteGrammarIssueFormat   = "Pub/Sub route %s composes to %q, which is not a subscription path the broker relays; it is left out of the broker's set."
-	pubsubSubscriptionPathFormat    = "projects/%s/subscriptions/%s"
-	pubsubSubscriptionPathPrefix    = "projects/"
-	pubsubSubscriptionsSeparator    = ","
+	// The drift detector's own subscription is never a plugin's: a second
+	// consumer would pull and ack drift events the detector then never sees,
+	// and nothing would report it.
+	pubsubRouteWatcherIssueFormat = "Pub/Sub route %s names the drift detector's subscription %q, which the platform relay does not serve; it is left out of the broker's set."
+	pubsubSubscriptionPathFormat  = "projects/%s/subscriptions/%s"
+	pubsubSubscriptionPathPrefix  = "projects/"
+	pubsubSubscriptionsSeparator  = ","
 )
 
 // The shape the broker's policy matches a subscription on the wire by
@@ -89,7 +93,8 @@ func pluginPubsubSubscriptions(agent *agentv1alpha1.PlatformAgent, agentPlugins 
 			continue
 		}
 		for _, route := range pubsubRoutes(config) {
-			if path := pubsubSubscriptionPath(route, project); pubsubSubscriptionPathPattern.MatchString(path) {
+			path := pubsubSubscriptionPath(route, project)
+			if pubsubSubscriptionPathPattern.MatchString(path) && path != watcherPubsubSubscription(agent) {
 				seen[path] = struct{}{}
 			}
 		}
@@ -136,6 +141,8 @@ func pubsubRouteIssues(agent *agentv1alpha1.PlatformAgent, plugin *agentv1alpha1
 			issue = fmt.Sprintf(pubsubRouteNoProjectIssueFormat, pubsubRouteIssueOperand(name))
 		case !pubsubSubscriptionPathPattern.MatchString(path):
 			issue = fmt.Sprintf(pubsubRouteGrammarIssueFormat, pubsubRouteIssueOperand(name), pubsubRouteIssueOperand(path))
+		case path == watcherPubsubSubscription(agent):
+			issue = fmt.Sprintf(pubsubRouteWatcherIssueFormat, pubsubRouteIssueOperand(name), path)
 		default:
 			continue
 		}
