@@ -4068,7 +4068,8 @@ class TestAuditChatReport(unittest.TestCase):
             json.dump(record, handle)
 
     def post(self, fleet_audit=True, send=None, job="compliance-audit", shipped=True, scheduler=True,
-             report=None, failure=False):
+             report=None, failure=False, roster_job=None):
+        """Post `job` as the request's id; `roster_job` is the string the image roster hands back for it."""
         sent = []
 
         def default_send(platform, message, chat_id="", thread_id="", timeout=None):
@@ -4077,7 +4078,7 @@ class TestAuditChatReport(unittest.TestCase):
 
         with patch.object(session_kv_server, "enabled_chat_platforms", return_value=["google_chat"]), \
              patch.object(session_kv_server, "_is_fleet_audit_job", return_value=fleet_audit), \
-             patch.object(session_kv_server, "_is_shipped_audit_job", return_value=shipped), \
+             patch.object(session_kv_server, "_shipped_audit_job", return_value=(roster_job or job) if shipped else None), \
              patch.object(session_kv_server, "_send_to_chat", side_effect=send or default_send):
             response = self.client.post(
                 "/v1/cron-reports",
@@ -4356,15 +4357,24 @@ class TestAuditChatReport(unittest.TestCase):
         _, sent = self.post(job="nightly-compliance", shipped=False)
         self.assertEqual(sent, [self.FINAL])
 
+    def test_the_record_is_read_under_the_rosters_copy_of_the_job_id(self):
+        # The branch continues with the string the image roster handed back,
+        # not the request's: the record under the roster's id is what posts.
+        # With the request's id the read would find no record and post the
+        # not-finished notice instead.
+        self.leave([self.REPORT], job="roster-copy")
+        _, sent = self.post(job="compliance-audit", roster_job="roster-copy")
+        self.assertEqual(sent, [self.REPORT])
+
     def test_the_image_roster_decides_which_audit_jobs_are_shipped(self):
         roster = os.path.join(self.scratch, "jobs.json")
         with open(roster, "w", encoding="utf-8") as handle:
             json.dump({"jobs": [{"id": "compliance-audit", "skills": ["fleet-audit"]},
                                 {"id": "stall-watch", "no_agent": True}]}, handle)
         with patch.object(session_kv_server, "IMAGE_PLATFORM_ROSTER", roster):
-            self.assertTrue(session_kv_server._is_shipped_audit_job("compliance-audit"))
-            self.assertFalse(session_kv_server._is_shipped_audit_job("stall-watch"))
-            self.assertFalse(session_kv_server._is_shipped_audit_job("nightly-compliance"))
+            self.assertEqual(session_kv_server._shipped_audit_job("compliance-audit"), "compliance-audit")
+            self.assertIsNone(session_kv_server._shipped_audit_job("stall-watch"))
+            self.assertIsNone(session_kv_server._shipped_audit_job("nightly-compliance"))
 
     def test_a_record_over_the_size_cap_posts_the_unreadable_notice(self):
         self.leave([self.REPORT])
@@ -4680,7 +4690,7 @@ class TestSlackAuditHeadline(unittest.TestCase):
         # report is the one `finish` left (TestAuditChatReport covers that).
         with patch.object(session_kv_server, "enabled_chat_platforms", return_value=list(platforms)), \
              patch.object(session_kv_server, "_is_fleet_audit_job", return_value=fleet_audit) as is_audit, \
-             patch.object(session_kv_server, "_is_shipped_audit_job", return_value=True), \
+             patch.object(session_kv_server, "_shipped_audit_job", return_value=job_id), \
              patch.object(session_kv_server, "audit_chat_report", return_value=(composed.strip(), "")), \
              patch.object(session_kv_server, "_is_managed_github_repo", return_value=managed) as is_managed, \
              patch.object(session_kv_server, "_fetch_ledger_issue", return_value=issue) as fetch, \
