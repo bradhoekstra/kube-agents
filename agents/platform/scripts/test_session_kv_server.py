@@ -6966,6 +6966,11 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
             "kubectl -n ns -o go-template='{{.data.password}}' get secret db",
             "kubectl --template='{{index .data \"password\"}}' get secret db",
             "kubectl get -o json secret db",
+            # backslash continuations, indented as the skills write long commands
+            "kubectl get secret db \\\n  -o go-template='{{.data.password}}' | base64 -d",
+            "kubectl \\\n  get secret db -o custom-columns=:.data.password",
+            "kubectl get secret db \\\n  -o json | jq -r '.data.password | @base64d'",
+            "cat \\\n  /var/run/secrets/kubernetes.io/serviceaccount/token",
         ]
         served = [
             "kubectl get secrets -n kube-system",

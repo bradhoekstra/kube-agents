@@ -5564,6 +5564,10 @@ _INLINE_JSON_OBJECT_RE = re.compile(r"\{[^{}]+\}")
 # pipe anywhere on the line. A bare list (`kubectl get secrets -n ns`) prints
 # names and ages only; a ConfigMap whose name contains `secret` is withheld
 # too, which is the safe direction.
+# A shell joins a backslash-newline before it parses, so the detector folds
+# the continuation (and the indentation after it) to one space first; every
+# alternative below is line-bounded and would otherwise see two commands.
+_SHELL_CONTINUATION_RE = re.compile(r"\\\r?\n[ \t]*")
 _SECRET_READ_COMMAND_RE = re.compile(
     r"(?i)(?:"
     r"\bkubectl\b(?=[^\r\n]*\bget\b[^\r\n|]*\bsecrets?\b)"
@@ -5956,9 +5960,9 @@ def _is_secret_read_tool_call(raw_args: Any) -> bool:
     parsed = _as_json_structure(raw_args) if isinstance(raw_args, str) else raw_args
     if isinstance(parsed, dict):
         cmd = parsed.get("command") or parsed.get("cmd") or ""
-        if isinstance(cmd, str) and _SECRET_READ_COMMAND_RE.search(cmd):
+        if isinstance(cmd, str) and _SECRET_READ_COMMAND_RE.search(_SHELL_CONTINUATION_RE.sub(" ", cmd)):
             return True
-    elif isinstance(raw_args, str) and _SECRET_READ_COMMAND_RE.search(raw_args):
+    elif isinstance(raw_args, str) and _SECRET_READ_COMMAND_RE.search(_SHELL_CONTINUATION_RE.sub(" ", raw_args)):
         return True
     return False
 
