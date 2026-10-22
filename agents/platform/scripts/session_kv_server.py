@@ -139,6 +139,7 @@ TRIAGE_SESSION_TITLE_PREFIX = "Triage "
 # to the second, and Hermes stamps its rows as floats, so a floored dispatch
 # would claim the previous turn's last second on a reused session.
 LEDGER_NOW_SQL = "strftime('%Y-%m-%d %H:%M:%f', 'now')"
+LEDGER_WRITE_TIMEOUT_SECONDS = 5.0
 PRE_KANBAN_STATUS_IN_PROGRESS = "in_progress"
 PRE_KANBAN_STATUS_COMPLETED = "completed"
 PRE_KANBAN_STATUS_FAILED = "failed"
@@ -955,8 +956,10 @@ def init_db() -> None:
                 # carding of a drift-backlog row. created_at is the row's
                 # arrival, which precedes the dispatch by the background queue
                 # for an event row and by the digest's whole wait for a backlog
-                # row. Sub-second, as Hermes's clocks are. NULL on rows from
-                # before the column, which read as created_at.
+                # row. Sub-second, as Hermes's clocks are. NULL means admitted
+                # and not yet dispatched (the queue, the chat post); the rows
+                # from before the column are backfilled to created_at below,
+                # once, so NULL never means "old".
                 ("dispatched_at", "dispatched_at TEXT"),
             ):
                 if column in ledger_columns:
@@ -966,6 +969,8 @@ def init_db() -> None:
                 except sqlite3.OperationalError as exc:
                     if _SQLITE_DUPLICATE_COLUMN_SUBSTR not in str(exc).lower():
                         raise
+                if column == "dispatched_at":
+                    conn.execute("UPDATE intercepted_events SET dispatched_at = created_at WHERE dispatched_at IS NULL")
             # By contrast, no ALTER TABLE migration accompanies `cluster`,
             # `object_uid`, or `delivery_error`: those columns were added
             # before the table first shipped in 0.2.0, so the only databases
@@ -1204,7 +1209,7 @@ def mark_dispatched(event_row_id: Optional[int]) -> None:
     if not event_row_id:
         return
     try:
-        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=LEDGER_WRITE_TIMEOUT_SECONDS)) as conn:
             with conn:
                 conn.execute(
                     f"UPDATE intercepted_events SET dispatched_at = {LEDGER_NOW_SQL} WHERE id = ?",
@@ -6266,22 +6271,35 @@ def _session_first_order_key(
     return (ts, msg_id)
 
 
-def _is_intercepted_event_session(session_id: str) -> Optional[Any]:
-    """Return the ledger row's dispatch time (`dispatched_at`, or `created_at`
-    for a row written before that column) when `session_id` was admitted and
-    dispatched (`notified >= 1` or `delivery_error != ''`), or `None` when no
-    dispatched row exists."""
+class _LedgerDispatch(NamedTuple):
+    """What the ledger says about a triage session's dispatch: its clock (the
+    dispatch when stamped, else the row's arrival) and whether the dispatcher
+    has stamped it yet. An admitted row the dispatcher has not reached is
+    queued, and a queued turn is never aged into a terminal verdict."""
+
+    clock: Any
+    dispatched: bool
+
+
+def _is_intercepted_event_session(session_id: str) -> Optional[_LedgerDispatch]:
+    """Return the ledger row's dispatch when `session_id` was admitted
+    (`notified >= 1` or `delivery_error != ''`), or `None` when no such row
+    exists."""
     if not session_id or not os.path.isfile(SESSION_KV_DB_PATH):
         return None
     try:
         with closing(_read_only(SESSION_KV_DB_PATH)) as conn:
             row = conn.execute(
-                "SELECT COALESCE(dispatched_at, created_at) AS dispatched_at FROM intercepted_events "
+                "SELECT dispatched_at, created_at FROM intercepted_events "
                 "WHERE session_id = ? AND (notified >= 1 OR COALESCE(delivery_error, '') != '') "
                 "ORDER BY id DESC LIMIT 1",
                 (session_id,),
             ).fetchone()
-            return (row["dispatched_at"] or "") if row is not None else None
+            if row is None:
+                return None
+            if row["dispatched_at"]:
+                return _LedgerDispatch(row["dispatched_at"], True)
+            return _LedgerDispatch(row["created_at"] or "", False)
     except sqlite3.Error:
         return None
 
@@ -6379,9 +6397,10 @@ def _read_pre_kanban_session_task(session_id: str) -> Optional[Dict[str, Any]]:
     `sqlite3.Error`, the same ledger-backed object carries `routing_error`
     naming the read error.
     """
-    ledger_created_at = _is_intercepted_event_session(session_id)
-    if ledger_created_at is None:
+    ledger = _is_intercepted_event_session(session_id)
+    if ledger is None:
         return None
+    ledger_created_at = ledger.clock
     db_path = _profile_state_db(_feed_data_root(), DEFAULT_PROFILE)
     window_size = SESSION_TASK_LIVE_STEPS_MAX * TASK_STEP_ROW_MULTIPLIER
     steps: list[Dict[str, Any]] = []
@@ -6457,6 +6476,11 @@ def _read_pre_kanban_session_task(session_id: str) -> Optional[Dict[str, Any]]:
                     raise_on_error=True,
                 )
                 has_session = has_session or bool(steps)
+                # Rows cut by the read window are this turn's only when the
+                # oldest row that survived it is; otherwise the previous turn
+                # filled the window and nothing of this turn was lost.
+                if steps and _before_turn(steps[0].get("at"), turn_floor):
+                    rows_clipped = False
                 steps = [s for s in steps if not _before_turn(s.get("at"), turn_floor)]
                 if (not has_session or created_at is None) and "session_id" in msg_cols:
                     mrow = sconn.execute(
@@ -6475,8 +6499,11 @@ def _read_pre_kanban_session_task(session_id: str) -> Optional[Dict[str, Any]]:
             has_session = False
     if not has_session:
         ledger_epoch = _timestamp_epoch_seconds(ledger_created_at)
+        # Only a dispatched row can have failed to start its turn; a queued
+        # one has no clock to age by yet, whatever the row's arrival says.
         if (
-            ledger_epoch is not None
+            ledger.dispatched
+            and ledger_epoch is not None
             and (time.time() - ledger_epoch) > PRE_KANBAN_STALE_AFTER_SECONDS
         ):
             return _routing_object(

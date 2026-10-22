@@ -929,6 +929,28 @@ class TestDeliveryFailureIsWrittenBack(unittest.TestCase):
         session_kv_server.trigger_agent_troubleshooter("sess-y", "msg", {}, row_id)
         self.assertEqual(self._row(row_id), (1, ""))
 
+    @patch.object(session_kv_server, "_start_agent_turn")
+    @patch.object(session_kv_server, "_register_session_routing")
+    @patch.object(session_kv_server, "_post_initial_alert", return_value="spaces/A/threads/B")
+    def test_the_dispatcher_stamps_the_dispatch_before_creating_the_session(self, *_):
+        """The pre-kanban read ages a turn from this stamp, so it is written
+        by the dispatcher itself, right before the gateway session, sub-second."""
+        import sqlite3
+
+        row_id = self._record()
+        seen: list = []
+
+        def create(api_url, session_id, headers):
+            with sqlite3.connect(temp_db_path) as conn:
+                seen.append(conn.execute("SELECT dispatched_at FROM intercepted_events WHERE id = ?", (row_id,)).fetchone()[0])
+            return True
+
+        with patch.object(session_kv_server, "_create_gateway_session", side_effect=create):
+            session_kv_server.trigger_agent_troubleshooter("sess-stamp", "msg", {}, row_id)
+        self.assertEqual(len(seen), 1)
+        self.assertTrue(seen[0], "dispatched_at must be stamped before the gateway session is created")
+        self.assertIn(".", seen[0])
+
     @patch.object(session_kv_server, "_create_gateway_session", return_value=False)
     @patch.object(session_kv_server, "_register_session_routing")
     @patch.object(session_kv_server, "_post_initial_alert", return_value="spaces/A/threads/B")
@@ -7619,8 +7641,11 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
                 "UPDATE intercepted_events SET created_at = ?, dispatched_at = ? WHERE session_id = 'k8s-evt-dispatched-late'",
                 (old_ts, old_ts),
             )
-        # A row from before the column, never stamped, reads as its arrival.
-        self.assertEqual(self.client.get("/v1/sessions/k8s-evt-carded-late/tasks").json()["routing"]["status"], "failed")
+        # An admitted row the dispatcher has not stamped is queued, whatever
+        # its arrival says: in progress, never aged into failed.
+        queued_old = self.client.get("/v1/sessions/k8s-evt-carded-late/tasks").json()["routing"]
+        self.assertEqual(queued_old["status"], "in_progress")
+        self.assertIsNone(queued_old["error"])
         # The dispatcher's stamp, as it runs right before the gateway session is created.
         session_kv_server.mark_dispatched(carded_late_id)
         with sqlite3.connect(self.kv_db_path) as conn:
@@ -7645,6 +7670,30 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
         queued = self.client.get("/v1/sessions/k8s-evt-queued/tasks").json()["routing"]
         self.assertEqual(queued["status"], "in_progress")
         self.assertEqual(queued["started_at"], now - 3.0)
+
+    def test_pre_kanban_previous_turn_rows_do_not_count_as_truncation(self):
+        # A reused session whose earlier turns left more rows than the read
+        # window holds: the window clips the previous turn, not this one.
+        import sqlite3
+
+        now = time.time()
+        self._record_ledger_session("k8s-evt-matrix-clip")
+        with sqlite3.connect(self.kv_db_path) as conn:
+            ts = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(now - 5.0))
+            conn.execute(
+                "UPDATE intercepted_events SET created_at = ?, dispatched_at = ? WHERE session_id = 'k8s-evt-matrix-clip'",
+                (ts, ts),
+            )
+        prompt = "A Kubernetes Warning event needs triage..."
+        rows = [("k8s-evt-matrix-clip", "user", prompt, None, None, now - 1200.0, None)]
+        for idx in range(22):
+            rows.append(("k8s-evt-matrix-clip", "assistant", None, None, None, now - 1199.0 + idx, f"old thought {idx}"))
+        rows.append(("k8s-evt-matrix-clip", "assistant", None, None, None, now - 2.0, "this turn's thought"))
+        self._write_profile_store("default", rows, sessions=[("k8s-evt-matrix-clip", "Triage clip", now - 1200.0, None)])
+        routing = self.client.get("/v1/sessions/k8s-evt-matrix-clip/tasks").json()["routing"]
+        self.assertEqual(routing["status"], "in_progress")
+        self.assertEqual([s["preview"] for s in routing["live_steps"]], ["this turn's thought"])
+        self.assertFalse(routing["steps_truncated"])
 
     def test_pre_kanban_ended_or_stale_session_reports_terminal_status(self):
         import sqlite3
