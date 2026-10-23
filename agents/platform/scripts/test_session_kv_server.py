@@ -8349,6 +8349,33 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
         self.assertEqual(queued["status"], "in_progress")
         self.assertEqual(queued["started_at"], now - 3.0)
 
+    def test_pre_kanban_startup_stamps_a_dispatch_the_previous_process_lost(self):
+        # A row admitted right before a restart never reaches mark_dispatched,
+        # so dispatched_at stays NULL and, read as queued, it would say
+        # in_progress for its whole retention. Startup stamps every unstamped
+        # row to created_at: no dispatcher from an earlier process can.
+        import sqlite3
+
+        now = time.time()
+        old_ts = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(now - 1200.0))
+        self._record_ledger_session("k8s-evt-lost-dispatch")
+        with sqlite3.connect(self.kv_db_path) as conn:
+            conn.execute(
+                "UPDATE intercepted_events SET created_at = ?, dispatched_at = NULL WHERE session_id = 'k8s-evt-lost-dispatch'",
+                (old_ts,),
+            )
+        before = self.client.get("/v1/sessions/k8s-evt-lost-dispatch/tasks").json()["routing"]
+        self.assertEqual(before["status"], "in_progress")
+        session_kv_server.init_db()
+        with sqlite3.connect(self.kv_db_path) as conn:
+            row = conn.execute(
+                "SELECT created_at, dispatched_at FROM intercepted_events WHERE session_id = 'k8s-evt-lost-dispatch'"
+            ).fetchone()
+        self.assertEqual(row[1], row[0], "startup stamps the lost dispatch to the row's arrival")
+        after = self.client.get("/v1/sessions/k8s-evt-lost-dispatch/tasks").json()["routing"]
+        self.assertEqual(after["status"], "failed")
+        self.assertEqual(after["error"], session_kv_server.PRE_KANBAN_STALE_ERROR)
+
     def test_pre_kanban_previous_turn_rows_do_not_count_as_truncation(self):
         # A reused session whose earlier turns left more rows than the read
         # window holds: the window clips the previous turn, not this one.

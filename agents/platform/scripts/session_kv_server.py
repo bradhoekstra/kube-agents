@@ -1133,9 +1133,10 @@ def init_db() -> None:
                 # arrival, which precedes the dispatch by the background queue
                 # for an event row and by the digest's whole wait for a backlog
                 # row. Sub-second, as Hermes's clocks are. NULL means admitted
-                # and not yet dispatched (the queue, the chat post); the rows
-                # from before the column are backfilled to created_at below,
-                # once, so NULL never means "old".
+                # and not yet dispatched by this process (the queue, the chat
+                # post); a row still NULL when the server starts belongs to no
+                # live dispatcher, so startup stamps it to created_at below
+                # and NULL never means "old".
                 ("dispatched_at", "dispatched_at TEXT"),
             ):
                 if column in ledger_columns:
@@ -1145,8 +1146,12 @@ def init_db() -> None:
                 except sqlite3.OperationalError as exc:
                     if _SQLITE_DUPLICATE_COLUMN_SUBSTR not in str(exc).lower():
                         raise
-                if column == "dispatched_at":
-                    conn.execute("UPDATE intercepted_events SET dispatched_at = created_at WHERE dispatched_at IS NULL")
+            # Every start, not only the migration: a row the previous process
+            # admitted and never stamped (a restart between the inject and
+            # mark_dispatched, or a database from before the column) has no
+            # dispatcher left to stamp it, and unstamped it would read as
+            # queued, in_progress, for the row's whole retention.
+            conn.execute("UPDATE intercepted_events SET dispatched_at = created_at WHERE dispatched_at IS NULL")
             # By contrast, no ALTER TABLE migration accompanies `cluster`,
             # `object_uid`, or `delivery_error`: those columns were added
             # before the table first shipped in 0.2.0, so the only databases
