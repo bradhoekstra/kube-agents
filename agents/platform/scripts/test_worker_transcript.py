@@ -151,6 +151,27 @@ class TestScrubStepText(unittest.TestCase):
         other_arg = json.dumps({"path": "a \\\n  b", "command": "ls"})
         self.assertEqual(_scrub("tool_call", other_arg), other_arg)
 
+    def test_unquoted_value_after_a_credential_key_is_masked_to_the_line_end(self):
+        for line in ("password: one two three", "DB_PASSWORD=one two three", "DB_PASSWORD:  my secret phrase here"):
+            with self.subTest(line=line):
+                out = _scrub("tool_result", f"{line}   \nnext: line")
+                for word in ("one", "two", "three", "my", "phrase", "here"):
+                    self.assertNotIn(word, out.split("\n")[0])
+                self.assertEqual(out.count(MARKER), 1)
+                self.assertTrue(out.endswith("   \nnext: line"), out)
+        # A quoted value ends at its quote.
+        self.assertEqual(_scrub("tool_result", 'password: "one two" three'), f"password: {MARKER} three")
+
+    def test_file_name_key_keeps_its_diagnostic_value(self):
+        for line in ("tls.crt:  1679 bytes", "cert.pem: OK", "cert.pem:28:-----END"):
+            with self.subTest(line=line):
+                self.assertEqual(_scrub("tool_result", line), line)
+
+    def test_prose_that_names_a_credential_field_is_kept(self):
+        # `Note:` names no credential and `password` is a word in its value, not a key.
+        text = "Note: the password field is required"
+        self.assertEqual(_scrub("reply", text), text)
+
     def test_ordinary_output_is_left_alone(self):
         text = "NAME READY STATUS\ncheckout-7d9f 0/1 CrashLoopBackOff\nservice token-refresher ok"
         self.assertEqual(_scrub("tool_result", text), text)

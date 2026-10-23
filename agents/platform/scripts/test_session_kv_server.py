@@ -7710,7 +7710,7 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
         self.assertEqual(session_kv_server._scrub_worker_step_text("tool_result", benign), benign)
 
     def test_cli_segment_rules_read_past_an_operator_inside_a_quoted_argument(self):
-        # `_CLI_USERPASS_FLAG_RE` and `_CLI_SHORT_P_RE` end a command's segment
+        # `worker_transcript.CLI_USERPASS_FLAG_RE` and `CLI_SHORT_P_RE` end a command's segment
         # at `&`, `;` or `|`; inside a quoted argument those are data.
         for cmd, cred, kept in (
             (

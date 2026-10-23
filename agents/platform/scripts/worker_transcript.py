@@ -41,6 +41,9 @@ REDACTED_PRIVATE_KEY_MARKER = "[REDACTED_PRIVATE_KEY]"
 # Every marker the redactor and this module write starts with this; a block
 # whose every line already carries one is not masked again.
 REDACTED_MARKER_PREFIX = "[REDACTED_"
+# A marker as a value token: the `NAME: value` rules read it so that a line
+# the redactor already masked the first word of is masked to its end.
+REDACTED_MARKER_TOKEN_RE_SRC = r"\[REDACTED_[A-Z_]+\]"
 # The step kinds whose text takes a rule of its own: a `tool_call` carries a
 # shell command the continuation fold applies to, a `tool_result` the
 # inline-object rule.
@@ -48,11 +51,11 @@ STEP_KIND_TOOL_CALL = "tool_call"
 STEP_KIND_TOOL_RESULT = "tool_result"
 # The first character of a string that may be a JSON document.
 JSON_STRUCTURE_OPENERS = "{["
-# The Kubernetes keys and kind whose mapping is blanked wholesale.
-SECRET_DATA_KEY = "data"
-SECRET_STRING_DATA_KEY = "stringData"
+# The manifest keys and kind whose mapping is blanked wholesale.
+MANIFEST_DATA_KEY = "data"
+MANIFEST_STRING_DATA_KEY = "stringData"
 KIND_KEY = "kind"
-SECRET_KIND = "Secret"
+CREDENTIAL_MANIFEST_KIND = "Secret"
 ENV_NAME_KEY = "name"
 ENV_VALUE_KEY = "value"
 # The redactor's own list of key suffixes that name no credential (`name`,
@@ -67,6 +70,16 @@ BASE64_SECRET_VALUE_MIN_CHARS = 4
 BASE64_QUANTUM_CHARS = 4
 BASE64_PADDING_CHAR = "="
 BASE64_DECODED_TEXT_WHITESPACE = "\n\r\t"
+BASE64_DECODED_TEXT_ENCODING = "utf-8"
+# The separator a `NAME=value` token is rescanned on, the character the
+# shell continuation folds to, and the whitespace an indent or a line's tail
+# is made of.
+EQUALS_SEPARATOR = "="
+SHELL_CONTINUATION_FOLD = " "
+INDENT_CHAR = " "
+INLINE_WHITESPACE = " \t"
+LINE_BREAK = "\n"
+LINE_TAIL_WHITESPACE = " \t\r"
 # A CLI value that starts with this is the next flag, not a credential.
 CLI_FLAG_LEAD_CHAR = "-"
 CLI_FLAG_WORD_SEPARATOR = "_"
@@ -95,7 +108,7 @@ WORKER_SESSION_ID_METADATA_KEY = "worker_session_id"
 # The block rules below run only on text that can hold a `data:` block;
 # `stringData` carries its only "data" capitalised.
 SECRET_BLOCK_FAST_PATH_WORDS = ("data", "Data")
-JSON_STRING_DATA_KEY_QUOTED = '"' + SECRET_STRING_DATA_KEY + '"'
+JSON_STRING_DATA_KEY_QUOTED = '"' + MANIFEST_STRING_DATA_KEY + '"'
 JSON_OBJECT_OPEN = "{"
 JSON_OBJECT_CLOSE = "}"
 YAML_SECRET_BLOCK_RE = re.compile(r"^(\s*)(data|stringData)\s*:\s*$")
@@ -161,7 +174,7 @@ AUTH_SCHEME_HEADER_RE = re.compile(
 )
 TEXT_COLON_KV_RE = re.compile(
     r"(?m)^(?P<prefix>[ \t]*(?:-[ \t]+)?[\"']?)(?P<key>[\w.\-]+)(?P<sep>[\"']?[ \t]*:[ \t]*)"
-    r"(?P<val>\"(?:[^\"\\\r\n]|\\.)*(?:\"|\Z)|'[^'\r\n]*(?:'|\Z)|[^\s\"',}{\[\]]+)"
+    r"(?P<val>" + REDACTED_MARKER_TOKEN_RE_SRC + r"|\"(?:[^\"\\\r\n]|\\.)*(?:\"|\Z)|'[^'\r\n]*(?:'|\Z)|[^\s\"',}{\[\]]+)"
 )
 QUOTED_COLON_KV_RE = re.compile(
     r"(?P<prefix>[\"'])(?P<key>[\w.\-]+)(?P<sep>(?P=prefix)[ \t]*:[ \t]*)"
@@ -169,7 +182,7 @@ QUOTED_COLON_KV_RE = re.compile(
 )
 TEXT_EQUALS_KV_RE = re.compile(
     r"(?<![\w.\-/\"])(?P<prefix>)(?P<key>[\w.\-]+)(?P<sep>[ \t]*=[ \t]*)"
-    r"(?P<val>\"(?:[^\"\\\r\n]|\\.)*\"|'[^'\r\n]*'|[^\s\"',}{\[\]]+)"
+    r"(?P<val>" + REDACTED_MARKER_TOKEN_RE_SRC + r"|\"(?:[^\"\\\r\n]|\\.)*\"|'[^'\r\n]*'|[^\s\"',}{\[\]]+)"
 )
 SUPPLEMENT_BLOCK_SCALAR_RE = re.compile(
     r"(?m)^(?P<indent>[ \t]*)(?:-[ \t]+)?[\"']?(?P<key>[\w.\-]+)[\"']?[ \t]*:[ \t]*[|>][+-]?[0-9]?[+-]?[ \t]*\r?\n"
@@ -268,7 +281,7 @@ def scrub_secret_blocks(redactor: Any, text: str) -> str:
     # let it through to the block rules below.
     if not any(word in text for word in SECRET_BLOCK_FAST_PATH_WORDS):
         return text
-    lines = text.split("\n")
+    lines = text.split(LINE_BREAK)
     block: Optional[int] = None
     for i, line in enumerate(lines):
         opener = YAML_SECRET_BLOCK_RE.match(line)
@@ -283,10 +296,10 @@ def scrub_secret_blocks(redactor: Any, text: str) -> str:
             continue
         pair = YAML_PAIR_RE.match(line)
         if pair is None:
-            lines[i] = " " * indent + REDACTED_SECRET_MARKER
+            lines[i] = INDENT_CHAR * indent + REDACTED_SECRET_MARKER
         elif pair.group(3):
             lines[i] = f"{pair.group(1)}{pair.group(2)}: {REDACTED_SECRET_MARKER}"
-    joined = "\n".join(lines)
+    joined = LINE_BREAK.join(lines)
 
     def _mask_json_block(m: "re.Match[str]") -> str:
         if JSON_STRING_DATA_KEY_QUOTED not in m.group(1) and not redactor.JSON_CREDENTIAL_KIND_PATTERN.search(joined):
@@ -391,8 +404,8 @@ def scrub_supplement_env_pairs(redactor: Any, text: str) -> str:
         lines = [line.strip() for line in body.splitlines() if line.strip()]
         if lines and all(line.startswith(REDACTED_MARKER_PREFIX) for line in lines):
             return match.group(0)
-        body_indent = body[: len(body) - len(body.lstrip(" \t"))]
-        ending = "\n" if body.endswith("\n") else ""
+        body_indent = body[: len(body) - len(body.lstrip(INLINE_WHITESPACE))]
+        ending = LINE_BREAK if body.endswith(LINE_BREAK) else ""
         return f"{match.group(0)[: match.start('body') - match.start()]}{body_indent}{REDACTED_SECRET_MARKER}{ending}"
 
     def _mask_env_span(match: "re.Match[str]", start: int, end: int) -> str:
@@ -422,6 +435,48 @@ def scrub_supplement_env_pairs(redactor: Any, text: str) -> str:
     return text
 
 
+def is_quoted_token(raw: str) -> bool:
+    """Whether `raw` is one quoted span: a value its quotes delimit."""
+    stripped = raw.strip()
+    return len(stripped) >= 2 and stripped[0] == stripped[-1] and stripped[0] in SHELL_QUOTE_CHARS
+
+
+def line_tail_end(text: str, pos: int) -> int:
+    """The offset where the line holding `pos` ends, trailing whitespace excluded."""
+    end = text.find(LINE_BREAK, pos)
+    if end < 0:
+        end = len(text)
+    while end > pos and text[end - 1] in LINE_TAIL_WHITESPACE:
+        end -= 1
+    return end
+
+
+def sub_named_pairs(
+    pattern: "re.Pattern[str]",
+    text: str,
+    mask: "Callable[[re.Match[str]], tuple[str, bool]]",
+) -> str:
+    """`pattern.sub` whose `mask` returns `(replacement, to_line_end)`: when the
+    second is true the replacement also stands for the rest of the line, trailing
+    whitespace excluded, and no later match on that line is read.
+
+    An unquoted value after a credential-named key is the rest of the line
+    (`DB_PASSWORD:  my secret phrase`), not its first word; a quoted value ends
+    at its quote.
+    """
+    out: list[str] = []
+    pos = 0
+    for match in pattern.finditer(text):
+        if match.start() < pos:
+            continue
+        replacement, to_line_end = mask(match)
+        out.append(text[pos : match.start()])
+        out.append(replacement)
+        pos = max(match.end(), line_tail_end(text, match.end())) if to_line_end else match.end()
+    out.append(text[pos:])
+    return "".join(out)
+
+
 def file_key_value_is_benign(value: str, tail: str) -> bool:
     """True for what a file-named key holds on a diagnostic line and never as
     key material: a line number, a byte count that the word `bytes` follows
@@ -441,35 +496,57 @@ def blank_named_values(redactor: Any, text: str) -> str:
         lines = [line.strip() for line in body.splitlines() if line.strip()]
         if lines and all(line.startswith(REDACTED_MARKER_PREFIX) for line in lines):
             return match.group(0)
-        body_indent = body[: len(body) - len(body.lstrip(" \t"))]
-        ending = "\n" if body.endswith("\n") else ""
+        body_indent = body[: len(body) - len(body.lstrip(INLINE_WHITESPACE))]
+        ending = LINE_BREAK if body.endswith(LINE_BREAK) else ""
         head = match.group(0)[: match.start("body") - match.start()]
         return f"{head}{body_indent}{REDACTED_SECRET_MARKER}{ending}"
 
-    def _mask_colon_kv(match: "re.Match[str]") -> str:
-        key = match.group("key")
-        unquoted = unquote_token(match.group("val"))
-        if key.lower().endswith(FILE_NAME_KEY_SUFFIXES) and file_key_value_is_benign(
-            unquoted, match.string[match.end() :]
-        ):
-            return match.group(0)
-        if named_value_is_sensitive(redactor, key) and redactor._is_credential_value(unquoted):
-            return f"{match.group('prefix')}{key}{match.group('sep')}{REDACTED_SECRET_MARKER}"
-        return match.group(0)
-
-    def _mask_equals_kv(match: "re.Match[str]") -> str:
+    def _mask_colon_kv(match: "re.Match[str]") -> tuple[str, bool]:
         key = match.group("key")
         raw_val = match.group("val")
         unquoted = unquote_token(raw_val)
-        if named_value_is_sensitive(redactor, key) and redactor._is_credential_value(unquoted):
-            return f"{match.group('prefix')}{key}{match.group('sep')}{REDACTED_SECRET_MARKER}"
-        if "=" in unquoted:
-            rescanned = TEXT_EQUALS_KV_RE.sub(_mask_equals_kv, unquoted)
+        # A file-name key opens diagnostic lines; its value is masked by the
+        # token, never to the line's end.
+        is_file_key = key.lower().endswith(FILE_NAME_KEY_SUFFIXES)
+        if is_file_key and file_key_value_is_benign(unquoted, match.string[match.end() :]):
+            return match.group(0), False
+        if not named_value_is_sensitive(redactor, key):
+            return match.group(0), False
+        to_line_end = not is_file_key and not is_quoted_token(raw_val)
+        if unquoted.startswith(REDACTED_MARKER_PREFIX):
+            # The redactor masked the first word; the rest of the line is the
+            # value too. The marker it chose stays.
+            return f"{match.group('prefix')}{key}{match.group('sep')}{unquoted}", to_line_end
+        if redactor._is_credential_value(unquoted):
+            return f"{match.group('prefix')}{key}{match.group('sep')}{REDACTED_SECRET_MARKER}", to_line_end
+        return match.group(0), False
+
+    def _mask_equals_kv(match: "re.Match[str]") -> tuple[str, bool]:
+        key = match.group("key")
+        raw_val = match.group("val")
+        unquoted = unquote_token(raw_val)
+        if named_value_is_sensitive(redactor, key):
+            to_line_end = not is_quoted_token(raw_val)
+            if unquoted.startswith(REDACTED_MARKER_PREFIX):
+                return f"{match.group('prefix')}{key}{match.group('sep')}{unquoted}", to_line_end
+            if redactor._is_credential_value(unquoted):
+                return f"{match.group('prefix')}{key}{match.group('sep')}{REDACTED_SECRET_MARKER}", to_line_end
+        if EQUALS_SEPARATOR in unquoted:
+            # A token that holds pairs of its own (`--from-literal=password=x`)
+            # is rescanned as a token: a pair inside it ends where it does.
+            rescanned = sub_named_pairs(TEXT_EQUALS_KV_RE, unquoted, _mask_equals_token)
             if rescanned != unquoted:
-                if len(raw_val) >= 2 and raw_val[0] == raw_val[-1] and raw_val[0] in SHELL_QUOTE_CHARS:
-                    return f"{match.group('prefix')}{key}{match.group('sep')}{raw_val[0]}{rescanned}{raw_val[0]}"
-                return f"{match.group('prefix')}{key}{match.group('sep')}{rescanned}"
-        return match.group(0)
+                if is_quoted_token(raw_val):
+                    return f"{match.group('prefix')}{key}{match.group('sep')}{raw_val[0]}{rescanned}{raw_val[0]}", False
+                return f"{match.group('prefix')}{key}{match.group('sep')}{rescanned}", False
+        return match.group(0), False
+
+    def _mask_equals_token(match: "re.Match[str]") -> tuple[str, bool]:
+        return _mask_equals_kv(match)[0], False
+
+    def _mask_quoted_colon_kv(match: "re.Match[str]") -> str:
+        # Inline pairs (`"password": "x", "user": "y"`): one token each.
+        return _mask_colon_kv(match)[0]
 
     def _mask_long_flag(match: "re.Match[str]") -> str:
         flag = match.group("flag")
@@ -511,9 +588,9 @@ def blank_named_values(redactor: Any, text: str) -> str:
     text = CLI_LONG_FLAG_RE.sub(_mask_long_flag, text)
     text = sub_shell_segments(CLI_USERPASS_FLAG_RE, text, _mask_userpass_segment)
     text = sub_shell_segments(CLI_SHORT_P_RE, text, _mask_short_p)
-    text = TEXT_COLON_KV_RE.sub(_mask_colon_kv, text)
-    text = QUOTED_COLON_KV_RE.sub(_mask_colon_kv, text)
-    return TEXT_EQUALS_KV_RE.sub(_mask_equals_kv, text)
+    text = sub_named_pairs(TEXT_COLON_KV_RE, text, _mask_colon_kv)
+    text = QUOTED_COLON_KV_RE.sub(_mask_quoted_colon_kv, text)
+    return sub_named_pairs(TEXT_EQUALS_KV_RE, text, _mask_equals_kv)
 
 
 def as_json_structure(text: str) -> Any:
@@ -536,7 +613,7 @@ def is_base64_encoded_secret_value(v: str) -> bool:
     if not raw:
         return False
     try:
-        decoded_text = raw.decode("utf-8")
+        decoded_text = raw.decode(BASE64_DECODED_TEXT_ENCODING)
     except UnicodeDecodeError:
         return v.endswith(BASE64_PADDING_CHAR)
     return all(ch.isprintable() or ch in BASE64_DECODED_TEXT_WHITESPACE for ch in decoded_text)
@@ -590,8 +667,8 @@ def supplement_redact(
         return blank_named_values(redactor, scrub_secret_blocks(redactor, text))
     if isinstance(value, dict):
         if (
-            key == SECRET_STRING_DATA_KEY
-            or (key == SECRET_DATA_KEY and parent_is_secret)
+            key == MANIFEST_STRING_DATA_KEY
+            or (key == MANIFEST_DATA_KEY and parent_is_secret)
             or (is_tool_result and key is None and is_flat_base64_secret_map(redactor, value))
         ):
             return {
@@ -600,7 +677,7 @@ def supplement_redact(
                 else supplement_redact(redactor, v, str(k), is_tool_result=is_tool_result)
                 for k, v in value.items()
             }
-        is_secret_obj = value.get(KIND_KEY) == SECRET_KIND
+        is_secret_obj = value.get(KIND_KEY) == CREDENTIAL_MANIFEST_KIND
         env_name = value.get(ENV_NAME_KEY)
         is_cred_env = isinstance(env_name, str) and named_value_is_sensitive(redactor, env_name)
         return {
@@ -645,9 +722,9 @@ def scrub_step_text(redactor: Any, kind: str, text: str, withheld: str) -> str:
             if isinstance(parsed, dict):
                 for arg_key in COMMAND_ARG_KEYS:
                     if isinstance(parsed.get(arg_key), str):
-                        parsed[arg_key] = SHELL_CONTINUATION_RE.sub(" ", parsed[arg_key])
+                        parsed[arg_key] = SHELL_CONTINUATION_RE.sub(SHELL_CONTINUATION_FOLD, parsed[arg_key])
             elif parsed is None:
-                text = SHELL_CONTINUATION_RE.sub(" ", text)
+                text = SHELL_CONTINUATION_RE.sub(SHELL_CONTINUATION_FOLD, text)
         if parsed is not None:
             return json.dumps(
                 supplement_redact(redactor, redactor.redact(parsed), is_tool_result=(kind == STEP_KIND_TOOL_RESULT))
@@ -665,9 +742,9 @@ def is_secret_read_tool_call(raw_args: Any) -> bool:
     parsed = as_json_structure(raw_args) if isinstance(raw_args, str) else raw_args
     if isinstance(parsed, dict):
         cmd = next((parsed.get(k) for k in COMMAND_ARG_KEYS if parsed.get(k)), "")
-        if isinstance(cmd, str) and SECRET_READ_COMMAND_RE.search(SHELL_CONTINUATION_RE.sub(" ", cmd)):
+        if isinstance(cmd, str) and SECRET_READ_COMMAND_RE.search(SHELL_CONTINUATION_RE.sub(SHELL_CONTINUATION_FOLD, cmd)):
             return True
-    elif isinstance(raw_args, str) and SECRET_READ_COMMAND_RE.search(SHELL_CONTINUATION_RE.sub(" ", raw_args)):
+    elif isinstance(raw_args, str) and SECRET_READ_COMMAND_RE.search(SHELL_CONTINUATION_RE.sub(SHELL_CONTINUATION_FOLD, raw_args)):
         return True
     return False
 

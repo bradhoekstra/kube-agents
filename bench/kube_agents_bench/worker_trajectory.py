@@ -47,8 +47,10 @@ install's own ``AuditRedactor`` (the one the audit log and the LiteLLM gateway
 run every message through, loaded from :data:`REDACTOR_PATH`) first, then the
 supplement for what it leaves -- block scalars under ``data:``/``stringData:``,
 the JSON ``data`` object, URL userinfo, ``NAME: value`` lines, the CLI
-credential flags, the bearer-scheme pair. One copy, so a shape the feed masks
-is masked here too; a new shape lands in that module and nowhere else.
+credential flags, the bearer-scheme pair, and the secret-read detector that
+withholds the result of a call that prints a secret's value. One copy, so a
+shape the feed masks is masked here too; a new shape lands in that module and
+nowhere else.
 Blanking is by shape, not by ``kind``: a ConfigMap's ``data:`` is blanked as a
 Secret's is, the call the redactor documents as the safe direction to err in.
 A pod whose redactor or rules module cannot be loaded withholds every result
@@ -157,8 +159,10 @@ TRUNCATED_GAP = "the read stopped at %d cards; later cards were not read" % MAX_
 CALL_CAP_GAP = "the read stopped at %d tool calls; later calls were not read" % MAX_CALLS
 CLIP_GAPS = {"cards": TRUNCATED_GAP, "calls": CALL_CAP_GAP}
 # What the in-pod script puts in place of every result and argument when the
-# redactor or the shared rules module will not load. Named here too so a verifier can tell a withheld
-# result from a real one; a test holds the two spellings together.
+# redactor will not load, and of the result of a call the shared rules'
+# secret-read detector matches (a store without the shared rules module reads
+# no session at all). Named here too so a verifier can tell a withheld result
+# from a real one; a test holds the two spellings together.
 WITHHELD = "[WITHHELD: redactor unavailable in the pod]"
 
 # Runs inside the agent container under hermes' own interpreter. Plain
@@ -225,6 +229,9 @@ TOKEN_COLUMNS = (
 # inline-object rule.
 CALL_KIND = "tool_call"
 RESULT_KIND = "tool_result"
+# The names the two files are registered under in sys.modules.
+REDACTOR_MODULE_NAME = "kube_agents_audit_redactor"
+SUPPLEMENT_MODULE_NAME = "kube_agents_worker_transcript"
 
 
 def load_module(name, path):
@@ -241,7 +248,7 @@ def load_module(name, path):
 
 
 try:
-    redactor = load_module("kube_agents_audit_redactor", REDACTOR).AuditRedactor
+    redactor = load_module(REDACTOR_MODULE_NAME, REDACTOR).AuditRedactor
 except Exception as exc:
     out["errors"].append(
         "redactor %s: %s; results and arguments withheld" % (REDACTOR, exc)
@@ -251,11 +258,9 @@ except Exception as exc:
 # The shared transcript reader: the supplement rules and the card-to-session
 # mapping. An image without it is an image whose rules this read cannot run.
 try:
-    wt = load_module("kube_agents_worker_transcript", SUPPLEMENT)
+    wt = load_module(SUPPLEMENT_MODULE_NAME, SUPPLEMENT)
 except Exception as exc:
-    out["errors"].append(
-        "transcript rules %s: %s; results and arguments withheld" % (SUPPLEMENT, exc)
-    )
+    out["errors"].append("transcript rules %s: %s; no session read" % (SUPPLEMENT, exc))
     wt = None
 
 
@@ -263,6 +268,8 @@ def scrub(value, kind):
     # The feed's rules in the feed's order: AuditRedactor.redact, then the
     # supplement, on the text as hermes stored it (a structured result is
     # serialised first and walked as JSON inside).
+    if value is None:
+        return None
     if redactor is None or wt is None:
         return WITHHELD
     text = value if isinstance(value, str) else json.dumps(value, default=str)
@@ -413,6 +420,10 @@ def read_session(conn, card, profile, sid):
                     "session": sid,
                     "at": row["timestamp"],
                     "_id": tc.get("id") or tc.get("call_id"),
+                    # A call that reads a secret's value has its result
+                    # withheld, as the feed withholds it; the verdict is
+                    # still taken on the raw result.
+                    "_withhold": wt is not None and wt.is_secret_read_tool_call(arguments),
                 }
                 pending.append(entry)
                 out["calls"].append(entry)
@@ -437,7 +448,10 @@ def read_session(conn, card, profile, sid):
             pending.remove(target)
             result = decode(row["content"])
             target["failed"] = failed(result)
-            target["result"] = clip(scrub(result, RESULT_KIND), MAX_RESULT)
+            if target["_withhold"] and result is not None:
+                target["result"] = WITHHELD
+            else:
+                target["result"] = clip(scrub(result, RESULT_KIND), MAX_RESULT)
     if orphans:
         out["errors"].append(
             "session %s of %s: %d tool result(s) matched no call" % (sid, profile, orphans)
@@ -573,6 +587,7 @@ while kb is not None and queue:
 out["cards"] = [c for c in cards.values() if c is not None]
 for entry in out["calls"]:
     entry.pop("_id", None)
+    entry.pop("_withhold", None)
 print(SENTINEL)
 reply = json.dumps(out, default=str) + "\n"
 for start in range(0, len(reply), WRITE_CHUNK):

@@ -842,13 +842,65 @@ def test_a_curl_basic_auth_password_is_masked_as_the_feed_masks_it(data_root: Pa
     assert first["args"]["command"] == f"curl -u admin:{REDACTED} https://x/"
 
 
+def test_a_secret_read_calls_result_is_withheld_as_the_feed_withholds_it(data_root: Path) -> None:
+    """The shared detector: a call that prints a secret's value gets the placeholder,
+    not a scrub of the value; the verdict is still the raw result's."""
+    command = "kubectl get secret db -o go-template='{{.data.password}}' | base64 -d"
+    value = "Tr0ub4dor&3"
+    with sqlite3.connect(data_root / "profiles" / "platform" / "state.db") as conn:
+        conn.execute(
+            "DELETE FROM messages WHERE session_id = ? AND role != 'user'", (PLATFORM_SESSION,)
+        )
+        conn.execute(
+            "INSERT INTO messages (session_id, role, tool_calls, timestamp)"
+            " VALUES (?, 'assistant', ?, 2)",
+            (
+                PLATFORM_SESSION,
+                json.dumps([{"id": "c1", "name": "terminal", "arguments": json.dumps({"command": command})}]),
+            ),
+        )
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, tool_call_id, timestamp)"
+            " VALUES (?, 'tool', ?, 'c1', 3)",
+            (PLATFORM_SESSION, value),
+        )
+    reply = _run_script(data_root, [FRONT])
+    assert value not in reply
+    entry = next(c for c in _payload(reply)["calls"] if c["task"] == FRONT)
+    assert entry["result"] == worker_trajectory.WITHHELD
+    assert entry["failed"] is False
+    assert "get secret db" in entry["args"]
+
+
+def test_a_result_row_with_null_content_stays_called(data_root: Path) -> None:
+    with sqlite3.connect(data_root / "profiles" / "platform" / "state.db") as conn:
+        conn.execute(
+            "DELETE FROM messages WHERE session_id = ? AND role != 'user'", (PLATFORM_SESSION,)
+        )
+        conn.execute(
+            "INSERT INTO messages (session_id, role, tool_calls, timestamp)"
+            " VALUES (?, 'assistant', ?, 2)",
+            (PLATFORM_SESSION, json.dumps([{"id": "c1", "name": "terminal", "arguments": "{}"}])),
+        )
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, tool_call_id, timestamp)"
+            " VALUES (?, 'tool', NULL, 'c1', 3)",
+            (PLATFORM_SESSION,),
+        )
+    reply = _run_script(data_root, [FRONT])
+    entry = next(c for c in _payload(reply)["calls"] if c["task"] == FRONT)
+    assert entry["result"] is None
+    captured = worker_trajectory.capture(lambda s, t: reply, [FRONT], 5.0)
+    assert [e["status"] for e in captured.entries if e["task"] == FRONT] == ["called"]
+
+
 def test_a_pod_without_the_shared_rules_withholds_content_and_names_the_path(data_root: Path) -> None:
     """Fail closed as for the redactor: nothing a worker said leaves the pod, and the
     error names the module path; the mapping is the module's too, so no store is read."""
     missing = data_root / "no-such-worker-transcript.py"
     reply = _run_script(data_root, [FRONT], supplement=missing)
     payload = _payload(reply)
-    assert any(str(missing) in e and "withheld" in e for e in payload["errors"])
+    assert any(str(missing) in e and "no session read" in e for e in payload["errors"])
     assert TOKEN not in reply and "hunter" not in reply
     assert payload["calls"] == []
     assert all(c["sessions"] == [] for c in payload["cards"])
