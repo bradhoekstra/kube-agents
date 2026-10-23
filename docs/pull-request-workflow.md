@@ -203,7 +203,10 @@ version before opening the pull request.
 **CodeQL alerts.** CodeQL runs here through
 [`codeql.yml`](../.github/workflows/codeql.yml): on every pull request that touches Python, Go,
 JavaScript or workflow files, pull requests from forks included, on pushes to `main` and
-`release/**`, and weekly. It needs GitHub's default setup off: GitHub rejects the workflow's
+`release/**`, and weekly. A push runs the workflow file on the pushed branch, so a release line
+is covered once it is cut from a `main` that carries the file; a line cut before that
+(`release/0.17` and older) gets no analysis after default setup is off until the file is
+back-ported to it. It needs GitHub's default setup off: GitHub rejects the workflow's
 uploads while default setup is on, so an administrator switches it off when this workflow lands
 and leaves it off, and turning it back on fails every run at upload. A pull-request
 run analyses the merge commit and reports the findings on changed lines as annotations on the
