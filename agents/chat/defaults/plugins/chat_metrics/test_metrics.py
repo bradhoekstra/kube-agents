@@ -343,11 +343,6 @@ class ListenerTest(unittest.TestCase):
         self.addCleanup(server.server_close)
         self.assertTrue(any(t.daemon and t.name.startswith(metrics.LISTENER_THREAD_NAME) for t in threading.enumerate()))
 
-
-if __name__ == "__main__":
-    unittest.main()
-
-
 class _Platform:
     def __init__(self, value):
         self.value = value
@@ -396,3 +391,7 @@ class NegativeFeedbackTest(unittest.TestCase):
         self.assertEqual(frozenset(), metrics.slack_bot_user_ids())
         metrics.note_gateway(object())
         self.assertEqual(frozenset(), metrics.slack_bot_user_ids())
+
+
+if __name__ == "__main__":
+    unittest.main()
