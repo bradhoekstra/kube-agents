@@ -931,10 +931,34 @@ def test_a_pod_without_the_shared_rules_withholds_content_and_names_the_path(dat
     reply = _run_script(data_root, [FRONT], supplement=missing)
     payload = _payload(reply)
     assert any(str(missing) in e and "no session read" in e for e in payload["errors"])
-    assert TOKEN not in reply and "hunter" not in reply
+    assert TOKEN not in reply and "CrashLoopBackOff" not in reply
     assert payload["calls"] == []
     assert all(c["sessions"] == [] for c in payload["cards"])
-    assert any(e.startswith(f"card {FRONT}:") for e in payload["unread"])
+    # One note per card, and no "no session found": no store was opened.
+    assert payload["unread"] == [
+        f"card {card}: transcript rules unavailable; sessions not read" for card in (FRONT, CHILD)
+    ]
+
+
+def test_a_pod_without_the_redactor_withholds_a_credential_read_as_everything_else(data_root: Path) -> None:
+    """The read placeholder says one result was recorded; in a capture nothing of
+    which is readable, that call is withheld as the rest are."""
+    with sqlite3.connect(data_root / "profiles" / "platform" / "state.db") as conn:
+        conn.execute(
+            "UPDATE messages SET tool_calls = ?"
+            " WHERE role = 'assistant' AND tool_calls LIKE '%get pods%'",
+            (
+                json.dumps(
+                    [{"name": "terminal", "arguments": json.dumps({"command": "kubectl get secret db -o yaml"})}]
+                ),
+            ),
+        )
+    reply = _run_script(data_root, [FRONT], redactor=data_root / "no-such-redactor.py")
+    assert worker_trajectory.WITHHELD_READ_RESULT not in reply
+    assert "[REDACTED_" not in reply
+    calls = _payload(reply)["calls"]
+    assert all(c["result"] == worker_trajectory.WITHHELD for c in calls if c["result"] is not None)
+    assert any("get secret db" not in json.dumps(c["args"]) for c in calls)  # the arguments are withheld too
 
 
 def test_a_pod_without_the_redactor_withholds_content_and_says_so(data_root: Path) -> None:

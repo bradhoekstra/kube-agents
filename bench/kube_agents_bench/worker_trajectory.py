@@ -279,7 +279,7 @@ def scrub(value, kind):
     # serialised first and walked as JSON inside).
     if value is None:
         return None
-    if redactor is None or wt is None:
+    if redactor is None:
         return WITHHELD
     text = value if isinstance(value, str) else json.dumps(value, default=str)
     return wt.scrub_step_text(redactor, kind, text, WITHHELD)
@@ -431,8 +431,9 @@ def read_session(conn, card, profile, sid):
                     "_id": tc.get("id") or tc.get("call_id"),
                     # A call that reads a secret's value has its result
                     # withheld, as the feed withholds it; the verdict is
-                    # still taken on the raw result.
-                    "_withhold": wt is not None and wt.is_secret_read_tool_call(arguments),
+                    # still taken on the raw result. (`sessions_for` reads no
+                    # session without the rules module, so `wt` is loaded here.)
+                    "_withhold": wt.is_secret_read_tool_call(arguments),
                 }
                 pending.append(entry)
                 out["calls"].append(entry)
@@ -457,7 +458,9 @@ def read_session(conn, card, profile, sid):
             pending.remove(target)
             result = decode(row["content"])
             target["failed"] = failed(result)
-            if target["_withhold"] and result is not None:
+            # Without a redactor nothing is readable; the read placeholder
+            # would say this one result was recorded in a capture that is not.
+            if target["_withhold"] and result is not None and redactor is not None:
                 target["result"] = WITHHELD_READ_RESULT
             else:
                 target["result"] = clip(scrub(result, RESULT_KIND), MAX_RESULT)
@@ -599,7 +602,9 @@ while kb is not None and queue:
         card["sessions"].append(
             {"id": sid, "agent": profile, "match": match, "calls": calls, "tokens": tokens}
         )
-    if not card["sessions"] and runs:
+    # Without the rules module `sessions_for` has already said no store was
+    # opened; "no session found" would send a reader to the store.
+    if not card["sessions"] and runs and wt is not None:
         unread("no session found for card %s" % tid)
 
 out["cards"] = [c for c in cards.values() if c is not None]

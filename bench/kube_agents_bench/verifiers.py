@@ -3388,7 +3388,10 @@ class WorkerBudgetVerifier(BaseVerifier):
             calls[task] = calls.get(task, 0) + 1
             tagged += 1
             result = entry.get("result")
-            if result is None or result == worker_trajectory.WITHHELD:
+            # A credential read's result is withheld whole, the checkpoint
+            # notice that may have landed in it with the rest: unreadable
+            # here, as a redactor-less pod's results are.
+            if result is None or result in (worker_trajectory.WITHHELD, worker_trajectory.WITHHELD_READ_RESULT):
                 unreadable += 1
                 continue
             match = _BUDGET_NOTICE_RE.search(str(result))

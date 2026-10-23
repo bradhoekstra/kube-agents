@@ -178,10 +178,39 @@ class TestScrubStepText(unittest.TestCase):
                 self.assertNotIn("hunter2", out)
                 bare = _scrub("tool_call", command)
                 self.assertIn(kept, bare)
-        # A tool call's other strings are text: a manifest in `content` is
-        # masked to the line's end.
+        # A file-write argument (`TEXT_ARG_KEYS`) is text: a manifest in
+        # `content` is masked to the line's end.
         out = json.loads(_scrub("tool_call", json.dumps({"path": "x.yaml", "content": "password: one two three\nkind: Pod\n"})))
         self.assertEqual(out["content"], f"password: {MARKER}\nkind: Pod\n")
+
+    def test_heredoc_body_and_escaped_space_values_leave_no_word(self):
+        heredoc = "cat <<EOF > values.yaml\nauth:\n  password: my secret phrase\nEOF"
+        for out in (
+            json.loads(_scrub("tool_call", json.dumps({"command": heredoc})))["command"],
+            _scrub("tool_call", heredoc),
+        ):
+            for word in ("my", "secret phrase", "phrase"):
+                self.assertNotIn(word, out)
+            self.assertEqual(out, f"cat <<EOF > values.yaml\nauth:\n  password: {MARKER}\nEOF")
+        escaped = "kubectl create secret generic db --from-literal=password=my\\ secret\\ phrase -n prod"
+        for out in (
+            json.loads(_scrub("tool_call", json.dumps({"command": escaped})))["command"],
+            _scrub("tool_call", escaped),
+        ):
+            self.assertEqual(out, f"kubectl create secret generic db --from-literal=password={MARKER} -n prod")
+        # An escaped space the rules do not mask is given back as written.
+        plain = "ls my\\ dir -n prod"
+        self.assertEqual(_scrub("tool_call", plain), plain)
+
+    def test_a_tool_calls_prose_argument_keeps_its_diagnosis(self):
+        # A worker reports through `kanban_complete(result=...)`: prose, as a reply is.
+        report = "## Why\n- Secret: db-credentials is missing the key 'password'\n- Token: expired at 10:00\n"
+        out = json.loads(_scrub("tool_call", json.dumps({"result": report, "summary": "Secret: key missing"})))
+        # Prose keeps its diagnosis past the redactor's first word and the one
+        # word the bearer rule takes, as a reply does.
+        self.assertIn("missing the key 'password'", out["result"])
+        self.assertIn("10:00", out["result"])
+        self.assertNotIn("db-credentials", out["result"])
 
     def test_text_line_value_is_masked_to_its_end_whatever_it_holds(self):
         # A tool result's line is text: a shell operator in the value is not a stop.
@@ -247,6 +276,9 @@ class TestScrubStepText(unittest.TestCase):
         self.assertEqual(_scrub("tool_result", logs), logs)
         envelope = 'HTTP/1.1 200 OK\n\n{"status":"success","data":{"resultType":"vector","result":[]}}'
         self.assertEqual(_scrub("tool_result", envelope), envelope)
+        # A marker on an earlier line is that line's document, not a later one's.
+        mixed = '{"kind":"Event","apiVersion":"audit.k8s.io/v1","verb":"get"}\n{"level":"info","data":{"user":"bob","action":"login"}}'
+        self.assertEqual(_scrub("tool_result", mixed), mixed)
         command = "kubectl patch cm app -p '{\"data\":{\"LOG_LEVEL\":\"debug\"}}'"
         self.assertEqual(json.loads(_scrub("tool_call", json.dumps({"command": command})))["command"], command)
         # Cut short before `kind`, a Secret still carries `apiVersion`.

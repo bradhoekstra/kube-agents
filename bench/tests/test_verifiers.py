@@ -1669,6 +1669,19 @@ def test_worker_budget_withheld_results_are_unreadable_not_a_wrong_cap():
     assert "withheld" in res.reason and res.reason.startswith("no delegated worker")
 
 
+def test_worker_budget_withheld_credential_reads_are_unreadable_not_a_wrong_cap():
+    # Every call read a secret, so every result is the read placeholder: the
+    # checkpoint notice went with the output. An error, not "the cap was larger".
+    from kube_agents_bench import worker_trajectory
+    worker = [{"name": "terminal", "args": {"command": "kubectl get secret db -o yaml"},
+               "result": worker_trajectory.WITHHELD_READ_RESULT, "agent": "platform", "task": "t_1"}] * 137
+    transcript.set("ok", _TRAJECTORY + worker,
+                   worker_runs=[{"task": "t_1", "profile": "platform", "status": "done", "outcome": "completed", "error": None}])
+    res = _budget(150).verify(5.0)
+    assert res.status == "error"
+    assert "withheld" in res.reason and res.reason.startswith("no delegated worker")
+
+
 def test_worker_budget_one_missing_result_among_readable_ones_keeps_the_fail():
     # A worker killed mid-call leaves one call with no result row; the notice
     # would have landed on one of the other 200 readable results, so the plain
