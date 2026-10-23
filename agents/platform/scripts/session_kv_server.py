@@ -3677,7 +3677,7 @@ def _slack_audit_headline(
     return AuditHeadline(text, issue, ref)
 
 
-def _profile_home(profile: str, data_root: Optional[Path] = None) -> Optional[Path]:
+def _validated_profile_home(profile: str, data_root: Optional[Path] = None) -> Optional[Path]:
     """Return the validated directory for `profile` under `data_root` (or `agent_home()`)."""
     if not _PROFILE_SEGMENT_RE.match(profile):
         return None
@@ -3698,7 +3698,7 @@ def _profile_home(profile: str, data_root: Optional[Path] = None) -> Optional[Pa
 
 def _is_fleet_audit_job(profile: str, job_id: str) -> bool:
     """Whether `job_id` in `profile`'s cron roster runs fleet-audit; False when it cannot be read."""
-    home = _profile_home(profile)
+    home = _validated_profile_home(profile)
     if home is None:
         return False
     try:
@@ -6252,7 +6252,7 @@ def list_tasks(since: int = 0, limit: int = FEED_TASKS_DEFAULT_LIMIT, assignee: 
 
 def _profile_state_db(data_root: Path, profile: str) -> Optional[Path]:
     """Return the read-only `state.db` path for `profile` under `data_root`."""
-    home = _profile_home(profile or DEFAULT_PROFILE, data_root)
+    home = _validated_profile_home(profile or DEFAULT_PROFILE, data_root)
     if home is None:
         return None
     candidate = home / HERMES_STATE_DB_FILENAME
