@@ -6687,14 +6687,15 @@ def list_tasks(since: int = 0, limit: int = FEED_TASKS_DEFAULT_LIMIT, assignee: 
 def _profile_state_db(data_root: Path, profile: str) -> Optional[Path]:
     """Return the read-only `state.db` path for `profile` under `data_root`.
 
-    The layout is `worker_transcript.profile_state_db_path`'s; the profile
-    home is validated first, so a profile name cannot step out of the root.
+    The path is built from the validated profile home, never from the raw
+    name, so the check is the one CodeQL sees; the layout is the one
+    `worker_transcript.profile_state_db_path` gives the bench.
     """
-    profile = profile or DEFAULT_PROFILE
-    if _validated_profile_home(profile, data_root) is None:
+    home = _validated_profile_home(profile or DEFAULT_PROFILE, data_root)
+    if home is None:
         return None
     try:
-        candidate = worker_transcript.profile_state_db_path(data_root.resolve(), profile)
+        candidate = home / HERMES_STATE_DB_FILENAME
         return candidate if candidate.is_file() else None
     except OSError:
         return None
