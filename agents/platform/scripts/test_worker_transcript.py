@@ -162,13 +162,37 @@ class TestScrubStepText(unittest.TestCase):
         # A quoted value ends at its quote, and keeps the quotes the redactor kept.
         self.assertEqual(_scrub("tool_result", 'password: "one two" three'), f'password: "{MARKER}" three')
 
-    def test_rest_of_line_stops_at_an_unquoted_shell_operator(self):
-        out = _scrub("tool_call", json.dumps({"command": "export GH_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123456789 && gh auth status"}))
-        self.assertEqual(json.loads(out), {"command": f"export GH_TOKEN={MARKER} && gh auth status"})
-        self.assertEqual(_scrub("tool_result", "password: one two; echo done"), f"password: {MARKER}; echo done")
-        # An operator inside a quoted argument is data, not a stop.
-        out = _scrub("tool_result", "password: one 'two && three' four")
-        self.assertEqual(out, f"password: {MARKER}")
+    def test_shell_command_values_end_at_their_word(self):
+        # A tool call's command is read as a shell line: the flags after a
+        # masked assignment stay, and the marker is not a scheme that takes
+        # the next word.
+        for command, kept in (
+            ("helm upgrade app chart --set db.password=hunter2 --namespace prod", f"--set db.password={MARKER} --namespace prod"),
+            ("kubectl set env deploy/app DB_PASSWORD=x LOG_LEVEL=debug -n prod", f"DB_PASSWORD={MARKER} LOG_LEVEL=debug -n prod"),
+            ("docker run -e DB_PASSWORD=x -e X=y image", f"-e DB_PASSWORD={MARKER} -e X=y image"),
+            ("export GH_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123456789 && gh auth status", f"export GH_TOKEN={MARKER} && gh auth status"),
+        ):
+            with self.subTest(command=command):
+                out = json.loads(_scrub("tool_call", json.dumps({"command": command})))["command"]
+                self.assertIn(kept, out)
+                self.assertNotIn("hunter2", out)
+                bare = _scrub("tool_call", command)
+                self.assertIn(kept, bare)
+        # A tool call's other strings are text: a manifest in `content` is
+        # masked to the line's end.
+        out = json.loads(_scrub("tool_call", json.dumps({"path": "x.yaml", "content": "password: one two three\nkind: Pod\n"})))
+        self.assertEqual(out["content"], f"password: {MARKER}\nkind: Pod\n")
+
+    def test_text_line_value_is_masked_to_its_end_whatever_it_holds(self):
+        # A tool result's line is text: a shell operator in the value is not a stop.
+        for line in ("DB_PASSWORD: my secret | phrase", "password: one two; echo done", "password: one 'two && three' four"):
+            with self.subTest(line=line):
+                self.assertEqual(_scrub("tool_result", line), f"{line.split(':')[0]}: {MARKER}")
+
+    def test_reply_prose_keeps_its_diagnosis(self):
+        out = _scrub("reply", "Secret: db-credentials is missing the key 'password'")
+        self.assertIn("missing the key 'password'", out)
+        self.assertNotIn("db-credentials", out)
 
     def test_kubectl_env_source_row_keeps_its_reference(self):
         for source in ("in secret 'db'", "of config map 'app'"):
@@ -208,6 +232,26 @@ class TestScrubStepText(unittest.TestCase):
         # An API response's `data` is not a manifest's.
         api = json.dumps({"status": "success", "data": {"resultType": "vector", "result": []}})
         self.assertEqual(json.loads(_scrub("tool_result", api))["data"]["resultType"], "vector")
+        # A whole `{"data": {base64 map}}` with no manifest round it is a Secret
+        # filtered to its data: blanked by shape, as its text form is.
+        wrapped = json.dumps({"data": {"username": "YWRtaW4=", "kubeconfig": "YXBpVmVyc2lvbg=="}})
+        out = _scrub("tool_result", wrapped)
+        self.assertNotIn("YWRtaW4", out)
+        self.assertNotIn("YXBpVmVy", out)
+        self.assertEqual(json.loads(out), {"data": {"username": MARKER, "kubeconfig": MARKER}})
+
+    def test_json_data_without_a_manifest_marker_is_kept_in_text(self):
+        # Two JSON log lines do not parse as one document; a `data` object
+        # with no manifest marker in the text is a log's or an API's.
+        logs = '{"level":"info","data":{"user":"bob","action":"login"}}\n{"level":"info","data":{"user":"ann","action":"logout"}}'
+        self.assertEqual(_scrub("tool_result", logs), logs)
+        envelope = 'HTTP/1.1 200 OK\n\n{"status":"success","data":{"resultType":"vector","result":[]}}'
+        self.assertEqual(_scrub("tool_result", envelope), envelope)
+        command = "kubectl patch cm app -p '{\"data\":{\"LOG_LEVEL\":\"debug\"}}'"
+        self.assertEqual(json.loads(_scrub("tool_call", json.dumps({"command": command})))["command"], command)
+        # Cut short before `kind`, a Secret still carries `apiVersion`.
+        cut = '{"apiVersion": "v1", "data": {"config.yaml": "YmFzZTY0ZGF0YQ==", "kubeconfig": "YXBpVmVyc2lvbg=="'
+        self.assertNotIn("YmFzZTY0", _scrub("tool_result", cut))
 
     def test_file_name_key_keeps_its_diagnostic_value(self):
         for line in ("tls.crt:  1679 bytes", "cert.pem: OK", "cert.pem:28:-----END"):

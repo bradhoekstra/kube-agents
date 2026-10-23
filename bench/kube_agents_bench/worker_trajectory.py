@@ -48,8 +48,9 @@ run every message through, loaded from :data:`REDACTOR_PATH`) first, then the
 supplement for what it leaves -- block scalars under ``data:``/``stringData:``,
 a ``data``/``stringData`` object in JSON text or in a parsed manifest, URL
 userinfo, ``NAME: value`` lines, the CLI credential flags, the bearer-scheme
-pair, and the secret-read detector that withholds the result of a call that
-prints a secret's value. One copy, so a shape the feed masks is masked here
+pair, and the secret-read detector under which the result of a call that
+prints a secret's value is recorded as :data:`WITHHELD_READ_RESULT`, a
+redacted result rather than an unread one. One copy, so a shape the feed masks is masked here
 too; a new shape lands in that module and nowhere else. A manifest's ``data`` mapping
 is blanked by shape, not by ``kind``, in YAML and JSON alike: a ConfigMap's is
 blanked as a Secret's, the call the redactor documents as the safe direction
@@ -161,11 +162,16 @@ TRUNCATED_GAP = "the read stopped at %d cards; later cards were not read" % MAX_
 CALL_CAP_GAP = "the read stopped at %d tool calls; later calls were not read" % MAX_CALLS
 CLIP_GAPS = {"cards": TRUNCATED_GAP, "calls": CALL_CAP_GAP}
 # What the in-pod script puts in place of every result and argument when the
-# redactor will not load, and of the result of a call the shared rules'
-# secret-read detector matches (a store without the shared rules module reads
-# no session at all). Named here too so a verifier can tell a withheld result
+# redactor will not load (a store without the shared rules module reads no
+# session at all). Named here too so a verifier can tell an unreadable capture
 # from a real one; a test holds the two spellings together.
 WITHHELD = "[WITHHELD: redactor unavailable in the pod]"
+# What it puts in place of the one result of a call the shared rules'
+# secret-read detector matches, the arguments and every other result readable.
+# It starts with `[REDACTED_` so the verifiers read it as a recorded call whose
+# output is redacted (as they read a `[REDACTED_SECRET]` in any output), never
+# as the whole capture being unread; a test holds the two spellings together.
+WITHHELD_READ_RESULT = "[REDACTED_RESULT: the call read a credential; its output is not recorded]"
 
 # Runs inside the agent container under hermes' own interpreter. Plain
 # ``python3`` and ``sqlite3``, plus the redactor and the shared transcript
@@ -215,6 +221,7 @@ def unread(problem):
 
 JSON_PREFIX = "\x00json:"
 WITHHELD = "[WITHHELD: redactor unavailable in the pod]"
+WITHHELD_READ_RESULT = "[REDACTED_RESULT: the call read a credential; its output is not recorded]"
 TOOL_ERROR_PREFIX = "Error executing tool"
 # hermes' usage columns, on the ``sessions`` row as aggregates and, in a
 # hermes that attributes usage per model, on ``session_model_usage`` rows.
@@ -451,7 +458,7 @@ def read_session(conn, card, profile, sid):
             result = decode(row["content"])
             target["failed"] = failed(result)
             if target["_withhold"] and result is not None:
-                target["result"] = WITHHELD
+                target["result"] = WITHHELD_READ_RESULT
             else:
                 target["result"] = clip(scrub(result, RESULT_KIND), MAX_RESULT)
     if orphans:

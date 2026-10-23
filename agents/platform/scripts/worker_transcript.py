@@ -55,12 +55,31 @@ STEP_KIND_TOOL_RESULT = "tool_result"
 # The first character of a string that may be a JSON document.
 JSON_STRUCTURE_OPENERS = "{["
 # The manifest keys whose mapping is blanked wholesale, and the keys that
-# mark a parsed object as a Kubernetes manifest: `data` is blanked by shape
-# under any manifest kind (a ConfigMap's as a Secret's), never in an API
-# response (`{"status": "success", "data": {"resultType": "vector"}}`).
+# mark a document as a Kubernetes manifest. A `data` mapping is blanked by
+# shape under any manifest kind (a ConfigMap's as a Secret's): in a parsed
+# document when the object holds a marker, in text when the text does
+# (kubectl's JSON is key-sorted, so `apiVersion` precedes a `data` the
+# output was cut short inside). A `data` map of base64 strings is blanked
+# with or without a marker: a Secret filtered to `{"data": {...}}` by `jq`.
+# An API response's `data` (`{"status": "success", "data": {"resultType":
+# "vector"}}`) and a JSON log line's are neither, and are kept.
 MANIFEST_DATA_KEY = "data"
 MANIFEST_STRING_DATA_KEY = "stringData"
 MANIFEST_MARKER_KEYS = ("apiVersion", "kind")
+JSON_MANIFEST_MARKER_RE = re.compile('"(?:' + "|".join(re.escape(k) for k in MANIFEST_MARKER_KEYS) + r')"\s*:')
+JSON_STRING_DATA_KEY_QUOTED = '"' + MANIFEST_STRING_DATA_KEY + '"'
+# How far the unquoted value after a credential-named key reaches, by what is
+# being read. `shell`: a command's word ends at whitespace (`--set
+# db.password=x --namespace prod` keeps its flags) and the marker the redactor
+# left is not a scheme that takes the next word. `line`: a text line's value
+# is the rest of the line (`DB_PASSWORD:  my secret phrase` leaves no word).
+# `token`: prose keeps the first-token mask (`Secret: db-credentials is
+# missing the key 'password'` is a diagnosis). `scrub_step_text` picks by
+# step kind: `shell` for a tool call's command, `line` for a tool result and
+# a tool call's other strings, `token` for a reply.
+VALUE_SPAN_SHELL = "shell"
+VALUE_SPAN_LINE = "line"
+VALUE_SPAN_TOKEN = "token"
 ENV_NAME_KEY = "name"
 ENV_VALUE_KEY = "value"
 # The redactor's own list of key suffixes that name no credential (`name`,
@@ -85,17 +104,12 @@ INDENT_CHAR = " "
 INLINE_WHITESPACE = " \t"
 LINE_BREAK = "\n"
 LINE_TAIL_WHITESPACE = " \t\r"
-# Where the rest-of-line mask after a credential-named key stops. (a) An
-# unquoted shell operator ends the value: the command a worker chained after
-# an assignment (`export GH_TOKEN=... && gh auth status`) is kept. Found on
-# the quote-blanked copy of the line, so an operator inside a quoted argument
-# is data.
-SHELL_OPERATOR_RE = re.compile(r"&&|\|\||;|\|")
-# (b) kubectl's `describe pod` env row names where a value comes from and
-# holds none of it: `<set to the key 'password' in secret 'db'>  Optional:
-# false` (a ConfigMap-backed one reads `of config map`). The redactor runs
-# first and has masked `<set` by then, so the marker is accepted in its
-# place; the row is kept as it stands, in every rule that would read it.
+# The one text line the rest-of-line mask keeps whole: kubectl's `describe
+# pod` env row names where a value comes from and holds none of it, `<set to
+# the key 'password' in secret 'db'>  Optional: false` (a ConfigMap-backed one
+# reads `of config map`). The redactor runs first and has masked `<set` by
+# then, so the marker is accepted in its place; the row is kept as it stands,
+# in every rule that would read it.
 KUBECTL_ENV_SOURCE_REF_RE = re.compile(
     r"(?:<set|" + REDACTED_MARKER_TOKEN_RE_SRC + r") to the key '[^'\r\n]*' (?:in|of) (?:secret|config ?map) '[^'\r\n]*'>"
     r"(?:[ \t]+Optional:[ \t]+(?:true|false))?[ \t]*(?=\r?$|\n)",
@@ -322,10 +336,15 @@ def scrub_secret_blocks(redactor: Any, text: str) -> str:
             lines[i] = f"{pair.group(1)}{pair.group(2)}: {REDACTED_SECRET_MARKER}"
     joined = LINE_BREAK.join(lines)
 
-    # By shape, not by kind: kubectl's JSON is key-sorted, so a Secret cut
-    # short inside `data` has no `kind` to find, and a ConfigMap's `data` is
-    # blanked as the YAML line scan blanks it (the redactor's safe direction).
+    # By shape under a manifest marker anywhere in the text, not by kind: a
+    # ConfigMap's `data` is blanked as the YAML line scan blanks it (the
+    # redactor's safe direction), and kubectl's key-sorted JSON cut short
+    # inside `data` still carries `apiVersion`. A `stringData` object is a
+    # Secret's wherever it sits. A log line's or an API envelope's `data` is
+    # kept.
     def _mask_json_block(m: "re.Match[str]") -> str:
+        if JSON_STRING_DATA_KEY_QUOTED not in m.group(1) and not JSON_MANIFEST_MARKER_RE.search(joined):
+            return m.group(0)
         return (
             m.group(1)
             + JSON_PAIR_RE.sub(lambda p: p.group(1) + REDACTED_SECRET_MARKER + p.group(3), m.group(2))
@@ -473,19 +492,6 @@ def line_tail_end(text: str, pos: int) -> int:
     return end
 
 
-def value_tail_end(text: str, pos: int) -> int:
-    """Where an unquoted value that started before `pos` ends: the line's end,
-    or the first unquoted shell operator after `pos` (`SHELL_OPERATOR_RE`),
-    trailing whitespace excluded either way."""
-    end = line_tail_end(text, pos)
-    operator = SHELL_OPERATOR_RE.search(blank_quoted_spans(text[pos:end]))
-    if operator is not None:
-        end = pos + operator.start()
-        while end > pos and text[end - 1] in LINE_TAIL_WHITESPACE:
-            end -= 1
-    return end
-
-
 def is_env_source_ref(text: str, pos: int) -> bool:
     """Whether the value at `pos` is kubectl's env-source row (`KUBECTL_ENV_SOURCE_REF_RE`)."""
     return KUBECTL_ENV_SOURCE_REF_RE.match(text, pos) is not None
@@ -495,15 +501,17 @@ def sub_named_pairs(
     pattern: "re.Pattern[str]",
     text: str,
     mask: "Callable[[re.Match[str]], tuple[str, bool]]",
+    extend: bool,
 ) -> str:
-    """`pattern.sub` whose `mask` returns `(replacement, to_line_end)`: when the
-    second is true the replacement also stands for the rest of the value
-    (`value_tail_end`: the line's end or the first unquoted shell operator,
-    trailing whitespace excluded), and no later match in that span is read.
+    """`pattern.sub` whose `mask` returns `(replacement, to_line_end)`: when
+    `extend` and the second are true the replacement also stands for the rest
+    of the line (`line_tail_end`, trailing whitespace excluded), and no later
+    match on that line is read.
 
-    An unquoted value after a credential-named key is the rest of the line
-    (`DB_PASSWORD:  my secret phrase`), not its first word; a quoted value ends
-    at its quote.
+    With `extend` (a text line, `VALUE_SPAN_LINE`) an unquoted value after a
+    credential-named key is the rest of the line (`DB_PASSWORD:  my secret
+    phrase`), not its first word; without it (a shell command, prose) the
+    value is its token. A quoted value ends at its quote either way.
     """
     out: list[str] = []
     pos = 0
@@ -513,7 +521,7 @@ def sub_named_pairs(
         replacement, to_line_end = mask(match)
         out.append(text[pos : match.start()])
         out.append(replacement)
-        pos = max(match.end(), value_tail_end(text, match.end())) if to_line_end else match.end()
+        pos = max(match.end(), line_tail_end(text, match.end())) if extend and to_line_end else match.end()
     out.append(text[pos:])
     return "".join(out)
 
@@ -529,7 +537,11 @@ def file_key_value_is_benign(value: str, tail: str) -> bool:
     return value.lower() in FILE_KEY_BENIGN_WORDS
 
 
-def blank_named_values(redactor: Any, text: str) -> str:
+def blank_named_values(redactor: Any, text: str, value_span: str = VALUE_SPAN_TOKEN) -> str:
+    """The `NAME: value` / `NAME=value` / CLI / bearer rules on `text`; `value_span`
+    says how far an unquoted value reaches (`VALUE_SPAN_SHELL`, `_LINE`, `_TOKEN`)."""
+    extend = value_span == VALUE_SPAN_LINE
+
     def _mask_block(match: "re.Match[str]") -> str:
         if not named_value_is_sensitive(redactor, match.group("key")):
             return match.group(0)
@@ -575,7 +587,7 @@ def blank_named_values(redactor: Any, text: str) -> str:
         if EQUALS_SEPARATOR in unquoted:
             # A token that holds pairs of its own (`--from-literal=password=x`)
             # is rescanned as a token: a pair inside it ends where it does.
-            rescanned = sub_named_pairs(TEXT_EQUALS_KV_RE, unquoted, _mask_equals_token)
+            rescanned = sub_named_pairs(TEXT_EQUALS_KV_RE, unquoted, _mask_equals_token, False)
             if rescanned != unquoted:
                 if is_quoted_token(raw_val):
                     return f"{match.group('prefix')}{key}{match.group('sep')}{raw_val[0]}{rescanned}{raw_val[0]}", False
@@ -623,6 +635,10 @@ def blank_named_values(redactor: Any, text: str) -> str:
             not named_value_is_sensitive(redactor, match.group("key"))
             or not redactor._is_credential_value(val)
             or is_env_source_ref(match.string, match.start("scheme"))
+            # In a shell command the word after a masked assignment is the
+            # next argument (`DB_PASSWORD=[REDACTED_SECRET] LOG_LEVEL=debug`),
+            # not a token after a scheme.
+            or (value_span == VALUE_SPAN_SHELL and match.group("scheme").startswith(REDACTED_MARKER_PREFIX))
         ):
             return match.group(0)
         return f"{match.group('prefix')}{REDACTED_SECRET_MARKER}"
@@ -633,9 +649,9 @@ def blank_named_values(redactor: Any, text: str) -> str:
     text = CLI_LONG_FLAG_RE.sub(_mask_long_flag, text)
     text = sub_shell_segments(CLI_USERPASS_FLAG_RE, text, _mask_userpass_segment)
     text = sub_shell_segments(CLI_SHORT_P_RE, text, _mask_short_p)
-    text = sub_named_pairs(TEXT_COLON_KV_RE, text, _mask_colon_kv)
+    text = sub_named_pairs(TEXT_COLON_KV_RE, text, _mask_colon_kv, extend)
     text = QUOTED_COLON_KV_RE.sub(_mask_quoted_colon_kv, text)
-    return sub_named_pairs(TEXT_EQUALS_KV_RE, text, _mask_equals_kv)
+    return sub_named_pairs(TEXT_EQUALS_KV_RE, text, _mask_equals_kv, extend)
 
 
 def as_json_structure(text: str) -> Any:
@@ -685,12 +701,21 @@ def supplement_redact(
     *,
     is_tool_result: bool = False,
     parent_is_manifest: bool = False,
+    value_span: str = VALUE_SPAN_TOKEN,
+    shell_keys: Sequence[str] = (),
 ) -> Any:
+    """The supplement over a value: text rules on a string, by-shape blanking on a
+    mapping, recursion through the rest. `value_span` is how far an unquoted
+    value reaches in a string (`VALUE_SPAN_*`); a string under a key in
+    `shell_keys` is a shell command whatever `value_span` says."""
     if isinstance(value, str):
+        span = VALUE_SPAN_SHELL if key in shell_keys else value_span
         nested = as_json_structure(value)
         if nested is not None:
             return json.dumps(
-                supplement_redact(redactor, nested, key=None, is_tool_result=is_tool_result)
+                supplement_redact(
+                    redactor, nested, key=None, is_tool_result=is_tool_result, value_span=span, shell_keys=shell_keys
+                )
             )
         if is_tool_result and JSON_OBJECT_OPEN in value and JSON_OBJECT_CLOSE in value:
 
@@ -709,19 +734,23 @@ def supplement_redact(
         text = redactor.PRIVATE_KEY_PATTERN.sub(REDACTED_PRIVATE_KEY_MARKER, value)
         text = UNTERMINATED_PRIVATE_KEY_RE.sub(REDACTED_PRIVATE_KEY_MARKER, text)
         text = URL_USERINFO_RE.sub(lambda m: m.group(1) + REDACTED_SECRET_MARKER, text)
-        return blank_named_values(redactor, scrub_secret_blocks(redactor, text))
+        return blank_named_values(redactor, scrub_secret_blocks(redactor, text), span)
     if isinstance(value, dict):
         # A manifest's `data`/`stringData` mapping is blanked by shape,
-        # whatever its kind, as the text forms are.
+        # whatever its kind, as the text forms are; so is a `data` map of
+        # base64 strings with no manifest round it.
         if (
             key == MANIFEST_STRING_DATA_KEY
             or (key == MANIFEST_DATA_KEY and parent_is_manifest)
+            or (key in (MANIFEST_DATA_KEY, MANIFEST_STRING_DATA_KEY) and is_flat_base64_secret_map(redactor, value))
             or (is_tool_result and key is None and is_flat_base64_secret_map(redactor, value))
         ):
             return {
                 k: REDACTED_SECRET_MARKER
                 if isinstance(v, str)
-                else supplement_redact(redactor, v, str(k), is_tool_result=is_tool_result)
+                else supplement_redact(
+                    redactor, v, str(k), is_tool_result=is_tool_result, value_span=value_span, shell_keys=shell_keys
+                )
                 for k, v in value.items()
             }
         is_manifest = any(marker in value for marker in MANIFEST_MARKER_KEYS)
@@ -734,13 +763,22 @@ def supplement_redact(
                 and ((is_cred_env and k == ENV_VALUE_KEY) or dict_key_needs_supplement(redactor, str(k)))
                 and redactor._is_credential_value(v.strip())
                 else supplement_redact(
-                    redactor, v, str(k), is_tool_result=is_tool_result, parent_is_manifest=is_manifest
+                    redactor,
+                    v,
+                    str(k),
+                    is_tool_result=is_tool_result,
+                    parent_is_manifest=is_manifest,
+                    value_span=value_span,
+                    shell_keys=shell_keys,
                 )
             )
             for k, v in value.items()
         }
     if isinstance(value, list):
-        return [supplement_redact(redactor, v, is_tool_result=is_tool_result) for v in value]
+        return [
+            supplement_redact(redactor, v, is_tool_result=is_tool_result, value_span=value_span, shell_keys=shell_keys)
+            for v in value
+        ]
     return value
 
 
@@ -748,16 +786,23 @@ def scrub_step_text(redactor: Any, kind: str, text: str, withheld: str) -> str:
     """Scrub one worker step's text: `redactor.redact` first, then the supplement.
 
     `kind` is the step kind (`thinking`, `tool_call`, `tool_result`, `reply`);
-    a `tool_call` has its shell continuations folded first and a
-    `tool_result` takes the inline-object rule. Returns `withheld` for every
-    kind when `redactor` is `None` or the structure is deeper than Python
-    recurses, so an unscrubbable step is never served as written.
+    a `tool_call` has its shell continuations folded first and its command
+    read as a shell line (`VALUE_SPAN_SHELL`), a `tool_result` takes the
+    inline-object rule and, with a tool call's other strings, the rest-of-line
+    mask (`VALUE_SPAN_LINE`); a reply keeps the first-token mask. Returns
+    `withheld` for every kind when `redactor` is `None` or the structure is
+    deeper than Python recurses, so an unscrubbable step is never served as
+    written.
     """
     if redactor is None:
         return withheld
+    is_call = kind == STEP_KIND_TOOL_CALL
+    is_result = kind == STEP_KIND_TOOL_RESULT
+    value_span = VALUE_SPAN_LINE if (is_call or is_result) else VALUE_SPAN_TOKEN
+    shell_keys = COMMAND_ARG_KEYS if is_call else ()
     try:
         parsed = as_json_structure(text)
-        if kind == STEP_KIND_TOOL_CALL:
+        if is_call:
             # Fold a shell line continuation once, here, so every line-bounded
             # CLI rule below (`-u user:pass`, `-p pass`, `--password pass`)
             # reads the command the shell would run; `as_json_structure`
@@ -770,9 +815,23 @@ def scrub_step_text(redactor: Any, kind: str, text: str, withheld: str) -> str:
                 text = SHELL_CONTINUATION_RE.sub(SHELL_CONTINUATION_FOLD, text)
         if parsed is not None:
             return json.dumps(
-                supplement_redact(redactor, redactor.redact(parsed), is_tool_result=(kind == STEP_KIND_TOOL_RESULT))
+                supplement_redact(
+                    redactor,
+                    redactor.redact(parsed),
+                    is_tool_result=is_result,
+                    value_span=value_span,
+                    shell_keys=shell_keys,
+                )
             )
-        return str(supplement_redact(redactor, redactor.redact(text), is_tool_result=(kind == STEP_KIND_TOOL_RESULT)))
+        # A bare-string tool call is the shell line itself.
+        return str(
+            supplement_redact(
+                redactor,
+                redactor.redact(text),
+                is_tool_result=is_result,
+                value_span=VALUE_SPAN_SHELL if is_call else value_span,
+            )
+        )
     except RecursionError:
         return withheld
 

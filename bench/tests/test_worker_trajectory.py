@@ -867,7 +867,9 @@ def test_a_secret_read_calls_result_is_withheld_as_the_feed_withholds_it(data_ro
     reply = _run_script(data_root, [FRONT])
     assert value not in reply
     entry = next(c for c in _payload(reply)["calls"] if c["task"] == FRONT)
-    assert entry["result"] == worker_trajectory.WITHHELD
+    assert entry["result"] == worker_trajectory.WITHHELD_READ_RESULT
+    assert entry["result"].startswith("[REDACTED_")
+    assert worker_trajectory.WITHHELD not in reply
     assert entry["failed"] is False
     assert "get secret db" in entry["args"]
 
