@@ -11,7 +11,7 @@ path is broken; see [Detecting a broken leg](#detecting-a-broken-leg).
 A watchdog on a named profile runs with the right brain and no voice.
 
 `profile-cron-tick` fires the specialist's job under its own `HERMES_HOME`, so it
-keeps that profile's persona, skills, model and turn budget — which is the whole
+keeps that profile's persona and the entry's skills, model and turn budget — which is the whole
 reason the watchdogs live on the Platform Agent's roster rather than as kanban
 cards. What it does not get is a way to say anything useful to the person who
 cares.
@@ -907,10 +907,12 @@ pod-to-operator path and a new grant first. One such path exists now: the
 operator reads the event watcher's and the credential broker's metrics
 listeners for the usage counters ([design](usage-counters-producer.md)), and it
 carries integer totals and nothing about a report, so the grant is still the
-missing piece. The operator binds no metrics endpoint of its own in the shipped
-deploy; the ones the agent's pods expose are the event watcher's and the
-credential broker's, scraped through the chart's `PodMonitoring`s beside
-LiteLLM's and Hindsight's, and neither carries anything about a report. Those are the next step, with this
+missing piece. The operator's own metrics endpoint, bound since the usage
+gauges landed, serves copies of that status and controller-runtime's series
+([the status as gauges](usage-counters-producer.md#the-status-as-gauges)); the
+ones the agent's pods expose are the event watcher's and the credential
+broker's, scraped through the chart's `PodMonitoring`s beside LiteLLM's and
+Hindsight's, and none of them carries anything about a report. Those are the next step, with this
 section as the record of why the first step took the channels it did.
 
 ## Related
