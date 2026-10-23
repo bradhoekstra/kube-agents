@@ -46,13 +46,15 @@ image at :data:`SUPPLEMENT_PATH`), applied in the session-kv feed's order: the
 install's own ``AuditRedactor`` (the one the audit log and the LiteLLM gateway
 run every message through, loaded from :data:`REDACTOR_PATH`) first, then the
 supplement for what it leaves -- block scalars under ``data:``/``stringData:``,
-the JSON ``data`` object, URL userinfo, ``NAME: value`` lines, the CLI
-credential flags, the bearer-scheme pair, and the secret-read detector that
-withholds the result of a call that prints a secret's value. One copy, so a
-shape the feed masks is masked here too; a new shape lands in that module and
-nowhere else.
-Blanking is by shape, not by ``kind``: a ConfigMap's ``data:`` is blanked as a
-Secret's is, the call the redactor documents as the safe direction to err in.
+a ``data``/``stringData`` object in JSON text or in a parsed manifest, URL
+userinfo, ``NAME: value`` lines, the CLI credential flags, the bearer-scheme
+pair, and the secret-read detector that withholds the result of a call that
+prints a secret's value. One copy, so a shape the feed masks is masked here
+too; a new shape lands in that module and nowhere else. A manifest's ``data`` mapping
+is blanked by shape, not by ``kind``, in YAML and JSON alike: a ConfigMap's is
+blanked as a Secret's, the call the redactor documents as the safe direction
+to err in, and a Secret kubectl's key-sorted JSON cut short before its
+``kind`` is blanked as text. An API response's ``data`` is not a manifest's.
 A pod whose redactor or rules module cannot be loaded withholds every result
 and argument rather than sending them unscrubbed; the call names, tags and
 statuses still come back when the redactor is the one missing; when the rules
@@ -464,7 +466,8 @@ def sessions_for(card, assignee, runs):
         # The mapping is the shared module's; without it no store is opened.
         unread("card %s: transcript rules unavailable; sessions not read" % card)
         return []
-    found = [(sid, profile, "run_metadata") for sid, profile in wt.stamped_worker_sessions(runs, assignee)]
+    stamped, _ = wt.stamped_worker_sessions(runs, assignee)
+    found = [(sid, profile, "run_metadata") for sid, profile in stamped]
     dispatched = [r["profile"] or assignee for r in runs]
     profiles = list(dict.fromkeys(dispatched + [assignee]))
     for profile in profiles:

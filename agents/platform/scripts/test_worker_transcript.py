@@ -159,8 +159,55 @@ class TestScrubStepText(unittest.TestCase):
                     self.assertNotIn(word, out.split("\n")[0])
                 self.assertEqual(out.count(MARKER), 1)
                 self.assertTrue(out.endswith("   \nnext: line"), out)
-        # A quoted value ends at its quote.
-        self.assertEqual(_scrub("tool_result", 'password: "one two" three'), f"password: {MARKER} three")
+        # A quoted value ends at its quote, and keeps the quotes the redactor kept.
+        self.assertEqual(_scrub("tool_result", 'password: "one two" three'), f'password: "{MARKER}" three')
+
+    def test_rest_of_line_stops_at_an_unquoted_shell_operator(self):
+        out = _scrub("tool_call", json.dumps({"command": "export GH_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123456789 && gh auth status"}))
+        self.assertEqual(json.loads(out), {"command": f"export GH_TOKEN={MARKER} && gh auth status"})
+        self.assertEqual(_scrub("tool_result", "password: one two; echo done"), f"password: {MARKER}; echo done")
+        # An operator inside a quoted argument is data, not a stop.
+        out = _scrub("tool_result", "password: one 'two && three' four")
+        self.assertEqual(out, f"password: {MARKER}")
+
+    def test_kubectl_env_source_row_keeps_its_reference(self):
+        for source in ("in secret 'db'", "of config map 'app'"):
+            for tail in ("  Optional: false", "  Optional: true", ""):
+                row = f"    Environment:\n      DB_PASSWORD:  <set to the key 'password' {source}>{tail}\n      LOG_LEVEL:  debug\n"
+                with self.subTest(row=row):
+                    out = _scrub("tool_result", row)
+                    self.assertIn(f"to the key 'password' {source}>{tail}\n", out)
+                    self.assertIn("LOG_LEVEL:  debug", out)
+                    self.assertNotIn(f"{MARKER} {MARKER}", out)
+
+    def test_already_masked_quoted_values_keep_their_quotes(self):
+        fragment = '{"password": "hunter2", "user": "app"} and more'
+        out = _scrub("tool_result", fragment)
+        self.assertEqual(json.loads(out.split(" and more")[0]), {"password": MARKER, "user": "app"})
+        self.assertEqual(_scrub("tool_result", 'password: "hunter2"\nuser: app'), f'password: "{MARKER}"\nuser: app')
+        command = 'kubectl patch secret db -p \'{"stringData":{"password":"x"}}\''
+        out = json.loads(_scrub("tool_call", json.dumps({"command": command})))["command"]
+        self.assertNotIn('"x"', out)
+        body = out[out.index("-p '") + 4 : -1]
+        self.assertEqual(json.loads(body), {"stringData": {"password": MARKER}})
+
+    def test_json_data_object_is_blanked_by_shape(self):
+        # kubectl's JSON is key-sorted: a Secret cut short inside `data` has
+        # no `kind` to find and does not parse.
+        cut = '{"apiVersion": "v1", "data": {"config.yaml": "YmFzZTY0ZGF0YQ==", "kubeconfig": "YXBpVmVyc2lvbg=="'
+        out = _scrub("tool_result", cut)
+        self.assertNotIn("YmFzZTY0", out)
+        self.assertNotIn("YXBpVmVy", out)
+        self.assertIn(f'"config.yaml": "{MARKER}", "kubeconfig": "{MARKER}', out)
+        # A parsed ConfigMap document is treated like the YAML form.
+        cm = json.dumps({"apiVersion": "v1", "data": {"CONN_STRING": "Server=db;Uid=app;Pwd=hunter2x", "LOG_LEVEL": "debug"}, "kind": "ConfigMap", "metadata": {"name": "app"}})
+        parsed = json.loads(_scrub("tool_result", cm))
+        self.assertEqual(parsed["data"], {"CONN_STRING": MARKER, "LOG_LEVEL": MARKER})
+        self.assertEqual(parsed["metadata"], {"name": "app"})
+        self.assertEqual(parsed["kind"], "ConfigMap")
+        # An API response's `data` is not a manifest's.
+        api = json.dumps({"status": "success", "data": {"resultType": "vector", "result": []}})
+        self.assertEqual(json.loads(_scrub("tool_result", api))["data"]["resultType"], "vector")
 
     def test_file_name_key_keeps_its_diagnostic_value(self):
         for line in ("tls.crt:  1679 bytes", "cert.pem: OK", "cert.pem:28:-----END"):
@@ -283,9 +330,10 @@ class TestCardToSession(unittest.TestCase):
         ]
         self.assertEqual(
             worker_transcript.stamped_worker_sessions(runs, "assignee-p"),
-            [("s-1", "platform"), ("s-2", "assignee-p")],
+            ([("s-1", "platform"), ("s-2", "assignee-p")], True),
         )
-        self.assertEqual(worker_transcript.stamped_worker_sessions([], "x"), [])
+        self.assertEqual(worker_transcript.stamped_worker_sessions(runs[:2], "x"), ([("s-1", "platform"), ("s-2", "x")], False))
+        self.assertEqual(worker_transcript.stamped_worker_sessions([], "x"), ([], False))
         self.assertEqual(
             [worker_transcript.run_worker_session_id(r) for r in runs],
             ["s-1", "s-2", "s-1", None, None, None, None, None],
@@ -306,7 +354,7 @@ class TestCardToSession(unittest.TestCase):
         rows = conn.execute("SELECT * FROM task_runs ORDER BY id").fetchall()
         self.assertEqual(
             worker_transcript.stamped_worker_sessions(rows, "cluster-x"),
-            [("s-9", "platform"), ("s-8", "cluster-x")],
+            ([("s-9", "platform"), ("s-8", "cluster-x")], True),
         )
 
 

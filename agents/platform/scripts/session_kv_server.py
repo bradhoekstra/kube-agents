@@ -7039,12 +7039,10 @@ def _read_task_worker_steps(
                 include_detail=include_detail,
             )
 
-    stamped_sessions = worker_transcript.stamped_worker_sessions(runs, assignee)
+    stamped_sessions, unstamped = worker_transcript.stamped_worker_sessions(runs, assignee)
     seen_sids: set[str] = {sid for sid, _ in stamped_sessions}
     # A run without a stamp sends the read to the prompt index below.
-    missing_run_session = not runs or any(
-        worker_transcript.run_worker_session_id(run) is None for run in runs
-    )
+    missing_run_session = not runs or unstamped
 
     window_size = max_steps * TASK_STEP_ROW_MULTIPLIER
     session_chunks: list[tuple[tuple[float, int, int], list[Dict[str, Any]]]] = []

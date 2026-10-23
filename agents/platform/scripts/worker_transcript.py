@@ -6,7 +6,10 @@ serves a card's live worker steps to the chat surfaces, and the bench's in-pod
 trajectory read (`bench/kube_agents_bench/worker_trajectory.py`) appends the
 worker's tool calls to a run record. Each scrubs the text with the install's
 `AuditRedactor` and then with a supplement for the shapes the redactor leaves:
-block scalars under `data:`/`stringData:`, the JSON `data` object, URL userinfo,
+block scalars under `data:`/`stringData:`, a `data`/`stringData` object in
+JSON text or in a parsed manifest (by shape, whatever the kind: a ConfigMap's
+is blanked as a Secret's, and kubectl's key-sorted JSON cut short before its
+`kind` is text), URL userinfo,
 `NAME: value` and `NAME=value` lines, the CLI credential flags (`-u user:pass`,
 `-p pass`, `--password pass`), the bearer-scheme pair, and the secret-read
 command detector that withholds a result instead of scrubbing it. Each reader
@@ -51,11 +54,13 @@ STEP_KIND_TOOL_CALL = "tool_call"
 STEP_KIND_TOOL_RESULT = "tool_result"
 # The first character of a string that may be a JSON document.
 JSON_STRUCTURE_OPENERS = "{["
-# The manifest keys and kind whose mapping is blanked wholesale.
+# The manifest keys whose mapping is blanked wholesale, and the keys that
+# mark a parsed object as a Kubernetes manifest: `data` is blanked by shape
+# under any manifest kind (a ConfigMap's as a Secret's), never in an API
+# response (`{"status": "success", "data": {"resultType": "vector"}}`).
 MANIFEST_DATA_KEY = "data"
 MANIFEST_STRING_DATA_KEY = "stringData"
-KIND_KEY = "kind"
-CREDENTIAL_MANIFEST_KIND = "Secret"
+MANIFEST_MARKER_KEYS = ("apiVersion", "kind")
 ENV_NAME_KEY = "name"
 ENV_VALUE_KEY = "value"
 # The redactor's own list of key suffixes that name no credential (`name`,
@@ -80,6 +85,22 @@ INDENT_CHAR = " "
 INLINE_WHITESPACE = " \t"
 LINE_BREAK = "\n"
 LINE_TAIL_WHITESPACE = " \t\r"
+# Where the rest-of-line mask after a credential-named key stops. (a) An
+# unquoted shell operator ends the value: the command a worker chained after
+# an assignment (`export GH_TOKEN=... && gh auth status`) is kept. Found on
+# the quote-blanked copy of the line, so an operator inside a quoted argument
+# is data.
+SHELL_OPERATOR_RE = re.compile(r"&&|\|\||;|\|")
+# (b) kubectl's `describe pod` env row names where a value comes from and
+# holds none of it: `<set to the key 'password' in secret 'db'>  Optional:
+# false` (a ConfigMap-backed one reads `of config map`). The redactor runs
+# first and has masked `<set` by then, so the marker is accepted in its
+# place; the row is kept as it stands, in every rule that would read it.
+KUBECTL_ENV_SOURCE_REF_RE = re.compile(
+    r"(?:<set|" + REDACTED_MARKER_TOKEN_RE_SRC + r") to the key '[^'\r\n]*' (?:in|of) (?:secret|config ?map) '[^'\r\n]*'>"
+    r"(?:[ \t]+Optional:[ \t]+(?:true|false))?[ \t]*(?=\r?$|\n)",
+    re.MULTILINE,
+)
 # A CLI value that starts with this is the next flag, not a credential.
 CLI_FLAG_LEAD_CHAR = "-"
 CLI_FLAG_WORD_SEPARATOR = "_"
@@ -108,7 +129,6 @@ WORKER_SESSION_ID_METADATA_KEY = "worker_session_id"
 # The block rules below run only on text that can hold a `data:` block;
 # `stringData` carries its only "data" capitalised.
 SECRET_BLOCK_FAST_PATH_WORDS = ("data", "Data")
-JSON_STRING_DATA_KEY_QUOTED = '"' + MANIFEST_STRING_DATA_KEY + '"'
 JSON_OBJECT_OPEN = "{"
 JSON_OBJECT_CLOSE = "}"
 YAML_SECRET_BLOCK_RE = re.compile(r"^(\s*)(data|stringData)\s*:\s*$")
@@ -164,13 +184,14 @@ SHELL_QUOTED_SPAN_RE = re.compile(r"'[^'\r\n]*'|\"(?:[^\"\\\r\n]|\\[^\r\n])*\"")
 # `auth:`, `token:` or `AUTH_HEADER=` would otherwise outlive the marker.
 # The redactor runs first and, for a key its own key rule knows (`token:`),
 # masks the scheme word as the value; the marker it leaves there counts as
-# the scheme so the token after it is still taken.
+# the scheme so the token after it is still taken. A shell operator is not a
+# token: `GH_TOKEN=[REDACTED_SECRET] && gh auth status` keeps its tail.
 AUTH_SCHEME_HEADER_RE = re.compile(
     r"(?i)(?P<prefix>[\"']?\b(?P<key>[\w.\-]+)[\"']?[ \t]*[:=][ \t]*"
-    r"(?:bearer|basic|token|apikey|api-key|digest|negotiate|aws4-hmac-sha256|mutual|"
+    r"(?P<scheme>bearer|basic|token|apikey|api-key|digest|negotiate|aws4-hmac-sha256|mutual|"
     + re.escape(REDACTED_SECRET_MARKER)
     + r")[ \t]+)"
-    r"(?P<val>[^\s\"',}{\[\]\\]+)"
+    r"(?P<val>[^\s\"',}{\[\]\\&|;]+)"
 )
 TEXT_COLON_KV_RE = re.compile(
     r"(?m)^(?P<prefix>[ \t]*(?:-[ \t]+)?[\"']?)(?P<key>[\w.\-]+)(?P<sep>[\"']?[ \t]*:[ \t]*)"
@@ -301,9 +322,10 @@ def scrub_secret_blocks(redactor: Any, text: str) -> str:
             lines[i] = f"{pair.group(1)}{pair.group(2)}: {REDACTED_SECRET_MARKER}"
     joined = LINE_BREAK.join(lines)
 
+    # By shape, not by kind: kubectl's JSON is key-sorted, so a Secret cut
+    # short inside `data` has no `kind` to find, and a ConfigMap's `data` is
+    # blanked as the YAML line scan blanks it (the redactor's safe direction).
     def _mask_json_block(m: "re.Match[str]") -> str:
-        if JSON_STRING_DATA_KEY_QUOTED not in m.group(1) and not redactor.JSON_CREDENTIAL_KIND_PATTERN.search(joined):
-            return m.group(0)
         return (
             m.group(1)
             + JSON_PAIR_RE.sub(lambda p: p.group(1) + REDACTED_SECRET_MARKER + p.group(3), m.group(2))
@@ -451,14 +473,33 @@ def line_tail_end(text: str, pos: int) -> int:
     return end
 
 
+def value_tail_end(text: str, pos: int) -> int:
+    """Where an unquoted value that started before `pos` ends: the line's end,
+    or the first unquoted shell operator after `pos` (`SHELL_OPERATOR_RE`),
+    trailing whitespace excluded either way."""
+    end = line_tail_end(text, pos)
+    operator = SHELL_OPERATOR_RE.search(blank_quoted_spans(text[pos:end]))
+    if operator is not None:
+        end = pos + operator.start()
+        while end > pos and text[end - 1] in LINE_TAIL_WHITESPACE:
+            end -= 1
+    return end
+
+
+def is_env_source_ref(text: str, pos: int) -> bool:
+    """Whether the value at `pos` is kubectl's env-source row (`KUBECTL_ENV_SOURCE_REF_RE`)."""
+    return KUBECTL_ENV_SOURCE_REF_RE.match(text, pos) is not None
+
+
 def sub_named_pairs(
     pattern: "re.Pattern[str]",
     text: str,
     mask: "Callable[[re.Match[str]], tuple[str, bool]]",
 ) -> str:
     """`pattern.sub` whose `mask` returns `(replacement, to_line_end)`: when the
-    second is true the replacement also stands for the rest of the line, trailing
-    whitespace excluded, and no later match on that line is read.
+    second is true the replacement also stands for the rest of the value
+    (`value_tail_end`: the line's end or the first unquoted shell operator,
+    trailing whitespace excluded), and no later match in that span is read.
 
     An unquoted value after a credential-named key is the rest of the line
     (`DB_PASSWORD:  my secret phrase`), not its first word; a quoted value ends
@@ -472,7 +513,7 @@ def sub_named_pairs(
         replacement, to_line_end = mask(match)
         out.append(text[pos : match.start()])
         out.append(replacement)
-        pos = max(match.end(), line_tail_end(text, match.end())) if to_line_end else match.end()
+        pos = max(match.end(), value_tail_end(text, match.end())) if to_line_end else match.end()
     out.append(text[pos:])
     return "".join(out)
 
@@ -510,13 +551,13 @@ def blank_named_values(redactor: Any, text: str) -> str:
         is_file_key = key.lower().endswith(FILE_NAME_KEY_SUFFIXES)
         if is_file_key and file_key_value_is_benign(unquoted, match.string[match.end() :]):
             return match.group(0), False
-        if not named_value_is_sensitive(redactor, key):
+        if not named_value_is_sensitive(redactor, key) or is_env_source_ref(match.string, match.start("val")):
             return match.group(0), False
         to_line_end = not is_file_key and not is_quoted_token(raw_val)
         if unquoted.startswith(REDACTED_MARKER_PREFIX):
-            # The redactor masked the first word; the rest of the line is the
-            # value too. The marker it chose stays.
-            return f"{match.group('prefix')}{key}{match.group('sep')}{unquoted}", to_line_end
+            # The redactor masked the first word, quotes and marker as it
+            # wrote them; the rest of the value goes with it.
+            return match.group(0), to_line_end
         if redactor._is_credential_value(unquoted):
             return f"{match.group('prefix')}{key}{match.group('sep')}{REDACTED_SECRET_MARKER}", to_line_end
         return match.group(0), False
@@ -525,10 +566,10 @@ def blank_named_values(redactor: Any, text: str) -> str:
         key = match.group("key")
         raw_val = match.group("val")
         unquoted = unquote_token(raw_val)
-        if named_value_is_sensitive(redactor, key):
+        if named_value_is_sensitive(redactor, key) and not is_env_source_ref(match.string, match.start("val")):
             to_line_end = not is_quoted_token(raw_val)
             if unquoted.startswith(REDACTED_MARKER_PREFIX):
-                return f"{match.group('prefix')}{key}{match.group('sep')}{unquoted}", to_line_end
+                return match.group(0), to_line_end
             if redactor._is_credential_value(unquoted):
                 return f"{match.group('prefix')}{key}{match.group('sep')}{REDACTED_SECRET_MARKER}", to_line_end
         if EQUALS_SEPARATOR in unquoted:
@@ -578,7 +619,11 @@ def blank_named_values(redactor: Any, text: str) -> str:
 
     def _mask_auth_scheme(match: "re.Match[str]") -> str:
         val = unquote_token(match.group("val"))
-        if not named_value_is_sensitive(redactor, match.group("key")) or not redactor._is_credential_value(val):
+        if (
+            not named_value_is_sensitive(redactor, match.group("key"))
+            or not redactor._is_credential_value(val)
+            or is_env_source_ref(match.string, match.start("scheme"))
+        ):
             return match.group(0)
         return f"{match.group('prefix')}{REDACTED_SECRET_MARKER}"
 
@@ -639,7 +684,7 @@ def supplement_redact(
     key: Optional[str] = None,
     *,
     is_tool_result: bool = False,
-    parent_is_secret: bool = False,
+    parent_is_manifest: bool = False,
 ) -> Any:
     if isinstance(value, str):
         nested = as_json_structure(value)
@@ -666,9 +711,11 @@ def supplement_redact(
         text = URL_USERINFO_RE.sub(lambda m: m.group(1) + REDACTED_SECRET_MARKER, text)
         return blank_named_values(redactor, scrub_secret_blocks(redactor, text))
     if isinstance(value, dict):
+        # A manifest's `data`/`stringData` mapping is blanked by shape,
+        # whatever its kind, as the text forms are.
         if (
             key == MANIFEST_STRING_DATA_KEY
-            or (key == MANIFEST_DATA_KEY and parent_is_secret)
+            or (key == MANIFEST_DATA_KEY and parent_is_manifest)
             or (is_tool_result and key is None and is_flat_base64_secret_map(redactor, value))
         ):
             return {
@@ -677,7 +724,7 @@ def supplement_redact(
                 else supplement_redact(redactor, v, str(k), is_tool_result=is_tool_result)
                 for k, v in value.items()
             }
-        is_secret_obj = value.get(KIND_KEY) == CREDENTIAL_MANIFEST_KIND
+        is_manifest = any(marker in value for marker in MANIFEST_MARKER_KEYS)
         env_name = value.get(ENV_NAME_KEY)
         is_cred_env = isinstance(env_name, str) and named_value_is_sensitive(redactor, env_name)
         return {
@@ -687,11 +734,7 @@ def supplement_redact(
                 and ((is_cred_env and k == ENV_VALUE_KEY) or dict_key_needs_supplement(redactor, str(k)))
                 and redactor._is_credential_value(v.strip())
                 else supplement_redact(
-                    redactor,
-                    v,
-                    str(k),
-                    is_tool_result=is_tool_result,
-                    parent_is_secret=is_secret_obj,
+                    redactor, v, str(k), is_tool_result=is_tool_result, parent_is_manifest=is_manifest
                 )
             )
             for k, v in value.items()
@@ -790,18 +833,26 @@ def run_worker_session_id(run: Any) -> Optional[str]:
     return sid if isinstance(sid, str) and sid else None
 
 
-def stamped_worker_sessions(runs: Sequence[Any], assignee: Optional[str]) -> list[tuple[str, str]]:
-    """The `(session_id, profile)` pairs `task_runs.metadata.worker_session_id` stamps.
+def stamped_worker_sessions(
+    runs: Sequence[Any], assignee: Optional[str]
+) -> tuple[list[tuple[str, str]], bool]:
+    """The `(session_id, profile)` pairs `task_runs.metadata.worker_session_id`
+    stamps, and whether any run carried no stamp.
 
     In run order, each session once; the profile is the run's, or the card's
-    assignee when the run records none.
+    assignee when the run records none. One walk: the second value is what
+    sends the feed to its prompt index for the runs the first does not cover.
     """
     found: list[tuple[str, str]] = []
     seen: set[str] = set()
+    unstamped = False
     for run in runs:
         sid = run_worker_session_id(run)
-        if sid is None or sid in seen:
+        if sid is None:
+            unstamped = True
+            continue
+        if sid in seen:
             continue
         seen.add(sid)
         found.append((sid, str(_run_field(run, TASK_RUN_PROFILE_FIELD) or assignee or "")))
-    return found
+    return found, unstamped

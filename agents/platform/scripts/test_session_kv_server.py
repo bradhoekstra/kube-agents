@@ -7637,6 +7637,9 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
             self.assertNotIn(leaked, sess_serialized)
         self.assertIn("[REDACTED_SECRET]", serialized)
         self.assertIn("[REDACTED_PRIVATE_KEY]", serialized)
+        # A manifest's `data` is blanked by shape, a ConfigMap's as a Secret's.
+        self.assertNotIn("kept_plain_value", serialized)
+        self.assertIn("plain_field", serialized)
         for preserved in (
             "app-tls-secret",
             "/var/run/secrets/token",
@@ -7650,7 +7653,6 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
             "tls.crt:  1679 bytes",
             "cert.pem: OK",
             "cert.pem: PEM certificate",
-            "kept_plain_value",
             "/etc/creds/mounted-path",
             "deployment-controller mounts them",
             "/opt/data/gitops/x",
