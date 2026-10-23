@@ -3758,8 +3758,10 @@ def _profile_home(profile: str, data_root: str | os.PathLike | None = None) -> s
     its directory here: abspath (a relative root resolves against the working
     directory, as the open would) followed by startswith is the containment
     check CodeQL recognises (py/path-injection); the segment check alone, and
-    `Path.resolve` with `is_relative_to`, are not. The check is lexical: it
-    does not follow symlinks.
+    `Path.resolve` with `is_relative_to`, are not. A second containment check
+    on the real paths then refuses a `profiles/<name>` that is a symlink out
+    of the profiles directory, which the lexical check cannot see; a home
+    that is itself a symlink passes, since both sides resolve through it.
     """
     if not _PROFILE_SEGMENT_RE.match(profile):
         return None
@@ -3769,6 +3771,8 @@ def _profile_home(profile: str, data_root: str | os.PathLike | None = None) -> s
     root = os.path.join(home, PROFILES_DIR)
     base = os.path.normpath(os.path.join(root, profile))
     if not base.startswith(root + os.sep):
+        return None
+    if not os.path.realpath(base).startswith(os.path.realpath(root) + os.sep):
         return None
     return base
 

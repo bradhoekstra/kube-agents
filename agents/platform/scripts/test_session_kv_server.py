@@ -4094,6 +4094,31 @@ class TestProfileHome(unittest.TestCase):
                 self.assertIsNone(session_kv_server._profile_state_db(root, profile))
         self.assertIsNone(session_kv_server._profile_state_db(root, "platform"))  # no store there
 
+    def test_a_profile_that_is_a_symlink_out_of_the_profiles_directory_is_none(self):
+        # `profiles/<name>` that points outside the profiles directory is no
+        # profile, even though its name is one segment and its lexical path
+        # stays under `profiles/`: the store it would reach is not the
+        # profile's. A link that stays inside, and a home that is itself a
+        # link, both pass.
+        import gitops_workspace
+
+        outside = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, outside, True)
+        (Path(outside) / "state.db").write_bytes(b"")
+        profiles = os.path.join(self.home, "profiles")
+        os.makedirs(os.path.join(profiles, "platform"))
+        os.symlink(outside, os.path.join(profiles, "escaped"))
+        os.symlink(os.path.join(profiles, "platform"), os.path.join(profiles, "alias"))
+        linked_home = os.path.join(outside, "home-link")
+        os.symlink(self.home, linked_home)
+        with patch.object(gitops_workspace, "agent_home", return_value=self.home):
+            self.assertIsNone(session_kv_server._profile_home("escaped"))
+            self.assertEqual(session_kv_server._profile_home("alias"), os.path.join(profiles, "alias"))
+        self.assertIsNone(session_kv_server._profile_state_db(Path(self.home), "escaped"))
+        self.assertEqual(
+            session_kv_server._profile_home("platform", linked_home), os.path.join(linked_home, "profiles", "platform")
+        )
+
 
 class TestAuditChatReport(unittest.TestCase):
     """A fleet-audit job posts the report its run's `finish` left, never its final message."""
