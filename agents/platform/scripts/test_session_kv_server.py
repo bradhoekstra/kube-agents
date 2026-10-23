@@ -4094,6 +4094,21 @@ class TestProfileHome(unittest.TestCase):
                 self.assertIsNone(session_kv_server._profile_state_db(root, profile))
         self.assertIsNone(session_kv_server._profile_state_db(root, "platform"))  # no store there
 
+    def test_a_relative_home_whose_working_directory_is_gone_names_no_profile(self):
+        # `agent_home` returns "." for PLATFORM_AGENT_HOME=.; once the process's
+        # working directory is unlinked, `abspath` cannot resolve it. That is
+        # no profile, not an exception: each reader keeps its fallback.
+        import gitops_workspace
+
+        self.addCleanup(os.chdir, os.getcwd())
+        gone = tempfile.mkdtemp()
+        os.chdir(gone)
+        os.rmdir(gone)
+        with patch.object(gitops_workspace, "agent_home", return_value="."):
+            self.assertIsNone(session_kv_server._profile_home("platform"))
+            self.assertIsNone(session_kv_server._profile_home("default"))
+        self.assertIsNone(session_kv_server._profile_state_db(Path("."), "platform"))
+
     def test_a_profile_that_is_a_symlink_out_of_the_profiles_directory_is_none(self):
         # `profiles/<name>` that points outside the profiles directory is no
         # profile, even though its name is one segment and its lexical path

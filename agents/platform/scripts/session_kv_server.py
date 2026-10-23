@@ -3762,17 +3762,22 @@ def _profile_home(profile: str, data_root: str | os.PathLike | None = None) -> s
     on the real paths then refuses a `profiles/<name>` that is a symlink out
     of the profiles directory, which the lexical check cannot see; a home
     that is itself a symlink passes, since both sides resolve through it.
+    A root that cannot be resolved (a relative home whose working directory
+    is gone) names no profile either, so every reader keeps its fallback.
     """
     if not _PROFILE_SEGMENT_RE.match(profile):
         return None
-    home = os.path.abspath(os.fspath(data_root) if data_root is not None else gitops_workspace.agent_home())
-    if profile == DEFAULT_PROFILE:
-        return home
-    root = os.path.join(home, PROFILES_DIR)
-    base = os.path.normpath(os.path.join(root, profile))
-    if not base.startswith(root + os.sep):
-        return None
-    if not os.path.realpath(base).startswith(os.path.realpath(root) + os.sep):
+    try:
+        home = os.path.abspath(os.fspath(data_root) if data_root is not None else gitops_workspace.agent_home())
+        if profile == DEFAULT_PROFILE:
+            return home
+        root = os.path.join(home, PROFILES_DIR)
+        base = os.path.normpath(os.path.join(root, profile))
+        if not base.startswith(root + os.sep):
+            return None
+        if not os.path.realpath(base).startswith(os.path.realpath(root) + os.sep):
+            return None
+    except OSError:
         return None
     return base
 
