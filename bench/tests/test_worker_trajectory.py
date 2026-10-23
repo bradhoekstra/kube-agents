@@ -39,6 +39,8 @@ REDACTED = "[REDACTED_SECRET]"
 REDACTOR = (
     Path(__file__).resolve().parents[2] / "agents" / "chat" / "defaults" / "plugins" / "common"
 ) / "redactor.py"
+# The shared transcript rules the pod loads from the image, at their source path here.
+SUPPLEMENT = Path(__file__).resolve().parents[2] / "agents" / "platform" / "scripts" / "worker_transcript.py"
 
 _BOARD_DDL = (
     "CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, assignee TEXT, status TEXT,"
@@ -241,6 +243,7 @@ def _run_script(
     max_calls: int = 2000,
     max_result: int = 2000,
     redactor: Path = REDACTOR,
+    supplement: Path = SUPPLEMENT,
 ) -> str:
     """The in-pod script under the test interpreter, with the caps the harness passes."""
     if not REDACTOR.exists():
@@ -253,6 +256,7 @@ def _run_script(
             str(root),
             worker_trajectory.CAPTURE_PRESENT,
             str(redactor),
+            str(supplement),
             str(max_cards),
             str(max_calls),
             str(max_result),
@@ -646,7 +650,8 @@ def test_a_secrets_yaml_block_is_blanked_including_block_scalars(data_root: Path
     for gone in ("TFMwdExT", "SUPER_SECRET", "ANOTHER_LINE", "first line"):
         assert gone not in out
     assert f"  tls.key: {REDACTED}\n" in out
-    assert f"  config.txt: {REDACTED}\n    {REDACTED}\n    {REDACTED}\n    {REDACTED}\n" in out
+    # The shared block-scalar rule masks the body as one marker line, as the feed does.
+    assert f"  config.txt: {REDACTED}\n    {REDACTED}\ntype:" in out
     assert "namespace: shop" in out and "type: kubernetes.io/tls" in out
 
 
@@ -810,6 +815,44 @@ def test_a_manifest_inside_an_argument_is_scrubbed_with_its_newlines(data_root: 
 def test_ordinary_output_is_left_alone(data_root: Path) -> None:
     text = "NAME READY STATUS\ncheckout-7d9f 0/1 CrashLoopBackOff\nservice token-refresher ok"
     assert _read_result(data_root, text)["result"] == text
+
+
+def test_a_curl_basic_auth_password_is_masked_as_the_feed_masks_it(data_root: Path) -> None:
+    """``AuditRedactor`` leaves ``-u user:pass`` alone; the shared supplement does not,
+    so the record and the session-kv feed mask the same credential."""
+    with sqlite3.connect(data_root / "profiles" / "platform" / "state.db") as conn:
+        conn.execute(
+            "UPDATE messages SET tool_calls = ?"
+            " WHERE role = 'assistant' AND tool_calls LIKE '%get pods%'",
+            (
+                json.dumps(
+                    [
+                        {
+                            "name": "terminal",
+                            "arguments": json.dumps({"command": "curl -u admin:hunter2 https://x/"}),
+                        }
+                    ]
+                ),
+            ),
+        )
+    reply = _run_script(data_root, [FRONT])
+    assert "hunter2" not in reply
+    captured = worker_trajectory.capture(lambda s, t: reply, [FRONT], 5.0)
+    first = captured.entries[0]
+    assert first["args"]["command"] == f"curl -u admin:{REDACTED} https://x/"
+
+
+def test_a_pod_without_the_shared_rules_withholds_content_and_names_the_path(data_root: Path) -> None:
+    """Fail closed as for the redactor: nothing a worker said leaves the pod, and the
+    error names the module path; the mapping is the module's too, so no store is read."""
+    missing = data_root / "no-such-worker-transcript.py"
+    reply = _run_script(data_root, [FRONT], supplement=missing)
+    payload = _payload(reply)
+    assert any(str(missing) in e and "withheld" in e for e in payload["errors"])
+    assert TOKEN not in reply and "hunter" not in reply
+    assert payload["calls"] == []
+    assert all(c["sessions"] == [] for c in payload["cards"])
+    assert any(e.startswith(f"card {FRONT}:") for e in payload["unread"])
 
 
 def test_a_pod_without_the_redactor_withholds_content_and_says_so(data_root: Path) -> None:
@@ -1194,7 +1237,7 @@ def _run_recorded_script(root: Path, script: str) -> tuple[str, int, bool]:
     if not REDACTOR.exists():
         pytest.skip(f"{REDACTOR} is not beside this checkout")
     proc = subprocess.run(
-        [sys.executable, "-c", _WRITE_RECORDER + script, str(root), worker_trajectory.CAPTURE_PRESENT, str(REDACTOR), "32", "2000", "2000", "2000", FRONT],
+        [sys.executable, "-c", _WRITE_RECORDER + script, str(root), worker_trajectory.CAPTURE_PRESENT, str(REDACTOR), str(SUPPLEMENT), "32", "2000", "2000", "2000", FRONT],
         capture_output=True,
         text=True,
         check=False,
