@@ -4041,6 +4041,60 @@ class TestIsFleetAuditJob(unittest.TestCase):
                     self.assertFalse(session_kv_server._is_fleet_audit_job(profile, job_id))
 
 
+class TestProfileHome(unittest.TestCase):
+    """A profile's directory is resolved once, under the agent home; a name that leaves it is no profile."""
+
+    def setUp(self):
+        self.home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.home, True)
+
+    def test_the_default_profile_is_the_agent_home_and_a_named_one_sits_under_profiles(self):
+        import gitops_workspace
+
+        with patch.object(gitops_workspace, "agent_home", return_value=self.home):
+            self.assertEqual(session_kv_server._profile_home("default"), self.home)
+            self.assertEqual(session_kv_server._profile_home("platform"), os.path.join(self.home, "profiles", "platform"))
+            self.assertEqual(session_kv_server._profile_home("seeded-a.v2"), os.path.join(self.home, "profiles", "seeded-a.v2"))
+
+    def test_a_profile_that_leaves_the_profiles_directory_is_none(self):
+        import gitops_workspace
+
+        with patch.object(gitops_workspace, "agent_home", return_value=self.home):
+            for profile in ("..", ".", "../..", "../platform", "profiles/platform", "a/b", self.home, "/etc", "", "a b"):
+                with self.subTest(profile=profile):
+                    self.assertIsNone(session_kv_server._profile_home(profile))
+
+    def test_a_home_of_slash_or_dot_still_resolves(self):
+        # `agent_home` returns "/" for PLATFORM_AGENT_HOME=/ and "." for
+        # PLATFORM_AGENT_HOME=.: the first is a root that already ends in a
+        # separator, the second resolves against the working directory, as the
+        # open would.
+        import gitops_workspace
+
+        with patch.object(gitops_workspace, "agent_home", return_value="/"):
+            self.assertEqual(session_kv_server._profile_home("default"), "/")
+            self.assertEqual(session_kv_server._profile_home("platform"), "/profiles/platform")
+            self.assertIsNone(session_kv_server._profile_home(".."))
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(self.home)
+        with patch.object(gitops_workspace, "agent_home", return_value="."):
+            self.assertEqual(session_kv_server._profile_home("default"), os.getcwd())
+            self.assertEqual(session_kv_server._profile_home("platform"), os.path.join(os.getcwd(), "profiles", "platform"))
+            self.assertIsNone(session_kv_server._profile_home(".."))
+
+    def test_the_state_db_of_a_profile_that_leaves_the_data_root_is_none(self):
+        # A `state.db` where a climb out of `profiles/` would land, the data
+        # root itself: the default profile's store, never `..`'s.
+        root = Path(self.home)
+        (root / "state.db").write_bytes(b"")
+        self.assertEqual(session_kv_server._profile_state_db(root, "default"), root / "state.db")
+        self.assertEqual(session_kv_server._profile_state_db(root, ""), root / "state.db")
+        for profile in ("..", "../..", "a/b", self.home):
+            with self.subTest(profile=profile):
+                self.assertIsNone(session_kv_server._profile_state_db(root, profile))
+        self.assertIsNone(session_kv_server._profile_state_db(root, "platform"))  # no store there
+
+
 class TestAuditChatReport(unittest.TestCase):
     """A fleet-audit job posts the report its run's `finish` left, never its final message."""
 
@@ -4581,6 +4635,24 @@ class TestSchedulerFailureLine(unittest.TestCase):
                 failure = session_kv_server.scheduler_failure_line("platform", "obtainability-audit", self.TITLE, self.QUOTA)
                 self.assertTrue(failure.text.endswith("It will try again at its next scheduled run."))
 
+    def test_a_profile_that_leaves_the_profiles_directory_reads_no_roster(self):
+        # A daily roster where a climb out of `profiles/` would land, the agent
+        # home itself: readable as the default profile's, never as `..`'s, so
+        # the line for such a profile says "next scheduled run", not "tomorrow".
+        import cron_schedule
+
+        cron = os.path.join(self.home, "cron")
+        os.makedirs(cron)
+        with open(os.path.join(cron, "jobs.json"), "w", encoding="utf-8") as handle:
+            json.dump({"jobs": [{"id": "obtainability-audit", "schedule": {"kind": "cron", "expr": "50 6 * * *"}}]}, handle)
+        self.assertTrue(session_kv_server._runs_daily("default", "obtainability-audit"))
+        for profile in ("..", "../..", self.home, "a/b"):
+            with self.subTest(profile=profile), patch.object(cron_schedule, "open", create=True) as opened:
+                self.assertFalse(session_kv_server._runs_daily(profile, "obtainability-audit"))
+                opened.assert_not_called()
+                failure = session_kv_server.scheduler_failure_line(profile, "obtainability-audit", self.TITLE, self.QUOTA)
+                self.assertTrue(failure.text.endswith(session_kv_server.SCHEDULER_FAILURE_NEXT_UNKNOWN))
+
     def test_every_leg_gets_the_same_line_with_no_clock_time(self):
         self.roster("50 6 * * *")
         _, sent = self.post(platforms=("slack", "google_chat"))
@@ -4629,8 +4701,20 @@ class TestSchedulerFailureLine(unittest.TestCase):
         self.assertEqual(len(sent), 1)
 
     def test_a_profile_that_is_not_one_segment_reads_no_ledger(self):
+        import sqlite3
+
+        # A ledger with a clean run where a climb out of `profiles/` would land,
+        # the agent home itself: read as the default profile's, never as `..`'s.
         self.ledger(("obtainability-audit", "failed", "2026-10-21T06:50:00+00:00"))
-        for profile in ("..", "../..", "/var/lib/x", "a/b"):
+        cron = os.path.join(self.home, "cron")
+        os.makedirs(cron)
+        with sqlite3.connect(os.path.join(cron, "executions.db")) as conn, conn:
+            conn.execute("CREATE TABLE executions (job_id TEXT, status TEXT, started_at TEXT)")
+            conn.execute("INSERT INTO executions VALUES ('obtainability-audit', 'completed', '2026-10-21T06:50:00+00:00')")
+        with patch.object(session_kv_server.sqlite3, "connect", wraps=sqlite3.connect) as connect:
+            self.assertTrue(session_kv_server._run_completed_since("default", "obtainability-audit", 0.0))
+            connect.assert_called_once()
+        for profile in ("..", "../..", "/var/lib/x", self.home, "a/b"):
             with self.subTest(profile=profile), patch.object(session_kv_server.sqlite3, "connect") as connect:
                 self.assertTrue(session_kv_server._run_completed_since(profile, "obtainability-audit", 0.0))
                 connect.assert_not_called()
