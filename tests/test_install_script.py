@@ -1223,7 +1223,7 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
             'prompt_read() { echo "PROMPT: $1 default=[${3:-}]"; printf -v "$2" "%s" "${READ[$READ_AT]}"; READ_AT=$((READ_AT + 1)); }\n'
             + preset
             + "ask_gitops_forge\n"
-            'echo "DECLINED=$GITOPS_INTERVIEW_DECLINED FORGE=$PARAM_GITOPS_FORGE HOST=[${PARAM_GITOPS_HOST:-}] CA=[${PARAM_GITOPS_CA_FILE:-}] MENUS=$MENU_AT READS=$READ_AT"\n'
+            'echo "DECLINED=$GITOPS_INTERVIEW_DECLINED FORGE=$PARAM_GITOPS_FORGE HOST=[${PARAM_GITOPS_HOST:-}] CA=[${PARAM_GITOPS_CA_FILE:-}] MENUS=$MENU_AT READS=$READ_AT SECRET=[${PARAM_GITOPS_CA_SECRET:-}]"\n'
         )
         return self._run_install_func(cmd)
 
@@ -1261,6 +1261,23 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
                     proc = self._ask_gitops_forge(menus, reads)
                     self.assertEqual(proc.returncode, 0, proc.stderr)
                     self.assertIn(expected, proc.stdout, proc.stdout + proc.stderr)
+            # After a refusal the hostname prompt has no default: prompt_read
+            # substitutes a default for an empty answer, so a refused host
+            # offered again would make enter resubmit it rather than return
+            # to the menu, which INSTALL.md says an empty hostname does.
+            proc = self._ask_gitops_forge(["2", "2"], ["https://ghe.example.com", "", "ghe.example.com", ""])
+            host_prompt = "PROMPT: GitHub Enterprise Server hostname (for example github.example.com) default=["
+            self.assertEqual(proc.stdout.count(host_prompt + "]"), 2, proc.stdout)
+            self.assertNotIn(host_prompt + "https://ghe.example.com]", proc.stdout)
+            # On a first install with GITOPS_HOST exported and --gitops-ca-file
+            # given, the early flag check derives the CA Secret's name before
+            # the menu. No repository drops the name with the file: nothing
+            # recorded it, and the later flag check would otherwise report it
+            # dropped as a recorded one.
+            proc = self._ask_gitops_forge(["4"], [], preset=(
+                f'PARAM_GITOPS_HOST="ghe.example.com"\nPARAM_GITOPS_CA_FILE="{ca}"\n'
+                'PARAM_GITOPS_CA_FILE_FROM_FLAG="true"\nPARAM_GITOPS_CA_SECRET="github-forge-ca"\n'))
+            self.assertIn("DECLINED=true FORGE=github HOST=[] CA=[] MENUS=1 READS=0 SECRET=[]", proc.stdout, proc.stdout + proc.stderr)
             # An exported GITOPS_HOST and GITOPS_CA_FILE reach a first
             # install's menu as answers. No repository, or github.com, names
             # no host, so neither keeps the CA file, and one given by flag is
@@ -2508,6 +2525,19 @@ run_menu_system "."
         proc = self._run_install_func(cmd)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("CHOICE=1", proc.stdout)
+
+    def test_prompt_menu_stores_the_answer_as_canonical_digits(self):
+        """"04" is within bounds, and callers compare the stored answer as a
+        string: the forge menu's `case` would read "04" as github.com rather
+        than "Nowhere yet", and every `[ "$choice" = "2" ]` over a menu
+        answer has the same hole."""
+        cmd = (
+            'has_controlling_tty() { return 1; }; prompt_read() { printf -v "$2" %s "04"; }; '
+            'menu_choice=""; prompt_menu "Pick" "a" "b" "c" "d" menu_choice >/dev/null; echo "CHOICE=[$menu_choice]"'
+        )
+        proc = self._run_install_func(cmd)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("CHOICE=[4]", proc.stdout)
 
     def _run_with_kubectl_stub(self, func_call, kubectl_script, env=None):
         """Run `func_call` with a stub `kubectl` on PATH.
