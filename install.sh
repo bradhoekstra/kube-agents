@@ -5409,6 +5409,21 @@ apply_gitlab_token_secret() {
   fi
 }
 
+# github.com presents a certificate the public CAs sign, and the later flag
+# check refuses a CA file with no host. Called by the forge menu's github.com
+# and no-repository answers: an exported GITOPS_CA_FILE, or one typed for an
+# Enterprise Server host, is dropped without a word, as the GitLab validator
+# drops one for gitlab.com; one given by flag is dropped with a line, since
+# refusing it after the whole interview would be the alternative. A recorded
+# forge, org, App or host flag settles the forge before the menu, so neither
+# answer is ever a change to a recorded install.
+drop_gitops_ca_file_for_github_com() {
+  if [ -n "${PARAM_GITOPS_CA_FILE:-}" ] && [ "${PARAM_GITOPS_CA_FILE_FROM_FLAG:-false}" = "true" ]; then
+    print_info "Dropping --gitops-ca-file '${PARAM_GITOPS_CA_FILE}': this run's GitOps forge is github.com, which uses the public CAs."
+  fi
+  PARAM_GITOPS_CA_FILE=""
+}
+
 # The forge question, asked only when nothing has settled the forge: github.com,
 # a GitHub Enterprise Server (its host and an optional CA file, asked until
 # the validator accepts them), GitLab, whose own questions follow in main, or
@@ -5442,16 +5457,10 @@ ask_gitops_forge() {
     case "$forge_choice" in
       4)
         # The same install as option 1, with the repository menu declined:
-        # github.com, no host, and no CA file. A recorded forge, org, App or
-        # host flag settles the forge and the menu is not asked, but an
-        # exported GITOPS_HOST and GITOPS_CA_FILE reach a first install's
-        # menu as answers, and the later flag check refuses a CA file with
-        # no host; a CA file given by flag is the operator's to keep.
+        # github.com, no host, and no CA file.
         PARAM_GITOPS_FORGE="github"
         PARAM_GITOPS_HOST=""
-        if [ "${PARAM_GITOPS_CA_FILE_FROM_FLAG:-false}" != "true" ]; then
-          PARAM_GITOPS_CA_FILE=""
-        fi
+        drop_gitops_ca_file_for_github_com
         GITOPS_INTERVIEW_DECLINED="true"
         return 0
         ;;
@@ -5487,9 +5496,9 @@ ask_gitops_forge() {
         fi
         # The validator refused the host or the CA file: the menu comes back
         # as it was first shown, with option 2 still selected, and enter asks
-        # for them again. Without this, option 1 or 4 taken next would carry
-        # the refused answers into the later flag check, which exits 1 over
-        # a host or CA file the operator never meant to keep.
+        # for them again. Options 1 and 4 clear the host and CA file
+        # themselves; option 3 does not, and without this it would offer the
+        # refused Enterprise Server host as the GitLab host's default.
         PARAM_GITOPS_HOST="$host_on_entry"
         if [ "${PARAM_GITOPS_CA_FILE_FROM_FLAG:-false}" != "true" ]; then
           PARAM_GITOPS_CA_FILE="$ca_file_on_entry"
@@ -5499,11 +5508,7 @@ ask_gitops_forge() {
       *)
         PARAM_GITOPS_FORGE="github"
         PARAM_GITOPS_HOST=""
-        # As in option 4: an exported CA file is an answer for a host that
-        # this answer does not name.
-        if [ "${PARAM_GITOPS_CA_FILE_FROM_FLAG:-false}" != "true" ]; then
-          PARAM_GITOPS_CA_FILE=""
-        fi
+        drop_gitops_ca_file_for_github_com
         return 0
         ;;
     esac

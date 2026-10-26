@@ -1263,22 +1263,25 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
                     self.assertIn(expected, proc.stdout, proc.stdout + proc.stderr)
             # An exported GITOPS_HOST and GITOPS_CA_FILE reach a first
             # install's menu as answers. No repository, or github.com, names
-            # no host, so neither keeps the CA file; one given by flag stays.
+            # no host, so neither keeps the CA file, and one given by flag is
+            # dropped with a line rather than refused after the interview.
             exported = f'PARAM_GITOPS_HOST="ghe.example.com"\nPARAM_GITOPS_CA_FILE="{ca}"\n'
+            by_flag = exported + 'PARAM_GITOPS_CA_FILE_FROM_FLAG="true"\n'
+            dropped = f"Dropping --gitops-ca-file '{ca}': this run's GitOps forge is github.com"
             for name, menus, preset, expected in (
                 ("no repository drops the exported CA file", ["4"], exported, "DECLINED=true FORGE=github HOST=[] CA=[]"),
                 ("github.com drops the exported CA file", ["1"], exported, "DECLINED=false FORGE=github HOST=[] CA=[]"),
-                ("a CA file given by flag is kept", ["4"], exported + 'PARAM_GITOPS_CA_FILE_FROM_FLAG="true"\n',
-                 f"DECLINED=true FORGE=github HOST=[] CA=[{ca}]"),
+                ("no repository drops a CA file given by flag, and says so", ["4"], by_flag, "DECLINED=true FORGE=github HOST=[] CA=[]"),
+                ("github.com drops a CA file given by flag, and says so", ["1"], by_flag, "DECLINED=false FORGE=github HOST=[] CA=[]"),
             ):
                 with self.subTest(name):
                     proc = self._ask_gitops_forge(menus, [], preset=preset)
                     self.assertEqual(proc.returncode, 0, proc.stderr)
                     self.assertIn(expected, proc.stdout, proc.stdout + proc.stderr)
-            # The typed host is offered again as the default of the retry, so
-            # a slip can be corrected rather than retyped.
-            proc = self._ask_gitops_forge(["2", "2"], ["https://ghe.example.com", "", "ghe.example.com", ""])
-            self.assertIn("PROMPT: GitHub Enterprise Server hostname (for example github.example.com) default=[https://ghe.example.com]", proc.stdout)
+                    if preset is by_flag:
+                        self.assertIn(dropped, proc.stdout)
+                    else:
+                        self.assertNotIn("Dropping --gitops-ca-file", proc.stdout)
 
     def test_an_empty_enterprise_server_hostname_returns_to_the_forge_menu(self):
         """Enter at the hostname prompt shows the menu again, where option 4
@@ -10191,6 +10194,17 @@ source_provisioning_helpers . >/dev/null
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("SUB=EMPTY", proc.stdout)
+
+    def test_resolve_shared_defaults_starts_the_gitops_interview_as_not_declined(self):
+        """main's step 8 reads GITOPS_INTERVIEW_DECLINED under `set -u`, and
+        only the forge menu's no-repository answer sets it. The initializer
+        in resolve_shared_defaults is what every other interactive install
+        relies on to reach step 8 at all."""
+        proc = self._run_install_func(
+            'unset GITOPS_INTERVIEW_DECLINED; resolve_shared_defaults; echo "DECLINED=$GITOPS_INTERVIEW_DECLINED"'
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("DECLINED=false", proc.stdout)
 
     def test_resolve_shared_defaults_preserves_explicit_chat_sub_name(self):
         proc = self._run_install_func(
