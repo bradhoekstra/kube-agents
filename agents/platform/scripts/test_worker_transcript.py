@@ -339,24 +339,42 @@ class TestSecretReadDetector(unittest.TestCase):
         "sops --decrypt secrets.enc.yaml",
         "kubectl exec deploy/api -- cat /etc/db-creds/password",
         "kubectl exec -n prod api-0 -- head -c 64 /var/secrets/token",
-        # forms no list named: the grammar fails closed on anything that is
-        # not provably the bare list
+        # an output flag the old list also caught, kept as the grammar's refusal
         "kubectl get secret db -o name",
         "kubectl get secret db -o wide",
         "kubectl get secret db --output jsonpath-as-json={.data}",
         "kubectl get secret db -ojsonpath={.data.password}",
-        "kubectl get secrets --sort-by=.metadata.name",
         "kubectl get secret db -o yaml > /tmp/s.yaml",
-        "kubectl get secrets -n prod | wc -l",
         "echo $(kubectl get secret db -o json)",
-        "echo `kubectl get secrets -n prod`",
-        "kubectl get secret db -n prod --some-flag-added-next-release",
-        "kubectl get secrets -n prod -w",
-        "kubectl get secrets,configmaps -n prod",
-        "kubectl get secrets -n \"prod",
         "kubectl version; kubectl get secret db -o json",
         "kubectl exec api-0 -- sh -c 'kubectl get secret db -o json'",
-        # a store's command that is not one of its named lists
+        "sh -c 'kubectl get secret db -o json'",
+        # forms no list named: the grammar fails closed on anything that is
+        # not provably the bare list
+        "kubectl get secret db -n prod --some-flag-added-next-release",
+        "kubectl --unknown-global-flag x get secrets -n prod",
+        "kubectl get secrets,configmaps -n prod",
+        "kubectl get secrets -n \"prod",
+        "echo `kubectl get secrets -n prod`",
+        "kubectl get secrets.v1. db -o yaml",
+        # a variable expands to words, flags included, so it is not admitted
+        # beside a secret resource
+        "NS='prod -o yaml'; kubectl get secrets -n $NS",
+        "kubectl get secrets -n $NS",
+        "for ns in a b; do kubectl get secrets -n $ns; done",
+        # a substitution before the binary on the same command
+        "echo $(kubectl get secret db -o json) kubectl get secrets",
+        "FOO=$(kubectl get secret db -o json) kubectl get secrets -n prod",
+        # the resource is not on the line, or is not a word
+        "printf secret/db | xargs kubectl get -n prod -o yaml",
+        "kubectl get secrets -n prod -o name | xargs kubectl get -o yaml",
+        "kubectl get -o yaml -f db.yaml",
+        "kind=secret; kubectl get $kind db -o yaml",
+        "kubectl get -o yaml $(cat /tmp/names)",
+        "kubectl get --raw /api/v1/namespaces/prod/secrets/db",
+        "kubectl view-secret db -n prod",
+        # a store's command that is not one of its named lists, alone and
+        # fed by the store's own list through a pipe
         "aws secretsmanager batch-get-secret-value --secret-id-list db",
         "aws ssm get-parameters-by-path --path /prod --with-decryption",
         "aws ssm get-parameter-history --name /prod/db --with-decryption",
@@ -365,6 +383,11 @@ class TestSecretReadDetector(unittest.TestCase):
         "vault kv get -field=password secret/db",
         "vault read secret/db",
         "sops prod.enc.yaml",
+        "gcloud secrets list --format='value(name)' | xargs -I{} gcloud secrets versions access latest --secret={}",
+        "aws secretsmanager list-secrets --query 'SecretList[].Name' --output text | xargs -n1 aws secretsmanager get-secret-value --secret-id",
+        "vault kv list -format=json secret/ | jq -r '.[]' | xargs -I{} vault kv get secret/{}",
+        "az keyvault secret list --vault-name kv -o tsv | xargs -I{} az keyvault secret show --vault-name kv --name {}",
+        "aws ssm describe-parameters | aws ssm get-parameter --name /prod/db --with-decryption",
     ]
     SERVED_COMMANDS = [
         "kubectl get secrets -n kube-system",
@@ -381,20 +404,42 @@ class TestSecretReadDetector(unittest.TestCase):
         "kubectl get secret db -n prod --ignore-not-found",
         "kubectl -n prod get secrets -l app=db --no-headers",
         "kubectl get secrets -A 2>/dev/null",
+        "kubectl get secrets -n prod 2>&1",
         "kubectl get secrets -nprod",
         "kubectl get secret/db -n prod",
-        "kubectl get secrets -n $NS",
+        "kubectl get secrets.v1. -n prod",
+        "kubectl get -A secrets",
         "kubectl --context prod get secrets --show-labels=true",
+        "kubectl --token abc123 --server https://10.0.0.1 --insecure-skip-tls-verify get secrets -n prod",
         "KUBECONFIG=/tmp/k kubectl get secrets --all-namespaces",
-        "kubectl --token $TOKEN --server https://10.0.0.1 --insecure-skip-tls-verify get secrets -n prod",
-        "for ns in a b; do kubectl get secrets -n $ns; done",
+        "kubectl get secrets -n prod --sort-by=.metadata.name",
+        "kubectl get secrets -n prod -L app",
+        "kubectl get secrets -n prod -w",
+        "kubectl get secrets -n prod -v=6",
         "kubectl get secrets -n prod && echo ok",
         "kubectl get secrets -n prod || true",
+        "bash -c 'kubectl get secrets -n prod'",
+        # the bare list piped anywhere is still the bare list; the consumer
+        # is read as its own command
+        "kubectl get secrets -n prod | wc -l",
+        "kubectl get secrets -n prod | grep db",
+        "kubectl get pods -o name | xargs kubectl describe pod",
+        # another kind by name, whatever the flags, the namespace or the
+        # object's name say
+        "kubectl get pods -n external-secrets",
+        "kubectl get deploy -n sealed-secrets",
+        "kubectl get pods -l app.kubernetes.io/name=external-secrets",
+        "kubectl get pod secret-rotator-7d9f -n prod",
+        "kubectl get events -n prod --field-selector involvedObject.name=db-secret",
+        "kubectl get pods -n $NS",
+        "kubectl get pods -n prod -l 'env in (prod,stage)'",
+        "kubectl get externalsecrets -n prod -o yaml",
+        "bash -c 'kubectl get pods -n prod | grep -v Running'",
+        "kubectl exec deploy/api -- sh -c 'ps aux | grep java'",
         # the word, not the store: a namespace named vault, a config file
-        # named for sops, a resource whose name contains the word
+        # named for sops
         "kubectl get pods -n vault",
         "cat .sops.yaml",
-        "kubectl get externalsecrets -n prod -o yaml",
         # a store's named lists
         "gcloud secrets versions list --secret=db",
         "aws secretsmanager describe-secret --secret-id db",
@@ -414,16 +459,36 @@ class TestSecretReadDetector(unittest.TestCase):
 
     def test_bare_list_grammar_decides_closed_where_it_cannot_tell(self):
         # The grammar, not a list of spellings, is what serves a result: a
-        # token it does not admit, a quoting error, or two `kubectl`
-        # invocations on one segment all refuse, whatever the token means.
+        # token it does not admit, a variable, a quoting error, or two
+        # `kubectl` words on one command all refuse, whatever the token means.
         self.assertTrue(worker_transcript.is_kubectl_bare_secret_list("kubectl get secrets -n prod -l app=db -A --no-headers 2>&1"))
         self.assertFalse(worker_transcript.is_kubectl_bare_secret_list("kubectl get secrets -n prod --no-headers=maybe"))
         self.assertFalse(worker_transcript.is_kubectl_bare_secret_list("kubectl get secrets -n"))
         self.assertFalse(worker_transcript.is_kubectl_bare_secret_list("kubectl get secrets -n 'prod"))
+        self.assertFalse(worker_transcript.is_kubectl_bare_secret_list("kubectl get secrets -n $NS"))
         self.assertFalse(worker_transcript.is_kubectl_bare_secret_list("kubectl get secrets -n prod kubectl get secret db -o json"))
         self.assertFalse(worker_transcript.is_kubectl_bare_secret_list("kubectl get db secret"))
         self.assertFalse(worker_transcript.is_kubectl_bare_secret_list("kubectl describe secret db"))
         self.assertFalse(worker_transcript.is_kubectl_bare_secret_list("echo 'kubectl get secret db -o json'"))
+
+    def test_resource_reader_withholds_what_it_cannot_tell_and_serves_another_kind(self):
+        reads = worker_transcript.kubectl_command_reads_a_secret
+        self.assertFalse(reads("kubectl get pods -n prod -o json"))
+        self.assertFalse(reads("kubectl describe secret db"))
+        self.assertFalse(reads("xargs kubectl describe pod"))
+        self.assertTrue(reads("xargs kubectl get -n prod -o yaml"))
+        self.assertTrue(reads("kubectl get -f db.yaml"))
+        self.assertTrue(reads("kubectl get $kind db"))
+        self.assertTrue(reads("kubectl --flag-the-reader-does-not-know x get pods"))
+        self.assertTrue(reads("kubectl get secrets -n prod -o wide"))
+        self.assertFalse(reads("kubectl get secrets -n prod"))
+        self.assertFalse(reads("echo kubectl"))
+
+    def test_shell_line_is_cut_at_unquoted_separators_only(self):
+        split = worker_transcript.split_shell_commands
+        self.assertEqual(split("a 'b;c' | d && e 2>&1 & f || g \"h|i\""), ["a 'b;c'", "d", "e 2>&1", "f", 'g "h|i"'])
+        self.assertEqual(split("kubectl get secrets -n prod 2>/dev/null"), ["kubectl get secrets -n prod 2>/dev/null"])
+        self.assertEqual(split("x \\; y"), ["x \\; y"])
 
     def test_reads_every_argument_shape(self):
         cmd = self.WITHHELD_COMMANDS[0]

@@ -13,8 +13,10 @@ is blanked as a Secret's, and kubectl's key-sorted JSON cut short before its
 `NAME: value` and `NAME=value` lines, the CLI credential flags (`-u user:pass`,
 `-p pass`, `--password pass`), the bearer-scheme pair, and the secret-read
 command detector that withholds a result instead of scrubbing it, and fails
-closed: a `kubectl get` of a secret is served only as the bare list and a
-secret store's command only as one of its named lists. Each reader
+closed: a `kubectl get` is served when its resource is another kind by
+name or the command is provably the bare list of secrets, and withheld when
+the resource is a secret in any other form or cannot be told; a secret
+store's command is served only as one of its named lists. Each reader
 used to keep its own copy of the supplement and of the card-to-session mapping
 (`task_runs.metadata.worker_session_id`, the dispatcher's prompt), and a fix
 landed in one of them: `curl -u admin:hunter2` was masked in the feed and kept
@@ -38,7 +40,7 @@ import re
 import shlex
 import sys
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 # The markers the redactor leaves, spelled once so a reader grepping a
 # transcript finds one marker whichever rule masked the value.
@@ -293,63 +295,117 @@ SHELL_CONTINUATION_RE = re.compile(r"\\\r?\n[ \t]*")
 # `is_secret_read_tool_call` and `scrub_step_text` read them.
 COMMAND_ARG_KEYS = ("command", "cmd")
 # The secret-read detector decides whether a `tool_result` is served or
-# withheld. It fails closed where the spelling space is open: a `kubectl get`
-# of a secret is withheld unless the command is provably the bare list
-# (`is_kubectl_bare_secret_list`: names, types and ages, nothing shaped or
-# piped), and a command that names a secret store's family is withheld
-# unless its subcommand is one of the store's named lists
-# (`SECRET_STORE_FAMILIES`). Output flags, formatters and pipes are not
-# enumerated: a form the rules do not name is withheld, where a list of
-# unsafe spellings served it until someone added the spelling. The file
-# reads under a credential path stay a list (`SECRET_READ_COMMAND_RE`): the
-# paths that hold a credential are not enumerable, so that rule names the
-# well-known mounts and the directory names that announce one.
+# withheld. It fails closed where the spelling space is open. A command is
+# cut into its simple commands first (`split_shell_commands`), and each is
+# read on its own: the bare list piped anywhere is still the bare list, and
+# the command that consumes it (`xargs kubectl get -o yaml`) is read as its
+# own command. A `kubectl` command is read by its tokens
+# (`kubectl_command_reads_a_secret`): the resource is the first positional
+# after the verb; when it is a secret, the whole command must be provably
+# the bare list (`is_kubectl_bare_secret_list`: names, types and ages,
+# nothing shaped, substituted or expanded); when the resource cannot be
+# told (none on the line, so it comes from stdin or a file; a variable; a
+# second `kubectl` or a substitution on the same command; a flag the reader
+# does not know before it; a quoting error) the result is withheld as if it
+# were one; when it is another kind by name, the command is not a secret
+# read. A command that names a secret store's family is withheld unless its
+# subcommand is one of the store's named lists (`SECRET_STORE_FAMILIES`).
+# Output flags, formatters and pipes are not enumerated: a form the rules do
+# not name is withheld, where a list of unsafe spellings served it until
+# someone added the spelling. The file reads under a credential path stay a
+# list (`SECRET_READ_COMMAND_RE`): the paths that hold a credential are not
+# enumerable, so that rule names the well-known mounts and the directory
+# names that announce one.
 #
-# The separators a command is cut into segments on before each segment is
-# read on its own. A pipe is not one: it stays in its segment, where the
-# bare-list grammar refuses it.
-SHELL_SEGMENT_SEPARATOR_RE = re.compile(r"\s*(?:;|&&|\|\||\r?\n)\s*")
-# A segment that runs `kubectl ... get ... secret(s)`: the verb and then the
-# resource word, the resource before any pipe. kubectl takes its flags in
-# any position, so nothing between them is read here; the grammar reads
-# the tokens.
-KUBECTL_SECRET_GET_MENTION_RE = re.compile(r"(?i)\bkubectl\b[^|]*\bget\b[^|]*\bsecrets?\b")
+# The shell's quoting and the separators `split_shell_commands` reads.
+SHELL_QUOTES = ("'", '"')
+SHELL_ESCAPE = "\\"
+SHELL_DOUBLE_QUOTE = '"'
+SHELL_TWO_CHAR_SEPARATORS = ("&&", "||")
+SHELL_ONE_CHAR_SEPARATORS = ";|\n\r"
+SHELL_BACKGROUND = "&"
+SHELL_REDIRECT_CHARS = "<>"
 KUBECTL_BINARY = "kubectl"
 KUBECTL_GET_VERB = "get"
-# The bare-list grammar: after `kubectl`, every token is the verb, the secret
-# resource (with an optional `/name`), a resource name, one of these flags
-# with its value (the list's own flags and the connection flags, which
-# choose the cluster and never the columns), one of these boolean flags, or
-# a redirect that prints nothing. Any other token, a pipe, a token the shell
-# would expand into a command, a second `kubectl` or a quoting error is not
-# the bare list.
-KUBECTL_SECRET_RESOURCE_RE = re.compile(r"(?i)^secrets?(?:/[a-z0-9][a-z0-9.-]*)?$")
-KUBECTL_RESOURCE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9.-]*$")
+# The kubectl verbs besides `get` that print a secret's values (`view-secret`
+# is the krew plugin that decodes them); a command with one is withheld.
+KUBECTL_SECRET_PRINTING_VERBS = frozenset(("view-secret",))
+PATH_SEPARATOR = "/"
+# A flag token starts with this and carries an inline value after this;
+# `--` ends the flags.
+FLAG_PREFIX = "-"
+FLAG_VALUE_SEPARATOR = "="
+END_OF_FLAGS = "--"
+# A short flag is the prefix and one letter; a longer token that starts with
+# a short value flag carries the value attached (`-nprod`, `-ojson`).
+SHORT_FLAG_LENGTH = 2
+# The kubectl flags the resource reader knows. A value flag consumes the next
+# token when it carries no inline value; a boolean flag consumes nothing; a
+# flag the reader does not know, with no inline value, may take the next
+# token, so the resource cannot be told. The file flags read the objects
+# from a file, stdin or a raw API path, so the resource is not on the line.
+KUBECTL_VALUE_FLAGS = frozenset(
+    (
+        "-n", "--namespace", "-l", "--selector", "--field-selector", "-o", "--output", "--template",
+        "--sort-by", "-L", "--label-columns", "--chunk-size", "--context", "--kubeconfig", "--cluster",
+        "--user", "--token", "-s", "--server", "--as", "--as-group", "--request-timeout",
+        "--certificate-authority", "--client-certificate", "--client-key", "--tls-server-name",
+        "-v", "--v", "--field-manager", "--subresource", "--cache-dir", "--profile", "--profile-output",
+    )
+)
+KUBECTL_FILE_FLAGS = frozenset(("-f", "--filename", "-k", "--kustomize", "--raw"))
+KUBECTL_BOOLEAN_FLAGS = frozenset(
+    (
+        "-A", "--all-namespaces", "--show-labels", "--no-headers", "--ignore-not-found", "--show-kind",
+        "--show-managed-fields", "-w", "--watch", "--watch-only", "--output-watch-events",
+        "--insecure-skip-tls-verify", "-R", "--recursive", "--allow-missing-template-keys",
+        "--warnings-as-errors", "--match-server-version", "--disable-compression",
+    )
+)
+KUBECTL_SHORT_VALUE_FLAGS = frozenset(
+    flag for flag in KUBECTL_VALUE_FLAGS | KUBECTL_FILE_FLAGS if len(flag) == SHORT_FLAG_LENGTH
+)
+# The bare-list grammar admits these flags and no others: the list's own
+# flags and the connection flags, which choose the cluster and the rows and
+# never the columns, and never an output flag in any spelling.
 KUBECTL_LIST_VALUE_FLAGS = frozenset(
     (
-        "-n", "--namespace", "-l", "--selector", "--field-selector",
-        "--context", "--kubeconfig", "--cluster", "--user", "--token", "-s", "--server",
-        "--as", "--as-group", "--request-timeout", "--certificate-authority",
-        "--client-certificate", "--client-key", "--tls-server-name",
+        "-n", "--namespace", "-l", "--selector", "--field-selector", "--sort-by", "-L", "--label-columns",
+        "--chunk-size", "--context", "--kubeconfig", "--cluster", "--user", "--token", "-s", "--server",
+        "--as", "--as-group", "--request-timeout", "--certificate-authority", "--client-certificate",
+        "--client-key", "--tls-server-name", "-v", "--v",
     )
 )
 KUBECTL_LIST_BOOLEAN_FLAGS = frozenset(
-    ("-A", "--all-namespaces", "--show-labels", "--no-headers", "--ignore-not-found", "--show-kind", "--insecure-skip-tls-verify")
+    (
+        "-A", "--all-namespaces", "--show-labels", "--no-headers", "--ignore-not-found", "--show-kind",
+        "-w", "--watch", "--watch-only", "--insecure-skip-tls-verify",
+    )
 )
-# The one-letter value flags, whose value may be attached (`-nprod`).
-KUBECTL_SHORT_VALUE_FLAGS = frozenset(flag for flag in KUBECTL_LIST_VALUE_FLAGS if len(flag) == 2)
-FLAG_VALUE_SEPARATOR = "="
+KUBECTL_LIST_SHORT_VALUE_FLAGS = frozenset(flag for flag in KUBECTL_LIST_VALUE_FLAGS if len(flag) == SHORT_FLAG_LENGTH)
 BOOLEAN_FLAG_VALUES = frozenset(("true", "false"))
+# A resource token: a kind, with an optional `.version.group` and `/name`; a
+# comma joins several. The secret kind in that shape (`secret`, `secrets`,
+# `secrets.v1.`, `secret/db`).
+KUBECTL_RESOURCE_SEPARATOR = ","
+KUBECTL_RESOURCE_TOKEN_RE = re.compile(r"(?i)^[a-z][a-z0-9.-]*(?:/[a-z0-9][a-z0-9.-]*)?$")
+KUBECTL_SECRET_RESOURCE_RE = re.compile(r"(?i)^secrets?(?:\.[a-z0-9.-]*)?(?:/[a-z0-9][a-z0-9.-]*)?$")
+KUBECTL_RESOURCE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9.-]*$")
 # A token the shell would still expand or route: a command substitution, a
-# pipe, a redirect, a separator, a subshell or a glob. A variable (`$NS`)
-# is left alone: it expands to a name, not to a command.
-SHELL_UNSAFE_TOKEN_RE = re.compile(r"[`|<>;&()*?]|\$\(")
+# variable (it expands to words, flags included), a redirect, a separator,
+# a subshell or a glob. The redirects that print nothing are admitted by
+# name.
+SHELL_UNSAFE_TOKEN_RE = re.compile(r"[`$|<>;&()*?]")
+# The word `kubectl` inside one token that is not the binary: a substitution
+# (`$(kubectl …`, a backtick) is withheld; any other, a quoted script
+# (`sh -c 'kubectl …'`), is read as a command of its own.
+SHELL_SUBSTITUTION_RE = re.compile(r"[`$]")
 HARMLESS_REDIRECT_TOKENS = frozenset(("2>/dev/null", "2>&1", ">/dev/null", "&>/dev/null"))
 # The secret stores: for each, the pattern that names its family on a
-# segment (the text after the family captured) and the pattern of the named
+# command (the text after the family captured) and the pattern of the named
 # lists that text may start with. gcloud and aws take global flags and a
 # release track before the subcommand, so the family is matched anywhere on
-# the segment after the binary. `vault` is read only as a command followed
+# the command after the binary. `vault` is read only as a command followed
 # by `kv` or `read`, since the word is also a namespace name; `sops` only as
 # a command word, since the word is also a config file's name.
 SECRET_STORE_FAMILIES = (
@@ -972,28 +1028,87 @@ def scrub_step_text(redactor: Any, kind: str, text: str, withheld: str) -> str:
     except RecursionError:
         return withheld
 
-def is_kubectl_bare_secret_list(segment: str) -> bool:
-    """Whether `segment` is provably a `kubectl get` of secrets that prints names, types and ages only.
+def split_shell_commands(command: str) -> List[str]:
+    """Cut a shell line into its simple commands at an unquoted `;`, `&&`, `||`, `|`, `&` or newline.
+
+    Quotes and backslash escapes are kept as written, so each command parses
+    with `shlex` as the shell would parse it; a quote left open runs to the
+    end and is the last command's to refuse. A `&` beside `<` or `>` is a
+    redirect, not a separator.
+    """
+    commands: List[str] = []
+    current: List[str] = []
+    quote: Optional[str] = None
+    i = 0
+    while i < len(command):
+        ch = command[i]
+        if quote:
+            if ch == SHELL_ESCAPE and quote == SHELL_DOUBLE_QUOTE and i + 1 < len(command):
+                current.append(command[i : i + 2])
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            current.append(ch)
+            i += 1
+            continue
+        if ch == SHELL_ESCAPE and i + 1 < len(command):
+            current.append(command[i : i + 2])
+            i += 2
+            continue
+        if ch in SHELL_QUOTES:
+            quote = ch
+            current.append(ch)
+            i += 1
+            continue
+        if command[i : i + 2] in SHELL_TWO_CHAR_SEPARATORS:
+            commands.append("".join(current))
+            current = []
+            i += 2
+            continue
+        beside_redirect = (i > 0 and command[i - 1] in SHELL_REDIRECT_CHARS) or command[i + 1 : i + 2] in SHELL_REDIRECT_CHARS
+        if ch in SHELL_ONE_CHAR_SEPARATORS or (ch == SHELL_BACKGROUND and not beside_redirect):
+            commands.append("".join(current))
+            current = []
+            i += 1
+            continue
+        current.append(ch)
+        i += 1
+    commands.append("".join(current))
+    return [c.strip() for c in commands if c.strip()]
+
+
+def _kubectl_start(tokens: Sequence[str]) -> Optional[int]:
+    """The index of the one token that is the kubectl binary, or None when there is none or more than one word carries it."""
+    starts = [i for i, token in enumerate(tokens) if KUBECTL_BINARY in token]
+    if len(starts) != 1:
+        return None
+    return starts[0]
+
+
+def is_kubectl_bare_secret_list(command: str) -> bool:
+    """Whether `command` is provably a `kubectl get` of secrets that prints names, types and ages only.
 
     The grammar admits the verb, the secret resource, resource names, the
-    namespace, selector and context flags, the boolean list flags and a
-    redirect that prints nothing. Everything else, including an output flag
-    in any spelling, a pipe, a substitution and a quoting error, is not the
-    bare list, so an output form nobody named fails closed.
+    list flags and the connection flags with their values, the boolean list
+    flags and a redirect that prints nothing. Everything else, including an
+    output flag in any spelling, a variable, a substitution, a second
+    `kubectl` and a quoting error, is not the bare list, so an output form
+    nobody named fails closed.
     """
     try:
-        tokens = shlex.split(segment)
+        tokens = shlex.split(command)
     except ValueError:
         return False
-    starts = [i for i, token in enumerate(tokens) if token == KUBECTL_BINARY or token.endswith("/" + KUBECTL_BINARY)]
-    if len(starts) != 1:
+    start = _kubectl_start(tokens)
+    if start is None or not (tokens[start] == KUBECTL_BINARY or tokens[start].endswith(PATH_SEPARATOR + KUBECTL_BINARY)):
+        return False
+    if any(SHELL_UNSAFE_TOKEN_RE.search(token) for token in tokens if token not in HARMLESS_REDIRECT_TOKENS):
         return False
     saw_verb = saw_resource = expect_value = False
-    for token in tokens[starts[0] + 1 :]:
+    for token in tokens[start + 1 :]:
         if token in HARMLESS_REDIRECT_TOKENS:
             continue
-        if SHELL_UNSAFE_TOKEN_RE.search(token):
-            return False
         if expect_value:
             expect_value = False
             continue
@@ -1005,7 +1120,7 @@ def is_kubectl_bare_secret_list(segment: str) -> bool:
             if separator and value.lower() not in BOOLEAN_FLAG_VALUES:
                 return False
             continue
-        if len(token) > 2 and token[:2] in KUBECTL_SHORT_VALUE_FLAGS:
+        if len(token) > SHORT_FLAG_LENGTH and token[:SHORT_FLAG_LENGTH] in KUBECTL_LIST_SHORT_VALUE_FLAGS:
             continue
         if not saw_verb:
             if token != KUBECTL_GET_VERB:
@@ -1020,16 +1135,90 @@ def is_kubectl_bare_secret_list(segment: str) -> bool:
     return saw_verb and saw_resource and not expect_value
 
 
+def kubectl_command_reads_a_secret(command: str) -> bool:
+    """Whether one simple command that runs kubectl prints a secret's values, deciding closed where the resource cannot be told.
+
+    The resource is the first positional after the verb. A secret resource
+    puts the whole command to the bare-list grammar; another kind by name is
+    not a secret read; no resource on the line (a file flag, stdin, a raw API
+    path), a variable or substitution before or in it, a flag the reader does
+    not know before it, a second `kubectl`, or a quoting error withholds. The
+    word inside one quoted token (`sh -c '...'`) is read as a command of its
+    own.
+    """
+    if KUBECTL_BINARY not in command:
+        return False
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return True
+    start = _kubectl_start(tokens)
+    if start is None:
+        return True
+    binary = tokens[start]
+    if binary != KUBECTL_BINARY and not binary.endswith(PATH_SEPARATOR + KUBECTL_BINARY):
+        if SHELL_SUBSTITUTION_RE.search(binary) or binary == command:
+            return True
+        return command_reads_a_secret(binary)
+    verb: Optional[str] = None
+    resource: Optional[str] = None
+    file_flag = False
+    index = start + 1
+    while index < len(tokens):
+        token = tokens[index]
+        index += 1
+        if token in HARMLESS_REDIRECT_TOKENS:
+            continue
+        if SHELL_UNSAFE_TOKEN_RE.search(token):
+            return True
+        if token == END_OF_FLAGS:
+            continue
+        if token.startswith(FLAG_PREFIX) and token != FLAG_PREFIX:
+            flag, separator, _ = token.partition(FLAG_VALUE_SEPARATOR)
+            short = token[:SHORT_FLAG_LENGTH]
+            if flag in KUBECTL_FILE_FLAGS:
+                file_flag = True
+            if flag in KUBECTL_VALUE_FLAGS or flag in KUBECTL_FILE_FLAGS:
+                if not separator:
+                    index += 1
+            elif flag in KUBECTL_BOOLEAN_FLAGS or separator:
+                pass
+            elif len(token) > SHORT_FLAG_LENGTH and short in KUBECTL_SHORT_VALUE_FLAGS:
+                file_flag = file_flag or short in KUBECTL_FILE_FLAGS
+            else:
+                return True
+            continue
+        if verb is None:
+            verb = token
+            if verb in KUBECTL_SECRET_PRINTING_VERBS:
+                return True
+            if verb != KUBECTL_GET_VERB:
+                return False
+            continue
+        resource = token
+        break
+    if verb != KUBECTL_GET_VERB:
+        return False
+    if resource is None or file_flag:
+        return True
+    kinds = resource.split(KUBECTL_RESOURCE_SEPARATOR)
+    if not all(KUBECTL_RESOURCE_TOKEN_RE.match(kind) for kind in kinds):
+        return True
+    if not any(KUBECTL_SECRET_RESOURCE_RE.match(kind) for kind in kinds):
+        return False
+    return not is_kubectl_bare_secret_list(command)
+
+
 def command_reads_a_secret(command: str) -> bool:
     """Whether the shell line `command` prints a secret's value, deciding closed where it cannot tell."""
     folded = SHELL_CONTINUATION_RE.sub(SHELL_CONTINUATION_FOLD, command)
     if SECRET_READ_COMMAND_RE.search(folded):
         return True
-    for segment in SHELL_SEGMENT_SEPARATOR_RE.split(folded):
-        if KUBECTL_SECRET_GET_MENTION_RE.search(segment) and not is_kubectl_bare_secret_list(segment):
+    for simple in split_shell_commands(folded):
+        if kubectl_command_reads_a_secret(simple):
             return True
         for family_re, named_lists_re in SECRET_STORE_FAMILIES:
-            family = family_re.search(segment)
+            family = family_re.search(simple)
             if family and not named_lists_re.match(family.group(1)):
                 return True
     return False
