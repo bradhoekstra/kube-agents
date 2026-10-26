@@ -3573,6 +3573,9 @@ prompt_menu() {
     [ "$default_choice" -lt 1 ] || [ "$default_choice" -gt "${#options[@]}" ]; then
     default_choice=1
   fi
+  # Canonical digits on this exit too, so a preset "04" and a typed "04"
+  # store the same answer.
+  default_choice=$((10#$default_choice))
 
   if [ "$PARAM_NON_INTERACTIVE" = "true" ]; then
     printf -v "$var_name" '%s' "$default_choice"
@@ -5419,9 +5422,11 @@ apply_gitlab_token_secret() {
 # the entry value back); one given by flag is dropped with a line, since
 # refusing it after the whole interview would be the alternative. The CA
 # Secret name goes with it: a recorded forge, org, App or host flag settles
-# the forge before the menu, so the only name here is the default the
-# validator derived for a refused Enterprise Server attempt, and the later
-# flag check would otherwise report it dropped as a recorded one.
+# the forge before the menu, so the only name here is the default the early
+# flag check derived from an exported host and CA file (a refused attempt
+# at the menu derives none: the validator names the Secret only after it
+# accepts the file), and the later flag check would otherwise report it
+# dropped as a recorded one.
 drop_gitops_ca_file_for_github_com() {
   if [ -n "${PARAM_GITOPS_CA_FILE:-}" ] && [ "${PARAM_GITOPS_CA_FILE_FROM_FLAG:-false}" = "true" ]; then
     print_info "Dropping --gitops-ca-file '${PARAM_GITOPS_CA_FILE}': this run's GitOps forge is github.com, which uses the public CAs."
