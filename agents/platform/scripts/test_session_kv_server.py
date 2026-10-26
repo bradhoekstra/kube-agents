@@ -8333,9 +8333,19 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
             "sops --decrypt secrets.enc.yaml",
             "kubectl exec deploy/api -- cat /etc/db-creds/password",
             "kubectl exec -n prod api-0 -- head -c 64 /var/secrets/token",
+            # a form no list named fails closed (the grammar's own cases
+            # live in test_worker_transcript.py)
+            "kubectl get secret db -o name",
+            "kubectl get secret db -n prod --some-flag-added-next-release",
+            "kubectl get secrets -n prod | wc -l",
+            "aws secretsmanager batch-get-secret-value --secret-id-list db",
+            "vault read secret/db",
         ]
         served = [
             "kubectl get secrets -n kube-system",
+            "kubectl get secret db -n prod --ignore-not-found",
+            "kubectl get secrets -A 2>/dev/null",
+            "kubectl get pods -n vault",
             "kubectl describe secret db",
             "kubectl get pods -o json | jq '.items[].metadata.name'",
             "kubectl get secrets -n kube-system --show-labels",

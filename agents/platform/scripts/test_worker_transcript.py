@@ -339,6 +339,32 @@ class TestSecretReadDetector(unittest.TestCase):
         "sops --decrypt secrets.enc.yaml",
         "kubectl exec deploy/api -- cat /etc/db-creds/password",
         "kubectl exec -n prod api-0 -- head -c 64 /var/secrets/token",
+        # forms no list named: the grammar fails closed on anything that is
+        # not provably the bare list
+        "kubectl get secret db -o name",
+        "kubectl get secret db -o wide",
+        "kubectl get secret db --output jsonpath-as-json={.data}",
+        "kubectl get secret db -ojsonpath={.data.password}",
+        "kubectl get secrets --sort-by=.metadata.name",
+        "kubectl get secret db -o yaml > /tmp/s.yaml",
+        "kubectl get secrets -n prod | wc -l",
+        "echo $(kubectl get secret db -o json)",
+        "echo `kubectl get secrets -n prod`",
+        "kubectl get secret db -n prod --some-flag-added-next-release",
+        "kubectl get secrets -n prod -w",
+        "kubectl get secrets,configmaps -n prod",
+        "kubectl get secrets -n \"prod",
+        "kubectl version; kubectl get secret db -o json",
+        "kubectl exec api-0 -- sh -c 'kubectl get secret db -o json'",
+        # a store's command that is not one of its named lists
+        "aws secretsmanager batch-get-secret-value --secret-id-list db",
+        "aws ssm get-parameters-by-path --path /prod --with-decryption",
+        "aws ssm get-parameter-history --name /prod/db --with-decryption",
+        "gcloud secrets versions access 3 --secret db --format=json",
+        "az keyvault secret download --vault-name kv --name db --file x",
+        "vault kv get -field=password secret/db",
+        "vault read secret/db",
+        "sops prod.enc.yaml",
     ]
     SERVED_COMMANDS = [
         "kubectl get secrets -n kube-system",
@@ -351,6 +377,31 @@ class TestSecretReadDetector(unittest.TestCase):
         "az keyvault secret list --vault-name kv",
         "kubectl exec deploy/api -- cat /opt/data/report.txt",
         "kubectl exec deploy/secrets-api -- cat /opt/data/report.txt",
+        # the bare list in every spelling the grammar admits
+        "kubectl get secret db -n prod --ignore-not-found",
+        "kubectl -n prod get secrets -l app=db --no-headers",
+        "kubectl get secrets -A 2>/dev/null",
+        "kubectl get secrets -nprod",
+        "kubectl get secret/db -n prod",
+        "kubectl get secrets -n $NS",
+        "kubectl --context prod get secrets --show-labels=true",
+        "KUBECONFIG=/tmp/k kubectl get secrets --all-namespaces",
+        "kubectl --token $TOKEN --server https://10.0.0.1 --insecure-skip-tls-verify get secrets -n prod",
+        "for ns in a b; do kubectl get secrets -n $ns; done",
+        "kubectl get secrets -n prod && echo ok",
+        "kubectl get secrets -n prod || true",
+        # the word, not the store: a namespace named vault, a config file
+        # named for sops, a resource whose name contains the word
+        "kubectl get pods -n vault",
+        "cat .sops.yaml",
+        "kubectl get externalsecrets -n prod -o yaml",
+        # a store's named lists
+        "gcloud secrets versions list --secret=db",
+        "aws secretsmanager describe-secret --secret-id db",
+        "aws ssm start-session --target i-1",
+        "vault kv list secret/",
+        "vault kv metadata get secret/db",
+        "sops --version",
     ]
 
     def test_covers_every_output_form(self):
@@ -360,6 +411,19 @@ class TestSecretReadDetector(unittest.TestCase):
         for cmd in self.SERVED_COMMANDS:
             with self.subTest(cmd=cmd):
                 self.assertFalse(worker_transcript.is_secret_read_tool_call(json.dumps({"command": cmd})))
+
+    def test_bare_list_grammar_decides_closed_where_it_cannot_tell(self):
+        # The grammar, not a list of spellings, is what serves a result: a
+        # token it does not admit, a quoting error, or two `kubectl`
+        # invocations on one segment all refuse, whatever the token means.
+        self.assertTrue(worker_transcript.is_kubectl_bare_secret_list("kubectl get secrets -n prod -l app=db -A --no-headers 2>&1"))
+        self.assertFalse(worker_transcript.is_kubectl_bare_secret_list("kubectl get secrets -n prod --no-headers=maybe"))
+        self.assertFalse(worker_transcript.is_kubectl_bare_secret_list("kubectl get secrets -n"))
+        self.assertFalse(worker_transcript.is_kubectl_bare_secret_list("kubectl get secrets -n 'prod"))
+        self.assertFalse(worker_transcript.is_kubectl_bare_secret_list("kubectl get secrets -n prod kubectl get secret db -o json"))
+        self.assertFalse(worker_transcript.is_kubectl_bare_secret_list("kubectl get db secret"))
+        self.assertFalse(worker_transcript.is_kubectl_bare_secret_list("kubectl describe secret db"))
+        self.assertFalse(worker_transcript.is_kubectl_bare_secret_list("echo 'kubectl get secret db -o json'"))
 
     def test_reads_every_argument_shape(self):
         cmd = self.WITHHELD_COMMANDS[0]
