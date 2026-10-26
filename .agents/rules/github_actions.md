@@ -140,4 +140,8 @@ Every `pull_request_target` workflow must:
   payload fields into `run:` steps through `env:`.
 
 `tests/conformance/test_B_write_path.py` (`test_B4_no_pull_request_target_workflow_checks_out_the_pull_request`)
-and `tests/test_pull_request_target_workflows.py` enforce these invariants.
+holds the `contents`/`id-token` write ceiling and non-PR checkout `ref:`, and
+`tests/test_pull_request_target_workflows.py` holds the workflow allowlist, `permissions: {}`, the
+repository guard, `timeout-minutes`, `ref: ${{ github.event.repository.default_branch }}` with
+`persist-credentials: false`, and the absence of event/input `${{ ... }}` interpolation in `run:`
+steps.
