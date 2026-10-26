@@ -326,6 +326,17 @@ SHELL_ONE_CHAR_SEPARATORS = ";|\n\r"
 SHELL_BACKGROUND = "&"
 SHELL_REDIRECT_CHARS = "<>"
 KUBECTL_BINARY = "kubectl"
+# The binary as a word: at the start of a token or after a path separator,
+# whitespace, a quote, `=`, `$`, `$(` or a backtick, and followed by
+# whitespace or the end, in any case (a variable is often `$KUBECTL`). A
+# name or label that merely contains the letters (`kubectl-proxy`,
+# `app=kubectl-runner`) is not it.
+KUBECTL_WORD_RE = re.compile(r"(?i)(?:^|[\s/`($='\"])kubectl(?=\s|$)")
+# A shell assignment token (`KUBECTL=/usr/bin/kubectl`, `k=kubectl`) ahead
+# of the binary: the word in its value names a binary a later `$KUBECTL`
+# runs, which cannot be read, so a command that makes one is withheld. The
+# same shape after the binary (`-l app=kubectl`) is an argument.
+SHELL_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 KUBECTL_GET_VERB = "get"
 # The kubectl verbs besides `get` that print a secret's values (`view-secret`
 # is the krew plugin that decodes them); a command with one is withheld.
@@ -1079,11 +1090,25 @@ def split_shell_commands(command: str) -> List[str]:
 
 
 def _kubectl_start(tokens: Sequence[str]) -> Optional[int]:
-    """The index of the one token that is the kubectl binary, or None when there is none or more than one word carries it."""
-    starts = [i for i, token in enumerate(tokens) if KUBECTL_BINARY in token]
-    if len(starts) != 1:
+    """The index of the one token that carries the kubectl word.
+
+    None when no token does, when the first such token is an assignment
+    (the binary stored in a variable), or when a second token after it is
+    the word again (a second binary); an assignment-shaped token after the
+    first is an argument (`-l app=kubectl`) and does not count.
+    """
+    starts = [i for i, token in enumerate(tokens) if KUBECTL_WORD_RE.search(token)]
+    if not starts or SHELL_ASSIGNMENT_RE.match(tokens[starts[0]]):
+        return None
+    if any(not SHELL_ASSIGNMENT_RE.match(tokens[i]) for i in starts[1:]):
         return None
     return starts[0]
+
+
+def _is_kubectl_binary(token: str) -> bool:
+    """Whether `token` is the binary itself (`kubectl`, `/usr/bin/kubectl`) rather than a word inside a script or a substitution."""
+    lowered = token.lower()
+    return lowered == KUBECTL_BINARY or lowered.endswith(PATH_SEPARATOR + KUBECTL_BINARY)
 
 
 def is_kubectl_bare_secret_list(command: str) -> bool:
@@ -1101,7 +1126,7 @@ def is_kubectl_bare_secret_list(command: str) -> bool:
     except ValueError:
         return False
     start = _kubectl_start(tokens)
-    if start is None or not (tokens[start] == KUBECTL_BINARY or tokens[start].endswith(PATH_SEPARATOR + KUBECTL_BINARY)):
+    if start is None or not _is_kubectl_binary(tokens[start]):
         return False
     if any(SHELL_UNSAFE_TOKEN_RE.search(token) for token in tokens if token not in HARMLESS_REDIRECT_TOKENS):
         return False
@@ -1142,11 +1167,12 @@ def kubectl_command_reads_a_secret(command: str) -> bool:
     puts the whole command to the bare-list grammar; another kind by name is
     not a secret read; no resource on the line (a file flag, stdin, a raw API
     path), a variable or substitution before or in it, a flag the reader does
-    not know before it, a second `kubectl`, or a quoting error withholds. The
-    word inside one quoted token (`sh -c '...'`) is read as a command of its
-    own.
+    not know before it, a second `kubectl`, an assignment that stores the
+    binary in a variable, or a quoting error withholds. The word inside one
+    quoted token (`sh -c '...'`) is read as a command of its own; a name that
+    merely contains the letters (`kubectl-proxy`) is not the word.
     """
-    if KUBECTL_BINARY not in command:
+    if not KUBECTL_WORD_RE.search(command):
         return False
     try:
         tokens = shlex.split(command)
@@ -1156,7 +1182,7 @@ def kubectl_command_reads_a_secret(command: str) -> bool:
     if start is None:
         return True
     binary = tokens[start]
-    if binary != KUBECTL_BINARY and not binary.endswith(PATH_SEPARATOR + KUBECTL_BINARY):
+    if not _is_kubectl_binary(binary):
         if SHELL_SUBSTITUTION_RE.search(binary) or binary == command:
             return True
         return command_reads_a_secret(binary)

@@ -362,9 +362,14 @@ class TestSecretReadDetector(unittest.TestCase):
         "NS='prod -o yaml'; kubectl get secrets -n $NS",
         "kubectl get secrets -n $NS",
         "for ns in a b; do kubectl get secrets -n $ns; done",
-        # a substitution before the binary on the same command
+        # a substitution before the binary on the same command, or the
+        # binary stored in a variable a later command runs
         "echo $(kubectl get secret db -o json) kubectl get secrets",
         "FOO=$(kubectl get secret db -o json) kubectl get secrets -n prod",
+        "KUBECTL=/usr/bin/kubectl; $KUBECTL get secret db -o json",
+        "KUBECTL=/usr/bin/kubectl",
+        "$KUBECTL get secret db -o json",
+        "k=kubectl; $k get secret db -o json",
         # the resource is not on the line, or is not a word
         "printf secret/db | xargs kubectl get -n prod -o yaml",
         "kubectl get secrets -n prod -o name | xargs kubectl get -o yaml",
@@ -436,6 +441,16 @@ class TestSecretReadDetector(unittest.TestCase):
         "kubectl get externalsecrets -n prod -o yaml",
         "bash -c 'kubectl get pods -n prod | grep -v Running'",
         "kubectl exec deploy/api -- sh -c 'ps aux | grep java'",
+        # a name or label that contains the letters is not a second binary
+        "kubectl get pods -n prod -l app=kubectl-proxy",
+        "kubectl get pods -n prod -l app=kubectl",
+        "kubectl get deploy kubectl-runner -n tools",
+        "kubectl get pods -n kubectl-test",
+        "kubectl get secrets -n kubectl-test",
+        "kubectl describe pod kubectl-proxy-7d9f",
+        "kubectl logs deploy/kubectl-runner",
+        "kubectl apply -f kubectl-rbac.yaml",
+        "KUBECTL_VERSION=1.30 kubectl get pods",
         # the word, not the store: a namespace named vault, a config file
         # named for sops
         "kubectl get pods -n vault",

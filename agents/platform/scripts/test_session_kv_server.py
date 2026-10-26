@@ -8295,8 +8295,10 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
         self.assertEqual(cleaned, crafted_line)
 
     def test_secret_read_command_detector_covers_every_output_form(self):
-        # The detector keys on "get secret" plus any output shaping or pipe,
-        # not on an enumerated list of formatters an agent may not pick.
+        # The detector fails closed: a `kubectl get` of a secret is served only
+        # as the bare list, a store's command only as one of its named lists,
+        # and a form no list named withholds (the grammar's own cases live in
+        # test_worker_transcript.py; this test reads it through the wrapper).
         withheld = [
             "kubectl get secret db -o jsonpath='{.data.password}' | base64 -d",
             "kubectl get secret db -o=go-template='{{.data.password}}'",
@@ -8337,6 +8339,7 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
             # live in test_worker_transcript.py)
             "kubectl get secret db -n prod --some-flag-added-next-release",
             "kubectl get secrets -n $NS",
+            "KUBECTL=/usr/bin/kubectl; $KUBECTL get secret db -o json",
             "printf secret/db | xargs kubectl get -n prod -o yaml",
             "aws secretsmanager batch-get-secret-value --secret-id-list db",
             "gcloud secrets list | xargs -I{} gcloud secrets versions access latest --secret={}",
@@ -8347,6 +8350,7 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
             "kubectl get secrets -A 2>/dev/null",
             "kubectl get secrets -n prod | wc -l",
             "kubectl get pods -n external-secrets",
+            "kubectl get pods -n prod -l app=kubectl-proxy",
             "kubectl get pods -n vault",
             "kubectl describe secret db",
             "kubectl get pods -o json | jq '.items[].metadata.name'",
