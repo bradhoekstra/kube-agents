@@ -3286,6 +3286,9 @@ resolve_shared_defaults() {
     PARAM_GITOPS_FORGE_GIVEN="true"
   fi
   PARAM_GITOPS_FORGE="${PARAM_GITOPS_FORGE:-$DEFAULT_GITOPS_FORGE}"
+  # Set by ask_gitops_forge when the operator answers that there is no GitOps
+  # repository; main's step 8 then skips the repository menu.
+  GITOPS_INTERVIEW_DECLINED="false"
   PARAM_GITLAB_TOKEN_SECRET="${PARAM_GITLAB_TOKEN_SECRET:-$DEFAULT_GITLAB_TOKEN_SECRET}"
   # DEFAULT_GITOPS_REPO is a GitHub repository name; a GitLab project has no
   # default path, so the validator asks for one instead of inventing it.
@@ -5408,47 +5411,103 @@ apply_gitlab_token_secret() {
 
 # The forge question, asked only when nothing has settled the forge: github.com,
 # a GitHub Enterprise Server (its host and an optional CA file, asked until
-# the validator accepts them), or GitLab, whose own questions follow in main.
+# the validator accepts them), GitLab, whose own questions follow in main, or
+# no repository at all. The last answer sets GITOPS_INTERVIEW_DECLINED, and
+# main then takes the same arm as "Skip for now" in the repository menu, so
+# an operator who wants no GitOps repository is not made to name a forge
+# first. An empty Enterprise Server hostname comes back to this menu rather
+# than asking for the hostname again: before this, an operator who picked
+# option 2 by mistake could only leave with Ctrl-C.
 ask_gitops_forge() {
-  if [ "$PARAM_NON_INTERACTIVE" != "true" ] && [ "${PARAM_GITOPS_FORGE_GIVEN:-false}" != "true" ]; then
-    local forge_choice="1"
-    [ "$PARAM_GITOPS_FORGE" = "github" ] && [ -n "${PARAM_GITOPS_HOST:-}" ] && forge_choice="2"
-    [ "$PARAM_GITOPS_FORGE" = "gitlab" ] && forge_choice="3"
+  if [ "$PARAM_NON_INTERACTIVE" = "true" ] || [ "${PARAM_GITOPS_FORGE_GIVEN:-false}" = "true" ]; then
+    return 0
+  fi
+  local forge_choice="1"
+  [ "$PARAM_GITOPS_FORGE" = "github" ] && [ -n "${PARAM_GITOPS_HOST:-}" ] && forge_choice="2"
+  [ "$PARAM_GITOPS_FORGE" = "gitlab" ] && forge_choice="3"
+  # What the menu was first shown over. An option 2 attempt the validator
+  # refuses puts these back, so the next answer -- option 2 again, github.com
+  # or no repository -- starts from here and not from the refused host and
+  # CA file. The typed host alone is kept, as the default of the next
+  # hostname prompt, so a slip can be corrected.
+  local host_on_entry="${PARAM_GITOPS_HOST:-}" ca_file_on_entry="${PARAM_GITOPS_CA_FILE:-}"
+  local ghes_host="${PARAM_GITOPS_HOST:-}"
+  while true; do
     prompt_menu "Where does the GitOps repository live?" \
       "GitHub (github.com)" \
       "GitHub Enterprise Server (a GitHub host that you run)" \
       "GitLab (gitlab.com or self-managed)" \
+      "Nowhere yet: install without a GitOps repository (you can connect one later)" \
       forge_choice
-    if [ "$forge_choice" = "3" ]; then
-      PARAM_GITOPS_FORGE="gitlab"
-    elif [ "$forge_choice" = "2" ]; then
-      PARAM_GITOPS_FORGE="github"
-      # The instance's host and its CA, asked until the validator accepts
-      # them. The CA prompt has no default, so empty stays a way to answer
-      # "a public CA signed it" on every pass.
-      while true; do
-        prompt_read "GitHub Enterprise Server hostname (for example github.example.com)" PARAM_GITOPS_HOST "${PARAM_GITOPS_HOST:-}"
+    case "$forge_choice" in
+      4)
+        # The same install as option 1, with the repository menu declined:
+        # github.com, no host, and no CA file. A recorded forge, org, App or
+        # host flag settles the forge and the menu is not asked, but an
+        # exported GITOPS_HOST and GITOPS_CA_FILE reach a first install's
+        # menu as answers, and the later flag check refuses a CA file with
+        # no host; a CA file given by flag is the operator's to keep.
+        PARAM_GITOPS_FORGE="github"
+        PARAM_GITOPS_HOST=""
         if [ "${PARAM_GITOPS_CA_FILE_FROM_FLAG:-false}" != "true" ]; then
           PARAM_GITOPS_CA_FILE=""
-          if [ -n "${PARAM_GITOPS_HOST:-}" ] && [ -z "${PARAM_GITOPS_CA_SECRET:-}" ]; then
+        fi
+        GITOPS_INTERVIEW_DECLINED="true"
+        return 0
+        ;;
+      3)
+        PARAM_GITOPS_FORGE="gitlab"
+        return 0
+        ;;
+      2)
+        prompt_read "GitHub Enterprise Server hostname (for example github.example.com)" ghes_host "$ghes_host"
+        if [ -z "$ghes_host" ]; then
+          print_error "A GitHub Enterprise Server install needs the instance's hostname. Choose 'Nowhere yet' to install without a GitOps repository."
+          # With no terminal every answer is the same default, so asking
+          # again would spin.
+          has_controlling_tty || exit 1
+          continue
+        fi
+        PARAM_GITOPS_FORGE="github"
+        PARAM_GITOPS_HOST="$ghes_host"
+        # The CA prompt has no default, so empty stays a way to answer "a
+        # public CA signed it" on every pass.
+        if [ "${PARAM_GITOPS_CA_FILE_FROM_FLAG:-false}" != "true" ]; then
+          PARAM_GITOPS_CA_FILE=""
+          if [ -z "${PARAM_GITOPS_CA_SECRET:-}" ]; then
             prompt_read "PEM CA file that signed the instance's certificate (empty if a public CA signed it)" PARAM_GITOPS_CA_FILE ""
           fi
         fi
-        if [ -n "${PARAM_GITOPS_HOST:-}" ] && validate_gitops_forge_flags; then
-          break
+        if validate_gitops_forge_flags; then
+          # A github.com spelling clears the host: the install is then github.com.
+          if [ -n "${PARAM_GITOPS_HOST:-}" ]; then
+            print_info "Create the GitHub App on ${PARAM_GITOPS_HOST}, not on github.com: an App belongs to one GitHub host."
+          fi
+          return 0
         fi
-        [ -z "${PARAM_GITOPS_HOST:-}" ] && print_error "A GitHub Enterprise Server install needs the instance's hostname."
+        # The validator refused the host or the CA file: the menu comes back
+        # as it was first shown, with option 2 still selected, and enter asks
+        # for them again. Without this, option 1 or 4 taken next would carry
+        # the refused answers into the later flag check, which exits 1 over
+        # a host or CA file the operator never meant to keep.
+        PARAM_GITOPS_HOST="$host_on_entry"
+        if [ "${PARAM_GITOPS_CA_FILE_FROM_FLAG:-false}" != "true" ]; then
+          PARAM_GITOPS_CA_FILE="$ca_file_on_entry"
+        fi
         has_controlling_tty || exit 1
-      done
-      # A github.com spelling clears the host: the install is then github.com.
-      if [ -n "${PARAM_GITOPS_HOST:-}" ]; then
-        print_info "Create the GitHub App on ${PARAM_GITOPS_HOST}, not on github.com: an App belongs to one GitHub host."
-      fi
-    else
-      PARAM_GITOPS_FORGE="github"
-      PARAM_GITOPS_HOST=""
-    fi
-  fi
+        ;;
+      *)
+        PARAM_GITOPS_FORGE="github"
+        PARAM_GITOPS_HOST=""
+        # As in option 4: an exported CA file is an answer for a host that
+        # this answer does not name.
+        if [ "${PARAM_GITOPS_CA_FILE_FROM_FLAG:-false}" != "true" ]; then
+          PARAM_GITOPS_CA_FILE=""
+        fi
+        return 0
+        ;;
+    esac
+  done
 }
 
 # The CA file the organization check may hand to curl: --gitops-ca-file when
@@ -7501,11 +7560,16 @@ main() {
     if [ -n "$github_org" ]; then
       gitops_choice="2"
     fi
-    prompt_menu "Would you like to connect or create a GitOps repo for automated PRs?" \
-      "Create a NEW GitHub Repository automatically (Recommended)" \
-      "Connect an EXISTING GitHub Repository" \
-      "Skip for now (Can be enabled later)" \
-      gitops_choice
+    if [ "$GITOPS_INTERVIEW_DECLINED" = "true" ]; then
+      # The forge menu already took the answer: no second menu to decline.
+      gitops_choice="3"
+    else
+      prompt_menu "Would you like to connect or create a GitOps repo for automated PRs?" \
+        "Create a NEW GitHub Repository automatically (Recommended)" \
+        "Connect an EXISTING GitHub Repository" \
+        "Skip for now (Can be enabled later)" \
+        gitops_choice
+    fi
 
     if [ "$gitops_choice" = "1" ] || [ "$gitops_choice" = "2" ]; then
       # The repo must be organization-owned: the token minter resolves App

@@ -1206,6 +1206,116 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
                 f"the skip arm must not clear {cleared!r}: it disables and removes a deployed minter",
             )
 
+    def _ask_gitops_forge(self, menu_answers, read_answers, preset=""):
+        """ask_gitops_forge on an interactive run: prompt_menu answers from
+        `menu_answers` in order, echoing the menu it was shown, and prompt_read
+        from `read_answers`, echoing each prompt. The validator is the real one."""
+        quote = shlex.quote
+        cmd = (
+            'PARAM_NON_INTERACTIVE="false"\n'
+            'PARAM_GITOPS_FORGE_GIVEN="false"\n'
+            'PARAM_GITOPS_FORGE="github"\n'
+            'GITOPS_INTERVIEW_DECLINED="false"\n'
+            "has_controlling_tty() { return 0; }\n"
+            "MENU=(" + " ".join(quote(a) for a in menu_answers) + ")\nMENU_AT=0\n"
+            'prompt_menu() { local v="${!#}"; echo "MENU: $*"; printf -v "$v" "%s" "${MENU[$MENU_AT]}"; MENU_AT=$((MENU_AT + 1)); }\n'
+            "READ=(" + " ".join(quote(a) for a in read_answers) + ")\nREAD_AT=0\n"
+            'prompt_read() { echo "PROMPT: $1 default=[${3:-}]"; printf -v "$2" "%s" "${READ[$READ_AT]}"; READ_AT=$((READ_AT + 1)); }\n'
+            + preset
+            + "ask_gitops_forge\n"
+            'echo "DECLINED=$GITOPS_INTERVIEW_DECLINED FORGE=$PARAM_GITOPS_FORGE HOST=[${PARAM_GITOPS_HOST:-}] CA=[${PARAM_GITOPS_CA_FILE:-}] MENUS=$MENU_AT READS=$READ_AT"\n'
+        )
+        return self._run_install_func(cmd)
+
+    def test_the_forge_menu_offers_an_install_without_a_gitops_repository(self):
+        """The first GitOps question has a way out. Before, "skip" lived one
+        menu later, behind the GitHub answer, and an operator who picked
+        Enterprise Server to look for it was asked for a hostname until Ctrl-C."""
+        proc = self._ask_gitops_forge(["4"], [])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("MENU: Where does the GitOps repository live?", proc.stdout)
+        self.assertIn("Nowhere yet: install without a GitOps repository", proc.stdout)
+        self.assertIn("DECLINED=true FORGE=github HOST=[] CA=[] MENUS=1 READS=0", proc.stdout)
+
+    def test_a_refused_enterprise_server_answer_does_not_outlive_the_menu(self):
+        """Option 2's host and CA file are this attempt's until the validator
+        accepts them. Refused, they are put back before the menu returns, so
+        github.com or no repository taken next does not carry a host or CA
+        file into the later flag check, which would exit 1 over a flag the
+        operator never gave; and a refused CA path does not leave a host
+        behind that install.env would record as an Enterprise Server install."""
+        with tempfile.TemporaryDirectory() as tmp:
+            ca = pathlib.Path(tmp) / "ca.pem"
+            ca.write_text("-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n")
+            for name, menus, reads, expected in (
+                ("scheme in the host, then no repository", ["2", "4"], ["https://ghe.example.com", ""],
+                 "DECLINED=true FORGE=github HOST=[] CA=[] MENUS=2 READS=2"),
+                ("upper-case host with a CA file, then github.com", ["2", "1"], ["GHE.Example.com", str(ca)],
+                 "DECLINED=false FORGE=github HOST=[] CA=[] MENUS=2 READS=2"),
+                ("good host, unreadable CA path, then no repository", ["2", "4"], ["ghe.example.com", f"{tmp}/missing.pem"],
+                 "DECLINED=true FORGE=github HOST=[] CA=[] MENUS=2 READS=2"),
+                ("refused host, then corrected on the second try", ["2", "2"], ["https://ghe.example.com", "", "ghe.example.com", ""],
+                 "DECLINED=false FORGE=github HOST=[ghe.example.com] CA=[] MENUS=2 READS=4"),
+            ):
+                with self.subTest(name):
+                    proc = self._ask_gitops_forge(menus, reads)
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    self.assertIn(expected, proc.stdout, proc.stdout + proc.stderr)
+            # An exported GITOPS_HOST and GITOPS_CA_FILE reach a first
+            # install's menu as answers. No repository, or github.com, names
+            # no host, so neither keeps the CA file; one given by flag stays.
+            exported = f'PARAM_GITOPS_HOST="ghe.example.com"\nPARAM_GITOPS_CA_FILE="{ca}"\n'
+            for name, menus, preset, expected in (
+                ("no repository drops the exported CA file", ["4"], exported, "DECLINED=true FORGE=github HOST=[] CA=[]"),
+                ("github.com drops the exported CA file", ["1"], exported, "DECLINED=false FORGE=github HOST=[] CA=[]"),
+                ("a CA file given by flag is kept", ["4"], exported + 'PARAM_GITOPS_CA_FILE_FROM_FLAG="true"\n',
+                 f"DECLINED=true FORGE=github HOST=[] CA=[{ca}]"),
+            ):
+                with self.subTest(name):
+                    proc = self._ask_gitops_forge(menus, [], preset=preset)
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    self.assertIn(expected, proc.stdout, proc.stdout + proc.stderr)
+            # The typed host is offered again as the default of the retry, so
+            # a slip can be corrected rather than retyped.
+            proc = self._ask_gitops_forge(["2", "2"], ["https://ghe.example.com", "", "ghe.example.com", ""])
+            self.assertIn("PROMPT: GitHub Enterprise Server hostname (for example github.example.com) default=[https://ghe.example.com]", proc.stdout)
+
+    def test_an_empty_enterprise_server_hostname_returns_to_the_forge_menu(self):
+        """Enter at the hostname prompt shows the menu again, where option 4
+        is the way out; it does not ask for the hostname a second time."""
+        proc = self._ask_gitops_forge(["2", "4"], [""])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("needs the instance's hostname. Choose 'Nowhere yet'", proc.stdout + proc.stderr)
+        self.assertEqual(proc.stdout.count("MENU: Where does the GitOps repository live?"), 2, proc.stdout)
+        self.assertIn("DECLINED=true FORGE=github HOST=[] CA=[] MENUS=2 READS=1", proc.stdout)
+
+    def test_an_enterprise_server_hostname_still_settles_the_forge(self):
+        """The happy path of option 2 is unchanged: hostname, CA prompt, done."""
+        proc = self._ask_gitops_forge(["2"], ["ghe.example.com", ""])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("PROMPT: PEM CA file that signed the instance's certificate", proc.stdout)
+        self.assertIn("Create the GitHub App on ghe.example.com, not on github.com", proc.stdout)
+        self.assertIn("DECLINED=false FORGE=github HOST=[ghe.example.com] CA=[] MENUS=1 READS=2", proc.stdout)
+
+    def test_a_declined_forge_menu_skips_the_repository_menu_in_main(self):
+        """main's step 8 does not ask the repository menu over an answer the
+        forge menu already took: the declined flag picks "Skip for now", and
+        the menu is the `else` of that test, not a call that follows it."""
+        text = _INSTALL_SH.read_text()
+        main_start = text.index("\nmain() {")
+        asked = text.index("  ask_gitops_forge\n", main_start)
+        head = 'if [ "$GITOPS_INTERVIEW_DECLINED" = "true" ]; then\n'
+        test_at = text.index(head, main_start)
+        self.assertLess(asked, test_at)
+        indent = text.rindex("\n", 0, test_at) + 1
+        block_end = text.index("\n" + text[indent:test_at] + "fi\n", test_at)
+        block = text[test_at:block_end]
+        menu = 'prompt_menu "Would you like to connect or create a GitOps repo for automated PRs?"'
+        self.assertIn('gitops_choice="3"', block)
+        self.assertIn("\n" + text[indent:test_at] + "else\n", block)
+        self.assertLess(block.index("else\n"), block.index(menu), "the repository menu must sit in the else arm")
+        self.assertEqual(text.count(menu, main_start), 1, "the repository menu is asked in one place")
+
     def test_preflight_rejects_directory_github_pem_path(self):
         """Preflight must fail fast when --github-pem-path is a directory instead of a file."""
         with tempfile.TemporaryDirectory() as tmp_dir:
