@@ -369,7 +369,23 @@ class TestSecretReadDetector(unittest.TestCase):
         "KUBECTL=/usr/bin/kubectl; $KUBECTL get secret db -o json",
         "KUBECTL=/usr/bin/kubectl",
         "$KUBECTL get secret db -o json",
+        "${KUBECTL} get secret db -o json",
         "k=kubectl; $k get secret db -o json",
+        "k=\"kubectl\"; $k get secret db -o json",
+        "k='/usr/bin/kubectl'; $k get secret db -o json",
+        "\"kubectl\" get secret db -o json",
+        "\"/usr/bin/kubectl\" get secret db -o json",
+        # the word inside a quoted script after an assignment, or inside a
+        # substitution in an argument
+        "kubectl exec api-0 -- sh -c 'FOO=1; kubectl get secret db -o json'",
+        "kubectl exec api-0 -- sh -c 'KUBECONFIG=/tmp/k kubectl get secret db -o json'",
+        "kubectl get pods -l app=$(kubectl get secret db -o json)",
+        "kubectl -l app=\"$(kubectl get secret db -o json)\" get pods",
+        # a secret among several positionals
+        "kubectl get pod/api-0 secret/db -o json",
+        "kubectl get configmap/app-cfg secret/db-creds -o yaml",
+        "kubectl get pod api-0 secret/db -o json",
+        "kubectl get pods -n prod -f x.yaml",
         # the resource is not on the line, or is not a word
         "printf secret/db | xargs kubectl get -n prod -o yaml",
         "kubectl get secrets -n prod -o name | xargs kubectl get -o yaml",
@@ -393,6 +409,13 @@ class TestSecretReadDetector(unittest.TestCase):
         "vault kv list -format=json secret/ | jq -r '.[]' | xargs -I{} vault kv get secret/{}",
         "az keyvault secret list --vault-name kv -o tsv | xargs -I{} az keyvault secret show --vault-name kv --name {}",
         "aws ssm describe-parameters | aws ssm get-parameter --name /prod/db --with-decryption",
+        # the same inside a quoted script, twice on one command, or by path
+        "bash -c 'gcloud secrets list | xargs -I{} gcloud secrets versions access latest --secret={}'",
+        "sh -c 'vault kv list secret/; vault kv get -field=password secret/db'",
+        "echo $(gcloud secrets versions access latest --secret=db) $(gcloud secrets list)",
+        "echo $(vault kv list secret/) $(vault kv get secret/db)",
+        "sh -c 'sops -d secrets.enc.yaml'",
+        "/usr/local/bin/sops -d secrets.enc.yaml",
     ]
     SERVED_COMMANDS = [
         "kubectl get secrets -n kube-system",
@@ -440,7 +463,9 @@ class TestSecretReadDetector(unittest.TestCase):
         "kubectl get pods -n prod -l 'env in (prod,stage)'",
         "kubectl get externalsecrets -n prod -o yaml",
         "bash -c 'kubectl get pods -n prod | grep -v Running'",
+        "bash -c 'KUBECONFIG=/tmp/k kubectl get pods -n prod'",
         "kubectl exec deploy/api -- sh -c 'ps aux | grep java'",
+        "kubectl get pod secret",
         # a name or label that contains the letters is not a second binary
         "kubectl get pods -n prod -l app=kubectl-proxy",
         "kubectl get pods -n prod -l app=kubectl",
