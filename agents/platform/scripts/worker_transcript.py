@@ -341,6 +341,15 @@ KUBECTL_WORD_RE = re.compile(r"(?i)(?:^|[\s/`(${='\"])kubectl(?=[\s'\"})`]|$)")
 # (`'KUBECONFIG=/tmp/k kubectl get pods'`) holds whitespace and is read as
 # a line of its own.
 SHELL_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=\S*$")
+# The words that may stand ahead of the binary on a command that lists
+# secrets: a shell keyword, a wrapper that runs the command as given, a flag
+# or a number for such a wrapper (`nice -n 10`, `timeout 30`), and an
+# assignment (`SHELL_ASSIGNMENT_RE`). Any other word (`xargs`, its `-I`
+# placeholder, `echo`) may supply arguments the line does not show, so a
+# `kubectl get` after one is withheld.
+HARMLESS_COMMAND_PREFIX_WORDS = frozenset(
+    ("do", "then", "else", "elif", "if", "while", "until", "!", "{", "(", "sudo", "time", "nohup", "command", "exec", "nice", "timeout", "env")
+)
 # A quoted script (`sh -c '...'`, one token that holds whitespace) is read
 # as a shell line of its own, to this depth of nesting.
 MAX_NESTED_COMMAND_DEPTH = 4
@@ -383,13 +392,15 @@ KUBECTL_SHORT_VALUE_FLAGS = frozenset(
 )
 # The bare-list grammar admits these flags and no others: the list's own
 # flags and the connection flags, which choose the cluster and the rows and
-# never the columns, and never an output flag in any spelling.
+# never the columns, and never an output flag in any spelling. Verbosity
+# (`-v`, `--v`) is not among them: at 8 and above client-go logs every
+# response body, and a secrets listing's body carries the values.
 KUBECTL_LIST_VALUE_FLAGS = frozenset(
     (
         "-n", "--namespace", "-l", "--selector", "--field-selector", "--sort-by", "-L", "--label-columns",
         "--chunk-size", "--context", "--kubeconfig", "--cluster", "--user", "--token", "-s", "--server",
         "--as", "--as-group", "--request-timeout", "--certificate-authority", "--client-certificate",
-        "--client-key", "--tls-server-name", "-v", "--v",
+        "--client-key", "--tls-server-name",
     )
 )
 KUBECTL_LIST_BOOLEAN_FLAGS = frozenset(
@@ -422,15 +433,19 @@ HARMLESS_REDIRECT_TOKENS = frozenset(("2>/dev/null", "2>&1", ">/dev/null", "&>/d
 # named lists those words may be. Every mention on the command is read, so
 # a list and a value read on one line (`echo $(gcloud secrets list)
 # $(gcloud secrets versions access latest --secret=db)`) withhold. gcloud
-# and aws take global flags and a release track before the subcommand, so
-# the family is matched after the binary anywhere on the command. `vault`
-# is read only as a command followed by `kv` or `read`, since the word is
-# also a namespace name; `sops` only as a command word (after a space, a
-# quote, a backtick, a parenthesis or a path separator), since the word is
-# also a config file's name.
+# and aws take global flags and a release track before the subcommand, and
+# a flag may sit between the family and its subcommand (`aws ssm --region r
+# get-parameter`, `vault -namespace=p kv get`), so the family and the
+# subcommand are each matched anywhere after the one before. The capture is
+# one word, or two after `versions`, so a `list` at the end of a
+# substitution does not take the next binary as its argument. `vault` and
+# `sops` are read only as command words (after a space, a quote, a backtick,
+# a parenthesis or a path separator), since each is also a name elsewhere
+# (a namespace, `--vault-name`, a config file), and `vault` only with `kv`
+# or `read` as a word after its flags.
 SECRET_STORE_FAMILIES = (
     (
-        re.compile(r"(?i)\bgcloud\b[^|&;]*?\bsecrets\s+(\S+(?:\s+\S+)?)"),
+        re.compile(r"(?i)\bgcloud\b[^|&;]*?\bsecrets\s+((?:versions\s+)?\S+)"),
         re.compile(r"(?i)^(?:list|describe|versions\s+(?:list|describe))\b"),
     ),
     (
@@ -438,7 +453,7 @@ SECRET_STORE_FAMILIES = (
         re.compile(r"(?i)^(?:list-secrets|describe-secret|list-secret-version-ids|get-resource-policy)\b"),
     ),
     (
-        re.compile(r"(?i)\baws\b[^|&;]*?\bssm\s+((?:get|describe)-parameters?\S*)"),
+        re.compile(r"(?i)\baws\b[^|&;]*?\bssm\s+(?:\S+\s+)*?((?:get|describe)-parameters?\S*)"),
         re.compile(r"(?i)^describe-parameters\b"),
     ),
     (
@@ -446,7 +461,7 @@ SECRET_STORE_FAMILIES = (
         re.compile(r"(?i)^(?:list|list-versions|list-deleted)\b"),
     ),
     (
-        re.compile(r"(?i)\bvault\s+((?:kv|read)\b(?:\s+\S+)?)"),
+        re.compile(r"(?i)(?:^|[\s('\"`/])vault\s+(?:\S+\s+)*?((?:kv|read)\b(?:\s+\S+)?)"),
         re.compile(r"(?i)^kv\s+(?:list|metadata)\b"),
     ),
     (
@@ -1106,6 +1121,17 @@ def _is_kubectl_binary(token: str) -> bool:
     return lowered == KUBECTL_BINARY or lowered.endswith(PATH_SEPARATOR + KUBECTL_BINARY)
 
 
+def _prefix_runs_the_command_as_given(tokens: Sequence[str]) -> bool:
+    """Whether every token ahead of the binary is an assignment, a shell keyword, a plain wrapper, its flag or a number."""
+    return all(
+        SHELL_ASSIGNMENT_RE.match(token)
+        or token in HARMLESS_COMMAND_PREFIX_WORDS
+        or token.startswith(CLI_FLAG_LEAD_CHAR)
+        or token.isdigit()
+        for token in tokens
+    )
+
+
 def _holds_whitespace(token: str) -> bool:
     """Whether `token` was a quoted script: a shell word the parser kept whole around whitespace."""
     return any(ch.isspace() for ch in token)
@@ -1150,6 +1176,8 @@ def is_kubectl_bare_secret_list(command: str) -> bool:
     if len(binaries) != 1:
         return False
     start = binaries[0]
+    if not _prefix_runs_the_command_as_given(tokens[:start]):
+        return False
     if any(KUBECTL_WORD_RE.search(token) for i, token in enumerate(tokens) if i != start):
         return False
     if any(SHELL_UNSAFE_TOKEN_RE.search(token) for token in tokens if token not in HARMLESS_REDIRECT_TOKENS):
@@ -1193,9 +1221,10 @@ def kubectl_command_reads_a_secret(command: str) -> bool:
     grammar; other kinds by name are not a secret read; no resource on the
     line (a file flag, stdin, a raw API path), a variable or substitution in
     a positional, a flag the reader does not know, a second `kubectl`, the
-    word stored in a variable or run through one, or a quoting error
-    withholds. A quoted script on the command is not read here; the caller
-    reads it as a line of its own.
+    word stored in a variable or run through one, a word ahead of the binary
+    that may supply arguments (`xargs`), or a quoting error withholds. A
+    quoted script on the command is not read here; the caller reads it as a
+    line of its own.
     """
     if not KUBECTL_WORD_RE.search(command):
         return False
@@ -1231,7 +1260,7 @@ def kubectl_command_reads_a_secret(command: str) -> bool:
             if flag in KUBECTL_VALUE_FLAGS or flag in KUBECTL_FILE_FLAGS:
                 if not separator:
                     index += 1
-            elif flag in KUBECTL_BOOLEAN_FLAGS or separator:
+            elif flag in KUBECTL_BOOLEAN_FLAGS:
                 pass
             elif len(token) > SHORT_FLAG_LENGTH and short in KUBECTL_SHORT_VALUE_FLAGS:
                 file_flag = file_flag or short in KUBECTL_FILE_FLAGS
@@ -1246,6 +1275,8 @@ def kubectl_command_reads_a_secret(command: str) -> bool:
                 return True
             if verb != KUBECTL_GET_VERB:
                 return False
+            if not _prefix_runs_the_command_as_given(tokens[:start]):
+                return True
             continue
         positionals.append(token)
     if verb != KUBECTL_GET_VERB:

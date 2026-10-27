@@ -416,6 +416,24 @@ class TestSecretReadDetector(unittest.TestCase):
         "echo $(vault kv list secret/) $(vault kv get secret/db)",
         "sh -c 'sops -d secrets.enc.yaml'",
         "/usr/local/bin/sops -d secrets.enc.yaml",
+        # the list first, a flag between the family and its subcommand
+        "echo $(gcloud secrets list) $(gcloud secrets versions access latest --secret=db)",
+        "echo `gcloud secrets list` `gcloud secrets versions access latest --secret=db`",
+        "bash -c 'echo $(gcloud secrets list) $(gcloud secrets versions access latest --secret=db)'",
+        "aws ssm --region us-east-1 get-parameter --name /prod/db --with-decryption",
+        "vault -namespace=prod kv get secret/db",
+        "vault -address=https://vault:8200 read secret/db",
+        # verbosity prints the response body; xargs supplies what the line
+        # does not show; an attached or stacked file flag with `=`
+        "kubectl get secrets -n prod --sort-by=.metadata.name -v=9 2>&1",
+        "kubectl get secrets -n prod -v=6",
+        "kubectl get secrets -n prod --no-headers | awk '{print \"secret/\" $1}' | xargs -I item kubectl get item -o yaml",
+        "printf 'secret/db\\n' | xargs -I res kubectl get res -o json",
+        "printf 'secret/db\\n' | xargs kubectl get pod/api-0 -o yaml",
+        "printf -- '-o\\nyaml\\n' | xargs kubectl get secret db",
+        "kubectl get pods -fdb=1.yaml -o yaml",
+        "kubectl get pods -Rf=db.yaml -o yaml",
+        "kubectl --unknown-global-flag=x get pods",
     ]
     SERVED_COMMANDS = [
         "kubectl get secrets -n kube-system",
@@ -443,7 +461,6 @@ class TestSecretReadDetector(unittest.TestCase):
         "kubectl get secrets -n prod --sort-by=.metadata.name",
         "kubectl get secrets -n prod -L app",
         "kubectl get secrets -n prod -w",
-        "kubectl get secrets -n prod -v=6",
         "kubectl get secrets -n prod && echo ok",
         "kubectl get secrets -n prod || true",
         "bash -c 'kubectl get secrets -n prod'",
@@ -466,6 +483,14 @@ class TestSecretReadDetector(unittest.TestCase):
         "bash -c 'KUBECONFIG=/tmp/k kubectl get pods -n prod'",
         "kubectl exec deploy/api -- sh -c 'ps aux | grep java'",
         "kubectl get pod secret",
+        # a wrapper or keyword ahead of the binary runs the command as given
+        "sudo kubectl get secrets -n prod",
+        "timeout 30 kubectl get secrets -n prod",
+        "nice -n 10 kubectl get secrets -n prod",
+        "for ns in a b; do kubectl get pods -n $ns; done",
+        "kubectl get pods -n vault -o wide",
+        "vault -namespace=prod kv list secret/",
+        "aws ssm --region us-east-1 describe-parameters",
         # a name or label that contains the letters is not a second binary
         "kubectl get pods -n prod -l app=kubectl-proxy",
         "kubectl get pods -n prod -l app=kubectl",
@@ -510,6 +535,9 @@ class TestSecretReadDetector(unittest.TestCase):
         self.assertFalse(worker_transcript.is_kubectl_bare_secret_list("kubectl get db secret"))
         self.assertFalse(worker_transcript.is_kubectl_bare_secret_list("kubectl describe secret db"))
         self.assertFalse(worker_transcript.is_kubectl_bare_secret_list("echo 'kubectl get secret db -o json'"))
+        self.assertFalse(worker_transcript.is_kubectl_bare_secret_list("xargs kubectl get secret db"))
+        self.assertFalse(worker_transcript.is_kubectl_bare_secret_list("kubectl get secrets -n prod -v=9"))
+        self.assertTrue(worker_transcript.is_kubectl_bare_secret_list("sudo kubectl get secrets -n prod"))
 
     def test_resource_reader_withholds_what_it_cannot_tell_and_serves_another_kind(self):
         reads = worker_transcript.kubectl_command_reads_a_secret
