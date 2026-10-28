@@ -124,6 +124,21 @@ The comment readers already carry that as a `bot` flag beside `author`; the comm
 proposal listing and the closer lookup do not, and the design adds it there. The install's own
 events are not touches and appear under neither.
 
+A commit needs its own rule, because the install's commits carry no login. The forge links a
+commit to an account only through its author email, and the install's git identity is an address
+the forge cannot link by design: the broker stamps proxied commits `platform-agent@kube-agents.invalid`
+(`CREDENTIAL_PROXY_GIT_AUTHOR_EMAIL`), the workspace path `platform-agent@users.noreply.<host>`, and
+the sandbox client `kube-agents@users.noreply.invalid` (`KUBE_AGENTS_VCS_AUTHOR_EMAIL`), so GitHub
+returns no author account for them, the commit translator falls back to the git author name, and
+a login comparison would count every one of the install's own commits as a human touch and make
+"merged without any human touch" structurally zero. So a commit is the install's when its linked
+login is the install's, or when its git author email is one of the install's addresses: the three
+defaults above, whatever the two variables are set to, and the App's own noreply form
+`<id>+<slug>[bot]@users.noreply.github.com`. The commit readers on all three forges return the
+raw author email and the linked login beside the translated author; GitLab's returns a name and
+an email and no login at all, so there the email rule is the only one. A commit by anyone else
+is `human`, or `bot` when the linked account is automation.
+
 Bodiless reviews count. Today's `proposal-view` drops a review summary with an empty body
 (`github/forge.py`, the conversation reader), which hides every plain approval; the reading reads
 reviews itself and does not use that path.
@@ -211,16 +226,18 @@ a poll reports the reading the previous poll triggered, two intervals end to end
    the existing `proposal_commits`, and the comment readers the providers already have, plus, for
    a closed-unmerged proposal, who closed it (GitHub: the actor of the last `closed` event on
    `GET /issues/{n}/events`; GitLab: the merge request's `closed_by`; Gitea: the poster of the
-   last close comment). Each reader is paged to completion at a page size of one hundred, under
-   a cap of `VCS_READINGS_DETAIL_PAGES_PER_READER` (10) pages per reader per proposal; the
-   existing conversation readers stop at one page and report `truncated`, which the reading does
-   not accept, so the sweep walks the pages itself. A proposal that reaches the cap is counted
-   from what was read and moves `kubeagents_vcs_readings_failures_total{reason="detail_truncated"}`,
-   a per-proposal signal distinct from the repository walk's `truncated`. The commit reader and
-   the closer lookup return the account kind beside the translated author, as the comment
-   readers already do, since the `actor` label needs it. The result is a small record: touch
-   counts by `(kind, actor)` and the closer class. A proposal whose `updated` has not moved is
-   read from the cache.
+   last close comment). The conversation readers already page to completion when given a
+   `limit`, bounded by `MAX_CONVERSATION_SIZE` (1000 rows), and return `truncated` when more
+   remained, on all three forges; the sweep calls them with that limit and reads their
+   `truncated` as `kubeagents_vcs_readings_failures_total{reason="detail_truncated"}`, a
+   per-proposal signal distinct from the repository walk's `truncated`, counting the proposal
+   from what was read. `proposal_reviews` is the existing review pager with the bodiless-review
+   filter left off. The commit reader is the one single-page reader and gains a walk to the same
+   bound. The commit reader and the closer lookup return the account kind beside the translated
+   author, as the comment readers already do, since the `actor` label needs it, and the commit
+   reader returns the author email (section 4). The result is a small record: touch counts by
+   `(kind, actor)` and the closer class. A proposal whose `updated` has not moved is read from
+   the cache.
 
 **The cache** is a dict in the broker process keyed by `(forge host, repository, number)` holding
 `updated` and the record. It is written per proposal as each is read, whatever the sweep's
@@ -371,14 +388,18 @@ and keeps the two series from being each other's complement. A fall in a reading
 window, a repository removed from `managed_repos` or proposals deleted, is the case `clamp_min`
 alone handles badly: it clamps the fallen series to zero and hides a fortnight of the other
 repositories' merges, so `proposals_rejected_ratio_14d` could read one and fire
-`KubeAgentsProposalsRejected` falsely. So each recording rule also carries a fall guard: when
-`delta()` over the window is negative for any of the three recorded series, both ratios are
-absent and neither alert can fire, for the fourteen days the fall stays in the window. A removal
-silences the two proposal alerts for a fortnight rather than misfiring, and the chart README's
-upgrade paragraph says so beside the upward step. The template's header contract and
-`tests/test_chart_platform_agent_health_rules.py`, which pin every `increase()` under `sum by` and
-every `field=` to the operator's export list, learn the recorded-series `delta()` form and the
-fall guard. The first reading after an install upgrades replaces a per-process
+`KubeAgentsProposalsRejected` falsely. So each recording rule also carries a fall guard, and the
+guard reads `resets()`, not the window's net `delta()`: a `delta()` is end minus start and goes
+blind to a fall the moment later rises outrun it, netting the ratios over wrong numbers, where
+`resets(<recorded series>[14d]) > 0` sees any decrease between two samples anywhere in the window
+whatever follows. When any of the three recorded series shows a reset in the window, both ratios
+are absent and neither alert can fire, for the fourteen days the fall stays in the window. A
+removal, or a deleted proposal, silences the two proposal alerts for a fortnight rather than
+misfiring, and the chart README's upgrade paragraph says so beside the upward step. The
+template's header contract and `tests/test_chart_platform_agent_health_rules.py`, which pin every
+`increase()` under `sum by` and every `field=` to the operator's export list, learn the
+recorded-series `delta()` form and the `resets()` guard. The first reading after an install
+upgrades replaces a per-process
 count with the forge's all-time count, and the window reads that step as fourteen days of
 outcomes, so both rules are distorted for two weeks after the upgrade, and the merge rate can
 read above one in that time. The same step happens whenever a repository with a history enters
@@ -425,11 +446,13 @@ Python, beside the broker in `agents/platform/scripts/` (`test_vcs_broker.py`,
 `test_providers_*.py`):
 
 - a sweep over a fake forge with proposals in all three states and events of every kind by the
-  install, a human and a bot, asserting every series and every bucket;
+  install, a human and a bot, asserting every series and every bucket, where the install's own
+  commits carry no linked login and only its author email, as on a real forge, and land under
+  neither actor;
 - a repository past the walk bound publishes its state counts and withholds its touches; a Gitea
   repository past its own bound withholds the install's outcomes reading;
-- a proposal whose conversation runs past a page is paged to completion, and one past the cap is
-  counted from what was read with `reason="detail_truncated"`;
+- a proposal whose conversation runs past a page is read through the readers' own paging, and
+  one past their bound is counted from what was read with `reason="detail_truncated"`;
 - a proposal whose `updated` did not move is served from the cache and costs no detail call; one
   that moved is re-read;
 - one repository failing withholds the reading and moves the failure counter; the previous reading
@@ -450,7 +473,8 @@ Python, beside the broker in `agents/platform/scripts/` (`test_vcs_broker.py`,
 
 Go, beside the poller: the reading slot parsed from a broker body; one miss keeps, two clear, per
 reading, with a body that serves one reading and not the other; and, beside the chart, the
-health-rules test rendering a window with a fall and asserting both ratios absent;
+health-rules test rendering a window with a fall later outrun by rises and asserting both ratios
+absent;
 pointer zero written; the fields never move `lastActiveTime`; export rows; pruning record; the
 status key count. `tests/test_usage_counters_series_names.py` pins the new series names across
 Python and Go and loses the two removed ones.
@@ -461,7 +485,10 @@ and the status schema; no prompt, skill or SOP changes.
 Live validation on gkedemos3, the forge-backed install: open a proposal through the shell pod's
 `vcs.py`, merge it with `gh` as a person, add one review and one comment to a second proposal and
 close it, and watch the broker series and the six fields move within two poll intervals with no
-`proposal view` issued by anyone, and the broker's log show a read mint and no write mint. The record goes in the pull request and in #4120.
+`proposal view` issued by anyone, and the broker's log show a read mint and no write mint; and
+read `kubeagents_vcs_proposal_touches_per_proposal{outcome="merged",le="0"}` as one for the
+merged proposal nobody touched, which is the check the commit rule exists for. The record goes
+in the pull request and in #4120.
 
 ## 9. Left to the builder
 
@@ -493,9 +520,13 @@ listener "holds no route, credential or policy" as a security property,
 `reference/credential-isolation.md`, which take the qualification section 7 gives the docstring;
 Minty's rule template `default.yaml` in the chart (`github-minter.yaml`) and
 `k8s-operator/config/integrations/github/configmap.yaml.template`, where the sweep scope is
-declared, with `tests/test_chart_minter_read_scope.py`, which asserts the scopes a rendered
-policy carries and learns the third, and the site's `deploy/token-minter.md` and the
-integration's `README.md`, which describe the scopes; `mint_read_credential`'s role check and the
+declared, with `tests/test_chart_minter_read_scope.py`, whose `assert_two_scopes` asserts the
+scopes a rendered policy carries and learns the third, and every other statement in the tree that
+a policy carries two scopes (the site's `deploy/token-minter.md`, the integration's `README.md`,
+the chart comment above the template, and the `contents: read` docstrings in
+`github_token_refresh.py` and `MintedReadCredential`), each of which gains the third scope or is
+left true by naming the read scope alone; the commit translators of the three providers, which
+gain the author email; `mint_read_credential`'s role check and the
 read helper's single-repository scope in `credential_proxy.py` and `github_token_refresh.py`,
 `MintedReadCredential`, which backs clones only today, and the github.com forge's transport
 construction in `providers/github/forge.py`; the two feedback-summary copies and their tests;
@@ -511,7 +542,8 @@ construction in `providers/github/forge.py`; the two feedback-summary copies and
   do not.
 - The health rules move to readings on both sides of each ratio and keep their window; the
   two-week distortion after an upgrade or a registration is accepted, and a fall within the
-  window silences the two proposal alerts for a fortnight rather than letting them misfire.
+  window, seen through `resets()`, silences the two proposal alerts for a fortnight rather than
+  letting them misfire.
 - The read is triggered by a scrape rather than a broker timer, and on a stock install the
   collector's thirty-second scrape is what drives it.
 - The epic's Workstream 2 named a counter, `kubeagents_vcs_proposal_touches_total{kind}`, counted
@@ -519,6 +551,8 @@ construction in `providers/github/forge.py`; the two feedback-summary copies and
   with an `actor` label, plus the bucket series, for the same reason the outcomes are readings.
 - The install's own close is `actor="install"` and stays out of `remediationsClosedUnmergedTotal`.
 - A merge no longer moves `lastActiveTime`.
+- A commit is the install's by linked login or by its git author email against the install's
+  configured addresses, since the install's commits carry no login on any forge.
 - After a broker restart the details reading, the close count included, waits until the detail
   cache is warm under an hourly call budget, while the outcomes reading is published at once.
 - The sweep mints a token of its own per managed repository under a new Minty scope with
