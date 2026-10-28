@@ -42,8 +42,8 @@ class FakeGcloud:
     objects in argument order. Records every call so a test can count
     listings and fetches. `fail_urls` fail a cat whole, with exit 1, as a
     5xx does; `absent_urls` are objects deleted since the listing, which
-    `gcloud storage cat` reports on stderr while printing the others and
-    exiting 0."""
+    `gcloud storage cat` names on stderr and exits 1 on, after printing the
+    others."""
 
     def __init__(self, objects=None, fail_ls=None, fail_cat=None, fail_urls=(), absent_urls=()):
         self.objects = dict(objects if objects is not None else fixture_objects())
@@ -72,7 +72,7 @@ class FakeGcloud:
             if absent:
                 text = "".join(self.objects[u] for u in args[1:] if u not in self.absent_urls)
                 err = "ERROR: (gcloud.storage.cat) The following URLs matched no objects or files:\n" + "\n".join(absent)
-                return subprocess.CompletedProcess(argv, 1 if len(args[1:]) == 1 else 0, text, err)
+                return subprocess.CompletedProcess(argv, 1, text, err)
             return subprocess.CompletedProcess(argv, 0, "".join(self.objects[u] for u in args[1:]), "")
         raise AssertionError(f"unexpected gcloud storage call {argv}")
 
@@ -249,10 +249,10 @@ class ReadStoreTest(unittest.TestCase):
         self.assertTrue(doc["warnings"][0].startswith(url_of("agent-kanban-smoke")))
 
     def test_an_object_absent_since_the_listing_is_a_warning_and_its_chunk_mates_are_kept(self):
-        """`gcloud storage cat` of several URLs prints the ones it finds and
-        exits 0 when one is gone, naming it on stderr; read as a success the
-        chunk would lose that object silently, so the call reads as failed
-        and the chunk is re-read one object at a time."""
+        """`gcloud storage cat` of several URLs prints the ones it finds,
+        names the gone one on stderr and exits 1; the chunk is re-read one
+        object at a time and the gone object is one warning in gcloud's
+        words, not a lost record or a failed read."""
         gone = url_of("rca-remediation-pr")
         gcloud = FakeGcloud(absent_urls=[gone])
         doc = read(gcloud)

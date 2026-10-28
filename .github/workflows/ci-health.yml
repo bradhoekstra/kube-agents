@@ -404,8 +404,10 @@ jobs:
         continue-on-error: true
         run: |
           mkdir -p work
-          # A NotFound ("matched no objects" for an absent object, "not found:
-          # 404" for an absent bucket) is "the periodic has never run", which is what no note
+          # A NotFound ("matched no objects" from `cat` or `cp` of an absent
+          # object, "not found: 404" of an absent bucket; `objects describe`
+          # below says the latter of an absent object too, and is read by
+          # exit code alone) is "the periodic has never run", which is what no note
           # is meant to look like. Anything else -- a denied read above all --
           # would otherwise ship the whole feature dark: no note, no digest
           # figure, and no ⚪ either, because the dead-man's switch only ages

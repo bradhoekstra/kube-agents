@@ -133,8 +133,8 @@ GCLOUD_TIMEOUT_S = 300
 #: What ``gcloud storage ls`` says about a prefix that holds nothing yet
 #: (collect.py reads the same phrase): an empty store, not an unreachable
 #: one. ``cat`` says it ("matched no objects or files") of an absent object
-#: too, and then exits 0 with the other objects' text when the call named
-#: several, so ``gcloud_storage_call`` reads the phrase as a failed call.
+#: too, with exit 1, after printing whichever of the call's other objects
+#: it found.
 NO_OBJECTS = "matched no objects"
 #: An object name: ``<recorded_at with ':' as '-'>-<build>.jsonl``, as
 #: evidence_store.GcsBackend.append writes it. The build is Prow's numeric
@@ -164,20 +164,19 @@ def max_objects_from_env(env: dict | None = None) -> int:
 
 def gcloud_storage_call(args: list[str], gcloud: str = DEFAULT_GCLOUD, runner=None) -> tuple[str | None, str]:
     """(stdout, stderr) of one ``gcloud storage`` call; stdout None when it
-    failed. A call that exits 0 but names an absent object on stderr is a
-    failed call too: ``cat`` of several URLs prints the ones it found and
-    exits 0, and a chunk read that way would lose the absent object
-    without a word. ``runner`` defaults to ``subprocess.run`` at call time,
-    so a test that patches it sees every call."""
+    failed. A ``cat`` of several URLs that found only some of them exits 1
+    with the found ones' text on stdout; that text is dropped with the rest
+    of a failed call, and the caller re-reads the chunk one object at a
+    time. ``runner`` defaults to ``subprocess.run`` at call time, so a test
+    that patches it sees every call."""
     run = runner or subprocess.run
     try:
         proc = run([gcloud, STORAGE_GROUP, *args], capture_output=True, text=True, timeout=GCLOUD_TIMEOUT_S, check=False)
     except (OSError, subprocess.TimeoutExpired) as exc:
         return None, str(exc)
-    stderr = proc.stderr or ""
-    if proc.returncode != 0 or NO_OBJECTS in stderr.lower():
-        return None, stderr.strip()
-    return proc.stdout, stderr
+    if proc.returncode != 0:
+        return None, (proc.stderr or "").strip()
+    return proc.stdout, (proc.stderr or "")
 
 
 def list_objects(location: str, gcloud: str = DEFAULT_GCLOUD, runner=None) -> list[str]:

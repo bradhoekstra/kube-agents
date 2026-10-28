@@ -2651,7 +2651,7 @@ class TestGitLabLane(_MergeBase):
         data, stderr = self.quiet_collect(pr_globs=[FAKE_GLOB], gitlab_globs=[FAKE_GITLAB_GLOB], gcloud=gcloud)
         self.assertEqual([r["build_id"] for r in data["runs"]], [BUILD_998_FULL])
         self.assertIn(f"note: glob {FAKE_GITLAB_GLOB} did not list", stderr)
-        self.assertNotRegex(stderr, r"warning: gcloud (ls|cat) .*(failed|timed out)")
+        self.assertIsNone(WORKFLOW_REFUSAL.search(stderr))
         # The presubmit's own glob keeps the warning: the gate's listing failing is a stall.
         data, stderr = self.quiet_collect(pr_globs=[FAKE_BUCKET + "pull/gke-labs_kube-agents/1/nowhere/*"], gcloud=gcloud)
         self.assertIn("warning: gcloud storage ls failed for", stderr)
@@ -2668,7 +2668,7 @@ class TestGitLabLane(_MergeBase):
         self.assertIn(f"ls {FAKE_GITLAB_INDEX_PREFIX}", log.read_text(), "the lane's index, cold")
         self.assertNotIn(f"ls {FAKE_GITLAB_INDEXED_GLOB}", log.read_text(), "never the archive-wide glob")
         self.assertIn(f"note: directory index {FAKE_GITLAB_INDEX_PREFIX} did not list", stderr)
-        self.assertNotRegex(stderr, r"warning: gcloud (ls|cat) .*(failed|timed out)")
+        self.assertIsNone(WORKFLOW_REFUSAL.search(stderr))
         # The first lane build lands: read through the index, no watermark yet.
         root = self.bucket_root()
         url = FAKE_GITLAB_INDEXED_GLOB.rstrip("*") + BUILD_956_TRUNCATED
@@ -2693,12 +2693,12 @@ class TestGitLabLane(_MergeBase):
         merged, stderr = self.quiet_collect(pr_globs=[FAKE_GLOB], gitlab_globs=[FAKE_GITLAB_INDEXED_GLOB], merge_with=prior, gcloud=gcloud, index_prefix=FAKE_INDEX_PREFIX)
         self.assertIn(f"ls {FAKE_GITLAB_INDEX_PREFIX}", log.read_text(), "the index path, not the glob")
         self.assertIn(f"note: directory index {FAKE_GITLAB_INDEX_PREFIX} did not list", stderr)
-        self.assertNotRegex(stderr, r"warning: gcloud (ls|cat) .*(failed|timed out)")
+        self.assertIsNone(WORKFLOW_REFUSAL.search(stderr))
         self.assertEqual(len(merged["runs"]), 2, "the old lane run stays on record")
         # The glob path with a watermark (index disabled) is the same note.
         _, stderr = self.quiet_collect(pr_globs=[FAKE_GLOB], gitlab_globs=[FAKE_GITLAB_GLOB], merge_with=prior, gcloud=gcloud, index_prefix="")
         self.assertIn(f"note: glob {FAKE_GITLAB_GLOB} did not list", stderr)
-        self.assertNotRegex(stderr, r"warning: gcloud (ls|cat) .*(failed|timed out)")
+        self.assertIsNone(WORKFLOW_REFUSAL.search(stderr))
         # Denied is not "no objects": with a run on record that is the warning line.
         os.environ["FAKE_GCLOUD_DENY"] = FAKE_GITLAB_INDEX_PREFIX
         self.addCleanup(os.environ.pop, "FAKE_GCLOUD_DENY", None)

@@ -1106,7 +1106,8 @@ that path the same way before the lookup. `partial` is `null`, or
 (`--deadline-s`) between waves of fetches with objects left for the next
 tick, which finds them absent from its `--prior` and reads them first;
 `warnings[]` names each line that
-would not parse (skipped, never fatal); `error` is set when the read did
+would not parse and each object the read could not fetch (failed, or gone
+since the listing), in gcloud's words (skipped, never fatal); `error` is set when the read did
 not happen — the listing failed, or the workflow called `--fail-with` for a
 read its `timeout` killed or its wall clock could not fit — and the
 document is the prior read written back with the reason. The reader lists
