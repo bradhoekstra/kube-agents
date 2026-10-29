@@ -44,6 +44,10 @@ VCS_READINGS_MAX_PAGES = 10
 # The walk's bound in proposals, for a server that clamps the page size (Gitea's
 # `MAX_RESPONSE_ITEMS`), where a page bound would mean fewer proposals.
 VCS_READINGS_MAX_PROPOSALS_GITEA = 1000
+# Pages past the proposal bound's own page count a clamped walk may take, read
+# at the smallest page seen: room for a repeat or two from a listing that
+# shifted mid-walk, and a hard ceiling for a server that never reaches its total.
+VCS_READINGS_CLAMPED_PAGE_SLACK = 2
 # Step 2's forge calls per hour: a fifth of an installation token's quota,
 # spread evenly over the sweeps in the hour.
 VCS_READINGS_DETAIL_CALLS_PER_HOUR = 1000
@@ -549,9 +553,12 @@ class ReadingsSweep:
 
         The bound is in pages while pages come back full and in proposals once
         one comes back shorter than asked with more remaining, which is a server
-        clamping the page size. The walk goes on while the forge's total says
-        more remain, whatever a page's `truncated` says, since a clamping server
-        can make a page look like the last. Any item by another author raises.
+        clamping the page size; a clamped walk also stops at a page ceiling
+        read from the smallest page seen. The walk goes on while the forge's
+        total says more remain, whatever a page's `truncated` says, since a
+        clamping server can make a page look like the last; a page that adds
+        no proposal or is marked incomplete ends it short. Any item by another
+        author raises.
         """
         bound = self._bound[repo]
         install = _login_key(self._logins[repo])
@@ -559,29 +566,41 @@ class ReadingsSweep:
         payload["limit"] = MAX_PAGE_SIZE
         read: list[dict] = []
         seen: set[Any] = set()
-        clamped = incomplete = False
+        clamped = False
+        smallest = MAX_PAGE_SIZE
         total: int | None = None
         page = 1
         while True:
             answer = bound.forge.proposal_list_by_author(bound.api, bound.path, {**payload, "page": page})
             batch = [item for item in answer.get("proposals") or [] if isinstance(item, dict)]
+            before = len(read)
             for item in batch:
                 if _login_key(str(item.get("author") or "")) != install:
                     raise _ForeignAuthor()
                 if item.get("number") not in seen:
                     seen.add(item.get("number"))
                     read.append(item)
-            incomplete = incomplete or bool(answer.get("incomplete"))
             if isinstance(answer.get("total"), int):
                 total = answer["total"]
+            if answer.get("incomplete") or (batch and len(read) == before):
+                # A page the forge marked incomplete, or one that added no
+                # proposal (a server that ignores `page`): the walk cannot
+                # finish whole, so it ends here, short.
+                return read, False, total, True
             exhausted = total is not None and len(read) >= total
             more = bool(answer.get("truncated")) or (total is not None and len(read) < total)
             if not batch or not more or exhausted:
-                short = incomplete or (total is not None and len(read) != total)
+                short = total is not None and len(read) != total
                 return read, False, total, short
             if len(batch) < MAX_PAGE_SIZE:
                 clamped = True
-            if len(read) >= VCS_READINGS_MAX_PROPOSALS_GITEA if clamped else page >= VCS_READINGS_MAX_PAGES:
+                smallest = min(smallest, len(batch))
+            if clamped:
+                ceiling = -(-VCS_READINGS_MAX_PROPOSALS_GITEA // smallest) + VCS_READINGS_CLAMPED_PAGE_SLACK
+                bounded = len(read) >= VCS_READINGS_MAX_PROPOSALS_GITEA or page >= ceiling
+            else:
+                bounded = page >= VCS_READINGS_MAX_PAGES
+            if bounded:
                 return read, True, total, False
             page += 1
 

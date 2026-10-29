@@ -214,7 +214,8 @@ so a merge reaches `status.usage` within two poll intervals end to end.
      look like the last. A walk that still ends short of the total (a proposal that updated
      mid-walk and moved to a page already read, or a GitHub page marked `incomplete_results`) is
      walked once more; short again, the repository's outcomes reading is withheld with
-     `reason="forge"`.
+     `reason="forge"`. A page that adds no new proposal (a server that ignores `page`) ends the walk short at
+     once, and a clamped walk also stops at a page ceiling read from its smallest page.
    - The walk is bounded by `VCS_READINGS_MAX_PAGES` (10), which on GitHub is also the search
      API's own ceiling of a thousand results, so it cannot be raised there. A repository whose
      own proposals exceed the bound is `truncated`, and truncation is a property of the

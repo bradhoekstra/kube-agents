@@ -794,6 +794,85 @@ class ListingCompletenessTest(unittest.TestCase):
         self.assertEqual(120, len([k for k in sweep._cache if k[:2] == ("gitea.example.com", "acme/infra")]))
         self.assertEqual([], metrics.failures)
 
+    def test_a_clamping_gitea_that_ignores_the_page_ends_the_walk_as_short(self):
+        # A server or proxy that ignores `page` serves page 1 again and again;
+        # the walk must end, short, rather than ask forever for a total it
+        # never reaches.
+        nodes = [gitea_pr(n) for n in range(1, 121)]
+        api = ClampingGitea(nodes)
+        serve = api.api
+
+        def ignoring_page(method, route, *, params=None, **kwargs):
+            if route == "repos/acme/infra/pulls":
+                params = {**params, "page": 1}
+            return serve(method, route, params=params, **kwargs)
+
+        api.api = ignoring_page
+        forge = GiteaForge("gitea.example.com", "/nonexistent/token", label="gitea")
+        sweep, metrics = real_forge_sweep(forge, api, GITEA_REPO)
+
+        with self.assertLogs(LOGGER_NAME, level="WARNING"):
+            sweep.run_once()
+
+        # Two pages a walk, the second adding nothing; walked twice.
+        self.assertEqual(4, len(api.pages))
+        self.assertEqual([], metrics.readings)
+        self.assertEqual(["forge"], metrics.failures)
+        self.assertEqual({}, sweep._cache)
+
+    def test_a_clamped_walk_stops_at_a_page_ceiling(self):
+        # Each page adds one new proposal under a total it never reaches: the
+        # proposal bound alone would allow a thousand pages.
+        forge = FakeForge(clamp=50)
+        for number in range(1, 2001):
+            forge.add(number, "merged", updated=f"2026-01-01T00:00:00Z{number:05d}")
+        served = []
+
+        def one_new_a_page(method_page):
+            served.append(method_page)
+
+        forge.before_page = one_new_a_page
+        original = forge.proposal_list_by_author
+
+        def listing(api, repo, payload):
+            answer = original(api, repo, payload)
+            # Page n repeats page 1's proposals but one, which is new.
+            first = original(api, repo, {**payload, "page": 1})["proposals"]
+            answer["proposals"] = first[:-1] + answer["proposals"][:1]
+            return answer
+
+        forge.proposal_list_by_author = listing
+        harness = Harness({REPO: forge}, interval=WIDE)
+
+        harness.sweep.run_once()
+
+        ceiling = -(-vcs_readings.VCS_READINGS_MAX_PROPOSALS_GITEA // 50) + vcs_readings.VCS_READINGS_CLAMPED_PAGE_SLACK
+        self.assertLessEqual(len(served), 2 * ceiling)
+        self.assertEqual(["truncated"], harness.metrics.failures)
+
+    def test_an_incomplete_page_ends_the_walk_at_once(self):
+        search = GitHubSearch(count=150, incomplete=True)
+        pages = []
+        serve = search.api
+
+        def paged(method, route, *, params=None, **kwargs):
+            if route == "search/issues" and params and "page" in params:
+                pages.append(params["page"])
+                answer = serve(method, route, params=params, **kwargs)
+                start = (params["page"] - 1) * 99
+                return {**answer, "items": answer["items"][start : start + 99]}
+            return serve(method, route, params=params, **kwargs)
+
+        search.api = paged
+        forge = GitHubForge(refresh=mock.Mock())
+        sweep, metrics = real_forge_sweep(forge, search, REPO)
+
+        with self.assertLogs(LOGGER_NAME, level="WARNING"):
+            sweep.run_once()
+
+        self.assertEqual([1, 1], pages)
+        self.assertEqual(["forge"], metrics.failures)
+
     def test_a_listing_that_shifts_mid_walk_is_walked_again(self):
         forge = FakeForge()
         for number in range(1, 151):
