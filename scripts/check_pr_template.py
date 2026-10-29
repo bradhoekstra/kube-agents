@@ -53,6 +53,10 @@ and a reviewer still reads the comment. What the check reads, per section:
   (they are not CommonMark parsers, and neither is this), and a fence left
   open swallows every later section.
 
+The text before the first heading is read for removal and shape too, since a
+whole-file "delete the sections that do not apply" would sit there, and not
+for a condition, since it is no section.
+
 The parser is the readers' shape, copied from ``app/pr_body.py`` in
 kube-agents-bot and ``runner/kube_agents_robot/pr_body.py`` in
 kube-agents-robot: ``##`` through ``######`` outside a fence is a section, a
@@ -97,7 +101,7 @@ REMOVAL_RE = re.compile(
     rf"\b{_VERB}\s+{_OBJECT}"
     rf"|\b(?:leave|take)\s+{_OBJECT}\s+out\b"
     rf"|\b{_OBJECT}\s+(?:is|are|will\s+be|can\s+be|may\s+be|should\s+be|must\s+be)\s+{_PASSIVE}\b"
-    rf"|\b{_OTHERWISE},?\s+{_SOFTENER}(?:{_VERB}|{_PASSIVE})(?:\s+(?:it|them))?{_CLAUSE_END}"
+    rf"|\b{_OTHERWISE},?\s+{_SOFTENER}(?:{_VERB}|{_PASSIVE})(?:\s+(?:it|them)\b|{_CLAUSE_END})"
     rf"|\b{_OTHERWISE},?\s+(?:leave|take)\s+(?:it|them)\s+out{_CLAUSE_END}",
     re.IGNORECASE,
 )
@@ -105,6 +109,7 @@ REMOVAL_RE = re.compile(
 # before it: "do not delete", "never remove", "rather than delete". A "not"
 # right after "if", "when" or "whether" is a condition, not a negation.
 CLAUSE_START_RE = re.compile(r"[.;:?!]")
+LEADING_CONDITION_RE = re.compile(r"^\s*(?:if|when|unless|whether)\b.*,", re.IGNORECASE | re.DOTALL)
 NEGATION_RE = re.compile(
     r"\b(?:never|rather\s+than|instead\s+of|no\s+(?:circumstances|reason|need))\b"
     r"|n't\b"
@@ -141,8 +146,12 @@ _WRITE = rf"\b{_OTHERWISE},?\s+(?:write|say)\s+(?:\w+\s+){{0,2}}"
 ANSWER_RE = re.compile(rf"{_WRITE}{_QUOTE}{_NOT_QUOTE}\n]+{_QUOTE}", re.IGNORECASE)
 SPLIT_ANSWER_RE = re.compile(rf"{_WRITE}{_QUOTE}{_NOT_QUOTE}]*\n{_NOT_QUOTE}]*{_QUOTE}", re.IGNORECASE)
 
-# The heading a problem is filed under when the file has no section at all.
+# The heading a problem is filed under when the file has no section at all,
+# and the one for the text before the first heading, where a whole-file
+# instruction ("delete the sections that do not apply") would sit.
 NO_SECTIONS_HEADING = "(whole file)"
+PREAMBLE_HEADING = "(before the first heading)"
+BOM = "\ufeff"
 
 # One message per rule; the tests import these rather than pin the prose.
 NO_SECTIONS_MESSAGE = "the template has no section heading at all"
@@ -170,10 +179,14 @@ REMEDY = (
 
 
 def _parse(markdown: str) -> tuple[list[tuple[str, str]], bool]:
-    """The sections, and whether a fence was still open at the end of the file."""
-    found: list[tuple[str, list[str]]] = []
+    """The preamble, the sections, and whether a fence was still open at the end.
+
+    The preamble is the first entry, under ``PREAMBLE_HEADING``; ``sections()``
+    drops it, because it is not a heading the readers hold a body to.
+    """
+    found: list[tuple[str, list[str]]] = [(PREAMBLE_HEADING, [])]
     fence: str | None = None
-    for line in markdown.splitlines():
+    for line in markdown.lstrip(BOM).splitlines():
         marker = FENCE_RE.match(line)
         if marker and fence is None:
             fence = marker.group(1)
@@ -182,14 +195,14 @@ def _parse(markdown: str) -> tuple[list[tuple[str, str]], bool]:
         heading = None if fence else HEADING_RE.match(line)
         if heading:
             found.append((heading.group(2), []))
-        elif found:
+        else:
             found[-1][1].append(line)
     return [(heading, "\n".join(lines)) for heading, lines in found], fence is not None
 
 
 def sections(markdown: str) -> list[tuple[str, str]]:
     """``(heading, content)`` for every section, in file order."""
-    return _parse(markdown)[0]
+    return _parse(markdown)[0][1:]
 
 
 def comments(content: str) -> list[str]:
@@ -210,6 +223,11 @@ def removal(comment: str) -> bool:
     for match in REMOVAL_RE.finditer(comment):
         before = comment[: match.start()]
         clause = CLAUSE_START_RE.split(before)[-1]
+        if LEADING_CONDITION_RE.match(clause):
+            # "If this PR does not add a case, delete this section": the
+            # words before the last comma are the condition, and only the
+            # words after it can negate the verb.
+            clause = clause.rsplit(",", 1)[-1]
         if not NEGATION_RE.search(clause):
             return True
     return False
@@ -229,7 +247,7 @@ def _shape_problems(content: str) -> list[str]:
 def problems(markdown: str) -> list[tuple[str, str]]:
     """``(heading, message)`` for every rule a section breaks, in file order."""
     parsed, open_fence = _parse(markdown)
-    if not parsed:
+    if len(parsed) == 1:
         message = OPEN_FENCE_MESSAGE if open_fence else NO_SECTIONS_MESSAGE
         return [(NO_SECTIONS_HEADING, message)]
     found = []
@@ -248,6 +266,8 @@ def problems(markdown: str) -> list[tuple[str, str]]:
             # One defect, one line: a comment that says to delete the
             # section names no answer either, and the remedy is the same.
             found.append((heading, REMOVAL_MESSAGE))
+        elif heading == PREAMBLE_HEADING:
+            continue
         elif any(CONDITION_RE.search(first_sentence(c)) for c in section_comments):
             if SPLIT_ANSWER_RE.search(joined) and not ANSWER_RE.search(joined):
                 found.append((heading, SPLIT_ANSWER_MESSAGE))

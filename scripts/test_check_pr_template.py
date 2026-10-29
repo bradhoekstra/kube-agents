@@ -116,6 +116,9 @@ class RemovalRuleTest(unittest.TestCase):
             "This section will be deleted when it does not apply.",
             "Otherwise, leave it out.",
             "Otherwise it can be deleted.",
+            "If this PR does not add a roster case, delete this section.",
+            "When this PR is not a bug fix, remove this section.",
+            "Show the red run and the misses. Otherwise delete it when the PR adds no roster case.",
         ):
             with self.subTest(phrase=phrase):
                 self.assertEqual(problems_of(section(phrase)), [check.REMOVAL_MESSAGE])
@@ -281,6 +284,19 @@ class ShapeRuleTest(unittest.TestCase):
     def test_a_fence_in_the_body_is_fine(self) -> None:
         text = "## R\n\n<!-- Paste the command. -->\n\n```\nmake test\n```\n\n## S\n"
         self.assertEqual(problems_of(text), [])
+
+    def test_a_removal_before_the_first_heading_is_read(self) -> None:
+        text = "# Pull request\n\n<!-- Delete the sections that do not apply to this PR. -->\n\n## Summary\n\n<!-- One paragraph. -->\n"
+        self.assertEqual(check.problems(text), [(check.PREAMBLE_HEADING, check.REMOVAL_MESSAGE)])
+        self.assertEqual([h for h, _ in check.sections(text)], ["Summary"])
+
+    def test_a_condition_before_the_first_heading_is_not_a_section(self) -> None:
+        text = "<!-- Optional: read the rules first. -->\n\n## Summary\n\n<!-- One paragraph. -->\n"
+        self.assertEqual(problems_of(text), [])
+
+    def test_a_byte_order_mark_does_not_hide_the_first_heading(self) -> None:
+        text = "\ufeff## Summary\n\n<!-- Otherwise delete this section. -->\n"
+        self.assertEqual(check.problems(text), [("Summary", check.REMOVAL_MESSAGE)])
 
     def test_a_fence_before_the_first_heading_is_reported_as_open(self) -> None:
         self.assertEqual(
