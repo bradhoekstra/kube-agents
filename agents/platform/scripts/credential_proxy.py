@@ -5285,6 +5285,13 @@ FORGE_REFRESH_HELPER_DIR = "/opt/defaults/scripts"
 # import its CLI side into the broker.
 FORGE_READ_ONLY_FLAG = "--read-only"
 
+# The flag that turns a forge's refresh helper into a sweep mint: the helper
+# prints a token that reads contents, pull requests and issues of the one
+# managed repository named, and installs nothing.
+# `github_token_refresh.SWEEP_FLAG` is the same string, kept in step by test
+# for FORGE_READ_ONLY_FLAG's reason.
+FORGE_SWEEP_FLAG = "--sweep"
+
 # The flag that turns a forge's refresh helper into a write mint for a forge
 # with no CLI behind it (GitHub Enterprise Server): the helper prints the
 # token and the repositories it covers as JSON and installs nothing, and
@@ -8098,6 +8105,23 @@ class CommandExecutor:
         return self._forge_write_mint_lock
 
     @property
+    def _sweep_mint_lock(self) -> threading.Lock:
+        if getattr(self, "_forge_sweep_mint_lock", None) is None:
+            self._forge_sweep_mint_lock = threading.Lock()
+        return self._forge_sweep_mint_lock
+
+    @property
+    def _sweep_tokens(self) -> dict[tuple[str, str, str], tuple[float, str]]:
+        """(provider, host, repository) -> (minted at, token): in memory only.
+
+        Apart from `_write_tokens`, because a sweep token reads and must never
+        be handed to a write, and one slot per repository, because the mint
+        covers the one repository it was asked for."""
+        if getattr(self, "_forge_sweep_tokens", None) is None:
+            self._forge_sweep_tokens = {}
+        return self._forge_sweep_tokens
+
+    @property
     def _write_tokens(self) -> dict[tuple[str, str, str], tuple[float, frozenset[str], str]]:
         """(provider, host, owner) -> (minted at, repositories covered, token): in memory only.
 
@@ -8573,6 +8597,52 @@ class CommandExecutor:
         token = result.stdout.strip()
         if not token:
             raise RuntimeError("read-only credential mint returned no token")
+        return token
+
+    def mint_sweep_credential(self, provider: str, repository: str) -> str:
+        """A token that reads one managed repository's pull requests and issues, or raise.
+
+        The same helper `mint_read_credential` runs, with the flag that makes
+        it print a sweep-scope token: contents, pull requests and issues, read
+        only, for this one repository. A context repository is refused: its
+        read stays `contents: read` alone. The role check runs on every call,
+        cached token or not, so a repository unregistered since the last mint
+        is refused. A token is handed out again for
+        FORGE_WRITE_TOKEN_REUSE_SECONDS for the repository it was minted for.
+
+        The token comes back on stdout and is returned, never logged.
+        """
+        forge = _provider_forge(provider)
+        if repository_role(repository, forge) != ROLE_MANAGED:
+            raise PermissionError(f"{repository} is not a repository this install manages")
+        host = forge.hosts[0] if forge.hosts else ""
+        key = (provider, host, repository.strip().lower())
+
+        def cached() -> str | None:
+            entry = self._sweep_tokens.get(key)
+            if entry is None:
+                return None
+            minted_at, token = entry
+            if time.monotonic() - minted_at < FORGE_WRITE_TOKEN_REUSE_SECONDS:
+                return token
+            return None
+
+        token = cached()
+        if token:
+            return token
+        helper = self._forge_helper(provider)
+        with self._sweep_mint_lock:
+            token = cached()
+            if token:
+                return token
+            with self._outside_budget():
+                result = self._run_forge_helper(
+                    provider, helper, [FORGE_SWEEP_FLAG, repository], "sweep credential mint"
+                )
+            token = result.stdout.strip()
+            if not token:
+                raise RuntimeError("sweep credential mint returned no token")
+            self._sweep_tokens[key] = (time.monotonic(), token)
         return token
 
     def mint_write_credential(self, provider: str, repository: str) -> str:
