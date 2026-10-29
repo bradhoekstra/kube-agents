@@ -256,6 +256,10 @@ class _Repository:
         return (self.host, self.path.casefold())
 
 
+def _host(forge: Any) -> str:
+    return forge.hosts[0] if forge.hosts else forge.name
+
+
 @dataclass
 class _Attempt:
     """What one repository's attempt gave each reading."""
@@ -371,7 +375,7 @@ class ReadingsSweep:
                 scopes.add(self._bound[key].scope)
             else:
                 details_whole = False
-        self._evict_unmanaged()
+        self._evict_unmanaged(managed)
         if not required:
             return
         now = time.time()
@@ -433,7 +437,7 @@ class ReadingsSweep:
     def _bind(self, key: str) -> _Repository:
         forge, path = self._registry.resolve(key)
         transport = self._transport_for(forge, path)
-        host = forge.hosts[0] if forge.hosts else forge.name
+        host = _host(forge)
 
         def api(method: str, route: str, **kwargs: Any) -> Any:
             self._calls += 1
@@ -649,9 +653,21 @@ class ReadingsSweep:
         for key in [k for k in self._cache if k[:2] == scope and k[2] not in listed]:
             del self._cache[key]
 
-    def _evict_unmanaged(self) -> None:
-        """A repository no longer managed takes its proposals out of the readings."""
-        live = {bound.scope for bound in self._bound.values()}
+    def _evict_unmanaged(self, managed: list[str]) -> None:
+        """A repository no longer managed takes its proposals out of the readings.
+
+        Judged against the managed list, not against the repositories bound this
+        sweep: a bind that failed (a mint outage in `transport_for`) leaves the
+        repository managed, and its records, the fallen-off ones of a truncated
+        repository among them, stay for the life of the process.
+        """
+        live: set[tuple[str, str]] = set()
+        for key in managed:
+            try:
+                forge, path = self._registry.resolve(key)
+            except Exception:  # noqa: BLE001 -- a host no forge serves holds no records
+                continue
+            live.add((_host(forge), path.casefold()))
         for key in [k for k in self._cache if k[:2] not in live]:
             del self._cache[key]
 

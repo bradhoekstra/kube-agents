@@ -469,6 +469,29 @@ class ReadingsSweepTest(unittest.TestCase):
         self.assertEqual(len(harness.sweep._cache), 5)
         self.assertIsNotNone(harness.last()[1])
 
+    def test_a_failing_transport_leaves_the_cache_intact(self):
+        forge = FakeForge()
+        forge.add(1, "merged")
+        forge.add(2, "open")
+        harness = Harness({REPO: forge})
+        harness.sweep.run_once()
+        self.assertEqual(len(harness.sweep._cache), 2)
+        harness.sweep._transport_for = mock.Mock(side_effect=WorkspaceError("mint failed", status=502))
+
+        with self.assertLogs(LOGGER_NAME, level="WARNING"):
+            harness.sweep.run_once()
+
+        self.assertEqual(len(harness.sweep._cache), 2)
+        self.assertEqual(harness.metrics.failures, ["forge"])
+        self.assertEqual(len(harness.metrics.readings), 1)
+
+        # A repository no longer managed still takes its records out.
+        harness.sweep._managed = lambda: frozenset({OTHER_REPO})
+        harness.sweep._registry.forges[OTHER_REPO] = FakeForge()
+        harness.sweep._transport_for = lambda forge, repo: FakeTransport(forge)
+        harness.sweep.run_once()
+        self.assertEqual(harness.sweep._cache, {})
+
     def test_a_proposal_whose_updated_did_not_move_costs_no_detail_call(self):
         forge = FakeForge()
         forge.add(1, "merged")
