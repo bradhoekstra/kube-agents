@@ -252,6 +252,13 @@ type fakeChatRelay struct {
 	tokens    []string
 }
 
+// fakeChatAPIError, as a response, makes the fake relay answer a call with
+// the Chat API's own refusal.
+type fakeChatAPIError struct {
+	status int
+	reason string
+}
+
 type relayCall struct {
 	resource  []string
 	method    string
@@ -283,6 +290,14 @@ func newFakeChatRelay(t *testing.T) *fakeChatRelay {
 		if !ok {
 			w.WriteHeader(http.StatusBadGateway)
 			json.NewEncoder(w).Encode(map[string]any{"error": "Google Chat operation failed"})
+			return
+		}
+		if apiErr, ok := resp.(fakeChatAPIError); ok {
+			// The relay's shape for a Chat API refusal: the API's status
+			// and reason under "chat" (gchatRelayError).
+			w.WriteHeader(http.StatusBadGateway)
+			json.NewEncoder(w).Encode(map[string]any{"error": "Google Chat operation failed",
+				"chat": map[string]any{"status": apiErr.status, "reason": apiErr.reason}})
 			return
 		}
 		json.NewEncoder(w).Encode(map[string]any{"response": resp})
@@ -372,7 +387,7 @@ func TestGchatEditPatchesText(t *testing.T) {
 		t.Fatal(err)
 	}
 	c := f.call(0)
-	if c.method != "patch" || c.arguments["name"] != "spaces/S1/messages/M77" || c.arguments["updateMask"] != "text" {
+	if c.method != "patch" || c.arguments["name"] != "spaces/S1/messages/M77" || c.arguments["updateMask"] != gchatLayoutUpdateMask {
 		t.Errorf("patch = %+v", c)
 	}
 	if c.arguments["body"].(map[string]any)["text"] != "✅ *completed*" {

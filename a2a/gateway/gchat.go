@@ -125,9 +125,15 @@ const (
 	gchatMentionOpen    = "<" + gchatUsersToken
 	gchatMentionDefused = "< " + gchatUsersToken
 	// gchatTextMax bounds one posted text, in bytes, under Chat's 32,000-byte
-	// message cap with room for the markdown rules' few added bytes: a
-	// rendered chunk past it posts its tables as written (toGchatText).
+	// message cap with room for the markdown rules' few added bytes and a
+	// laid-out message's buttons: a rendered chunk past it posts its tables
+	// as written (toGchatText), and a laid-out message past it posts its
+	// fallback (renderGchatChat).
 	gchatTextMax = 30000
+	// gchatLayoutUpdateMask names what a laid-out edit replaces: the text
+	// and the accessory widgets, in the field-path spelling the Chat API's
+	// messages.patch takes.
+	gchatLayoutUpdateMask = "text,accessory_widgets"
 )
 
 // Google Chat's own vocabulary, as it appears in event payloads and API
@@ -284,6 +290,9 @@ type gchatMessage struct {
 	// that does not support reply threading.
 	ThreadReply bool        `json:"threadReply"`
 	Sender      gchatSender `json:"sender"`
+	// AccessoryWidgets are the buttons under the message, as a click event
+	// carries the clicked message (gchat_clicks.go).
+	AccessoryWidgets []gchatAccessoryWidget `json:"accessoryWidgets"`
 }
 
 // gchatEvent is one Chat event normalized to the legacy field layout: Type
@@ -308,6 +317,8 @@ type gchatEvent struct {
 	// or, for an add-on event carrying some other payload, that payload's
 	// key(s).
 	shape string
+	// click is set on a CARD_CLICKED event (gchat_clicks.go).
+	click *gchatClick
 }
 
 // gchatWireEvent is the union of both wire shapes as JSON sees them.
@@ -316,6 +327,14 @@ type gchatWireEvent struct {
 	Space   gchatSpace                 `json:"space"`
 	Message gchatMessage               `json:"message"`
 	Chat    map[string]json.RawMessage `json:"chat"`
+	Common  gchatCommonEvent           `json:"commonEventObject"`
+	// The legacy layout's click fields (gchat_clicks.go, decodeGchatLegacyClick):
+	// the clicker, the event time, the button's action, and the common
+	// event object under its legacy key.
+	User         gchatSender       `json:"user"`
+	EventTime    string            `json:"eventTime"`
+	Action       gchatLegacyAction `json:"action"`
+	LegacyCommon gchatCommonEvent  `json:"common"`
 }
 
 // gchatAddonMessagePayload is chat.messagePayload of the add-on event object.
@@ -351,6 +370,11 @@ type GoogleChatAdapter struct {
 	// inverse, for OpenDirect.
 	userIDs    map[string]string
 	userEmails map[string]string
+	// ux is the click state: the questions posted, the clicks waiting on
+	// verification, and the questions answered (gchat_clicks.go).
+	// syncRewrites runs an answered question's rewrite inline, under test.
+	ux           *gchatUX
+	syncRewrites bool
 
 	// countInterval paces the received-events summary line
 	// (gchatEventCountInterval; tests shorten it). subscription is the Chat
@@ -468,19 +492,8 @@ func (a *GoogleChatAdapter) Post(conversation, text string) (string, error) {
 	if !ok {
 		return "", fmt.Errorf("gchat: not a gchat conversation: %q", conversation)
 	}
-	body := map[string]any{"text": toGchatText(text)}
-	arguments := map[string]any{"parent": space, "body": body}
-	if thread != "" {
-		body["thread"] = map[string]any{"name": thread}
-		arguments["messageReplyOption"] = gchatReplyOption
-	}
-	var created struct {
-		Name string `json:"name"`
-	}
-	if err := a.apiCall([]string{"spaces", "messages"}, "create", arguments, &created); err != nil {
-		return "", err
-	}
-	return created.Name, nil
+	message, _, err := a.create(space, thread, map[string]any{"text": toGchatText(text)})
+	return message, err
 }
 
 // PostNotify writes text into space, as a new thread when thread is empty or
@@ -492,7 +505,69 @@ func (a *GoogleChatAdapter) PostNotify(space, thread, text string) (message, lan
 	if !gchatIsSpaceName(space) {
 		return "", "", fmt.Errorf("gchat: not a space name: %q", space)
 	}
-	body := map[string]any{"text": toGchatText(text)}
+	return a.create(space, thread, map[string]any{"text": toGchatText(text)})
+}
+
+// Edit replaces the text of a previously posted message (Adapter.Edit) — the
+// rolling progress line edits one message as artifacts arrive. It is
+// EditMessage with the text alone: the widgets are patched empty too, since
+// the message may have been laid out before, in this process or one a
+// restart replaced, and a question it asked is closed.
+func (a *GoogleChatAdapter) Edit(conversation, messageID, text string) error {
+	return a.EditMessage(conversation, messageID, OutMessage{Text: text})
+}
+
+// PostMessage posts a message value: a chat message laid out as a text
+// message with accessory buttons (renderGchatChat, gchat_chat.go), with
+// m.Text as the fallback the gateway posts when the layout is refused; one
+// with no chat message is Post. A layout this renderer will not send, or one
+// Chat's API refuses, is ErrLayoutRefused, so the gateway posts the text
+// instead (Gateway.chatOutcome); a failed call is returned as it is.
+func (a *GoogleChatAdapter) PostMessage(conversation string, m OutMessage) (string, error) {
+	if m.Chat == nil {
+		return a.Post(conversation, m.Text)
+	}
+	space, thread, ok := gchatSpaceThread(conversation)
+	if !ok {
+		return "", fmt.Errorf("gchat: not a gchat conversation: %q", conversation)
+	}
+	name, _, err := a.createLaidOut(space, thread, conversation, m)
+	return name, err
+}
+
+// PostNotifyMessage is PostMessage for the chat.notify route's home posts
+// (notifyChatPoster): the same laid-out message into space, as a new thread
+// or on thread, and the thread it landed in back, as PostNotify gives it.
+func (a *GoogleChatAdapter) PostNotifyMessage(space, thread string, m OutMessage) (message, landed string, err error) {
+	if !gchatIsSpaceName(space) {
+		return "", "", fmt.Errorf("gchat: not a space name: %q", space)
+	}
+	if m.Chat == nil {
+		return a.PostNotify(space, thread, m.Text)
+	}
+	return a.createLaidOut(space, thread, "", m)
+}
+
+// createLaidOut lays m.Chat out and creates it in space, as a reply on
+// thread when one is given, and remembers it when it carries choices,
+// bound to conversation (empty for a home post).
+func (a *GoogleChatAdapter) createLaidOut(space, thread, conversation string, m OutMessage) (message, landed string, err error) {
+	layout, err := renderGchatChat(m.Chat)
+	if err != nil {
+		return "", "", fmt.Errorf("%w: %w", ErrLayoutRefused, err)
+	}
+	message, landed, err = a.create(space, thread, gchatLayoutBody(layout))
+	if err != nil {
+		return "", "", gchatLayoutError(err, false)
+	}
+	a.trackQuestion(message, conversation, m.Chat, layout)
+	return message, landed, nil
+}
+
+// create is spaces.messages.create with body, in space as a new thread or
+// as a reply on thread (degrading to a new thread when that one cannot take
+// replies), returning the message's name and the thread it landed in.
+func (a *GoogleChatAdapter) create(space, thread string, body map[string]any) (message, landed string, err error) {
 	arguments := map[string]any{"parent": space, "body": body}
 	if thread != "" {
 		body["thread"] = map[string]any{"name": thread}
@@ -510,28 +585,60 @@ func (a *GoogleChatAdapter) PostNotify(space, thread, text string) (message, lan
 	return created.Name, created.Thread.Name, nil
 }
 
-// Edit replaces the text of a previously posted message (Adapter.Edit) — the
-// rolling progress line edits one message as artifacts arrive.
-func (a *GoogleChatAdapter) Edit(conversation, messageID, text string) error {
+// EditMessage replaces a posted message with a message value, laid out when
+// it carries a chat message. Without one the text replaces the layout too:
+// the accessory widgets are sent empty, since a patch keeps whatever its
+// mask does not name.
+func (a *GoogleChatAdapter) EditMessage(conversation, messageID string, m OutMessage) error {
 	if _, _, ok := gchatSpaceThread(conversation); !ok {
 		return fmt.Errorf("gchat: not a gchat conversation: %q", conversation)
 	}
+	layout := gchatChatLayout{Text: toGchatText(m.Text)}
+	if m.Chat != nil {
+		var err error
+		if layout, err = renderGchatChat(m.Chat); err != nil {
+			return fmt.Errorf("%w: %w", ErrLayoutRefused, err)
+		}
+	}
+	layout = a.answeredLayout(messageID, m, layout)
 	arguments := map[string]any{
 		"name":       messageID,
-		"updateMask": "text",
-		"body":       map[string]any{"text": toGchatText(text)},
+		"updateMask": gchatLayoutUpdateMask,
+		"body":       gchatLayoutBody(layout),
 	}
-	return a.apiCall([]string{"spaces", "messages"}, "patch", arguments, nil)
+	if err := a.apiCall([]string{"spaces", "messages"}, "patch", arguments, nil); err != nil {
+		return gchatLayoutError(err, true)
+	}
+	a.trackQuestion(messageID, conversation, m.Chat, layout)
+	return nil
 }
 
-// PostMessage and EditMessage post text only: a chat message falls back to
-// its text (ErrTextOnly) until this adapter renders cards.
-func (a *GoogleChatAdapter) PostMessage(conversation string, m OutMessage) (string, error) {
-	return postTextOnly(a.Post, conversation, m)
+// gchatLayoutBody is the message body a layout posts or patches: its text,
+// and its accessory widgets, an empty list when it has none so a patch
+// clears the ones a message had.
+func gchatLayoutBody(layout gchatChatLayout) map[string]any {
+	widgets := layout.Widgets
+	if widgets == nil {
+		widgets = []map[string]any{}
+	}
+	return map[string]any{"text": layout.Text, "accessoryWidgets": widgets}
 }
 
-func (a *GoogleChatAdapter) EditMessage(conversation, messageID string, m OutMessage) error {
-	return editTextOnly(a.Edit, conversation, messageID, m)
+// gchatLayoutError reads the Chat API's answer to a laid-out post or patch:
+// a 400 refuses what the message carries (ErrLayoutRefused), a 404 on an
+// edit says the message is gone (ErrMessageGone), and anything else (a rate
+// limit, an outage, the relay down, a 404 on a create) is returned as it is.
+func gchatLayoutError(err error, edit bool) error {
+	var api *gchatAPIError
+	switch {
+	case err == nil || !errors.As(err, &api):
+		return err
+	case api.Status == http.StatusBadRequest:
+		return fmt.Errorf("%w: %w", ErrLayoutRefused, err)
+	case edit && api.Status == http.StatusNotFound:
+		return fmt.Errorf("%w: %w", ErrMessageGone, err)
+	}
+	return err
 }
 
 // Roster returns one page of the space's membership (Adapter.Roster):
@@ -807,7 +914,9 @@ func gchatRelayError(status string, body []byte) error {
 		return errors.New(status)
 	}
 	var details []string
+	chatStatus := 0
 	if parsed.Chat != nil && parsed.Chat.Status != 0 {
+		chatStatus = parsed.Chat.Status
 		detail := "chat " + strconv.Itoa(parsed.Chat.Status)
 		if reason := gchatRelayDetail(parsed.Chat.Reason); reason != "" {
 			detail += " " + reason
@@ -832,8 +941,23 @@ func gchatRelayError(status string, body []byte) error {
 	if len(details) == 0 {
 		return errors.New(status)
 	}
-	return errors.New(status + ": " + strings.Join(details, ", "))
+	err := errors.New(status + ": " + strings.Join(details, ", "))
+	if chatStatus != 0 {
+		return &gchatAPIError{Status: chatStatus, Err: err}
+	}
+	return err
 }
+
+// gchatAPIError is a relay answer that carried the Chat API's own status:
+// what the API said of the call, as distinct from the relay being down or
+// refusing the caller. Its text is the relay error's.
+type gchatAPIError struct {
+	Status int
+	Err    error
+}
+
+func (e *gchatAPIError) Error() string { return e.Err.Error() }
+func (e *gchatAPIError) Unwrap() error { return e.Err }
 
 // gchatRelayDetail makes one string from a relay response body safe to log: no
 // control, format, or line/paragraph-separator characters (a body that could
@@ -874,6 +998,9 @@ func decodeGchatEvent(data string) (*gchatEvent, error) {
 		return nil, fmt.Errorf("event json: %w", err)
 	}
 	if wire.Chat == nil {
+		if wire.Type == gchatEventTypeClick {
+			return decodeGchatLegacyClick(&wire), nil
+		}
 		return &gchatEvent{Type: wire.Type, Space: wire.Space, Message: wire.Message, shape: gchatShapeLegacy}, nil
 	}
 	if payload, ok := wire.Chat[gchatAddonMessageKey]; ok {
@@ -891,6 +1018,9 @@ func decodeGchatEvent(data string) (*gchatEvent, error) {
 			}
 		}
 		return ev, nil
+	}
+	if payload, ok := wire.Chat[gchatAddonClickKey]; ok {
+		return decodeGchatClick(payload, wire.Chat[gchatAddonUserKey], wire.Chat[gchatAddonEventTimeKey], wire.Common)
 	}
 	// An add-on event carrying some other interaction: name its payload
 	// keys so the drop log says what arrived rather than "not a MESSAGE".
@@ -996,6 +1126,9 @@ func defangGchatMentions(s string) string {
 // is indistinguishable from one that receives none — which is exactly how
 // the add-on wire shape went unnoticed until live traffic.
 func (a *GoogleChatAdapter) classify(ev *gchatEvent) (InboundMessage, string) {
+	if ev.Type == gchatEventTypeClick {
+		return a.classifyClick(ev)
+	}
 	if ev.Type != gchatEventTypeMessage {
 		return InboundMessage{}, "not a message event (shape " + ev.shape + ", type " + strconv.Quote(ev.Type) + ")"
 	}
@@ -1022,31 +1155,8 @@ func (a *GoogleChatAdapter) classify(ev *gchatEvent) (InboundMessage, string) {
 		return InboundMessage{}, "empty ask (bare mention)"
 	}
 
-	// A space misread as a DM would bind every thread in it to one session,
-	// so DM requires a positive signal; anything unclassifiable is a group.
-	kind := "group"
-	if ev.Space.SpaceType == gchatSpaceTypeDM || ev.Space.Type == gchatLegacySpaceTypeDM {
-		kind = "dm"
-	}
-	// A GROUP_CHAT surface never supports reply threading, whatever thread
-	// name the event carries — in an unthreaded space every message has its
-	// own thread resource, and binding those would fragment the group chat
-	// into one session per ask.
-	thread := ev.Message.Thread.Name
-	if ev.Space.SpaceThreadingState == gchatThreadingUnthreaded || ev.Space.SpaceType == gchatSpaceTypeGroupChat {
-		thread = ""
-	}
-	// A DM is threaded too, but Chat attaches a thread to every message: a
-	// top-level DM carries the thread Chat auto-created for it. Only a
-	// message typed inside an existing thread (threadReply) is a side
-	// thread with its own conversation, answered in that thread; top-level
-	// DMs share the space's one conversation and are answered top-level.
-	// This is the default-mode Hermes Google Chat rule (main flow versus
-	// side thread), read from Chat's own flag rather than an inbound count
-	// (spec-chatops-gateway.md, "The Google Chat adapter").
-	if kind == "dm" && !ev.Message.ThreadReply {
-		thread = ""
-	}
+	// The surface binding, shared with a click on a message (gchatSurface).
+	kind, thread := gchatSurface(ev)
 
 	a.mu.Lock()
 	if strings.HasPrefix(sender.Name, gchatUsersToken) {
@@ -1076,13 +1186,15 @@ func (a *GoogleChatAdapter) classify(ev *gchatEvent) (InboundMessage, string) {
 		return InboundMessage{}, "duplicate delivery of " + ev.Message.Name
 	}
 
-	return InboundMessage{
+	msg := InboundMessage{
 		Conversation: gchatConversationID(ev.Space.Name, thread, kind),
 		Kind:         kind,
 		AuthorID:     sender.Email,
 		MessageID:    ev.Message.Name,
 		Text:         text,
-	}, ""
+	}
+	a.noteTypedAnswer(msg, sender)
+	return msg, ""
 }
 
 // resolvePrincipal establishes the requester's principal from the backend's
