@@ -9749,21 +9749,14 @@ def sweep_app_credential(forge) -> bool:
 
 
 def start_readings_sweep(executor: CommandExecutor, broker) -> None:
-    """Start the proposal readings sweep beside the listeners, when there is anything to read.
+    """Start the proposal readings sweep beside the listeners.
 
-    Only when the install manages a repository at start. A started sweep
-    re-reads the list every interval, so a repository added later is read from
-    the next interval on; an install with none at start runs no sweep until
-    the broker restarts. An unreadable list at start is no sweep, logged.
+    Always, in the roles that build the broker: the managed list is a
+    live-reloaded mount, so whether there is anything to read is decided on
+    each pass inside the sweep. A pass over an empty or unreadable list makes
+    no attempt and counts no failure, and a repository registered later is
+    read on the next interval.
     """
-    try:
-        managed = managed_repositories()
-    except Exception as exc:  # noqa: BLE001 -- the broker serves without readings
-        LOGGER.warning("proposal readings off: managed repositories unreadable type=%s", type(exc).__name__)
-        return
-    if not managed:
-        LOGGER.info("proposal readings off: no managed repository")
-        return
     vcs_readings.ReadingsSweep(
         registry=broker.registry,
         transport_for=lambda forge, repo: sweep_transport_for(executor, forge, repo),
@@ -9771,7 +9764,7 @@ def start_readings_sweep(executor: CommandExecutor, broker) -> None:
         managed_repositories=managed_repositories,
         app_credential=sweep_app_credential,
     ).start()
-    LOGGER.info("proposal readings enabled repositories=%d", len(managed))
+    LOGGER.info("proposal readings sweep started")
 
 
 def warn_on_credential_reach(broker) -> None:
