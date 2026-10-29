@@ -283,9 +283,15 @@ class ReadingsSweep:
         mint: Callable[[str, str], str],
         clock: Callable[[], float] = time.monotonic,
         interval: float = VCS_READINGS_TTL_SECONDS,
+        app_credential: Callable[[Any], bool] | None = None,
     ) -> None:
         self._registry = registry
         self._transport_for = transport_for
+        # Whether a forge's credential is a GitHub App installation token,
+        # which the forge's author filter names as `app/<slug>`. The primary
+        # signal; the login's `[bot]` marking is the fallback, since the REST
+        # and GraphQL APIs disagree on whether an App login carries it.
+        self._app_credential = app_credential
         self._metrics = metrics
         self._managed = managed_repositories
         # Held for the transport builder; nothing here mints.
@@ -480,7 +486,9 @@ class ReadingsSweep:
     def _author_payload(self, repo: str) -> dict[str, Any]:
         login = self._logins[repo]
         author = login
-        if login.endswith(AUTOMATION_SUFFIX):
+        forge = self._bound[repo].forge
+        app = self._app_credential is not None and self._app_credential(forge)
+        if app or login.endswith(AUTOMATION_SUFFIX):
             author = APP_AUTHOR.format(slug=login.removesuffix(AUTOMATION_SUFFIX))
         payload: dict[str, Any] = {"author": author}
         if self._author_ids.get(repo) is not None:

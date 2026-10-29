@@ -10,6 +10,7 @@ import threading
 import unittest
 from unittest import mock
 
+import providers
 from providers import IdentityUnknown, WorkspaceError
 
 import vcs_readings
@@ -210,7 +211,9 @@ def install_commit():
 
 
 class Harness:
-    def __init__(self, forges: dict[str, FakeForge], interval=vcs_readings.VCS_READINGS_TTL_SECONDS):
+    def __init__(
+        self, forges: dict[str, FakeForge], interval=vcs_readings.VCS_READINGS_TTL_SECONDS, app_credential=None
+    ):
         self.forges = forges
         self.metrics = FakeMetrics()
         self.clock = FakeClock()
@@ -222,6 +225,7 @@ class Harness:
             mint=mock.Mock(side_effect=AssertionError("the fake transport never mints")),
             clock=self.clock,
             interval=interval,
+            app_credential=app_credential,
         )
 
     def last(self):
@@ -656,6 +660,56 @@ class ReadingsSweepTest(unittest.TestCase):
         finally:
             harness.sweep.stop()
             thread.join(5)
+
+
+class SweepIdentityTest(unittest.TestCase):
+    def test_the_sweeps_login_comes_from_the_sweep_transport_not_binding_whoami(self):
+        import credential_proxy
+        import vcs_broker
+        from test_credential_proxy import _SweepExecutor
+        from test_providers_http_transport import Opener
+
+        github = next(cls for cls in providers.AVAILABLE if cls.name == "github")
+        forge = github(refresh=mock.Mock(side_effect=AssertionError("the write credential is never refreshed")))
+        executor = _SweepExecutor()
+        opener = Opener({"data": {"viewer": {"login": INSTALL}}})
+        sweep = ReadingsSweep(
+            registry=FakeRegistry({REPO: forge}),
+            transport_for=lambda f, r: credential_proxy.sweep_transport_for(executor, f, r, opener=opener),
+            metrics=FakeMetrics(),
+            managed_repositories=lambda: frozenset({REPO}),
+            mint=executor.mint_sweep_credential,
+            app_credential=credential_proxy.sweep_app_credential,
+        )
+
+        with mock.patch.object(vcs_broker.Binding, "whoami", side_effect=AssertionError("Binding.whoami")):
+            sweep._bind(REPO)
+            self.assertEqual(INSTALL, sweep._login(REPO))
+
+        (request,) = opener.requests
+        self.assertEqual("https://api.github.com/graphql", request.full_url)
+        self.assertEqual("Bearer ghs_sweep_1", request.get_header("Authorization"))
+        self.assertEqual({"author": "app/kube-agents"}, sweep._author_payload(REPO))
+
+    def test_an_app_credential_is_searched_as_app_slug_with_or_without_the_marking(self):
+        # The credential's kind is the primary signal: GraphQL `viewer` may name
+        # an App installation without the `[bot]` marking.
+        for login in (INSTALL, INSTALL_BARE):
+            with self.subTest(login=login):
+                forge = FakeForge(login=login)
+                forge.add(1, "open", author=INSTALL_BARE)
+                harness = Harness({REPO: forge}, app_credential=lambda f: True)
+                harness.sweep.run_once()
+                self.assertEqual("app/kube-agents", forge.list_payloads[0]["author"])
+
+        # Not an App: the bare login, unless the marking says otherwise.
+        for login, author in ((INSTALL_BARE, INSTALL_BARE), (INSTALL, "app/kube-agents")):
+            with self.subTest(login=login, app=False):
+                forge = FakeForge(login=login)
+                forge.add(1, "open", author=INSTALL_BARE)
+                harness = Harness({REPO: forge}, app_credential=lambda f: False)
+                harness.sweep.run_once()
+                self.assertEqual(author, forge.list_payloads[0]["author"])
 
 
 class PureFunctionTest(unittest.TestCase):

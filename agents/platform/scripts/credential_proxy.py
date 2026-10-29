@@ -5292,6 +5292,20 @@ FORGE_READ_ONLY_FLAG = "--read-only"
 # for FORGE_READ_ONLY_FLAG's reason.
 FORGE_SWEEP_FLAG = "--sweep"
 
+# Where the readings sweep reads github.com: the forge's own transport there is
+# the `gh` CLI on the write credential, so the sweep builds the in-process HTTP
+# transport GitHub Enterprise Server already has, at github.com's API, with its
+# own read token. An installation token cannot read `GET /user`, so the login
+# comes from GraphQL `viewer`.
+GITHUB_PROVIDER = "github"
+GITHUB_COM_API_URL = "https://api.github.com"
+GITHUB_COM_GRAPHQL_URL = "https://api.github.com/graphql"
+SWEEP_AUTHORIZATION_HEADER = "Authorization"
+SWEEP_AUTHORIZATION_FORMAT = "Bearer {token}"
+# A forge's declared transport, and the scheme that lets that transport speak plain HTTP.
+FORGE_HTTP_TRANSPORT = "http"
+FORGE_HTTP_SCHEME = "http"
+
 # The flag that turns a forge's refresh helper into a write mint for a forge
 # with no CLI behind it (GitHub Enterprise Server): the helper prints the
 # token and the repositories it covers as JSON and installs nothing, and
@@ -8711,6 +8725,20 @@ class CommandExecutor:
             self._write_tokens[key] = (time.monotonic(), covered | {clean_repo}, token)
         return token
 
+    def drop_sweep_credential(self, provider: str, repository: str) -> None:
+        """Forget the sweep token cached for ``repository``, so the next sweep mints anew.
+
+        Called when the forge refuses the token (401), as `drop_write_credential` is.
+        """
+        try:
+            forge = _provider_forge(provider)
+        except PermissionError:
+            return
+        host = forge.hosts[0] if forge.hosts else ""
+        key = (provider, host, repository.strip().lower())
+        if self._sweep_tokens.pop(key, None) is not None:
+            LOGGER.info("%s sweep token for %s dropped after the forge refused it", provider, repository)
+
     def drop_write_credential(self, provider: str) -> None:
         """Forget the write token cached for ``provider``'s forge, so the next use mints anew.
 
@@ -9620,6 +9648,94 @@ def build_vcs_broker(
     # broker's start, and the answer is a log line either way.
     threading.Thread(target=lambda: warn_on_credential_reach(broker), daemon=True).start()
     return broker
+
+
+class _SweepTransport:
+    """The sweep's GitHub transport: a refused token is dropped and the call asked once more.
+
+    The sweep token is cached for FORGE_WRITE_TOKEN_REUSE_SECONDS, so a
+    reinstalled App or a revoked token would otherwise fail every sweep until
+    the window ends. One retry, on a fresh mint; a second 401 is the answer.
+    """
+
+    def __init__(self, inner: providers.HttpTransport, drop: Callable[[], None]) -> None:
+        self._inner = inner
+        self._drop = drop
+
+    def api(self, method: str, path: str, **kwargs: Any) -> Any:
+        return self._retried(lambda: self._inner.api(method, path, **kwargs))
+
+    def whoami(self) -> str:
+        return self._retried(self._inner.whoami)
+
+    def _retried(self, call: Callable[[], Any]) -> Any:
+        try:
+            return call()
+        except providers.WorkspaceError as refused:
+            if refused.status != HTTPStatus.UNAUTHORIZED:
+                raise
+            self._drop()
+            return call()
+
+
+def sweep_transport_for(executor: CommandExecutor, forge, repo: str, *, opener: Callable[..., Any] | None = None):
+    """The transport the readings sweep reads `repo` through, never the write credential's.
+
+    GitHub, on either host: an in-process HTTP transport presenting the sweep
+    token (`mint_sweep_credential`), at api.github.com on github.com and the
+    instance's own API on GitHub Enterprise Server, with the login from
+    GraphQL `viewer`. GitLab and Gitea: the forge's own HTTP transport with
+    its static token, as every verb reads. Bounded by the numbers
+    `build_vcs_broker` hands the broker. `opener` is the broker's
+    `http_opener`, for tests.
+    """
+    if forge.name == GITHUB_PROVIDER:
+        api_url = forge.api_url or GITHUB_COM_API_URL
+        whoami_graphql = forge.whoami_graphql or GITHUB_COM_GRAPHQL_URL
+        transport = providers.HttpTransport(
+            api_url,
+            lambda: {
+                SWEEP_AUTHORIZATION_HEADER: SWEEP_AUTHORIZATION_FORMAT.format(
+                    token=executor.mint_sweep_credential(forge.name, repo)
+                )
+            },
+            forge.error_overrides,
+            timeout=executor.timeout_seconds,
+            max_bytes=executor.max_output_bytes,
+            opener=opener,
+            outer_deadline=executor.request_deadline,
+            ca_file=forge.ca_file,
+            ca_source=forge.ca_source,
+            whoami_graphql=whoami_graphql,
+        )
+        return _SweepTransport(transport, lambda: executor.drop_sweep_credential(forge.name, repo))
+    if forge.transport == FORGE_HTTP_TRANSPORT and forge.api_url:
+        return providers.HttpTransport(
+            forge.api_url,
+            lambda: forge.credential.headers(repo),
+            forge.error_overrides,
+            timeout=executor.timeout_seconds,
+            max_bytes=executor.max_output_bytes,
+            whoami_route=forge.whoami_route,
+            whoami_graphql=forge.whoami_graphql,
+            opener=opener,
+            outer_deadline=executor.request_deadline,
+            ca_file=forge.ca_file,
+            ca_source=forge.ca_source,
+            allow_http=(forge.scheme == FORGE_HTTP_SCHEME),
+        )
+    raise providers.ForgeUnsupported(f"{forge.name} has no HTTP transport for the readings sweep")
+
+
+def sweep_app_credential(forge) -> bool:
+    """Whether `forge`'s credential is a GitHub App installation token.
+
+    A minted or brokered credential is one; a configured static identity is
+    not. The sweep's author filter names an App as `app/<slug>`.
+    """
+    return forge.name == GITHUB_PROVIDER and isinstance(
+        forge.credential, (providers.BrokeredCredential, providers.MintedWriteCredential)
+    )
 
 
 def warn_on_credential_reach(broker) -> None:

@@ -14870,6 +14870,179 @@ class SweepCredentialMintTest(unittest.TestCase):
         # Two copies of one string, kept in step here for FORGE_READ_ONLY_FLAG's reason.
         self.assertEqual(github_token_refresh.SWEEP_FLAG, credential_proxy.FORGE_SWEEP_FLAG)
 
+    def test_drop_sweep_credential_forgets_one_repositorys_token(self):
+        executor = self._executor()
+        with mock.patch.object(credential_proxy, "repository_role", return_value="managed"):
+            first = executor.mint_sweep_credential("github", "acme/gitops")
+            other = executor.mint_sweep_credential("github", "acme/apps")
+            with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+                executor.drop_sweep_credential("github", "acme/GitOps")
+            self.assertNotIn(first, "\n".join(logs.output))
+            renewed = executor.mint_sweep_credential("github", "acme/gitops")
+            self.assertNotEqual(first, renewed)
+            # The other repository's token is untouched.
+            self.assertEqual(other, executor.mint_sweep_credential("github", "acme/apps"))
+        self.assertEqual(3, len(executor.calls))
+        # An unknown provider or an empty cache is a no-op.
+        executor.drop_sweep_credential("nope", "acme/gitops")
+        executor.drop_sweep_credential("github", "acme/unknown")
+
+
+def _forge_class(name):
+    return next(cls for cls in providers.AVAILABLE if cls.name == name)
+
+
+class _SweepExecutor:
+    """The executor surface `sweep_transport_for` reads: the sweep mint and drop,
+    the broker's bounds, and tripwires on every other privileged operation."""
+
+    timeout_seconds = 7.0
+    max_output_bytes = 1 << 16
+
+    def __init__(self):
+        self.minted: list[tuple[str, str]] = []
+        self.dropped: list[tuple[str, str]] = []
+
+    def mint_sweep_credential(self, provider, repository):
+        self.minted.append((provider, repository))
+        return f"ghs_sweep_{len(self.minted)}"
+
+    def drop_sweep_credential(self, provider, repository):
+        self.dropped.append((provider, repository))
+
+    def request_deadline(self):
+        return None
+
+    def mint_write_credential(self, provider, repository):
+        raise AssertionError("the sweep never mints the write token")
+
+    def refresh_forge_credential(self, provider, repository, caller=None):
+        raise AssertionError("the sweep never refreshes the write credential")
+
+    def mint_read_credential(self, provider, repository):
+        raise AssertionError("the sweep never mints the context read token")
+
+
+class SweepTransportTest(unittest.TestCase):
+    """The sweep reads over HTTP with its own token on every forge."""
+
+    def _opener(self, *answers):
+        from test_providers_http_transport import Opener
+
+        return Opener(*answers)
+
+    def test_github_com_gets_an_http_transport_at_api_github_com(self):
+        forge = _forge_class("github")(refresh=mock.Mock(side_effect=AssertionError("no refresh")))
+        executor = _SweepExecutor()
+        opener = self._opener({"data": {"viewer": {"login": "kube-agents[bot]"}}}, {"items": []})
+
+        transport = credential_proxy.sweep_transport_for(executor, forge, "acme/gitops", opener=opener)
+
+        self.assertEqual("kube-agents[bot]", transport.whoami())
+        self.assertEqual({"items": []}, transport.api("GET", "search/issues"))
+        graphql, search = opener.requests
+        self.assertEqual(("POST", "https://api.github.com/graphql"), (graphql.get_method(), graphql.full_url))
+        self.assertEqual("https://api.github.com/search/issues", search.full_url)
+        # The fake executor mints per call; the real one reuses its cached token.
+        self.assertEqual("Bearer ghs_sweep_1", graphql.get_header("Authorization"))
+        self.assertEqual("Bearer ghs_sweep_2", search.get_header("Authorization"))
+        self.assertEqual(credential_proxy.GITHUB_COM_API_URL, "https://api.github.com")
+        self.assertEqual(credential_proxy.GITHUB_COM_GRAPHQL_URL, "https://api.github.com/graphql")
+
+    def test_github_enterprise_server_gets_its_own_api_and_graphql(self):
+        forge = _forge_class("github")(host="ghe.example.test", mint_write=mock.Mock(side_effect=AssertionError))
+        executor = _SweepExecutor()
+        opener = self._opener({"data": {"viewer": {"login": "kube-agents[bot]"}}}, [])
+
+        transport = credential_proxy.sweep_transport_for(executor, forge, "acme/gitops", opener=opener)
+        transport.whoami()
+        transport.api("GET", "repos/acme/gitops/pulls")
+
+        graphql, pulls = opener.requests
+        self.assertEqual("https://ghe.example.test/api/graphql", graphql.full_url)
+        self.assertEqual("https://ghe.example.test/api/v3/repos/acme/gitops/pulls", pulls.full_url)
+        self.assertEqual("Bearer ghs_sweep_2", pulls.get_header("Authorization"))
+
+    def test_the_sweep_mints_the_sweep_scope_and_never_the_write_scope(self):
+        # The executor's write mint, write refresh and context read mint are
+        # tripwires; Binding.whoami, which runs the write credential's ensure,
+        # is one too.
+        for forge in (
+            _forge_class("github")(refresh=mock.Mock(side_effect=AssertionError("no refresh"))),
+            _forge_class("github")(host="ghe.example.test", mint_write=mock.Mock(side_effect=AssertionError)),
+        ):
+            with self.subTest(host=forge.hosts[0]):
+                executor = _SweepExecutor()
+                opener = self._opener({"data": {"viewer": {"login": "kube-agents[bot]"}}}, {"items": []})
+                with mock.patch.object(vcs_broker.Binding, "whoami", side_effect=AssertionError("Binding")):
+                    transport = credential_proxy.sweep_transport_for(executor, forge, "acme/gitops", opener=opener)
+                    transport.whoami()
+                    transport.api("GET", "search/issues")
+                self.assertEqual([("github", "acme/gitops"), ("github", "acme/gitops")], executor.minted)
+
+    def test_a_refused_sweep_token_is_dropped_and_the_call_asked_once_more(self):
+        from test_providers_http_transport import refusal
+
+        forge = _forge_class("github")(refresh=mock.Mock(side_effect=AssertionError("no refresh")))
+        executor = _SweepExecutor()
+        opener = self._opener(refusal(401, {"message": "Bad credentials"}), {"items": []})
+
+        transport = credential_proxy.sweep_transport_for(executor, forge, "acme/gitops", opener=opener)
+
+        self.assertEqual({"items": []}, transport.api("GET", "search/issues"))
+        self.assertEqual([("github", "acme/gitops")], executor.dropped)
+        first, second = opener.requests
+        self.assertEqual("Bearer ghs_sweep_1", first.get_header("Authorization"))
+        self.assertEqual("Bearer ghs_sweep_2", second.get_header("Authorization"))
+
+        # Once: a second refusal is the answer, and the next token is the next call's.
+        opener.answers = [refusal(401, {}), refusal(401, {})]
+        with self.assertRaises(providers.WorkspaceError) as raised:
+            transport.whoami()
+        self.assertEqual(401, raised.exception.status)
+        self.assertEqual(2, len(executor.dropped))
+
+        # Any other refusal is not the token's: nothing is dropped, nothing retried.
+        opener.answers = [refusal(403, {})]
+        with self.assertRaises(providers.WorkspaceError):
+            transport.api("GET", "search/issues")
+        self.assertEqual(2, len(executor.dropped))
+        self.assertEqual(0, len(opener.answers))
+
+    def test_gitlab_and_gitea_read_with_their_static_token(self):
+        with tempfile.TemporaryDirectory() as temp:
+            token = Path(temp) / "token"
+            token.write_text("glpat-static\n")
+            gitlab = _forge_class("gitlab")("gitlab.example.test", str(token))
+            gitea = _forge_class("gitea")(
+                "gitea.example.test", str(token), label="gitea"
+            )
+            for forge, url, header in (
+                (gitlab, "https://gitlab.example.test/api/v4/user", "Private-token"),
+                (gitea, "https://gitea.example.test/api/v1/user", "Authorization"),
+            ):
+                with self.subTest(forge=forge.name):
+                    executor = _SweepExecutor()
+                    opener = self._opener({"login": "kube-agents", "username": "kube-agents", "id": 7})
+                    transport = credential_proxy.sweep_transport_for(executor, forge, "acme/gitops", opener=opener)
+                    self.assertEqual("kube-agents", transport.whoami())
+                    (request,) = opener.requests
+                    self.assertEqual(url, request.full_url)
+                    self.assertIn("static", request.get_header(header))
+                    self.assertEqual([], executor.minted)
+
+    def test_a_minted_or_brokered_github_credential_is_an_app_installation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            token = Path(temp) / "token"
+            token.write_text("glpat-static\n")
+            gitlab = _forge_class("gitlab")("gitlab.example.test", str(token))
+            self.assertTrue(credential_proxy.sweep_app_credential(_forge_class("github")()))
+            self.assertTrue(credential_proxy.sweep_app_credential(_forge_class("github")(host="ghe.example.test")))
+            self.assertFalse(credential_proxy.sweep_app_credential(gitlab))
+            static = _forge_class("github")()
+            static.credential = gitlab.credential
+            self.assertFalse(credential_proxy.sweep_app_credential(static))
+
 
 class ReadCredentialSelectionTest(unittest.TestCase):
     """What the store is handed per role, and how it reaches git."""
