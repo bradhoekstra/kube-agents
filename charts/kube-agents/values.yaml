@@ -872,6 +872,10 @@ platformAgent:
       # Friction
       stalledOnboardingDays: 5
       stalledOnboardingSilentDays: 30
+      # The proposal floors and ratios read the forge's readings over 14 days:
+      # proposals closed unmerged, merged, and authored (opened). A fall in
+      # proposals authored within the window removes both proposal ratios
+      # until it leaves the window; see the chart README's upgrade notes.
       proposalsRejectedMin14d: 3
       proposalsDecidedMin14d: 4
       proposalsRejectedRatio: 0.75
