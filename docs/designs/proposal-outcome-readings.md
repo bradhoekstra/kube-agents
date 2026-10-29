@@ -36,7 +36,7 @@ Goals:
 
 - Every merge and every close of a proposal the install opened reaches `status.usage` without a
   person asking the agent about the proposal, within two operator poll intervals plus the forge's
-  own lag: the reading is taken after a scrape, and the next poll reports it. Two bounds: the
+  own lag: the reading is taken on the broker's timer, and the next poll reports it. Two bounds: the
   close count returns after a broker restart once the detail cache is warm, and in a repository
   past a thousand own proposals the detail series cover the thousand most recently updated.
 - Every human event on those proposals is counted and labelled by kind in Prometheus, so a business
@@ -67,14 +67,17 @@ Anti-goals, what would make this a failure even if it works:
 1. **The broker makes no scheduled forge read and keeps no store.** Issue #2728 preferred counting
    where the broker already learns of merges "because it adds no scheduled forge traffic"; PR #2919
    rejected a persisted seen-set because "the broker keeps no state across requests by design".
-   This design keeps the second rule and relaxes the first in the narrowest way: the broker owns no
-   timer. A scrape of the broker's metrics listener triggers the read, and whatever the outcome
-   of an attempt, succeeded, failed or refused, the next one is not before
-   `VCS_READINGS_TTL_SECONDS` have passed, so the scrape rate never becomes the forge rate. On a
-   GKE install with the managed collector the chart's `PodMonitoring` scrapes that listener every
-   thirty seconds and the operator every five minutes, so the cadence is the TTL's; off that
-   collector only the operator's poll drives it, and an install with neither makes no forge
-   traffic at all.
+   This design keeps the second rule and gives up the first on purpose: the requirement that
+   every merge be counted cannot be met by reads the agent happens to make, so the broker takes
+   on one scheduled forge read, a daemon timer that runs the sweep every `VCS_READINGS_TTL_SECONDS`
+   while the install has a managed repository, bounded to one attempt per interval whatever the
+   outcome. A timer rather than a scrape-triggered read, which an earlier draft of this document
+   chose: a read every few minutes on a stock install is scheduled traffic whichever event starts
+   it, the scrape trigger made freshness depend on which scrapers an install happens to run, and
+   it changed the metrics listener's security property, that it "holds no route, credential or
+   policy of its own", in three security documents and the docstring, an exception that would
+   cost a second security edit to undo. The timer leaves the listener as it is, serves the same
+   series on the same cadence, and its cost bound is the TTL's alone.
 2. **A reading can go down.** A repository removed from `managed_repos`, or a proposal deleted,
    lowers the count. The operator's counter fold treats a fall as a restart or a foreign body and
    never lets a total fall (`usage_counters_fold.go`, `usageBranch`). Readings therefore bypass the
@@ -111,19 +114,21 @@ label.
 | `kubeagents_vcs_proposals_closed_by`           | gauge   | `actor` = `install` \| `human` \| `bot`                                                              | The `closed` proposals split by who closed them. A close the install made itself (the fleet audit tidying a stale proposal) is `install`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | `kubeagents_vcs_proposal_touches`              | gauge   | `kind`, `actor` = `human` \| `bot`                                                                   | Events on the install's proposals by anyone other than the install's own login, summed over every proposal.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `kubeagents_vcs_proposal_touches_per_proposal` | gauge   | `outcome` = `merged` \| `closed`, `le`                                                               | How many human touches each terminal proposal carried, rebuilt from scratch each sweep: one gauge family with a cumulative `le` label over the edges `0, 1, 2, 3, 5, 8, 13, 21, +Inf`, the `+Inf` sample being the count of such proposals. A plain gauge with its own name and no `_bucket` or `_count` suffix, because the text format the broker renders attaches `histogram` samples by suffix and a gauge family would not own them; `histogram_quantile()` needs only `le`. A proposal with zero touches is in the first bucket, so "merged without any human touch" is `le="0"` on `outcome="merged"`. |
+| `kubeagents_vcs_proposals_ignored`             | gauge   | none                                                                                                 | Open proposals of the install older than `VCS_READINGS_IGNORED_AFTER_SECONDS` (fourteen days) that carry no human touch of any kind: proposals nobody is looking at. Part of the details reading.                                                                                                                                                                                                                                                                                                                                                                                                             |
 | `kubeagents_vcs_readings_age_seconds`          | gauge   | `reading` = `outcomes` \| `details`                                                                  | Seconds since that reading was last taken in full. Two readings: `outcomes` is step 1 (`kubeagents_vcs_proposals`), `details` is step 2 (`closed_by`, the touch series, the per-proposal gauge). Each is absent until its first reading and never omitted after it, however old.                                                                                                                                                                                                                                                                                                                              |
 | `kubeagents_vcs_readings_failures_total`       | counter | `reason` = `forge` \| `identity` \| `truncated` \| `detail_truncated` \| `rate_limited` \| `warming` | Repository attempts, one per managed repository per sweep, that produced less than a full reading, by cause: `warming` is a partial reading (state counts only, details not yet taken); `truncated` is a partial reading too (state counts exact, details from the thousand most recently updated proposals and the cache); the other four are none. Two repositories rate-limited in one sweep are two.                                                                                                                                                                                                      |
 
 `kind` is a closed vocabulary:
 
-| `kind`                     | What it is                                                    | Source on GitHub           |
-| -------------------------- | ------------------------------------------------------------- | -------------------------- |
-| `review_approved`          | A review with state approved, body or not                     | `GET /pulls/{n}/reviews`   |
-| `review_changes_requested` | A review asking for changes                                   | same                       |
-| `review_commented`         | A review submitted with the comment state                     | same                       |
-| `review_comment`           | An inline comment on the diff                                 | `GET /pulls/{n}/comments`  |
-| `comment`                  | A comment on the conversation                                 | `GET /issues/{n}/comments` |
-| `commit`                   | A commit on the source branch whose author is not the install | `GET /pulls/{n}/commits`   |
+| `kind`                     | What it is                                                                                                                                                                          | Source on GitHub                        |
+| -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------- |
+| `review_approved`          | A review with state approved, body or not                                                                                                                                           | `GET /pulls/{n}/reviews`                |
+| `review_changes_requested` | A review asking for changes                                                                                                                                                         | same                                    |
+| `review_commented`         | A review submitted with the comment state                                                                                                                                           | same                                    |
+| `review_comment`           | An inline comment on the diff                                                                                                                                                       | `GET /pulls/{n}/comments`               |
+| `comment`                  | A comment on the conversation                                                                                                                                                       | `GET /issues/{n}/comments`              |
+| `commit`                   | A commit on the source branch whose author is not the install                                                                                                                       | `GET /pulls/{n}/commits`                |
+| `agent_address`            | A conversation comment that begins with `/agent`, the form the `pr_comments` sweep accepts as a person steering the agent on its own proposal; counted here and not under `comment` | `GET /issues/{n}/comments`, body prefix |
 
 `actor` is `human` unless the forge marks the account as automation (GitHub `type == "Bot"` or
 the `[bot]` suffix, GitLab's `bot` flag or project-bot login, Gitea's negative user id), then `bot`.
@@ -166,17 +171,14 @@ removed, with `_count_outcomes`, the seen-sets, `started_at`, the observers and 
 
 ## 5. How a reading is taken
 
-**Trigger.** `MetricsHandler` serves `GET /metrics` from the registry as today, in the same
-request. After rendering, if the install has at least one managed repository and the last
-attempt, whatever its outcome, is older than `VCS_READINGS_TTL_SECONDS` (240), or there has been
-none, the handler starts one refresh on a daemon thread. One at a time: a refresh already running
-is not joined by a second, and a failed attempt sets the same clock as a successful one, so a
-forge outage or a rate limit costs one attempt per TTL and not one per scrape. The scrape itself
-carries nothing to the forge: no parameter of the request reaches a sweep. The scrape never waits
-on the forge, so a scrape returns the previous reading and the one it triggered is
-served from the next scrape on. With the collector scraping every thirty seconds the operator's
-poll sees a reading at most about four and a half minutes old; with the operator alone scraping,
-a poll reports the reading the previous poll triggered, two intervals end to end.
+**Trigger.** A daemon thread the broker starts beside its listeners runs the sweep every
+`VCS_READINGS_TTL_SECONDS` (240) while the install has at least one managed repository, as the
+Slack relay's bootstrap thread runs today. One at a time: an attempt still running when the
+interval elapses is not joined by a second, and a failed attempt sets the same clock as a
+successful one, so a forge outage or a rate limit costs one attempt per interval. `MetricsHandler`
+serves `GET /metrics` from the registry as today and nothing about a scrape reaches the sweep.
+A reading is therefore at most one interval old when the operator's five-minute poll reads it,
+so a merge reaches `status.usage` within two poll intervals end to end.
 
 **Per managed repository**, with the repository's `whoami` login as `author`:
 
@@ -328,7 +330,7 @@ credential is a static token, the sweep reads with that token as every verb does
 therefore costs one read mint per thirty minutes per managed repository, holds no write
 capability, and leaves the write token's lifetime to the agent's own work. Rate-limit answers
 (`FORGE_RATE_LIMITED`) end the sweep for that repository without a retry inside the sweep; the
-next scrape tries again. The sweep runs without a request slot, as the forge-refresh route does,
+next interval tries again. The sweep runs without a request slot, as the forge-refresh route does,
 because a slot's deadline would cap a whole first refill at one request's length; it reserves
 transient child memory the same way.
 
@@ -447,15 +449,11 @@ scoped to contents, pull requests and issues read, and with the static token eve
 GitLab and Gitea; it asks for nothing the broker's own verbs could not already read on request,
 and it never keeps a write-capable token fresh on the agent's behalf.
 
-One contract does change and is changed on purpose. The metrics listener's docstring says it
-"holds no route, credential or policy of its own", which is why it may bind a port the credential
-runtime otherwise refuses; after this design an unauthenticated `GET /metrics` from a peer the
-NetworkPolicy admits (the collector's namespace and the operator; any pod where the CNI does not
-enforce NetworkPolicy) is the signal for a read the broker makes with a read-only credential. The
-listener still holds no credential and no route, and the signal is bounded so it cannot amplify:
-at most one attempt per TTL whatever the number of scrapes or their outcome, no request parameter
-reaches the forge, and the sweep reads only what the broker's own verbs already read. The
-docstring says this in the implementing pull request.
+The metrics listener's contract does not change: it still "holds no route, credential or policy
+of its own", a scrape still returns the registry and nothing else, and no peer that reaches the
+port can cause a forge read. The sweep runs on the broker's own clock, with a read-only
+credential the broker holds, and the three security documents that state the listener's property
+stay as written.
 
 ## 8. Tests and validation
 
@@ -481,8 +479,8 @@ Python, beside the broker in `agents/platform/scripts/` (`test_vcs_broker.py`,
 - one repository failing withholds the reading and moves the failure counter; the previous reading
   stays; past the stale bound the reading series are omitted and the age gauge and failure counter
   are not;
-- a scrape never blocks on the forge and starts at most one refresh; a second scrape inside the
-  TTL after a failed attempt starts none;
+- the timer runs at most one attempt per interval, a failed attempt included, and a scrape of
+  the listener starts nothing;
 - a forge that returns another author's proposal under the author filter ends the repository's
   attempt with nothing published;
 - a cache being warmed takes the outcomes reading and not the details reading until every listed
@@ -491,7 +489,9 @@ Python, beside the broker in `agents/platform/scripts/` (`test_vcs_broker.py`,
 - the sweep mints a read-scope token and never a write one, and reuses it for the reuse window;
 - a nameless credential on one repository leaves the other repositories' readings whole;
 - a credential that cannot name itself publishes nothing and logs once;
-- bodiless approvals count as `review_approved`;
+- bodiless approvals count as `review_approved`; a comment beginning `/agent` counts as
+  `agent_address` and not as `comment`; an open proposal older than fourteen days with no human
+  touch counts in `kubeagents_vcs_proposals_ignored` and one with a touch does not;
 - the removed counting path has no test left referring to it.
 
 Go, beside the poller: the reading slot parsed from a broker body; one miss keeps, two clear, per
@@ -536,12 +536,9 @@ and `operator/platformagent-crd.md`, including every line that says a merge move
 `lastActiveTime`; the rows, the summary, the `lastActiveTime` row and the testing record in
 `usage-counters-producer.md`; the chart's health rules, their header contract,
 `tests/test_chart_platform_agent_health_rules.py` and the chart README; the metrics listener's
-docstring in `credential_proxy.py`; the series constants in `usage_counters_scrape.go` and
-`migrateUsageDocument` in `usage_counters_fold.go`; the three documents that state the metrics
-listener "holds no route, credential or policy" as a security property,
-`docs/security-requirements.md`, `docs/credential-isolation-design.md` and the site's
-`reference/credential-isolation.md`, which take the qualification section 7 gives the docstring;
-Minty's rule template `default.yaml` in the chart (`github-minter.yaml`) and
+docstring in `credential_proxy.py`, which gains a sentence saying the sweep's timer is not the
+listener's; the series constants in `usage_counters_scrape.go` and `migrateUsageDocument` in
+`usage_counters_fold.go`; Minty's rule template `default.yaml` in the chart (`github-minter.yaml`) and
 `k8s-operator/config/integrations/github/configmap.yaml.template`, where the sweep scope is
 declared, with `tests/test_chart_minter_read_scope.py`, whose `assert_two_scopes` asserts the
 scopes a rendered policy carries and learns the third, and every other statement in the tree that
@@ -568,11 +565,17 @@ construction in `providers/github/forge.py`; the two feedback-summary copies and
   `proposalsAuthored` within the window, seen through `resets()`, silences the two proposal
   alerts for a fortnight rather than letting them misfire; a reopen is absorbed as a one-unit
   under-count of closes.
-- The read is triggered by a scrape rather than a broker timer, and on a stock install the
-  collector's thirty-second scrape is what drives it.
+- The broker owns one timer, the sweep's, at the TTL; an earlier draft triggered the read from
+  a scrape of the metrics listener, which the reviewer of this document showed costs the
+  listener's security property for no saving in forge traffic.
 - The epic's Workstream 2 named a counter, `kubeagents_vcs_proposal_touches_total{kind}`, counted
   per event per broker process. This document ships a reading, `kubeagents_vcs_proposal_touches`,
   with an `actor` label, plus the bucket series, for the same reason the outcomes are readings.
+- The epic's other two Workstream 2 items are both kept, in Prometheus and not in `status.usage`:
+  a `/agent` address is its own touch kind, `agent_address`, read from the comment body the
+  readers already return; and an open proposal untouched for fourteen days is counted by
+  `kubeagents_vcs_proposals_ignored`, a reading taken on the same sweep, rather than a counter.
+  Neither gets a status field until a reader of the CR asks for one.
 - The install's own close is `actor="install"` and stays out of `remediationsClosedUnmergedTotal`.
 - A merge no longer moves `lastActiveTime`.
 - A commit is the install's by linked login or by its git author email against the install's
