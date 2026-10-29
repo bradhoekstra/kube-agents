@@ -472,6 +472,39 @@ class Forge:
     def proposal_acknowledge(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
         return self._unsupported("proposal-acknowledge")
 
+    # -- the readings sweep's calls -------------------------------------------
+    #
+    # Not verbs: no route serves them and no forge lists them in `verbs`. The
+    # broker's own sweep calls them through a binding's `api`, to count the
+    # install's proposals by outcome and who touched them. A forge that
+    # cannot answer one inherits the same named refusal, and the sweep reads
+    # it as "no reading from this forge".
+
+    def proposal_list_by_author(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        """A page of the proposals `payload["author"]` opened, newest activity first.
+
+        Filtered by the forge, never here. Each item is `number`, `state`,
+        `author`, `authorBot`, `created`, `updated` and `closed`; beside
+        `count` and `truncated` is `total`, the forge's own count for the
+        query, or None when it gives none.
+        """
+        return self._unsupported("proposal-list-by-author")
+
+    def proposal_tally(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        """How many proposals `payload["author"]` has open, merged and closed.
+
+        None for a count the forge cannot split out.
+        """
+        return self._unsupported("proposal-tally")
+
+    def proposal_reviews(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        """A proposal's reviews, a bodiless approval included."""
+        return self._unsupported("proposal-reviews")
+
+    def proposal_closer(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        """Who closed a proposal: `actor`, "" when the forge does not say, and `bot`."""
+        return self._unsupported("proposal-closer")
+
     def issue_update(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
         return self._unsupported("issue-update")
 
@@ -554,3 +587,4 @@ class StubForge(Forge):
     proposal_update = proposal_close = proposal_commits = proposal_acknowledge = _refuse
     issue_create = issue_list = issue_view = issue_comment = _refuse
     issue_update = issue_close = label_ensure = _refuse
+    proposal_list_by_author = proposal_tally = proposal_reviews = proposal_closer = _refuse
