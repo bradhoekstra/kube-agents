@@ -84,6 +84,8 @@ The memory series are the measurement behind that advice. `kubeagents_credential
 
 The `git` the broker runs itself for its version-control and workspace routes is not a tool invocation and is not counted here. Every label value is a static enum or a word from a closed vocabulary: for `kubectl` the policy's read verbs plus the write verbs a refusal is counted under, for `gcloud` the command groups the policy reads plus the few a refusal is counted under (a `gcloud` command is labelled by its group, `container` or `iam`, never by a verb), for `git` and `gh` the broker's own lists. So nothing a caller sends reaches a series: an unlisted verb or an unserved executable counts under `other`.
 
+The proposal readings take as long as the forge allows. The sweep sends GitHub's search API at most 25 calls a minute, under the 30 it serves, and reads each proposal's events within 1000 forge calls an hour. On an install whose GitHub repositories need more searches than that per sweep, a sweep takes longer than 240 seconds and `kubeagents_vcs_readings_age_seconds` grows with it. Each reading is still whole or absent: a slower sweep does not change what it counts.
+
 #### A2A gateway series
 
 The `spec.mode: next` stack only.
@@ -117,7 +119,7 @@ The container's other runtime signals surface as OpenTelemetry traces (below) an
 
 #### The operator's five-minute `status.usage` rollup
 
-The operator reads some of these series itself, every five minutes, and writes them to `status.usage` on the `PlatformAgent`. Every counter is kept monotonic across restarts. The six proposal fields are readings instead: the forge's counts at the broker's last sweep, which fall when a repository leaves the managed list. No reading moves `lastActiveTime`, so a merge does not. That is where an install without a collector sees the counts and how much of its fleet is being watched ([CRD reference](/kube-agents/operator/platformagent-crd/)).
+The operator reads some of these series itself, every five minutes, and writes them to `status.usage` on the `PlatformAgent`. Every counter is kept monotonic across restarts. The six proposal fields are readings instead: the forge's counts at the broker's last sweep, which fall when a repository leaves the managed list. No reading moves `lastActiveTime`, so a merge does not. A broker restart clears the three details fields (`remediationsClosedUnmergedTotal`, `proposalHumanTouches`, `proposalsMergedUntouched`) until the broker has read every proposal again, which on a large install takes hours; the outcomes fields return on the first sweep. That is where an install without a collector sees the counts and how much of its fleet is being watched ([CRD reference](/kube-agents/operator/platformagent-crd/)).
 
 | `status.usage` field                      | Source                                                                                                                                                                                                                                              | Note                                                                                                            |
 | ----------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |

@@ -979,6 +979,12 @@ broker, or reads it without a reading, leaves that reading's fields as they were
 row clears them to absent. The broker stops serving a reading more than an hour old. A 0 is a
 reading.
 
+A broker restart clears the details fields (`remediationsClosedUnmergedTotal`,
+`proposalHumanTouches`, `proposalsMergedUntouched`). The broker keeps what it read of each proposal in
+memory, and after a restart it reads every proposal again within an hourly budget of forge calls.
+The details fields return when that is done, which takes some hours on an install with a thousand
+proposals. The outcomes fields return on the first sweep.
+
 The operator also serves every counter, cluster gauge, proposal reading and time of this block, and `status.phase`, as Prometheus gauges on its own metrics port, so a collector reads them without a query against the status; the series are on [Observability](/kube-agents/concepts/observability/#prometheus-metrics).
 
 `usage.activeInterfaces` is `dashboard` unless `harness.hermes.dashboardEnabled` is `false`, plus

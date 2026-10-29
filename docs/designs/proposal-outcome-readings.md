@@ -88,7 +88,7 @@ Anti-goals, what would make this a failure even if it works:
    answer with a total header on a one-item page. Per-proposal detail costs four or five calls per
    proposal and must not be paid for every proposal on every sweep.
 4. **Identity.** The install's login is the credential's `whoami`, cached per repository for the
-   life of the process as `_merged_viewer_for` caches it today, but the sweep does not ask through
+   life of the process as the removed `_merged_viewer_for` did, but the sweep does not ask through
    that path: `Binding.whoami()` runs the forge credential's `ensure()` first, which on github.com
    refreshes the write credential and on GitHub Enterprise Server mints a write token when the
    cached one is old, so the first sweep after a restart would mint the write token the sweep
@@ -209,6 +209,12 @@ so a merge reaches `status.usage` within two poll intervals end to end.
      parameter (a Gitea release from before `poster`, say) returns everyone's proposals and the
      walk would truncate on theirs; the first foreign author ends the sweep for that repository
      with `reason="forge"` and nothing published, rather than a wrong count.
+   - **A walk that ends inside its bound holds the forge's total.** The walk goes on while the
+     total says more remain, whatever a page's `truncated` says, since a clamped Gitea page can
+     look like the last. A walk that still ends short of the total (a proposal that updated
+     mid-walk and moved to a page already read, or a GitHub page marked `incomplete_results`) is
+     walked once more; short again, the repository's outcomes reading is withheld with
+     `reason="forge"`.
    - The walk is bounded by `VCS_READINGS_MAX_PAGES` (10), which on GitHub is also the search
      API's own ceiling of a thousand results, so it cannot be raised there. A repository whose
      own proposals exceed the bound is `truncated`, and truncation is a property of the
@@ -300,9 +306,9 @@ accepted, and the operator's two-miss clear bounds it.
 the install's own proposals, and step 2 only for proposals that changed since the last sweep. A
 repository where the install has opened 300 proposals and people add two reviews an hour costs
 three listing calls a sweep and, on the sweeps where a proposal changed, four or five more.
-GitHub's search quota is thirty calls a minute per token, so an install with many managed
-repositories spreads the per-repository work across consecutive sweeps rather than exceeding it;
-the builder sizes that.
+GitHub's search quota is thirty calls a minute per token, so the sweep paces its search calls at
+`VCS_READINGS_SEARCH_CALLS_PER_MINUTE` (25): an install with many managed repositories gets a
+sweep longer than the TTL and older readings, not a rate-limited tail that never completes.
 
 **The token.** The sweep does not ride the write token: an idle install would otherwise mint a
 write-capable installation token every TTL on the CLI transport, whose refresh runs before every
@@ -352,8 +358,8 @@ series in one body.
   reading's fields as they were. The second in a row clears them to absent. The broker's own
   staleness rule above makes an hour-old reading absent on the broker side first.
 - The fields are pointers, so a zero is written as a reading.
-- They do not move `lastActiveTime` or `lastHumanActiveTime`. This is a change: today a merge
-  the broker happens to read moves `lastActiveTime`. A reading cannot say when a merge happened,
+- They do not move `lastActiveTime` or `lastHumanActiveTime`. This is a change: before this design
+  a merge the broker happened to read moved `lastActiveTime`. A reading cannot say when a merge happened,
   only that a count differs from the last poll, which is a poor timestamp, and a merge is a
   person's or a forge rule's act, where the field's meaning is the agent at work. The field
   comments, the CRD docs and the producer design's `lastActiveTime` row say so in the
