@@ -118,6 +118,8 @@ class RemovalRuleTest(unittest.TestCase):
             "Otherwise it can be deleted.",
             "If this PR does not add a roster case, delete this section.",
             "When this PR is not a bug fix, remove this section.",
+            "If this PR does not fix a bug delete this section.",
+            "For a docs-only change that does not touch an agent, delete this section.",
             "Show the red run and the misses. Otherwise delete it when the PR adds no roster case.",
         ):
             with self.subTest(phrase=phrase):
@@ -136,6 +138,8 @@ class RemovalRuleTest(unittest.TestCase):
             "Do not, under any circumstances, delete this section.",
             "There is no reason to delete this section.",
             'Write the one-line answer, never "delete this section".',
+            "If this PR adds no case, do not, under any circumstances, delete this section.",
+            "You should not delete this section.",
         ):
             with self.subTest(phrase=phrase):
                 self.assertNotIn(check.REMOVAL_MESSAGE, problems_of(section(phrase)))
@@ -152,6 +156,8 @@ class RemovalRuleTest(unittest.TestCase):
             "Cut the section down to one paragraph.",
             "Strip the section of anything a changelog would carry.",
             "Skip this section's checklist when nothing ran.",
+            "Remove the bullets in this section that do not apply.",
+            "Delete the placeholder text under this heading before posting.",
         ):
             with self.subTest(phrase=phrase):
                 self.assertEqual(problems_of(section(phrase)), [])
@@ -280,6 +286,10 @@ class ShapeRuleTest(unittest.TestCase):
     def test_a_fenced_pair_inside_a_comment_fails(self) -> None:
         text = "## R\n<!--\nFor example:\n```\nmake test\n```\n-->\n## S\n<!-- ok -->\n"
         self.assertEqual(check.problems(text), [("R", check.LINE_IN_COMMENT_MESSAGE)])
+
+    def test_a_heading_shaped_line_in_a_comment_inside_a_body_fence_is_fine(self) -> None:
+        # The readers keep the comment whole there too, so there is nothing to report.
+        self.assertEqual(problems_of("## R\n\n```\n<!--\n## x\n-->\n```\n"), [])
 
     def test_a_fence_in_the_body_is_fine(self) -> None:
         text = "## R\n\n<!-- Paste the command. -->\n\n```\nmake test\n```\n\n## S\n"

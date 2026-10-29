@@ -21,7 +21,7 @@ to every heading and has no optional section, and the contributor robot's one ex
 "delete this section" phrase. So a section that applies to some pull requests only opens its
 comment with the condition and names the one-line answer the rest write (`Required when ...
 Otherwise write "Not a bug fix."`), never "delete this section"; `make docs-check-pr-template`
-fails a template that does.
+is the tripwire for the shapes seen so far, and a reviewer reads the rest.
 
 ## Adversarial self-review
 

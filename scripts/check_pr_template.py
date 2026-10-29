@@ -30,9 +30,11 @@ and a reviewer still reads the comment. What the check reads, per section:
   skip, erase, leave out or take out the section or heading (``REMOVAL_RE``):
   active ("delete this section"), passive ("this section is removed when"),
   or a clause of its own after "otherwise" or "if not" ("otherwise delete
-  it"). The section may be named, quoted or plural. A removal whose clause
-  negates it ("do not delete this section", "rather than delete") is not one;
-  "if not delete this section" is, because that "not" is the condition.
+  it"). The section may be named, quoted or plural. A removal negated right
+  before its verb ("do not delete this section", "rather than delete", "do
+  not, under any circumstances, delete") is not one; a "not" elsewhere in the
+  sentence ("if this PR does not fix a bug, delete this section") is the
+  condition, and the removal stands.
 - **Condition.** The first sentence of each comment, with a leading label such
   as "Note:" or "Optional:" kept, is read for a signal at its start that the
   section applies to some pull requests only (``CONDITION_RE``): "optional",
@@ -48,10 +50,12 @@ and a reviewer still reads the comment. What the check reads, per section:
   introduces an ordinary instruction ("If this PR closes an issue, link it").
   A conditional section opens with the condition, which is the convention
   the rule file states, and a reviewer reads the rest.
-- **Shape.** A section's comment markers balance, and no comment holds a
-  heading- or fence-shaped line, because both readers split a section there
-  (they are not CommonMark parsers, and neither is this), and a fence left
-  open swallows every later section.
+- **Shape.** A section's comment markers balance, which is how a heading-
+  shaped line inside a comment shows, since the parse splits the section on
+  it first; and no comment holds a fence-shaped line, which the marker count
+  cannot see, because both readers open a fence there (they are not
+  CommonMark parsers, and neither is this) and a fence left open swallows
+  every later section.
 
 The text before the first heading is read for removal and shape too, since a
 whole-file "delete the sections that do not apply" would sit there, and not
@@ -90,10 +94,14 @@ HTML_COMMENT_RE = re.compile(r"<!--(.*?)-->", re.DOTALL)
 COMMENT_OPEN = "<!--"
 COMMENT_CLOSE = "-->"
 
+# The quotes a stock answer may sit in, and that may precede a negated verb.
+QUOTE_CHARS = "\"'“”‘’`"
+
 # An instruction to take the section out of the body.
 _VERB = r"(?:delete|remove|omit|drop|skip|erase|leave\s+out|take\s+out)"
 _PASSIVE = r"(?:deleted|removed|omitted|dropped|skipped|erased|left\s+out)"
-_OBJECT = r"(?:this|the)\s+(?:[^\s.;]+\s+){0,4}(?:section|heading)s?\b(?!'s)"
+_FILLER = r"(?:(?!(?:in|under|of|from|below|above|within|this|the|that|a|an)\b)[^\s.;]+\s+){0,4}"
+_OBJECT = rf"(?:this|the)\s+{_FILLER}(?:section|heading)s?\b(?!'s)"
 _OTHERWISE = r"(?:otherwise|if\s+not|when\s+not)"
 _SOFTENER = r"(?:just\s+|simply\s+|feel\s+free\s+to\s+|you\s+(?:may|can)\s+|it\s+can\s+be\s+)?"
 _CLAUSE_END = r"\s*(?:[.;,!]|$)"
@@ -105,15 +113,17 @@ REMOVAL_RE = re.compile(
     rf"|\b{_OTHERWISE},?\s+(?:leave|take)\s+(?:it|them)\s+out{_CLAUSE_END}",
     re.IGNORECASE,
 )
-# A removal is negated when its clause (since the last sentence end) says so
-# before it: "do not delete", "never remove", "rather than delete". A "not"
-# right after "if", "when" or "whether" is a condition, not a negation.
-CLAUSE_START_RE = re.compile(r"[.;:?!]")
-LEADING_CONDITION_RE = re.compile(r"^\s*(?:if|when|unless|whether)\b.*,", re.IGNORECASE | re.DOTALL)
-NEGATION_RE = re.compile(
-    r"\b(?:never|rather\s+than|instead\s+of|no\s+(?:circumstances|reason|need))\b"
-    r"|n't\b"
-    r"|(?<!\bif )(?<!\bwhen )(?<!\bwhether )\bnot\b",
+# A removal is negated by the words right before its verb: "do not delete",
+# "never remove", "rather than delete", "no reason to delete", with one
+# parenthetical ("do not, under any circumstances, delete") and an opening
+# quote allowed between. A "not" elsewhere in the sentence ("if this PR does
+# not fix a bug, delete this section") is the condition, not a negation.
+_MODAL = r"(?:do|does|did|should|must|may|can|will|would|need)"
+NEGATION_BEFORE_RE = re.compile(
+    rf"(?:\b{_MODAL}\s+not|\b(?:don|doesn|didn|shouldn|mustn|can|won|wouldn|needn)'t"
+    r"|\bnever|\brather\s+than|\binstead\s+of|\bno\s+(?:reason|need)\s+to"
+    r"|\bunder\s+no\s+circumstances)"
+    rf"(?:,[^,]*,)?\s*(?:just\s+|simply\s+)?[{QUOTE_CHARS}]?\s*$",
     re.IGNORECASE,
 )
 
@@ -139,7 +149,6 @@ SENTENCE_END_RE = re.compile(r"(?<=[.!?])\s")
 # The stock answer a conditional section names for every other pull request,
 # in straight or curly quotes. The phrase inside may not contain a line break
 # (ANSWER_RE); one found only across a break is the split case (SPLIT_ANSWER_RE).
-QUOTE_CHARS = "\"'“”‘’`"
 _QUOTE = f"[{QUOTE_CHARS}]"
 _NOT_QUOTE = f"[^{QUOTE_CHARS}"
 _WRITE = rf"\b{_OTHERWISE},?\s+(?:write|say)\s+(?:\w+\s+){{0,2}}"
@@ -160,10 +169,11 @@ NO_ANSWER_MESSAGE = (
     'it applies to some pull requests only and names no answer for the rest (Otherwise write "...")'
 )
 SPLIT_ANSWER_MESSAGE = "its stock answer is split across a line break"
-UNBALANCED_MESSAGE = "a comment opens or closes without its pair, which splits the section for the readers"
-LINE_IN_COMMENT_MESSAGE = (
-    "a comment holds a heading- or fence-shaped line, which splits the section for the readers"
+UNBALANCED_MESSAGE = (
+    "a comment opens or closes without its pair, as one with a heading-shaped line inside it does,"
+    " which splits the section for the readers"
 )
+LINE_IN_COMMENT_MESSAGE = "a comment holds a fence-shaped line, which opens a fence for the readers"
 OPEN_FENCE_MESSAGE = "a fence is still open at the end of the file, so every later heading is hidden"
 
 REMEDY = (
@@ -220,17 +230,10 @@ def first_sentence(comment: str) -> str:
 
 def removal(comment: str) -> bool:
     """Whether the comment tells the author to take the section out."""
-    for match in REMOVAL_RE.finditer(comment):
-        before = comment[: match.start()]
-        clause = CLAUSE_START_RE.split(before)[-1]
-        if LEADING_CONDITION_RE.match(clause):
-            # "If this PR does not add a case, delete this section": the
-            # words before the last comma are the condition, and only the
-            # words after it can negate the verb.
-            clause = clause.rsplit(",", 1)[-1]
-        if not NEGATION_RE.search(clause):
-            return True
-    return False
+    return any(
+        not NEGATION_BEFORE_RE.search(comment[: match.start()])
+        for match in REMOVAL_RE.finditer(comment)
+    )
 
 
 def _shape_problems(content: str) -> list[str]:
@@ -238,7 +241,7 @@ def _shape_problems(content: str) -> list[str]:
     if content.count(COMMENT_OPEN) != content.count(COMMENT_CLOSE):
         found.append(UNBALANCED_MESSAGE)
     for comment in comments(content):
-        if any(FENCE_RE.match(line) or HEADING_RE.match(line) for line in comment.splitlines()):
+        if any(FENCE_RE.match(line) for line in comment.splitlines()):
             found.append(LINE_IN_COMMENT_MESSAGE)
             break
     return found
