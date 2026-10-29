@@ -22,7 +22,9 @@ Four rules of PromQL here, each held by tests/test_chart_platform_agent_health_r
   would read the fall as a reset and inflate the window; a delta() has no
   aggregation of its own to fold a roll-over's two pod series, so each reading
   is first recorded as `max by (agent_namespace, agent, field)` and the window
-  is taken over that. A fall in proposalsAuthored, which a reopen does not
+  is taken over that. Each window is then folded `max by (agent_namespace,
+  agent)`, which drops the `field` label: a ratio keeps its left side's labels,
+  and a field on it would name one input of two. A fall in proposalsAuthored, which a reopen does not
   move, removes both proposal ratios for the window: resets() sees it where a
   delta() nets it out behind later rises.
 - A day-long condition is a plain `for`. A window in the expression over a
@@ -83,13 +85,13 @@ spec:
         - record: {{ $reading }}
           expr: max by ({{ $by }}, field) ({{ $usage }}{field=~"remediationsMergedTotal|remediationsClosedUnmergedTotal|proposalsAuthored"})
         - record: {{ $merged }}
-          expr: clamp_min(delta({{ $reading }}{field="remediationsMergedTotal"}[14d]), 0)
+          expr: {{ $max }} (clamp_min(delta({{ $reading }}{field="remediationsMergedTotal"}[14d]), 0))
         - record: {{ $closed }}
-          expr: clamp_min(delta({{ $reading }}{field="remediationsClosedUnmergedTotal"}[14d]), 0)
+          expr: {{ $max }} (clamp_min(delta({{ $reading }}{field="remediationsClosedUnmergedTotal"}[14d]), 0))
         - record: {{ $authored }}
-          expr: clamp_min(delta({{ $reading }}{field="proposalsAuthored"}[14d]), 0)
+          expr: {{ $max }} (clamp_min(delta({{ $reading }}{field="proposalsAuthored"}[14d]), 0))
         - record: {{ $fell }}
-          expr: resets({{ $reading }}{field="proposalsAuthored"}[14d]) > 0
+          expr: {{ $max }} (resets({{ $reading }}{field="proposalsAuthored"}[14d]) > 0)
         - record: kubeagents:platformagent:proposals_rejected_ratio_14d
           expr: {{ $closed }} / {{ $on }} ({{ $closed }} + {{ $on }} {{ $merged }}) unless {{ $on }} {{ $fell }}
         - record: kubeagents:platformagent:proposals_merge_rate_14d

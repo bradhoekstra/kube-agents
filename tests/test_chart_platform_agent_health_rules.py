@@ -289,8 +289,15 @@ class HealthRulesRenderTest(unittest.TestCase):
                     self.assertTrue(expr.startswith(f"{fn}{_READING}{{", i), f"{fn} not over the recorded max series: ...{expr[i:i + 80]}")
             self.assertNotIn(f"clamp_min(delta({_GAUGE_PREFIX}", expr)
         self.assertEqual(4, windows, "three window deltas and one fall guard")
+        # Each window is folded to the agent pair: `a / on(...) b` keeps the
+        # left side's labels, so a `field` left on a window would ride onto
+        # both ratios and both alerts as the name of one input.
         for name, field in (("merged", "remediationsMergedTotal"), ("closed", "remediationsClosedUnmergedTotal"), ("authored", "proposalsAuthored")):
-            self.assertEqual(f'clamp_min(delta({_READING}{{field="{field}"}}[14d]), 0)', records[f"kubeagents:platformagent:proposals_{name}_14d"]["expr"], name)
+            self.assertEqual(f'max by ({_GROUPING}, agent) (clamp_min(delta({_READING}{{field="{field}"}}[14d]), 0))', records[f"kubeagents:platformagent:proposals_{name}_14d"]["expr"], name)
+        windows_14d = {name: rule["expr"] for name, rule in records.items() if name.endswith("_14d") and name.split(":")[-1].split("_")[1] in ("merged", "closed", "authored", "fell")}
+        self.assertEqual(4, len(windows_14d), sorted(windows_14d))
+        for name, expr in windows_14d.items():
+            self.assertTrue(expr.startswith(f"max by ({_GROUPING}, agent) (") and expr.endswith(")"), f"{name} is not folded to the agent pair: {expr}")
 
     def test_the_merge_rate_divides_by_authored_and_the_unmerged_guard_reads_authored(self):
         """One source only: the merge rate divides a reading by a reading, and the
@@ -315,13 +322,17 @@ class HealthRulesRenderTest(unittest.TestCase):
             self.assertNotIn("remediationsProposedTotal", alerts[name]["expr"], name)
             self.assertNotIn("increase(", alerts[name]["expr"], name)
 
+    # The fall guard's evaluation cannot run in CI: neither the host nor the CI
+    # image carries promtool, so these tests hold the rule's rendered text. Its
+    # behaviour on a reopen and a removal is verified live, against Managed
+    # Prometheus's recorded series, after an upgrade.
     def test_a_reopen_does_not_trip_the_fall_guard_and_a_removal_does(self):
         """A reopen moves closed and open but not their sum, proposalsAuthored; a
         removal or a deletion lowers it. So the guard reads that series alone, and
         with `resets()`, which sees a fall a later rise nets out of a `delta()`."""
         rules = _rules(_render(*_ON))[0]
         records = _records(rules)
-        self.assertEqual(f'resets({_READING}{{field="proposalsAuthored"}}[14d]) > 0', records["kubeagents:platformagent:proposals_fell_14d"]["expr"])
+        self.assertEqual(f'max by ({_GROUPING}, agent) (resets({_READING}{{field="proposalsAuthored"}}[14d]) > 0)', records["kubeagents:platformagent:proposals_fell_14d"]["expr"])
         exprs = " ".join(r["expr"] for g in rules["spec"]["groups"] for r in g["rules"])
         self.assertEqual(1, exprs.count("resets("), "the fall guard watches proposalsAuthored and no other field")
 
