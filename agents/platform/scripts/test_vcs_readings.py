@@ -222,7 +222,6 @@ class Harness:
             transport_for=lambda forge, repo: FakeTransport(forge),
             metrics=self.metrics,
             managed_repositories=lambda: frozenset(forges),
-            mint=mock.Mock(side_effect=AssertionError("the fake transport never mints")),
             clock=self.clock,
             interval=interval,
             app_credential=app_credential,
@@ -678,7 +677,6 @@ class SweepIdentityTest(unittest.TestCase):
             transport_for=lambda f, r: credential_proxy.sweep_transport_for(executor, f, r, opener=opener),
             metrics=FakeMetrics(),
             managed_repositories=lambda: frozenset({REPO}),
-            mint=executor.mint_sweep_credential,
             app_credential=credential_proxy.sweep_app_credential,
         )
 

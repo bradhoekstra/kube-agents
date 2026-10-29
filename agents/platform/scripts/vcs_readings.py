@@ -280,7 +280,6 @@ class ReadingsSweep:
         transport_for: Callable[[Any, str], Any],
         metrics: Any,
         managed_repositories: Callable[[], frozenset[str]],
-        mint: Callable[[str, str], str],
         clock: Callable[[], float] = time.monotonic,
         interval: float = VCS_READINGS_TTL_SECONDS,
         app_credential: Callable[[Any], bool] | None = None,
@@ -294,8 +293,6 @@ class ReadingsSweep:
         self._app_credential = app_credential
         self._metrics = metrics
         self._managed = managed_repositories
-        # Held for the transport builder; nothing here mints.
-        self._mint = mint
         self._clock = clock
         self._interval = interval
         # (forge host, casefolded repository, number) -> what step 2 read.

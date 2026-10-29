@@ -15,6 +15,7 @@ import io
 import functools
 import json
 import logging
+import math
 import os
 import posixpath
 import queue
@@ -53,6 +54,7 @@ import repo_ref
 import scoped_sa_pool
 import task_confinement
 import vcs_broker
+import vcs_readings
 import watcher_policy
 
 # The verb words go onto a line protocol the agent runtime reads; see
@@ -730,15 +732,28 @@ VCS_PROVIDER_NONE = "none"
 # ships (providers.AVAILABLE), which is also the set the registry admits a
 # configured forge from, so a configured forge's name is always in it.
 VCS_PROVIDERS = frozenset(cls.name for cls in providers.AVAILABLE)
-# Proposals this install opened that the forge reports merged, counted once
-# each per broker process as the broker's reads show them
-# (vcs_broker.VcsBroker._count_outcomes); the series the operator reads
-# `status.usage.remediationsMergedTotal` from. No labels.
-VCS_MERGED_METRIC = "kubeagents_vcs_proposals_merged_total"
-# Proposals this install opened that the forge reports closed without a merge,
-# counted the same way beside the merged series; the series the operator reads
-# `status.usage.remediationsClosedUnmergedTotal` from. No labels.
-VCS_CLOSED_UNMERGED_METRIC = "kubeagents_vcs_proposals_closed_unmerged_total"
+# The label keys of the proposal readings the sweep sets (vcs_readings.py;
+# the series names live there, beside the vocabularies these keys carry). The
+# operator filters `state`, `actor`, `outcome`, `le` and `reading` by these
+# spellings (usage_counters_scrape.go).
+VCS_READINGS_STATE_LABEL = "state"
+VCS_READINGS_ACTOR_LABEL = "actor"
+VCS_READINGS_KIND_LABEL = "kind"
+VCS_READINGS_OUTCOME_LABEL = "outcome"
+VCS_READINGS_LE_LABEL = "le"
+VCS_READINGS_READING_LABEL = "reading"
+VCS_READINGS_REASON_LABEL = "reason"
+# The `le` value of the last edge of the per-proposal gauge, its count.
+VCS_READINGS_LE_INF = "+Inf"
+# The failure counter's closed `reason` vocabulary; any other word is `other`.
+VCS_READINGS_FAILURE_REASONS = frozenset({
+    vcs_readings.REASON_FORGE,
+    vcs_readings.REASON_IDENTITY,
+    vcs_readings.REASON_TRUNCATED,
+    vcs_readings.REASON_DETAIL_TRUNCATED,
+    vcs_readings.REASON_RATE_LIMITED,
+    vcs_readings.REASON_WARMING,
+})
 # The broker's own failures, by kind and, for a timeout, by the tool it ran:
 # work it took on and could not carry out
 # for a reason that is its own or its upstream's, never the command's exit
@@ -9633,11 +9648,6 @@ def build_vcs_broker(
         request_deadline=executor.request_deadline,
         pinned_bases=pinned_bases,
         tls_refusal=executor.tls_refusal,
-        # Looked up at call time: the handler's registry is a class attribute
-        # a test replaces per case, and this broker outlives none of them.
-        merge_observer=lambda count: CredentialProxyHandler.metrics.record_merged(count),
-        close_observer=lambda count: CredentialProxyHandler.metrics.record_closed_unmerged(count),
-        started_at=PROCESS_START_TIME_SECONDS,
     )
     LOGGER.info(
         "version control enabled root=%s forges=%s",
@@ -9736,6 +9746,32 @@ def sweep_app_credential(forge) -> bool:
     return forge.name == GITHUB_PROVIDER and isinstance(
         forge.credential, (providers.BrokeredCredential, providers.MintedWriteCredential)
     )
+
+
+def start_readings_sweep(executor: CommandExecutor, broker) -> None:
+    """Start the proposal readings sweep beside the listeners, when there is anything to read.
+
+    Only when the install manages a repository at start. A started sweep
+    re-reads the list every interval, so a repository added later is read from
+    the next interval on; an install with none at start runs no sweep until
+    the broker restarts. An unreadable list at start is no sweep, logged.
+    """
+    try:
+        managed = managed_repositories()
+    except Exception as exc:  # noqa: BLE001 -- the broker serves without readings
+        LOGGER.warning("proposal readings off: managed repositories unreadable type=%s", type(exc).__name__)
+        return
+    if not managed:
+        LOGGER.info("proposal readings off: no managed repository")
+        return
+    vcs_readings.ReadingsSweep(
+        registry=broker.registry,
+        transport_for=lambda forge, repo: sweep_transport_for(executor, forge, repo),
+        metrics=CredentialProxyHandler.metrics,
+        managed_repositories=managed_repositories,
+        app_credential=sweep_app_credential,
+    ).start()
+    LOGGER.info("proposal readings enabled repositories=%d", len(managed))
 
 
 def warn_on_credential_reach(broker) -> None:
@@ -10181,15 +10217,18 @@ def _escape_label_value(value: str) -> str:
 class ProxyMetrics:
     """The broker's series in the Prometheus text exposition: the tool
     invocations counter and their latency histogram, the request counter, the
-    admission wait histogram and refusals counter by bound, and the slot and
-    child-memory gauges beside their caps when an executor is wired.
+    admission wait histogram and refusals counter by bound, the slot and
+    child-memory gauges beside their caps when an executor is wired, and the
+    proposal readings the readings sweep sets (`set_readings`) with its
+    failure counter.
 
     Hand-rolled: prometheus_client is not in the image, and what is needed is
     small enough that adding a dependency to the one container holding every
     credential is the worse trade. One lock, because the server is one thread
     per connection and a counter is read by the scrape while it is written.
     Series appear on first increment and are rendered in a fixed order, so
-    two scrapes of an idle broker are byte-identical.
+    two scrapes of an idle broker are byte-identical until the first reading,
+    whose age gauge moves with the clock.
     """
 
     def __init__(self) -> None:
@@ -10197,8 +10236,11 @@ class ProxyMetrics:
         self._tool_invocations: dict[tuple[str, str, str], int] = {}
         self._requests: dict[tuple[str, str], int] = {}
         self._vcs: dict[tuple[str, str, str], int] = {}
-        self._merged = 0
-        self._closed_unmerged = 0
+        # The sweep's last reading of each kind, None until the first; a
+        # withheld reading leaves the previous one here.
+        self._outcomes: vcs_readings.OutcomesReading | None = None
+        self._details: vcs_readings.DetailsReading | None = None
+        self._reading_failures: dict[str, int] = {}
         self._failures: dict[tuple[str, str], int] = {}
         # Per tool: cumulative bucket counts (one per TOOL_DURATION_BUCKETS
         # bound, the +Inf bucket being the count), the sum, and the count.
@@ -10303,13 +10345,110 @@ class ProxyMetrics:
         with self._lock:
             self._vcs[key] = self._vcs.get(key, 0) + 1
 
-    def record_merged(self, count: int) -> None:
+    def set_readings(
+        self,
+        outcomes: vcs_readings.OutcomesReading | None,
+        details: vcs_readings.DetailsReading | None,
+    ) -> None:
+        """The sweep's readings; None for a kind withheld, which keeps the last one."""
         with self._lock:
-            self._merged += count
+            if outcomes is not None:
+                self._outcomes = outcomes
+            if details is not None:
+                self._details = details
 
-    def record_closed_unmerged(self, count: int) -> None:
+    def record_reading_failure(self, reason: str) -> None:
+        reason = reason if reason in VCS_READINGS_FAILURE_REASONS else LABEL_OTHER
         with self._lock:
-            self._closed_unmerged += count
+            self._reading_failures[reason] = self._reading_failures.get(reason, 0) + 1
+
+    @staticmethod
+    def _render_readings(
+        lines: list[str],
+        outcomes: vcs_readings.OutcomesReading | None,
+        details: vcs_readings.DetailsReading | None,
+        failures: list[tuple[str, int]],
+        now: float,
+    ) -> None:
+        """The proposal readings (design section 4). A reading's series are
+        absent before it is first taken and once its age passes
+        VCS_READINGS_STALE_SECONDS; its age gauge stays from the first reading
+        on, so a stale reading shows as stale rather than as current."""
+
+        def fresh(reading: Any) -> bool:
+            return reading is not None and now - reading.taken_at <= vcs_readings.VCS_READINGS_STALE_SECONDS
+
+        if fresh(outcomes):
+            counts = {
+                vcs_readings.STATE_OPEN: outcomes.open,
+                vcs_readings.STATE_MERGED: outcomes.merged,
+                vcs_readings.STATE_CLOSED: outcomes.closed,
+            }
+            lines += [
+                f"# HELP {vcs_readings.VCS_PROPOSALS_METRIC} Proposals the install authored in its managed repositories, by state as the forge reports it now; closed is closed without a merge.",
+                f"# TYPE {vcs_readings.VCS_PROPOSALS_METRIC} gauge",
+            ]
+            for state in vcs_readings.STATES:
+                lines.append(f'{vcs_readings.VCS_PROPOSALS_METRIC}{{{VCS_READINGS_STATE_LABEL}="{state}"}} {counts[state]}')
+        if fresh(details):
+            lines += [
+                f"# HELP {vcs_readings.VCS_PROPOSALS_CLOSED_BY_METRIC} The install's proposals closed without a merge, by who closed them.",
+                f"# TYPE {vcs_readings.VCS_PROPOSALS_CLOSED_BY_METRIC} gauge",
+            ]
+            for actor in vcs_readings.CLOSERS:
+                lines.append(
+                    f'{vcs_readings.VCS_PROPOSALS_CLOSED_BY_METRIC}{{{VCS_READINGS_ACTOR_LABEL}="{actor}"}} '
+                    f"{details.closed_by.get(actor, 0)}"
+                )
+            lines += [
+                f"# HELP {vcs_readings.VCS_PROPOSAL_TOUCHES_METRIC} Events on the install's proposals by any account but the install's own, summed over every proposal, by kind and actor.",
+                f"# TYPE {vcs_readings.VCS_PROPOSAL_TOUCHES_METRIC} gauge",
+            ]
+            for touch, count in sorted(details.touches.items(), key=lambda item: (item[0].kind, item[0].actor)):
+                lines.append(
+                    f'{vcs_readings.VCS_PROPOSAL_TOUCHES_METRIC}{{{VCS_READINGS_KIND_LABEL}="{_escape_label_value(touch.kind)}",'
+                    f'{VCS_READINGS_ACTOR_LABEL}="{_escape_label_value(touch.actor)}"}} {count}'
+                )
+            lines += [
+                f"# HELP {vcs_readings.VCS_PROPOSAL_TOUCHES_PER_PROPOSAL_METRIC} The install's merged and closed proposals by how many human touches each carried, cumulative over le; the {VCS_READINGS_LE_INF} sample is the count of such proposals.",
+                f"# TYPE {vcs_readings.VCS_PROPOSAL_TOUCHES_PER_PROPOSAL_METRIC} gauge",
+            ]
+            for outcome in vcs_readings.OUTCOMES:
+                for edge, count in sorted(details.buckets.get(outcome, {}).items()):
+                    le = VCS_READINGS_LE_INF if math.isinf(edge) else f"{edge:g}"
+                    lines.append(
+                        f'{vcs_readings.VCS_PROPOSAL_TOUCHES_PER_PROPOSAL_METRIC}{{{VCS_READINGS_OUTCOME_LABEL}="{outcome}",'
+                        f'{VCS_READINGS_LE_LABEL}="{le}"}} {count}'
+                    )
+            lines += [
+                f"# HELP {vcs_readings.VCS_PROPOSALS_IGNORED_METRIC} Open proposals of the install older than {vcs_readings.VCS_READINGS_IGNORED_AFTER_SECONDS} seconds that carry no human touch.",
+                f"# TYPE {vcs_readings.VCS_PROPOSALS_IGNORED_METRIC} gauge",
+                f"{vcs_readings.VCS_PROPOSALS_IGNORED_METRIC} {details.ignored}",
+            ]
+        ages = [
+            (name, reading)
+            for name, reading in ((vcs_readings.READING_OUTCOMES, outcomes), (vcs_readings.READING_DETAILS, details))
+            if reading is not None
+        ]
+        if ages:
+            lines += [
+                f"# HELP {vcs_readings.VCS_READINGS_AGE_METRIC} Seconds since the reading was last taken in full; present from the first reading on, however old.",
+                f"# TYPE {vcs_readings.VCS_READINGS_AGE_METRIC} gauge",
+            ]
+            for name, reading in ages:
+                lines.append(
+                    f'{vcs_readings.VCS_READINGS_AGE_METRIC}{{{VCS_READINGS_READING_LABEL}="{name}"}} '
+                    f"{max(now - reading.taken_at, 0.0):.3f}"
+                )
+        if failures:
+            lines += [
+                f"# HELP {vcs_readings.VCS_READINGS_FAILURES_METRIC} Repository attempts by the readings sweep that produced less than a full reading, by cause.",
+                f"# TYPE {vcs_readings.VCS_READINGS_FAILURES_METRIC} counter",
+            ]
+            for reason, count in failures:
+                lines.append(
+                    f'{vcs_readings.VCS_READINGS_FAILURES_METRIC}{{{VCS_READINGS_REASON_LABEL}="{_escape_label_value(reason)}"}} {count}'
+                )
 
     def record_failure(self, kind: str, tool: str = BROKER_FAILURE_TOOL_NONE) -> None:
         kind = kind if kind in BROKER_FAILURE_KINDS else BROKER_FAILURE_OTHER_FAILED
@@ -10323,8 +10462,9 @@ class ProxyMetrics:
             invocations = sorted(self._tool_invocations.items())
             requests = sorted(self._requests.items())
             vcs = sorted(self._vcs.items())
-            merged = self._merged
-            closed_unmerged = self._closed_unmerged
+            outcomes = self._outcomes
+            details = self._details
+            reading_failures = sorted(self._reading_failures.items())
             failures = sorted(self._failures.items())
             durations = {
                 tool: (list(self._duration_buckets[tool]), self._duration_sum[tool], self._duration_count[tool])
@@ -10431,14 +10571,8 @@ class ProxyMetrics:
                 f'{TOOL_STATUS_LABEL}="{_escape_label_value(status)}",'
                 f'{VCS_PROVIDER_LABEL}="{_escape_label_value(provider)}"}} {count}'
             )
-        lines += [
-            f"# HELP {VCS_MERGED_METRIC} Proposals this install opened that the forge reported merged, counted once each per process.",
-            f"# TYPE {VCS_MERGED_METRIC} counter",
-            f"{VCS_MERGED_METRIC} {merged}",
-            f"# HELP {VCS_CLOSED_UNMERGED_METRIC} Proposals this install opened that the forge reported closed without a merge, counted once each per process.",
-            f"# TYPE {VCS_CLOSED_UNMERGED_METRIC} counter",
-            f"{VCS_CLOSED_UNMERGED_METRIC} {closed_unmerged}",
-        ]
+        # Wall clock, as the readings' `taken_at` is.
+        self._render_readings(lines, outcomes, details, reading_failures, time.time())
         lines += [
             f"# HELP {BROKER_FAILURES_METRIC} Brokered work the broker could not carry out, by kind (a command past its deadline, a broker fault, a git failure, a failed token mint or an upstream relay error) and, for a command past its deadline, the tool it ran; every other kind carries tool={BROKER_FAILURE_TOOL_NONE}.",
             f"# TYPE {BROKER_FAILURES_METRIC} counter",
@@ -13469,6 +13603,8 @@ def serve(args: argparse.Namespace) -> None:
         base_branch=CredentialProxyHandler.base_branch,
         pinned_bases=CredentialProxyHandler.pinned_bases,
     )
+    if role in ("broker", "combined"):
+        start_readings_sweep(executor, CredentialProxyHandler.vcs)
     CredentialProxyHandler.max_request_bytes = args.max_request_bytes
     CredentialProxyHandler.enforce_read_only = read_only_enforced()
     LOGGER.info("read-only enforcement enabled=%s", CredentialProxyHandler.enforce_read_only)

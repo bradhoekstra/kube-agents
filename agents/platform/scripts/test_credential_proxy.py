@@ -8964,6 +8964,11 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
 
     def setUp(self):
         self.original = CredentialProxyHandler.enforce_read_only
+        # No managed-repository ConfigMap is mounted here: an install with
+        # none, so `serve` starts no readings sweep and logs nothing about it.
+        managed = mock.patch.object(credential_proxy, "managed_repositories", return_value=frozenset())
+        managed.start()
+        self.addCleanup(managed.stop)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.policy_path = Path(self.tmp.name) / "policy.json"
@@ -9052,6 +9057,40 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
     def test_serve_leaves_the_gate_armed_on_a_typo(self):
         CredentialProxyHandler.enforce_read_only = False
         self.assertTrue(self._serve_with("banana"))
+
+    def test_the_sweep_starts_in_the_broker_role_and_not_in_api_proxy(self):
+        managed = frozenset({"github.com/acme/infra"})
+        for role in ("broker", "combined"):
+            with self.subTest(role=role), \
+                    mock.patch.object(credential_proxy, "resolve_role", return_value=role), \
+                    mock.patch.object(credential_proxy, "managed_repositories", return_value=managed), \
+                    mock.patch.object(credential_proxy, "start_agent_api_proxy", mock.MagicMock()), \
+                    mock.patch.object(credential_proxy.vcs_readings.ReadingsSweep, "start", autospec=True) as start:
+                self._serve_with(None)
+                start.assert_called_once()
+                (sweep,) = start.call_args.args
+                self.assertIs(CredentialProxyHandler.vcs.registry, sweep._registry)
+                self.assertIs(CredentialProxyHandler.metrics, sweep._metrics)
+                self.assertIs(credential_proxy.sweep_app_credential, sweep._app_credential)
+                self.assertEqual(managed, sweep._managed())
+                with mock.patch.object(credential_proxy, "sweep_transport_for", return_value="transport") as built:
+                    self.assertEqual("transport", sweep._transport_for("forge", "acme/infra"))
+                built.assert_called_once_with(CredentialProxyHandler.executor, "forge", "acme/infra")
+
+        with mock.patch.object(credential_proxy, "resolve_role", return_value="broker"), \
+                mock.patch.object(credential_proxy, "managed_repositories", return_value=frozenset()), \
+                mock.patch.object(credential_proxy.vcs_readings.ReadingsSweep, "start", autospec=True) as start:
+            self._serve_with(None)
+        start.assert_not_called()
+
+        proxy = mock.MagicMock()
+        with mock.patch.object(credential_proxy, "resolve_role", return_value="api-proxy"), \
+                mock.patch.object(credential_proxy, "managed_repositories", return_value=managed), \
+                mock.patch.object(credential_proxy, "start_agent_api_proxy", return_value=proxy), \
+                mock.patch.object(credential_proxy.vcs_readings.ReadingsSweep, "start", autospec=True) as start:
+            credential_proxy.serve(types.SimpleNamespace())
+        proxy.serve_forever.assert_called_once_with()
+        start.assert_not_called()
 
     def test_serve_wires_base_branch_and_refuses_push_with_env_cleared(self):
         # Wires --base-branch CLI argument into CredentialProxyHandler.base_branch
@@ -11464,6 +11503,10 @@ class BackendSocketModeTest(unittest.TestCase):
         pass
 
     def setUp(self):
+        # No managed repository: `serve` starts no readings sweep.
+        managed = mock.patch.object(credential_proxy, "managed_repositories", return_value=frozenset())
+        managed.start()
+        self.addCleanup(managed.stop)
         # `serve` assigns these on the class; put them back for whatever runs
         # next. Some are bare annotations until something sets them, so an
         # unset one has to be unset again rather than restored.
@@ -13317,6 +13360,10 @@ class ServeRefusesAnUnauthenticatedTCPListenerTest(unittest.TestCase):
     """
 
     def setUp(self):
+        # No managed repository: `serve` starts no readings sweep.
+        managed = mock.patch.object(credential_proxy, "managed_repositories", return_value=frozenset())
+        managed.start()
+        self.addCleanup(managed.stop)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.policy_path = Path(self.tmp.name) / "policy.json"
