@@ -177,6 +177,18 @@ Slack relay's bootstrap thread runs today. One at a time: an attempt still runni
 interval elapses is not joined by a second, and a failed attempt sets the same clock as a
 successful one, so a forge outage or a rate limit costs one attempt per interval. `MetricsHandler`
 serves `GET /metrics` from the registry as today and nothing about a scrape reaches the sweep.
+
+**Which pod.** The broker program runs under more than one role, selected by
+`CREDENTIAL_PROXY_ROLE`: `broker` is the stateful pod that holds the forge credentials and
+serves the version-control routes, `api-proxy` is the gateway's sidecar, and the scale-out
+design (the exec tier of #4132) adds a tier of exec replicas. The sweep's timer starts in the
+`broker` role alone; every other role starts no timer, publishes none of the reading series and
+keeps no detail cache, so scaling the exec tier to N replicas adds no forge traffic, the hourly
+detail budget is one install's, and the operator's poller reads the readings from the one pod
+that has them. That design keeps the version-control routes and the forge credentials on the
+single stateful pod, which is what the sweep needs; if a later design ever runs the `broker`
+role itself as more than one replica, the sweep needs a leader lease among them before that
+ships, and this document does not provide one.
 A reading is therefore at most one interval old when the operator's five-minute poll reads it,
 so a merge reaches `status.usage` within two poll intervals end to end.
 
@@ -339,8 +351,8 @@ transient child memory the same way.
 A new reading slot beside the cluster gauges, generic rather than a third special case: a declared
 list of reading series (`usageReadingSeries`) with, for each, the status field it lands in, its
 label filter, the reading it belongs to (`outcomes` or `details`) and the aggregation across pods
-(`max`, the cluster gauges' rule; the broker is one pod by design, with a `Recreate` strategy, so
-the rule is for form). The scrape parses them from the broker body into `usageReading.Readings`;
+(`max`, the cluster gauges' rule; the `broker` role is one pod with a `Recreate` strategy, and
+the exec tier's replicas serve no reading series, so the rule is for form). The scrape parses them from the broker body into `usageReading.Readings`;
 `foldUsage` never sees them; `projectStatus` writes them as the latest poll's reading. The rules
 are the cluster gauges' rules, applied to the broker target, with one difference: the cluster
 gauges share one miss streak, and here each reading has its own, because a warming sweep, or a
@@ -480,7 +492,8 @@ Python, beside the broker in `agents/platform/scripts/` (`test_vcs_broker.py`,
   stays; past the stale bound the reading series are omitted and the age gauge and failure counter
   are not;
 - the timer runs at most one attempt per interval, a failed attempt included, and a scrape of
-  the listener starts nothing;
+  the listener starts nothing; a process started under any role other than `broker` starts no
+  timer and serves no reading series;
 - a forge that returns another author's proposal under the author filter ends the repository's
   attempt with nothing published;
 - a cache being warmed takes the outcomes reading and not the details reading until every listed
@@ -565,6 +578,8 @@ construction in `providers/github/forge.py`; the two feedback-summary copies and
   `proposalsAuthored` within the window, seen through `resets()`, silences the two proposal
   alerts for a fortnight rather than letting them misfire; a reopen is absorbed as a one-unit
   under-count of closes.
+- The sweep runs in the `broker` role alone, never in the exec tier or the gateway sidecar, and
+  a multi-replica `broker` role would need a leader lease this document does not design.
 - The broker owns one timer, the sweep's, at the TTL; an earlier draft triggered the read from
   a scrape of the metrics listener, which the reviewer of this document showed costs the
   listener's security property for no saving in forge traffic.
