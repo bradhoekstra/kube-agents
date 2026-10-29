@@ -14,14 +14,15 @@ know how much human work it took: reviews, comments, commits a person added. Lat
 to an hour is fine. Missing a merge is not: a ratio that under-counts merges makes the agent look
 worse than it is, and that error compounds over a quarter.
 
-Today's merged and closed counters are event counts the credential broker keeps in memory. A merge
-is counted only when one of the broker's own reads, a `proposal-list` or `proposal-view`, happens to
-show it, only once per broker process, and only when it happened after the process started. On
-2026-10-28 on the gkedemos3 install both series stayed at zero after a merge and a close until a
-person issued a `proposal view` by hand (#4120, first comment). A watch list would fix that with a
-store, and the broker keeps no store by design: PR #2919 rejected a persisted seen-set because "the
-broker keeps no state across requests by design", and the `VcsBroker` class docstring names the
-in-memory seen-sets and identity cache as the one cross-request memory, on which no answer depends.
+Before this design, the merged and closed counters were event counts the credential broker kept in
+memory. A merge was counted only when one of the broker's own reads, a `proposal-list` or
+`proposal-view`, happened to show it, only once per broker process, and only when it happened after
+the process started. On 2026-10-28 on the gkedemos3 install both series stayed at zero after a merge
+and a close until a person issued a `proposal view` by hand (#4120, first comment). A watch list
+would have fixed that with a store, and the broker keeps no store by design: PR #2919 rejected a
+persisted seen-set because "the broker keeps no state across requests by design", and the
+`VcsBroker` class docstring then named the in-memory seen-sets and identity cache as the one
+cross-request memory, on which no answer depended.
 
 The decision this document records: stop counting events and read the state. The forge already
 holds every proposal the install opened, authored by the install's own login, in a repository the
