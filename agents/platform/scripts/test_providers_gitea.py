@@ -360,7 +360,7 @@ class ProposalTest(unittest.TestCase):
         self.assertEqual(["merged"], [p["state"] for p in answer["proposals"]])
         self.assertTrue(answer["truncated"])
         self.assertEqual("repos/acme/infra/pulls", api.calls[0][1])
-        self.assertEqual({"state": "all", "poster": 7, "limit": 1, "page": 2}, api.calls[0][2])
+        self.assertEqual({"state": "all", "poster": 7, "sort": "recentupdate", "limit": 1, "page": 2}, api.calls[0][2])
         # A page the server clamped short is still a page when the total says so.
         clamped = forge().proposal_list_by_author(
             Api(([pr(1)], {"x-total-count": "3"})), "acme/infra", {"author": "kube-agents", "authorId": 7, "limit": 2}

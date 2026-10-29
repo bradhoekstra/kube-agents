@@ -97,6 +97,10 @@ TOTAL_HEADER = "x-total-count"
 # count: Gitea's `state` is open or closed, with merged a flag on the item.
 AUTHORED_STATE = "all"
 OPEN_STATE = "open"
+# The order an author's pull requests are listed in: newest activity first, as
+# GitHub's search and GitLab's list are asked, so a bounded walk holds the
+# proposals that changed. Gitea's default is by creation.
+AUTHORED_SORT = "recentupdate"
 # The timeline event that records a close.
 CLOSE_EVENT = "close"
 
@@ -635,7 +639,13 @@ class GiteaForge(Forge):
         nodes, headers = api(
             "GET",
             f"repos/{repo}/pulls",
-            params={"state": state, "poster": poster, "limit": limit, "page": page},
+            params={
+                "state": state,
+                "poster": poster,
+                "sort": AUTHORED_SORT,
+                "limit": limit,
+                "page": page,
+            },
             with_headers=True,
         )
         return nodes or [], _total(headers)
