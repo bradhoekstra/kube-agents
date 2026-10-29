@@ -115,16 +115,15 @@ func humanMovedAt(res usageFoldResult, at time.Time) bool {
 }
 
 // Only the counter a person moves stamps LastHumanMoved: a chat message
-// does; a brokered command (the stall watch runs some every half hour), a
-// proposal (the fleet audits open them on their own) and a merge (a forge
-// rule can) do not, and LastMoved follows every advance as before.
+// does; a brokered command (the stall watch runs some every half hour) and a
+// proposal (the fleet audits open them on their own) do not, and LastMoved
+// follows every advance as before.
 func TestFoldUsage_HumanCountersAloneStampLastHumanMoved(t *testing.T) {
 	t0 := foldClock(0)
 	created := t0.Add(-time.Hour)
 	doc := foldDoc(t0,
 		&usagePodEntry{Name: "broker", PodUID: foldPodBroker, Counter: usageCounterToolExecutions, Sample: 10, Marker: metav1.NewTime(t0)},
 		&usagePodEntry{Name: "broker", PodUID: foldPodBroker, Counter: usageCounterRemediationsProposed, Sample: 0, Marker: metav1.NewTime(t0)},
-		&usagePodEntry{Name: "broker", PodUID: foldPodBroker, Counter: usageCounterRemediationsMerged, Sample: 0, Marker: metav1.NewTime(t0)},
 		&usagePodEntry{Name: "gateway", PodUID: foldPodA, Counter: usageCounterChatMessagesInbound, Sample: 1, Marker: metav1.NewTime(t0), StartTime: ptr.To(1.0)},
 	)
 	// A command alone: lastMoved, not lastHumanMoved.
@@ -157,16 +156,15 @@ func TestFoldUsage_HumanCountersAloneStampLastHumanMoved(t *testing.T) {
 	if !movedAt(res, foldClock(15)) || !humanMovedAt(res, foldClock(10)) || !res.Changed {
 		t.Fatalf("a later command: lastMoved=%v lastHumanMoved=%v, want 15 and 10", doc.LastMoved, doc.LastHumanMoved)
 	}
-	// A proposal and a merge: the audits open proposals and a forge rule can
-	// merge, so neither is a person; lastMoved moves, lastHumanMoved stays.
+	// A proposal: the audits open proposals with nobody asking, so it is not
+	// a person; lastMoved moves, lastHumanMoved stays.
 	res = foldUsage(doc, foldTestAgentUID, usageSeed{}, foldLive(doc), []usageScrapedPod{
 		scrapedPod(foldPodBroker, usageCounterToolExecutions, created, 20, nil),
 		scrapedPod(foldPodBroker, usageCounterRemediationsProposed, created, 1, nil),
-		scrapedPod(foldPodBroker, usageCounterRemediationsMerged, created, 1, nil),
 		scrapedPod(foldPodA, usageCounterChatMessagesInbound, created, 3, ptr.To(1.0)),
 	}, foldClock(20))
 	if !movedAt(res, foldClock(20)) || !humanMovedAt(res, foldClock(10)) {
-		t.Fatalf("a proposal and a merge: lastMoved=%v lastHumanMoved=%v, want 20 and 10", res.Document.LastMoved, res.Document.LastHumanMoved)
+		t.Fatalf("a proposal: lastMoved=%v lastHumanMoved=%v, want 20 and 10", res.Document.LastMoved, res.Document.LastHumanMoved)
 	}
 }
 
