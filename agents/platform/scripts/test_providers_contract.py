@@ -659,6 +659,26 @@ class ContractTest(unittest.TestCase):
                             )
                         self.assertEqual(api.calls, [])
 
+    def test_an_incomplete_github_search_is_never_a_whole_listing_or_a_count(self):
+        # GitHub sets `incomplete_results` when the search timed out, and then
+        # its items and its count may both be short.
+        for name, forge, directory in self.instances():
+            if name != "github":
+                continue
+            listing = self.load(directory, "proposal-list-by-author")
+            listing["responses"][0]["incomplete_results"] = True
+            with self.subTest(forge=name, verb="proposal-list-by-author"):
+                answer, _ = self.invoke(forge, "proposal-list-by-author", listing)
+                self.assertTrue(answer["truncated"])
+                self.assertIs(True, answer["incomplete"])
+            tally = self.load(directory, "proposal-tally")
+            for response in tally["responses"]:
+                response["incomplete_results"] = True
+            with self.subTest(forge=name, verb="proposal-tally"):
+                with self.assertRaises(WorkspaceError) as caught:
+                    self.invoke(forge, "proposal-tally", tally)
+                self.assertEqual("FORGE_CALL_FAILED", caught.exception.fields.get("code"))
+
     def test_proposal_tally_counts_by_state(self):
         for name, forge, directory in self.instances():
             fixture = self.load(directory, "proposal-tally")

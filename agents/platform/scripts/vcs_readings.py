@@ -24,7 +24,7 @@ import math
 import os
 import threading
 import time
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
 
@@ -53,6 +53,14 @@ VCS_READINGS_BUCKETS = (0.0, 1.0, 2.0, 3.0, 5.0, 8.0, 13.0, 21.0, math.inf)
 # The most commits any forge serves for one proposal; the forges cap there too.
 COMMIT_CAP = 250
 SECONDS_PER_HOUR = 3600
+SECONDS_PER_MINUTE = 60
+# GitHub serves thirty searches a minute; the sweep keeps under that, so a
+# large install stretches the sweep rather than having its tail rate-limited.
+VCS_READINGS_SEARCH_CALLS_PER_MINUTE = 25
+# How many more times a listing that came back short of the forge's total is
+# walked before the repository's outcomes reading is withheld.
+VCS_READINGS_SHORT_LISTING_RETRIES = 1
+METHOD_GET = "GET"
 
 # The series the metrics object renders from these readings.
 VCS_PROPOSALS_METRIC = "kubeagents_vcs_proposals"
@@ -240,6 +248,10 @@ class _ForeignAuthor(Exception):
     """The forge returned a proposal another account authored."""
 
 
+class _ShortListing(Exception):
+    """A complete-looking listing held fewer proposals than the forge counted."""
+
+
 @dataclass
 class _Repository:
     """One managed repository bound for one sweep."""
@@ -283,6 +295,7 @@ class ReadingsSweep:
         clock: Callable[[], float] = time.monotonic,
         interval: float = VCS_READINGS_TTL_SECONDS,
         app_credential: Callable[[Any], bool] | None = None,
+        sleep: Callable[[float], Any] | None = None,
     ) -> None:
         self._registry = registry
         self._transport_for = transport_for
@@ -313,6 +326,10 @@ class ReadingsSweep:
         self._bound: dict[str, _Repository] = {}
         self._running = threading.Lock()
         self._stop = threading.Event()
+        # The search calls' pacing: per forge host, when each of the last
+        # minute's searches went out, and how the sweep waits for the next.
+        self._searches: dict[str, deque] = {}
+        self._sleep = sleep if sleep is not None else self._stop.wait
 
     # ---- the timer -----------------------------------------------------
 
@@ -401,6 +418,9 @@ class ReadingsSweep:
         except _ForeignAuthor:
             LOGGER.warning("proposal readings: %s listed a proposal another account authored", key)
             return _Attempt(reason=REASON_FORGE)
+        except _ShortListing:
+            LOGGER.warning("proposal readings: %s listed fewer proposals than the forge counted", key)
+            return _Attempt(reason=REASON_FORGE)
         except Exception as exc:  # noqa: BLE001 -- one repository never ends the sweep
             return self._failed(key, exc, _Attempt())
         attempt = _Attempt(counts=counts, reason=REASON_TRUNCATED if truncated else None)
@@ -441,14 +461,30 @@ class ReadingsSweep:
         forge, path = self._registry.resolve(key)
         transport = self._transport_for(forge, path)
         host = _host(forge)
+        paced = getattr(forge, "search_routes", frozenset())
 
         def api(method: str, route: str, **kwargs: Any) -> Any:
+            if route in paced:
+                self._pace(host)
             self._calls += 1
             return transport.api(method, route, **kwargs)
 
         bound = _Repository(key, forge, path, host, transport, api)
         self._bound[key] = bound
         return bound
+
+    def _pace(self, host: str) -> None:
+        """Wait until a search to `host` keeps the last minute within the rate."""
+        sent = self._searches.setdefault(host, deque())
+        now = self._clock()
+        while sent and now - sent[0] >= SECONDS_PER_MINUTE:
+            sent.popleft()
+        if len(sent) >= VCS_READINGS_SEARCH_CALLS_PER_MINUTE:
+            self._sleep(SECONDS_PER_MINUTE - (now - sent[0]))
+            now = self._clock()
+            while sent and now - sent[0] >= SECONDS_PER_MINUTE:
+                sent.popleft()
+        sent.append(now)
 
     def _refill(self) -> None:
         now = self._clock()
@@ -475,7 +511,7 @@ class ReadingsSweep:
             login = ""
         if login and bound.forge.whoami_route and not bound.forge.whoami_graphql:
             # A forge whose author filter takes the account's numeric id.
-            answer = bound.api("GET", bound.forge.whoami_route[0])
+            answer = bound.api(METHOD_GET, bound.forge.whoami_route[0])
             self._author_ids[repo] = answer.get(USER_ID_FIELD) if isinstance(answer, dict) else None
         self._logins[repo] = login
         return login
@@ -496,9 +532,26 @@ class ReadingsSweep:
         """Step 1: the install's proposals, newest activity first, and whether
         the walk stopped at its bound with more remaining, and the forge's total.
 
+        A walk that ends inside the bound must hold every proposal the forge
+        counted: one short of the total (a proposal that moved to a page already
+        read, or a page the forge marked incomplete) is walked again, and short
+        again raises, so no short listing is ever published as complete.
+        """
+        for _ in range(1 + VCS_READINGS_SHORT_LISTING_RETRIES):
+            read, truncated, total, short = self._walk(repo)
+            if not short:
+                return read, truncated, total
+        raise _ShortListing()
+
+    def _walk(self, repo: str) -> tuple[list[dict], bool, int | None, bool]:
+        """One listing walk: what `_list` returns, and whether a walk that
+        ended inside its bound is short of the forge's count.
+
         The bound is in pages while pages come back full and in proposals once
         one comes back shorter than asked with more remaining, which is a server
-        clamping the page size. Any item by another author raises.
+        clamping the page size. The walk goes on while the forge's total says
+        more remain, whatever a page's `truncated` says, since a clamping server
+        can make a page look like the last. Any item by another author raises.
         """
         bound = self._bound[repo]
         install = _login_key(self._logins[repo])
@@ -506,7 +559,7 @@ class ReadingsSweep:
         payload["limit"] = MAX_PAGE_SIZE
         read: list[dict] = []
         seen: set[Any] = set()
-        clamped = False
+        clamped = incomplete = False
         total: int | None = None
         page = 1
         while True:
@@ -518,15 +571,18 @@ class ReadingsSweep:
                 if item.get("number") not in seen:
                     seen.add(item.get("number"))
                     read.append(item)
+            incomplete = incomplete or bool(answer.get("incomplete"))
             if isinstance(answer.get("total"), int):
                 total = answer["total"]
             exhausted = total is not None and len(read) >= total
-            if not batch or not answer.get("truncated") or exhausted:
-                return read, False, total
+            more = bool(answer.get("truncated")) or (total is not None and len(read) < total)
+            if not batch or not more or exhausted:
+                short = incomplete or (total is not None and len(read) != total)
+                return read, False, total, short
             if len(batch) < MAX_PAGE_SIZE:
                 clamped = True
             if len(read) >= VCS_READINGS_MAX_PROPOSALS_GITEA if clamped else page >= VCS_READINGS_MAX_PAGES:
-                return read, True, total
+                return read, True, total, False
             page += 1
 
     def _tally(self, repo: str) -> Counter | None:

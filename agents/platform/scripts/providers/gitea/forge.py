@@ -655,9 +655,12 @@ class GiteaForge(Forge):
         page = validate_page(payload.get("page"))
         nodes, total = self._authored(api, repo, payload, AUTHORED_STATE, limit, page)
         proposals = [translate.authored(node) for node in nodes]
-        # Gitea clamps `limit` to the server's `MAX_RESPONSE_ITEMS`, so a page
-        # shorter than asked is not the end; the total says when more remain.
-        more = total is not None and (page - 1) * limit + len(nodes) < total
+        # Gitea clamps `limit` to the server's `MAX_RESPONSE_ITEMS` and pages
+        # by the clamped size, so a page shorter than asked is not the end, and
+        # the rows read so far are this page's size times its number, not
+        # `limit` times it. On a short last page that undercounts, so the walk
+        # asks once more and gets an empty page: the safe side.
+        more = total is not None and bool(nodes) and page * len(nodes) < total
         return {
             "proposals": proposals,
             "count": len(proposals),

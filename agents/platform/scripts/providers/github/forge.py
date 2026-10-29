@@ -76,6 +76,9 @@ COMMIT_CAP = 250
 SEARCH_PATH = "search/issues"
 AUTHORED_SORT = "updated"
 AUTHORED_ORDER = "desc"
+# The search answer's flag for a query that timed out before it matched
+# everything: its items and its count may both be short.
+INCOMPLETE_RESULTS = "incomplete_results"
 
 # The qualifiers that count an author's proposals by outcome. `is:closed`
 # alone would count merged ones twice.
@@ -143,6 +146,7 @@ class GitHubForge(Forge):
     error_overrides = ERROR_OVERRIDES
     acknowledges = True
     labels = True
+    search_routes = frozenset({SEARCH_PATH})
     COMMIT_CAP = COMMIT_CAP
 
     def __init__(
@@ -710,6 +714,11 @@ class GitHubForge(Forge):
         )
         total = found.get("total_count")
         answer["total"] = total if isinstance(total, int) and not isinstance(total, bool) else None
+        if found.get(INCOMPLETE_RESULTS) is True:
+            # The search timed out on GitHub's side and this page may lack
+            # items the total counts; it is never the end of a listing.
+            answer["truncated"] = True
+            answer["incomplete"] = True
         return answer
 
     def proposal_tally(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
@@ -721,6 +730,12 @@ class GitHubForge(Forge):
             if not isinstance(total, int) or isinstance(total, bool):
                 raise WorkspaceError(
                     "GitHub's search answered with no count", status=502, code="FORGE_CALL_FAILED"
+                )
+            if found.get(INCOMPLETE_RESULTS) is True:
+                raise WorkspaceError(
+                    "GitHub's search timed out and its count is incomplete",
+                    status=502,
+                    code="FORGE_CALL_FAILED",
                 )
             tally[state] = total
         return tally

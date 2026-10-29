@@ -96,6 +96,12 @@ LOGGER = logging.getLogger("credential-proxy")
 # The optional key, in the Secret a forge's credentialsRef names, that holds
 # its read-only token. Named in the log when a context clone presents none.
 FORGE_READ_TOKEN_KEY = vcs_broker.FORGE_READ_TOKEN_KEY
+# The process roles `resolve_role` accepts (CREDENTIAL_PROXY_ROLE), and the
+# ones that run the credential broker and so the readings sweep.
+ROLE_COMBINED = "combined"
+ROLE_BROKER = "broker"
+ROLE_API_PROXY = "api-proxy"
+BROKER_ROLES = (ROLE_BROKER, ROLE_COMBINED)
 SLACK_EVENT_QUEUE_MAXSIZE = 1000
 SLACK_ERROR_DIAGNOSTIC_FIELDS = ("ok", "error", "needed", "provided")
 
@@ -13452,8 +13458,8 @@ def resolve_role() -> str:
     are on the same loopback. Splitting the broker into its own Pod splits
     those two roles across two containers in two Pods.
     """
-    role = os.getenv("CREDENTIAL_PROXY_ROLE", "combined").strip().lower() or "combined"
-    if role not in {"combined", "broker", "api-proxy"}:
+    role = os.getenv("CREDENTIAL_PROXY_ROLE", ROLE_COMBINED).strip().lower() or ROLE_COMBINED
+    if role not in {ROLE_COMBINED, ROLE_BROKER, ROLE_API_PROXY}:
         raise RuntimeError(
             f"unsupported CREDENTIAL_PROXY_ROLE {role!r}; "
             "expected 'combined', 'broker' or 'api-proxy'"
@@ -13526,7 +13532,7 @@ def platform_pubsub_subscriptions() -> frozenset[str]:
 
 def serve(args: argparse.Namespace) -> None:
     role = resolve_role()
-    if role == "api-proxy":
+    if role == ROLE_API_PROXY:
         start_agent_api_proxy().serve_forever()
         return
 
@@ -13599,7 +13605,7 @@ def serve(args: argparse.Namespace) -> None:
         base_branch=CredentialProxyHandler.base_branch,
         pinned_bases=CredentialProxyHandler.pinned_bases,
     )
-    if role in ("broker", "combined"):
+    if role in BROKER_ROLES:
         start_readings_sweep(executor, CredentialProxyHandler.vcs)
     CredentialProxyHandler.max_request_bytes = args.max_request_bytes
     CredentialProxyHandler.enforce_read_only = read_only_enforced()
@@ -13675,7 +13681,7 @@ def serve(args: argparse.Namespace) -> None:
             teams_app_id,
             teams_tenant_id or "common",
         )
-    if role == "combined":
+    if role == ROLE_COMBINED:
         api_server = start_agent_api_proxy()
         threading.Thread(target=api_server.serve_forever, daemon=True).start()
     if args.unix_socket:

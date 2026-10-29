@@ -1366,6 +1366,21 @@ class MetricsListenerTest(unittest.TestCase):
                     urllib.request.urlopen(self.endpoint + path)
                 self.assertEqual(404, caught.exception.code)
 
+    def test_a_scrape_starts_nothing(self):
+        """The readings are taken on the sweep's timer; a scrape only renders
+        what the last attempt left, so it never starts an attempt or a forge call."""
+        with mock.patch.object(vcs_readings.ReadingsSweep, "run_once", autospec=True) as run_once, \
+                mock.patch.object(vcs_readings.ReadingsSweep, "start", autospec=True) as start, \
+                mock.patch.object(credential_proxy, "sweep_transport_for") as transport_for:
+            before = {thread.name for thread in threading.enumerate()}
+            for _ in range(3):
+                urllib.request.urlopen(self.endpoint + "/metrics").read()
+            after = {thread.name for thread in threading.enumerate()}
+        run_once.assert_not_called()
+        start.assert_not_called()
+        transport_for.assert_not_called()
+        self.assertNotIn(vcs_readings.THREAD_NAME, after - before)
+
     def test_a_scrape_writes_no_access_log_line(self):
         captured = io.StringIO()
         with contextlib.redirect_stderr(captured), self.assertNoLogs(credential_proxy.LOGGER, level="DEBUG"):

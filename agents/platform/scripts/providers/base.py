@@ -248,6 +248,9 @@ class Forge:
     # find their own items by branch prefix and body marker. Off by default,
     # so a new forge that forgets it refuses a label instead of dropping one.
     labels = False
+    # The routes that spend a separate, smaller search quota, which the
+    # readings sweep paces (`vcs_readings.VCS_READINGS_SEARCH_CALLS_PER_MINUTE`).
+    search_routes: frozenset[str] = frozenset()
     # The login this install's credential acts as, when the forge cannot ask:
     # a token whose API has no current-user call, or refuses the call. A
     # provider package sets it from its forge configuration. Empty means ask
@@ -486,7 +489,8 @@ class Forge:
         Filtered by the forge, never here. Each item is `number`, `state`,
         `author`, `authorBot`, `created`, `updated` and `closed`; beside
         `count` and `truncated` is `total`, the forge's own count for the
-        query, or None when it gives none.
+        query, or None when it gives none. A page the forge itself says is
+        incomplete also carries `incomplete: True`, and is `truncated`.
         """
         return self._unsupported("proposal-list-by-author")
 

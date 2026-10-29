@@ -15031,10 +15031,13 @@ class SweepTransportTest(unittest.TestCase):
     def test_the_sweep_mints_the_sweep_scope_and_never_the_write_scope(self):
         # The executor's write mint, write refresh and context read mint are
         # tripwires; Binding.whoami, which runs the write credential's ensure,
-        # is one too.
+        # is one too. The forge's own write refresh and write mint are
+        # recorded rather than raising: `BrokeredCredential.ensure` swallows
+        # a refresh's exception, so a raising mock would pin nothing.
+        refresh, mint_write = mock.Mock(), mock.Mock()
         for forge in (
-            _forge_class("github")(refresh=mock.Mock(side_effect=AssertionError("no refresh"))),
-            _forge_class("github")(host="ghe.example.test", mint_write=mock.Mock(side_effect=AssertionError)),
+            _forge_class("github")(refresh=refresh),
+            _forge_class("github")(host="ghe.example.test", mint_write=mint_write),
         ):
             with self.subTest(host=forge.hosts[0]):
                 executor = _SweepExecutor()
@@ -15044,6 +15047,8 @@ class SweepTransportTest(unittest.TestCase):
                     transport.whoami()
                     transport.api("GET", "search/issues")
                 self.assertEqual([("github", "acme/gitops"), ("github", "acme/gitops")], executor.minted)
+                refresh.assert_not_called()
+                mint_write.assert_not_called()
 
     def test_a_refused_sweep_token_is_dropped_and_the_call_asked_once_more(self):
         from test_providers_http_transport import refusal

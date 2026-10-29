@@ -84,6 +84,10 @@ class FakeForge:
         self.list_payloads: list[dict] = []
         self.gate: threading.Event | None = None
         self.entered = threading.Event()
+        # Called with the page number before each listing page is served.
+        self.before_page = None
+        # Proposals whose reviews and comments run past the conversation bound.
+        self.long_conversations: set[int] = set()
 
     def add(self, number, state="open", author=INSTALL_BARE, created=RECENT, updated=None, **events):
         self.proposals[number] = {
@@ -114,6 +118,8 @@ class FakeForge:
         if self.gate is not None:
             self.gate.wait()
         self._call(api, "list")
+        if self.before_page is not None:
+            self.before_page(payload["page"])
         items = sorted(self.proposals.values(), key=lambda p: p["updated"], reverse=True)
         served = min(payload["limit"], self.clamp or payload["limit"])
         start = (payload["page"] - 1) * served
@@ -135,7 +141,8 @@ class FakeForge:
     def proposal_reviews(self, api, repo, payload):
         self._call(api, "reviews", payload["number"])
         reviews = self.reviews.get(payload["number"], [])
-        return {"reviews": reviews, "count": len(reviews), "truncated": False}
+        truncated = payload["number"] in self.long_conversations
+        return {"reviews": reviews, "count": len(reviews), "truncated": truncated}
 
     def proposal_view(self, api, repo, payload):
         self._call(api, "view", payload["number"])
@@ -145,7 +152,7 @@ class FakeForge:
             "proposal": dict(self.proposals[payload["number"]]),
             "comments": comments,
             "commentCount": len(comments),
-            "commentsTruncated": False,
+            "commentsTruncated": payload["number"] in self.long_conversations,
         }
 
     def proposal_commits(self, api, repo, payload):
@@ -635,6 +642,19 @@ class ReadingsSweepTest(unittest.TestCase):
         self.assertEqual(harness.metrics.failures, ["detail_truncated"])
         self.assertEqual(forge.calls.count("commits"), 3)
 
+    def test_a_conversation_past_its_bound_counts_what_was_read_with_detail_truncated(self):
+        forge = FakeForge()
+        forge.add(1, "merged", reviews=[review("approved")], comments=[comment("issue"), comment("issue", author="bob")])
+        forge.long_conversations.add(1)
+        harness = Harness({REPO: forge})
+
+        harness.sweep.run_once()
+
+        _, details = harness.last()
+        self.assertEqual(details.touches, {Touch("review_approved", "human"): 1, Touch("comment", "human"): 2})
+        self.assertEqual(details.buckets["merged"][3.0], 1)
+        self.assertEqual(harness.metrics.failures, ["detail_truncated"])
+
     def test_run_once_never_overlaps_itself(self):
         forge = FakeForge()
         forge.add(1, "open")
@@ -661,6 +681,275 @@ class ReadingsSweepTest(unittest.TestCase):
             thread.join(5)
 
 
+GiteaForge = next(cls for cls in providers.AVAILABLE if cls.name == "gitea")
+GitHubForge = next(cls for cls in providers.AVAILABLE if cls.name == "github")
+GITEA_PAGE_CLAMP = 50
+
+
+def gitea_pr(number, merged=False, state="closed"):
+    return {
+        "number": number,
+        "state": "open" if state == "open" else "closed",
+        "merged": merged,
+        "merged_at": "2026-10-04T14:20:45Z" if merged else None,
+        "title": f"change {number}",
+        "user": {"id": 7, "login": "kube-agents"},
+        "head": {"ref": "x", "sha": "a" * 40, "repo": {"full_name": "acme/infra"}},
+        "base": {"ref": "main"},
+        "created_at": RECENT,
+        "updated_at": f"2026-10-04T14:{number // 60:02d}:{number % 60:02d}Z",
+        "closed_at": None,
+    }
+
+
+class ClampingGitea:
+    """A Gitea API that serves at most `clamp` rows a page, whatever `limit` asks,
+    and pages by the clamped size, as a stock `MAX_RESPONSE_ITEMS` does."""
+
+    def __init__(self, nodes, clamp=GITEA_PAGE_CLAMP):
+        self.nodes = sorted(nodes, key=lambda n: n["updated_at"], reverse=True)
+        self.clamp = clamp
+        self.pages: list[int] = []
+
+    def whoami(self):
+        return "kube-agents"
+
+    def api(self, method, route, *, params=None, with_headers=False, **_):
+        params = params or {}
+        if route == "user":
+            return {"id": 7, "login": "kube-agents"}
+        if route == "repos/acme/infra/pulls":
+            size = min(params["limit"], self.clamp)
+            page = params["page"]
+            self.pages.append(page)
+            rows = self.nodes[(page - 1) * size : page * size]
+            return rows, {"x-total-count": str(len(self.nodes))}
+        prefix, _, number = route.rpartition("/")
+        if prefix == "repos/acme/infra/pulls" and number.isdigit():
+            return next(node for node in self.nodes if node["number"] == int(number))
+        # Step 2: every proposal has no reviews, comments, commits or events.
+        if with_headers:
+            return [], {}
+        return []
+
+
+class GitHubSearch:
+    """GitHub's search route over a fixed set of the install's proposals."""
+
+    def __init__(self, count=3, incomplete=False):
+        self.items = [
+            {
+                "number": n,
+                "state": "open",
+                "user": {"login": INSTALL, "type": "Bot"},
+                "created_at": RECENT,
+                "updated_at": f"2026-10-04T14:20:{n:02d}Z",
+                "closed_at": None,
+                "pull_request": {"merged_at": None},
+            }
+            for n in range(1, count + 1)
+        ]
+        self.incomplete = incomplete
+        self.routes: list[str] = []
+
+    def whoami(self):
+        return INSTALL
+
+    def api(self, method, route, *, params=None, **_):
+        self.routes.append(route)
+        if route == "search/issues":
+            return {"total_count": len(self.items), "incomplete_results": self.incomplete, "items": self.items}
+        prefix, _, number = route.rpartition("/")
+        if prefix == "repos/acme/infra/pulls" and number.isdigit():
+            return {**self.items[int(number) - 1], "head": {}, "base": {}}
+        return []
+
+
+def real_forge_sweep(forge, transport, repo, **kwargs):
+    metrics = FakeMetrics()
+    sweep = ReadingsSweep(
+        registry=FakeRegistry({repo: forge}),
+        transport_for=lambda f, r: transport,
+        metrics=metrics,
+        managed_repositories=lambda: frozenset({repo}),
+        clock=kwargs.pop("clock", FakeClock()),
+        interval=WIDE,
+        **kwargs,
+    )
+    return sweep, metrics
+
+
+class ListingCompletenessTest(unittest.TestCase):
+    def test_a_clamping_gitea_with_more_than_a_hundred_proposals_is_read_whole(self):
+        nodes = [gitea_pr(n, merged=n % 4 == 0) for n in range(1, 121)]
+        api = ClampingGitea(nodes)
+        forge = GiteaForge("gitea.example.com", "/nonexistent/token", label="gitea")
+        sweep, metrics = real_forge_sweep(forge, api, GITEA_REPO)
+
+        sweep.run_once()
+
+        self.assertEqual([1, 2, 3], api.pages)
+        outcomes, _ = metrics.readings[-1]
+        self.assertEqual((0, 30, 90), (outcomes.open, outcomes.merged, outcomes.closed))
+        self.assertEqual(120, len([k for k in sweep._cache if k[:2] == ("gitea.example.com", "acme/infra")]))
+        self.assertEqual([], metrics.failures)
+
+    def test_a_listing_that_shifts_mid_walk_is_walked_again(self):
+        forge = FakeForge()
+        for number in range(1, 151):
+            forge.add(number, "merged", updated=f"2026-01-01T00:00:00Z{number:05d}")
+        shifts = []
+
+        def shift(page):
+            # Between pages 1 and 2 of the first walk, the newest proposal on
+            # page 2 updates and moves to page 1, which has already been read.
+            if page == 2 and not shifts:
+                order = sorted(forge.proposals.values(), key=lambda p: p["updated"], reverse=True)
+                moved = order[100]
+                moved["updated"] = "2027-01-01T00:00:00Z"
+                shifts.append(moved["number"])
+
+        forge.before_page = shift
+        harness = Harness({REPO: forge}, interval=WIDE)
+
+        harness.sweep.run_once()
+
+        self.assertEqual(1, len(shifts))
+        self.assertEqual(5, forge.calls.count("list"), "the short walk of three pages is walked once more, in two")
+        outcomes, _ = harness.last()
+        self.assertEqual(150, outcomes.merged)
+        self.assertEqual([], harness.metrics.failures)
+
+    def test_a_listing_short_on_every_walk_publishes_no_outcomes_reading(self):
+        forge = FakeForge()
+        for number in range(1, 151):
+            forge.add(number, "merged", updated=f"2026-01-01T00:00:00Z{number:05d}")
+        bump = iter(range(10_000, 20_000))
+
+        def shift(page):
+            if page == 2:
+                order = sorted(forge.proposals.values(), key=lambda p: p["updated"], reverse=True)
+                order[100]["updated"] = f"2027-01-01T00:00:00Z{next(bump)}"
+
+        forge.before_page = shift
+        harness = Harness({REPO: forge}, interval=WIDE)
+
+        with self.assertLogs(LOGGER_NAME, level="WARNING"):
+            harness.sweep.run_once()
+
+        self.assertEqual([], harness.metrics.readings)
+        self.assertEqual(["forge"], harness.metrics.failures)
+        self.assertEqual(0, forge.detail_calls())
+
+    def test_an_incomplete_github_search_publishes_no_outcomes_reading(self):
+        search = GitHubSearch(incomplete=True)
+        forge = GitHubForge(refresh=mock.Mock())
+        sweep, metrics = real_forge_sweep(forge, search, REPO)
+
+        with self.assertLogs(LOGGER_NAME, level="WARNING"):
+            sweep.run_once()
+
+        self.assertEqual([], metrics.readings)
+        self.assertEqual(["forge"], metrics.failures)
+
+        search.incomplete = False
+        sweep.run_once()
+        outcomes, details = metrics.readings[-1]
+        self.assertEqual(3, outcomes.open)
+        self.assertIsNotNone(details)
+        self.assertEqual(["forge"], metrics.failures)
+
+
+class SearchPacingTest(unittest.TestCase):
+    def test_sixty_github_searches_are_paced_to_the_per_minute_rate(self):
+        clock = FakeClock()
+        sleeps: list[float] = []
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            clock.now += seconds
+
+        stamps: list[float] = []
+        search = GitHubSearch()
+        original = search.api
+
+        def api(method, route, **kwargs):
+            if route == "search/issues":
+                stamps.append(clock.now)
+            return original(method, route, **kwargs)
+
+        search.api = api
+        forge = GitHubForge(refresh=mock.Mock())
+        sweep, _ = real_forge_sweep(forge, search, REPO, clock=clock, sleep=sleep)
+        bound = sweep._bind(REPO)
+
+        for _ in range(60):
+            bound.api("GET", "search/issues", params={})
+        for _ in range(30):
+            bound.api("GET", "repos/acme/infra/pulls/1/reviews")
+
+        rate = vcs_readings.VCS_READINGS_SEARCH_CALLS_PER_MINUTE
+        self.assertEqual(25, rate)
+        self.assertTrue(sleeps, "sixty searches in one burst never waited")
+        self.assertEqual(60, len(stamps))
+        for i in range(len(stamps) - rate):
+            self.assertGreaterEqual(stamps[i + rate] - stamps[i], 60, f"more than {rate} searches inside one minute at {i}")
+        # The first minute's share goes out at once; only the overflow waits.
+        self.assertEqual(stamps[:rate], [stamps[0]] * rate)
+        self.assertLessEqual(len(sleeps), 60 - rate)
+
+    def test_a_forge_without_a_search_route_is_never_paced(self):
+        sleeps: list[float] = []
+        forge = FakeForge()
+        harness_clock = FakeClock()
+        sweep, _ = real_forge_sweep(forge, FakeTransport(forge), REPO, clock=harness_clock, sleep=sleeps.append)
+        bound = sweep._bind(REPO)
+        for _ in range(60):
+            bound.api("GET", "search/issues")
+        self.assertEqual([], sleeps)
+
+
+class SweepTimerTest(unittest.TestCase):
+    def _loop_once(self, harness, run_once):
+        waits: list[float] = []
+
+        def wait(timeout):
+            waits.append(timeout)
+            harness.sweep._stop.set()
+            return True
+
+        harness.sweep.run_once = run_once
+        harness.sweep._stop.wait = wait
+        harness.sweep._loop()
+        return waits
+
+    def test_a_failed_attempt_waits_the_same_interval_as_a_successful_one(self):
+        forge = FakeForge()
+        forge.add(1, "open")
+        interval = 123.0
+        harness = Harness({REPO: forge}, interval=interval)
+
+        ran = mock.Mock(side_effect=RuntimeError("the attempt fell over"))
+        with self.assertLogs(LOGGER_NAME, level="ERROR"):
+            failed = self._loop_once(harness, ran)
+        self.assertEqual([interval], failed)
+        ran.assert_called_once_with()
+
+        harness.sweep._stop.clear()
+        forge.fail["list"] = rate_limited()
+        attempt = ReadingsSweep.run_once.__get__(harness.sweep)
+        with self.assertLogs(LOGGER_NAME, level="WARNING"):
+            refused = self._loop_once(harness, attempt)
+        self.assertEqual([interval], refused)
+        self.assertEqual(["rate_limited"], harness.metrics.failures)
+
+        harness.sweep._stop.clear()
+        del forge.fail["list"]
+        succeeded = self._loop_once(harness, attempt)
+        self.assertEqual([interval], succeeded)
+        self.assertEqual(1, len(harness.metrics.readings))
+
+
 class SweepIdentityTest(unittest.TestCase):
     def test_the_sweeps_login_comes_from_the_sweep_transport_not_binding_whoami(self):
         import credential_proxy
@@ -669,7 +958,10 @@ class SweepIdentityTest(unittest.TestCase):
         from test_providers_http_transport import Opener
 
         github = next(cls for cls in providers.AVAILABLE if cls.name == "github")
-        forge = github(refresh=mock.Mock(side_effect=AssertionError("the write credential is never refreshed")))
+        # Recorded, not raising: `BrokeredCredential.ensure` swallows a
+        # refresh's exception, so only the call record can show none was made.
+        refresh = mock.Mock()
+        forge = github(refresh=refresh)
         executor = _SweepExecutor()
         opener = Opener({"data": {"viewer": {"login": INSTALL}}})
         sweep = ReadingsSweep(
@@ -688,6 +980,7 @@ class SweepIdentityTest(unittest.TestCase):
         self.assertEqual("https://api.github.com/graphql", request.full_url)
         self.assertEqual("Bearer ghs_sweep_1", request.get_header("Authorization"))
         self.assertEqual({"author": "app/kube-agents"}, sweep._author_payload(REPO))
+        refresh.assert_not_called()
 
     def test_an_app_credential_is_searched_as_app_slug_with_or_without_the_marking(self):
         # The credential's kind is the primary signal: GraphQL `viewer` may name

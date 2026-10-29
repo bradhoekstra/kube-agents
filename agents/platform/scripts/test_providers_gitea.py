@@ -366,6 +366,20 @@ class ProposalTest(unittest.TestCase):
             Api(([pr(1)], {"x-total-count": "3"})), "acme/infra", {"author": "kube-agents", "authorId": 7, "limit": 2}
         )
         self.assertTrue(clamped["truncated"])
+        # A server that clamps a page to 50 pages by 50 too: page 2 of 120 has
+        # read 100, not 150, so it is not the last page.
+        second = forge().proposal_list_by_author(
+            Api(([pr(n) for n in range(51, 101)], {"x-total-count": "120"})),
+            "acme/infra",
+            {"author": "kube-agents", "authorId": 7, "limit": 100, "page": 2},
+        )
+        self.assertTrue(second["truncated"])
+        last = forge().proposal_list_by_author(
+            Api(([], {"x-total-count": "120"})),
+            "acme/infra",
+            {"author": "kube-agents", "authorId": 7, "limit": 100, "page": 4},
+        )
+        self.assertFalse(last["truncated"])
         missing = forge().proposal_list_by_author(
             Api(([], {})), "acme/infra", {"author": "kube-agents", "authorId": 7}
         )
