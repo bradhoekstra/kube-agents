@@ -2016,9 +2016,9 @@ syntax for: a heading, ATX or setext, becomes a bold line (shedding any bold pai
 inside it, and left plain when a `**` that is not half of a pair remains), a
 thematic break is dropped, a list marker
 becomes `•`, and a pipe table becomes a fenced block with its columns padded (a cell
-keeps a code span's content without its backticks, sheds the marks of closed bold pairs, and shows a link as
-its label and URL, since a code block renders no link; only an escaped `\|` stays inside
-a cell). A table the chunker cuts gets its header and delimiter rows again at the head of the next chunk, so each part renders as a table. A
+keeps a code span's content without its backticks, sheds the marks of closed bold pairs, and shows a link,
+markdown or `<url|text>`, as its label and URL, since a code block renders no link; only an
+escaped `\|` and the pipe of a `<url|text>` link stay inside a cell). A table the chunker cuts gets its header and delimiter rows again at the head of the next chunk, so each part renders as a table. A
 heading run onto the end of a sentence with no line break is moved to its own line
 first. Bold and links are translated after it. The translation leaves
 code spans as written, converts bold only on a closed `**` pair, never alters a
@@ -2033,8 +2033,10 @@ to unfurl links or media: an answer cites console and documentation links, and e
 unfurled into a preview card under it. Everything else posted is escaped first (`&`,
 `<`, `>`), a kept link's URL and text included - relayed text is executor-authored, ie
 model output, and an unescaped `<!channel>` in a result would ping the room. The Google
-Chat adapter applies the same markdown rules, and keeps the same links, behind its own
-defang, in two halves: the link defang reads prose, link text and an unclosed fence but
+Chat adapter runs the same line pass first, with `- ` for a list marker, since Chat draws
+a bulleted list from that marker itself; its mention defang runs before the pass, so a
+table's cells are measured as they post. It then applies the same markdown rules, and
+keeps the same links, behind its own defang, in two halves: the link defang reads prose, link text and an unclosed fence but
 not a closed code span, a fenced block or a kept link; the mention defang reads
 everything, code included, but a kept link, whose URL and text hold no `<`. The adapters translate each chunk of a result alone, so the chunker closes a
 fenced block it cuts and reopens it with a bare fence at the start of the next chunk,

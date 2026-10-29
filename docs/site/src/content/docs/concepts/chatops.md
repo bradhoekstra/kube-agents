@@ -189,7 +189,7 @@ The gateway posts no status line: Working… on the thread, the reaction on your
 
 Each turn that becomes a task posts a status line, `⏳ submitted…`, which the gateway edits as the task moves: `⚙️ **working**`, followed by the agent's latest progress note. On Google Chat the note shows only with `googleChat.mode: debug`, and that setting also governs the console when the gateway holds Google Chat. A gateway without Google Chat (Slack, or no chat backend) is rendered no mode, so its console always shows the note.
 
-The answer posts as a message of its own, and the status line then reads `✅ **completed**`. A task that fails posts `❌ failed: <reason>`; one that is cancelled posts `🛑 canceled`; one the executor refuses posts `🚫 the executor rejected the task: <reason>`. When the agent needs something from you it posts `❓ <its question>`; your next message in the conversation is the answer.
+The answer posts as a message of its own, and the status line then reads `✅ **completed**`. A task that fails posts `❌ failed: <reason>`; one that is cancelled posts `🛑 canceled`; one the executor refuses posts `🚫 the executor rejected the task: <reason>`. When the agent needs something from you it posts `❓ <its question>`; your next message in the conversation is the answer. On Google Chat, the gateway rewrites the markdown Chat's text format has no syntax for. A heading becomes a bold line, a rule is dropped, and a bulleted list's marker becomes the one Chat draws a bullet from. A pipe table becomes a monospace block with its columns lined up.
 
 ### Follow-ups while a task runs
 

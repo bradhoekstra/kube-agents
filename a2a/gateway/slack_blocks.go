@@ -12,13 +12,17 @@ import (
 // pass rewrites those line-level forms before toMrkdwn escapes the text and
 // translates bold and links: a heading becomes a bold line, a rule goes, a
 // bullet becomes "•", and a table becomes a monospace block whose columns
-// line up. A line any part of which sits in a fenced block (mdCodeSpanRE,
-// so a fence opened mid-line counts) is left as written. It runs on the raw
-// text, before escaping, so a table's column widths are measured on what
-// Slack will display (Slack decodes the escaped &, < and > back). Widths are
-// counted in runes, so a cell holding East Asian wide characters or emoji
-// pads short. The relay chunks a long answer before this runs and each
-// chunk is rewritten alone; a table the chunker cuts gets its header and
+// line up. Google Chat's text format has the same gaps bar one, so the Google
+// Chat adapter runs the same pass (rewriteLineForms, from toGchatText) with
+// its own list marker: Chat draws a bulleted list from "- " and "* " itself,
+// so there every marker becomes "- " and nothing else changes. A line any
+// part of which sits in a fenced block (mdCodeSpanRE, so a fence opened
+// mid-line counts) is left as written. It runs on the raw text, before
+// escaping, so a table's column widths are measured on what Slack will
+// display (Slack decodes the escaped &, < and > back). Widths are counted in
+// runes, so a cell holding East Asian wide characters or emoji pads short.
+// The relay chunks a long answer before this runs and each chunk is
+// rewritten alone; a table the chunker cuts gets its header and
 // delimiter rows again at the head of the next chunk (chatChunks), so each
 // part renders as a block.
 var (
@@ -56,8 +60,11 @@ var (
 )
 
 const (
-	// slackBullet replaces a list item's marker.
+	// slackBullet replaces a list item's marker on Slack, which draws no
+	// list from a marker; gchatBullet is the one marker Google Chat draws a
+	// bulleted list from (its other, "* ", is also its bold mark).
 	slackBullet = "• "
+	gchatBullet = "- "
 	// mdBoldMark wraps a heading's text as markdown bold, which toMrkdwn's
 	// bold pass then turns into Slack's, and is the bold mark a table cell
 	// sheds outside its code spans.
@@ -89,7 +96,10 @@ const (
 	// slackCellLinkForm sets a link's URL after its label in a table cell
 	// (slackLinkRE's groups): inside the code block a table becomes, Slack
 	// renders no link, so the destination is shown rather than lost.
-	slackCellLinkForm = "$1 ($2)"
+	// chatNativeCellLinkForm does the same for a link written in the
+	// surfaces' own <url|text> form (chatNativeLinkRE's groups, URL first).
+	slackCellLinkForm      = "$1 ($2)"
+	chatNativeCellLinkForm = "$2 ($1)"
 	// slackBoldPairText keeps a bold pair's content (mdBoldRE's second group)
 	// and drops its marks.
 	slackBoldPairText = "${2}"
@@ -98,6 +108,12 @@ const (
 // rewriteSlackBlocks applies the line-level rewrites above to text, leaving
 // fenced code blocks as written.
 func rewriteSlackBlocks(text string) string {
+	return rewriteLineForms(text, slackBullet)
+}
+
+// rewriteLineForms is the pass itself, for either chat surface: bullet is
+// what a list item's marker becomes.
+func rewriteLineForms(text, bullet string) string {
 	lines := strings.Split(text, "\n")
 	for i, line := range lines {
 		lines[i] = strings.TrimSuffix(line, slackLineCR)
@@ -137,7 +153,7 @@ func rewriteSlackBlocks(text string) string {
 			continue
 		}
 		if m := slackBulletRE.FindStringSubmatch(line); m != nil {
-			out = append(out, m[1]+slackBullet+m[2])
+			out = append(out, m[1]+bullet+m[2])
 			continue
 		}
 		out = append(out, line)
@@ -255,11 +271,16 @@ func renderSlackTable(header string, body []string) []string {
 }
 
 // tableCells splits one table row into its trimmed cells as written,
-// dropping the outer pipes. An escaped pipe (\|) stays in its cell.
+// dropping the outer pipes. An escaped pipe (\|) stays in its cell, and so
+// does the pipe inside a <url|text> link (chatNativeLinkRE), which is the
+// link's own separator and not the row's.
 func tableCells(line string) []string {
 	line = strings.TrimSpace(line)
 	line = strings.TrimPrefix(line, slackTablePipe)
 	line = strings.TrimSuffix(line, slackTablePipe)
+	line = chatNativeLinkRE.ReplaceAllStringFunc(line, func(link string) string {
+		return strings.ReplaceAll(link, slackTablePipe, slackPipePlaceholder)
+	})
 	line = strings.ReplaceAll(line, slackEscapedPipe, slackPipePlaceholder)
 	parts := strings.Split(line, slackTablePipe)
 	cells := make([]string, len(parts))
@@ -288,9 +309,10 @@ func cellTexts(line string) []string {
 	return cells
 }
 
-// cellProse renders the prose between a cell's code spans: links as
-// "label (url)", bold marks dropped.
+// cellProse renders the prose between a cell's code spans: links, markdown
+// or <url|text>, as "label (url)", bold marks dropped.
 func cellProse(s string) string {
+	s = chatNativeLinkRE.ReplaceAllString(s, chatNativeCellLinkForm)
 	return shedBoldPairs(slackLinkRE.ReplaceAllString(s, slackCellLinkForm))
 }
 

@@ -538,10 +538,54 @@ func TestToGchatText(t *testing.T) {
 		// (TestToGchatTextDefangsAfterAChunkedFence), the defang does not
 		// lean on that. The bold and link passes still read it as a fence.
 		"see ``` <https://evil.example|https://good.example>": "see ``` < https://evil.example|https://good.example>",
+		// The line forms Chat's text format has no syntax for, rewritten by
+		// the pass the Slack adapter runs (#3108): a heading is a bold
+		// line, a rule goes, a table is a fenced block with its columns
+		// padded, and a list marker becomes the one Chat draws a bullet
+		// from. Fenced code is left as written.
+		"### Pods\n---\nthree ready": "*Pods*\nthree ready",
+		"Summary\n===\nok":           "*Summary*\nok",
+		"* one\n+ two\n  - sub":      "- one\n- two\n  - sub",
+		"| Cluster | Nodes |\n|:---|---:|\n| prod-east | **3** |\n| `dev` | 1 |": "```\nCluster   | Nodes\n----------+------\nprod-east | 3\ndev       | 1\n```",
+		"```\n# comment\n- flag\n---\n```":                                       "```\n# comment\n- flag\n---\n```",
+		// A table cell's link shows its URL inside the block, where Chat
+		// renders no link, and the defang does not read the block as prose.
+		"| pr |\n|---|\n| [#1](https://github.com/x/y/pull/1) |": "```\npr\n----------------------------------\n#1 (https://github.com/x/y/pull/1)\n```",
+		"| cmd |\n|---|\n| sort <f\\|uniq |":                     "```\ncmd\n------------\nsort <f|uniq\n```",
+		// A link in Chat's own form inside a cell is one cell, shown as its
+		// label and URL like a markdown link, not split on its pipe; and a
+		// mention in a cell is defanged before the column is measured, so
+		// the rows stay lined up.
+		"| PR | State |\n|---|---|\n| <https://github.com/x/y/pull/1|#1> | open |": "```\nPR                                 | State\n-----------------------------------+------\n#1 (https://github.com/x/y/pull/1) | open\n```",
+		"| who | n |\n|---|---|\n| <users/all> | 1 |\n| me | 2 |":                  "```\nwho          | n\n-------------+--\n< users/all> | 1\nme           | 2\n```",
 	}
 	for in, want := range cases {
 		if got := toGchatText(in); got != want {
 			t.Errorf("toGchatText(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// Through toGchatText, the fleet answer #3108 reported posting as raw pipes
+// ends as Chat's bold and a fenced block, with the links and mentions in its
+// prose still handled as before.
+func TestToGchatTextRendersAMarkdownReport(t *testing.T) {
+	in := "# Fleet Report\n\n---\n\n## Clusters\n\n* 2 clusters, both **Ready** ([board](https://x.example/b))\n\n| Cluster | Location | Nodes |\n|:---|:---|---:|\n| prod-east | us-east1 | 12 |\n| dev | us-central1 | 3 |\n\ncc <users/all>"
+	got := toGchatText(in)
+	for _, want := range []string{
+		"*Fleet Report*",
+		"*Clusters*",
+		"- 2 clusters, both *Ready* (<https://x.example/b|board>)",
+		"```\nCluster   | Location    | Nodes\n----------+-------------+------\nprod-east | us-east1    | 12\ndev       | us-central1 | 3\n```",
+		"cc < users/all>",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("toGchatText output lacks %q:\n%s", want, got)
+		}
+	}
+	for _, raw := range []string{"# ", "\n---\n", "|:---|", "* 2"} {
+		if strings.Contains(got, raw) {
+			t.Errorf("toGchatText output still carries raw %q:\n%s", raw, got)
 		}
 	}
 }

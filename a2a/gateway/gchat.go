@@ -120,6 +120,10 @@ const (
 	gchatThreadsToken   = "/threads/"
 	// gchatUsersToken prefixes a user resource name ("users/{id}").
 	gchatUsersToken = "users/"
+	// gchatMentionOpen opens the <users/…> mention Chat parses out of
+	// message text; gchatMentionDefused is what it posts as instead.
+	gchatMentionOpen    = "<" + gchatUsersToken
+	gchatMentionDefused = "< " + gchatUsersToken
 )
 
 // Google Chat's own vocabulary, as it appears in event payloads and API
@@ -922,7 +926,16 @@ func decodeGchatEvent(data string) (*gchatEvent, error) {
 // link's text admits no `<`, so no mention rides out in it. The markdown
 // rules (bold pairs, code spans, links, the label-host refusal) are the ones
 // markdown.go holds for both chat surfaces.
+//
+// Before any of it, the line pass the Slack adapter runs (rewriteLineForms,
+// slack_blocks.go) rewrites the forms Chat's text format has no syntax for
+// either: a heading becomes a bold line, a rule goes, a pipe table becomes a
+// fenced block with its columns padded, and a list marker becomes the one
+// Chat draws a bullet from. The mention defang runs before it, so a table's
+// cells are measured as they will post; the link defang runs after it, and
+// reads the fenced table as the code it is.
 func toGchatText(s string) string {
+	s = rewriteLineForms(defangGchatMentions(s), gchatBullet)
 	return rewriteMarkdown(keepChatLinks(s, defangGchatControls, func(dest, label string) string {
 		return chatLinkOpen + dest + chatLinkSep + label + chatLinkClose
 	}), gchatLinkRe)
@@ -945,12 +958,18 @@ func toGchatText(s string) string {
 // too: this adapter posts a result in chunks, so the fence is as likely the
 // closing one of a block the chunker cut as an opener (rewriteOutsideCode).
 func defangGchatControls(s string) string {
-	s = strings.ReplaceAll(s, "<users/", "< users/")
+	s = defangGchatMentions(s)
 	return rewriteOutsideCode(s, func(prose string) string {
 		return gchatPipeRe.ReplaceAllStringFunc(prose, func(m string) string {
 			return "< " + m[1:]
 		})
 	})
+}
+
+// defangGchatMentions defuses every <users/…> mention in s, code included,
+// with a visible space. Idempotent: the defused form is not the sequence.
+func defangGchatMentions(s string) string {
+	return strings.ReplaceAll(s, gchatMentionOpen, gchatMentionDefused)
 }
 
 // classify normalizes one Chat event to an InboundMessage, or names why it
