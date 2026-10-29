@@ -28,21 +28,25 @@ and a reviewer still reads the comment. What the check reads, per section:
 
 - **Removal.** A comment that tells the author to delete, remove, omit, drop,
   skip, erase, leave out or take out the section or heading (``REMOVAL_RE``):
-  active ("delete this section"), passive ("this section is removed when"),
-  or a clause of its own after "otherwise" or "if not" ("otherwise delete
-  it"). The section may be named, quoted or plural. A removal negated right
-  before its verb ("do not delete this section", "rather than delete", "do
-  not, under any circumstances, delete") is not one; a "not" elsewhere in the
-  sentence ("if this PR does not fix a bug, delete this section") is the
-  condition, and the removal stands.
+  active ("delete this section", "delete any sections that do not apply"),
+  passive ("this section is removed when"), bare before its condition
+  ("remove if not applicable"), or a clause of its own after "otherwise" or
+  "if not" ("otherwise delete it"). The section may be named, quoted or
+  plural. A removal negated right before its verb ("do not delete this
+  section", "rather than delete", "take care not to delete") is not one; a
+  "not" elsewhere in the sentence ("if this PR does not fix a bug, delete
+  this section") is the condition, and the removal stands. The pronoun form
+  is read as the section: "otherwise skip it" about a screenshot is a
+  finding, and the author rewords it.
 - **Condition.** The first sentence of each comment, with a leading label such
   as "Note:" or "Optional:" kept, is read for a signal at its start that the
   section applies to some pull requests only (``CONDITION_RE``): "optional",
-  "only when", "only if", "unless", "required when", "applies if", "fill in
-  when", "not required", with "this section" or "complete this section"
-  allowed in front. A section with one also says ``Otherwise write "..."``
-  (``ANSWER_RE``; "if not" and "say" count, and the quotes may be curly or
-  backticks), with the quoted answer on one line so a search for the phrase
+  "only when", "only if", "only for", "unless", "required when", "applies
+  if", "only applies when", "applies only to", "fill in when", "not
+  required", with "this section" or "complete this section" allowed in
+  front. A section with one also says ``Otherwise write "..."``
+  (``ANSWER_RE``; "if not", "say", "answer", "state" and a colon count, and
+  the quotes may be curly or backticks), with the quoted answer on one line so a search for the phrase
   finds the file that states it. Deeper sentences are not read, because the
   template's own prose says "a complete answer only when ..." there; a signal
   later in the sentence is not read either ("name the optional values"); and
@@ -100,13 +104,16 @@ QUOTE_CHARS = "\"'“”‘’`"
 # An instruction to take the section out of the body.
 _VERB = r"(?:delete|remove|omit|drop|skip|erase|leave\s+out|take\s+out)"
 _PASSIVE = r"(?:deleted|removed|omitted|dropped|skipped|erased|left\s+out)"
-_FILLER = r"(?:(?!(?:in|under|of|from|below|above|within|this|the|that|a|an)\b)[^\s.;]+\s+){0,4}"
-_OBJECT = rf"(?:this|the)\s+{_FILLER}(?:section|heading)s?\b(?!'s)"
+_DETERMINER = r"(?:this|the|that|those|these|any|all|every|each|both)"
+_FILLER = r"(?:(?!(?:in|under|of|from|within|this|the|that|a|an)\b)[^\s.;]+\s+){0,4}"
+_OBJECT = rf"{_DETERMINER}\s+{_FILLER}(?:section|heading)s?\b(?![{QUOTE_CHARS}]s)"
+_CONDITION_OPENER = r"(?:if|when|unless)"
 _OTHERWISE = r"(?:otherwise|if\s+not|when\s+not)"
 _SOFTENER = r"(?:just\s+|simply\s+|feel\s+free\s+to\s+|you\s+(?:may|can)\s+|it\s+can\s+be\s+)?"
 _CLAUSE_END = r"\s*(?:[.;,!]|$)"
 REMOVAL_RE = re.compile(
     rf"\b{_VERB}\s+{_OBJECT}"
+    rf"|\b{_VERB}(?=\s+{_CONDITION_OPENER}\b|{_CLAUSE_END})"
     rf"|\b(?:leave|take)\s+{_OBJECT}\s+out\b"
     rf"|\b{_OBJECT}\s+(?:is|are|will\s+be|can\s+be|may\s+be|should\s+be|must\s+be)\s+{_PASSIVE}\b"
     rf"|\b{_OTHERWISE},?\s+{_SOFTENER}(?:{_VERB}|{_PASSIVE})(?:\s+(?:it|them)\b|{_CLAUSE_END})"
@@ -122,7 +129,7 @@ _MODAL = r"(?:do|does|did|should|must|may|can|will|would|need)"
 NEGATION_BEFORE_RE = re.compile(
     rf"(?:\b{_MODAL}\s+not|\b(?:don|doesn|didn|shouldn|mustn|can|won|wouldn|needn)'t"
     r"|\bnever|\brather\s+than|\binstead\s+of|\bno\s+(?:reason|need)\s+to"
-    r"|\bunder\s+no\s+circumstances)"
+    r"|\bunder\s+no\s+circumstances|\bnot\s+to)"
     rf"(?:,[^,]*,)?\s*(?:just\s+|simply\s+)?[{QUOTE_CHARS}]?\s*$",
     re.IGNORECASE,
 )
@@ -132,13 +139,14 @@ NEGATION_BEFORE_RE = re.compile(
 # read and why.
 _SIGNAL = (
     r"(?:optional\b"
-    r"|only\s+(?:when|if)\b"
+    r"|only\s+(?:when|if|for|applies|fill)\b"
+    r"|applies\s+only\s+to\b"
     r"|unless\b"
     r"|(?:applies|required|needed)\s+(?:only\s+)?(?:when|if)\b"
     r"|not\s+(?:required|needed)\b"
     r"|fill(?:ed)?\s+(?:this\s+)?in\s+(?:only\s+)?(?:when|if)\b)"
 )
-_SUBJECT = r"(?:(?:complete|fill\s+in|answer|use)\s+)?(?:this\s+section\s+)?(?:is\s+)?"
+_SUBJECT = r"(?:(?:complete|fill\s+in|answer|use)\s+)?(?:this\s+section\s+)?(?:is\s+)?(?:only\s+)?"
 CONDITION_RE = re.compile(rf"^(?:(?:[\w'/.-]+\s*){{1,3}}:\s*)?{_SUBJECT}{_SIGNAL}", re.IGNORECASE)
 # A comment's first sentence: leading list markers dropped, a short label
 # ending in a colon kept with the sentence after it.
@@ -151,7 +159,7 @@ SENTENCE_END_RE = re.compile(r"(?<=[.!?])\s")
 # (ANSWER_RE); one found only across a break is the split case (SPLIT_ANSWER_RE).
 _QUOTE = f"[{QUOTE_CHARS}]"
 _NOT_QUOTE = f"[^{QUOTE_CHARS}"
-_WRITE = rf"\b{_OTHERWISE},?\s+(?:write|say)\s+(?:\w+\s+){{0,2}}"
+_WRITE = rf"\b{_OTHERWISE},?\s+(?:write|say|answer|state):?\s+(?:\w+\s+){{0,2}}"
 ANSWER_RE = re.compile(rf"{_WRITE}{_QUOTE}{_NOT_QUOTE}\n]+{_QUOTE}", re.IGNORECASE)
 SPLIT_ANSWER_RE = re.compile(rf"{_WRITE}{_QUOTE}{_NOT_QUOTE}]*\n{_NOT_QUOTE}]*{_QUOTE}", re.IGNORECASE)
 

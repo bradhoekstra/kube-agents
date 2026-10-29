@@ -120,6 +120,12 @@ class RemovalRuleTest(unittest.TestCase):
             "When this PR is not a bug fix, remove this section.",
             "If this PR does not fix a bug delete this section.",
             "For a docs-only change that does not touch an agent, delete this section.",
+            "Remove if not applicable.",
+            "Delete if this PR is not a bug fix.",
+            "Skip unless this PR adds a roster case.",
+            "Delete any sections that do not apply to this PR.",
+            "Delete every section that does not apply.",
+            "Delete the above section if this PR adds no case.",
             "Show the red run and the misses. Otherwise delete it when the PR adds no roster case.",
         ):
             with self.subTest(phrase=phrase):
@@ -140,6 +146,8 @@ class RemovalRuleTest(unittest.TestCase):
             'Write the one-line answer, never "delete this section".',
             "If this PR adds no case, do not, under any circumstances, delete this section.",
             "You should not delete this section.",
+            "Take care not to delete this section.",
+            "Be careful not to remove this heading.",
         ):
             with self.subTest(phrase=phrase):
                 self.assertNotIn(check.REMOVAL_MESSAGE, problems_of(section(phrase)))
@@ -158,6 +166,7 @@ class RemovalRuleTest(unittest.TestCase):
             "Skip this section's checklist when nothing ran.",
             "Remove the bullets in this section that do not apply.",
             "Delete the placeholder text under this heading before posting.",
+            "Skip this section\u2019s checklist when nothing ran.",
         ):
             with self.subTest(phrase=phrase):
                 self.assertEqual(problems_of(section(phrase)), [])
@@ -197,6 +206,10 @@ class ConditionRuleTest(unittest.TestCase):
             "Needed when this PR adds a roster case.",
             "Not required for a docs change.",
             "- Required when this PR adds a roster case.",
+            "This section only applies when this PR adds a roster case.",
+            "Only fill in when this PR adds a roster case.",
+            "Only for roster admissions.",
+            "Applies only to pull requests that add a roster case.",
         ):
             with self.subTest(opener=opener):
                 self.assertEqual(problems_of(section(opener)), [check.NO_ANSWER_MESSAGE])
@@ -250,6 +263,8 @@ class ConditionRuleTest(unittest.TestCase):
             'Otherwise write the line "Not a bug fix."',
             'Otherwise write exactly "Not a bug fix."',
             'Otherwise say "Not a bug fix."',
+            'Otherwise write: "Not a bug fix."',
+            'Otherwise answer "Not a bug fix."',
         ):
             with self.subTest(answer=answer):
                 self.assertEqual(problems_of(section(f"Required when this PR fixes a bug. {answer}")), [])
@@ -296,7 +311,7 @@ class ShapeRuleTest(unittest.TestCase):
         self.assertEqual(problems_of(text), [])
 
     def test_a_removal_before_the_first_heading_is_read(self) -> None:
-        text = "# Pull request\n\n<!-- Delete the sections that do not apply to this PR. -->\n\n## Summary\n\n<!-- One paragraph. -->\n"
+        text = "# Pull request\n\n<!-- Delete any sections that do not apply to this PR. -->\n\n## Summary\n\n<!-- One paragraph. -->\n"
         self.assertEqual(check.problems(text), [(check.PREAMBLE_HEADING, check.REMOVAL_MESSAGE)])
         self.assertEqual([h for h, _ in check.sections(text)], ["Summary"])
 
