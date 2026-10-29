@@ -1,9 +1,9 @@
 # Proposal Outcomes and Human Touches as Readings from the Forge
 
-**Status:** design of record, not yet implemented. Epic: gke-labs/kube-agents#4120, Workstreams 1
+**Status:** implemented 2026-10-29. Epic: gke-labs/kube-agents#4120, Workstreams 1
 and 2. Owner of the producer side: [`usage-counters-producer.md`](usage-counters-producer.md), which
 this document amends; the rows there for `remediationsMergedTotal` and
-`remediationsClosedUnmergedTotal` are replaced by the readings below once this ships.
+`remediationsClosedUnmergedTotal` point here.
 
 ## 1. Intent
 

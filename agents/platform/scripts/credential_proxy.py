@@ -10591,7 +10591,10 @@ class MetricsHandler(BaseHTTPRequestHandler):
     poller, hold no caller token; the operator's NetworkPolicy on this pod is
     what bounds who reaches the port. It serves the registry the credentialed handler writes and holds no
     route, credential or policy of its own, which is why it may bind a TCP
-    port the credential runtime otherwise refuses to (see serve). Bounded
+    port the credential runtime otherwise refuses to (see serve). The
+    proposal readings it serves come from the readings sweep, which runs on
+    the broker's own timer (start_readings_sweep), never on a scrape: no peer
+    that reaches this port can cause a forge read. Bounded
     because it shares the process with that handler: MetricsServer admits
     METRICS_MAX_CONNECTIONS at a time and handle() cuts every connection
     off at METRICS_CONNECTION_DEADLINE_SECONDS, so a peer that reaches the
