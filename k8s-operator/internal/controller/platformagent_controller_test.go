@@ -1029,7 +1029,7 @@ func reconcileInvalidCredentialProxyResources(t *testing.T, override *corev1.Res
 		Limits: corev1.ResourceList{
 			corev1.ResourceCPU:              resource.MustParse("1"),
 			corev1.ResourceMemory:           resource.MustParse("2Gi"),
-			corev1.ResourceEphemeralStorage: resource.MustParse("2Gi"),
+			corev1.ResourceEphemeralStorage: resource.MustParse("8Gi"),
 		},
 	}
 	if !equality.Semantic.DeepEqual(proxy.Resources, wantResources) {

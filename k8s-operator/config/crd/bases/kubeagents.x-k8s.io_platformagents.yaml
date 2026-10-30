@@ -1180,13 +1180,14 @@ spec:
                             Each key set here replaces the operator's default for that key and the
                             rest keep their defaults, unlike spec.deployment.resources, which replaces
                             the agent container's block wholesale: a CR that sets only limits.memory
-                            keeps the default 500m CPU request, 1 CPU limit and 2Gi ephemeral-storage
+                            keeps the default 500m CPU request, 1 CPU limit and 8Gi ephemeral-storage
                             limit. The broker sizes how many commands it admits at once from the
                             memory limit, so raising the limit is the one knob for an install whose
                             fleet outgrows the default; the ephemeral-storage limit bounds the content
-                            workspace the broker clones into; the proxy's state and /tmp emptyDirs
-                            (sizeLimits 5Gi and 2Gi) follow it when it is raised above their
-                            defaults, so the kubelet does not evict the pod at the smaller figure.
+                            workspace the broker clones into; the proxy's state emptyDir (sizeLimit
+                            5Gi) grows by whatever the limit is raised above the 8Gi default, and
+                            its /tmp emptyDir keeps its 2Gi, so the kubelet does not evict the pod
+                            at the smaller figure.
                             The limit a fleet needs grows with the size of its clusters as well as
                             their number: the broker charges each command about 128Mi, the size of
                             a listing of a small cluster, and a kubectl listing thousands of objects

@@ -157,16 +157,44 @@ const (
 	// under its state emptyDir) together with /tmp, so a runaway clone fills
 	// the container's allowance rather than the node's disk. A CR override
 	// that sets only limits.memory keeps all three of the others.
+	//
+	// The kubelet counts the pod's disk-backed emptyDirs, its writable layer
+	// and its logs together against the sum of its containers' ephemeral-storage
+	// limits, and this pod has one container, so this limit has to hold the
+	// state volume (credentialProxyStateSizeLimit) and /tmp
+	// (credentialProxyTmpSizeLimit) at their caps with room left for the layer
+	// and the logs: 5Gi + 2Gi + 1Gi. At the earlier 2Gi the kubelet evicted the
+	// pod as soon as state, /tmp and logs together crossed 2Gi, three times in
+	// ten days on a hyperscale fleet, while the 5Gi cap on the state volume was
+	// out of reach (#4314). TestCredentialProxyEphemeralStorageLimitCoversItsEmptyDirs
+	// holds the limit above the two caps together.
+	//
+	// There is no ephemeral-storage request, by design, and the API server
+	// defaults the request to this limit, so the pod requests 8Gi too: the
+	// chart's footprint file and its quota preflight sum it at that figure
+	// against requests.ephemeral-storage, and a namespace quota sized to the
+	// earlier 2Gi is short by 6Gi. Autopilot sets a pod's ephemeral-storage
+	// limit equal to its request whether or not bursting is on, so a request
+	// declared below this limit would put the limit back under the caps there,
+	// and the install's default cluster type is where the eviction would return;
+	// the request is left to follow the limit instead. 8Gi stays inside the 10Gi
+	// Autopilot admits per pod.
 	credentialProxyCPULimit              = "1"
 	credentialProxyMemoryLimit           = "2Gi"
-	credentialProxyEphemeralStorageLimit = "2Gi"
+	credentialProxyEphemeralStorageLimit = "8Gi"
+	// credentialProxyEphemeralStorageHeadroom is the part of the limit above
+	// the two emptyDir caps, for the writable layer and the container's logs.
+	// The sizing test holds the limit to the caps plus this.
+	credentialProxyEphemeralStorageHeadroom = "1Gi"
 	// The emptyDir sizeLimits of the broker's /tmp and of its state volume (the
 	// content workspace and vcs scratch). The kubelet evicts the pod when either
-	// fills, whatever the container's ephemeral-storage limit, so each is sized
-	// as the larger of its default here and that merged limit
-	// (credentialProxyEmptyDirSizeLimit): an override that raises the limit past
-	// a volume's default widens the volume with it, and the default render keeps
-	// these figures.
+	// fills, whatever the container's ephemeral-storage limit, and the default
+	// render keeps these figures, each under the container's limit so that a
+	// runaway in one volume cannot take the other's share. A CR override that
+	// raises the limit past credentialProxyEphemeralStorageLimit gives the
+	// whole excess to the state volume (credentialProxyEmptyDirSizeLimit),
+	// which is what a larger limit is raised for; /tmp keeps its cap, so the
+	// two caps and the headroom still add up to the limit at any override.
 	credentialProxyTmpSizeLimit    = "2Gi"
 	credentialProxyStateSizeLimit  = "5Gi"
 	credentialProxyTmpVolumeName   = "credential-proxy-tmp"   // #nosec G101 -- Volume name, not a credential
@@ -786,12 +814,8 @@ func buildCredentialProxyRuntimeVolumes(agent *agentv1alpha1.PlatformAgent) []co
 	volumes := filterVolumes(buildCredentialProxyVolumes(agent), credentialProxyRuntimeVolumeNames)
 	ephemeralLimit := resolveCredentialProxyResources(agent.Spec.Deployment).Limits[corev1.ResourceEphemeralStorage]
 	for i := range volumes {
-		emptyDir := volumes[i].EmptyDir
-		switch volumes[i].Name {
-		case credentialProxyTmpVolumeName:
-			emptyDir.SizeLimit = credentialProxyEmptyDirSizeLimit(credentialProxyTmpSizeLimit, ephemeralLimit)
-		case credentialProxyStateVolumeName:
-			emptyDir.SizeLimit = credentialProxyEmptyDirSizeLimit(credentialProxyStateSizeLimit, ephemeralLimit)
+		if volumes[i].Name == credentialProxyStateVolumeName {
+			volumes[i].EmptyDir.SizeLimit = credentialProxyEmptyDirSizeLimit(credentialProxyStateSizeLimit, credentialProxyEphemeralStorageLimit, ephemeralLimit)
 		}
 	}
 	volumes = append(volumes, buildGitopsStateVolume(agent))
@@ -799,12 +823,21 @@ func buildCredentialProxyRuntimeVolumes(agent *agentv1alpha1.PlatformAgent) []co
 	return append(volumes, buildCredentialProxyFederationVolume(agent)...)
 }
 
-// credentialProxyEmptyDirSizeLimit is the larger of a volume's default
-// sizeLimit and the container's merged ephemeral-storage limit.
-func credentialProxyEmptyDirSizeLimit(defaultSize string, ephemeralLimit resource.Quantity) *resource.Quantity {
+// credentialProxyEmptyDirSizeLimit is a volume's default sizeLimit plus
+// whatever a CR override has raised the container's merged ephemeral-storage
+// limit above the container's default limit. The comparison is with the
+// container's default and not the volume's, because the broker's default
+// limit is above both of its volumes' caps on purpose (the kubelet sums the
+// volumes against it), and comparing with the volume would widen it to the
+// limit on every default render. Adding the excess rather than taking the
+// limit keeps the other volume's cap and the layer-and-log headroom intact
+// under the raised limit; for a volume whose cap equals the default limit,
+// the gateway sidecar's /tmp, the two readings coincide.
+func credentialProxyEmptyDirSizeLimit(defaultSize, defaultLimit string, ephemeralLimit resource.Quantity) *resource.Quantity {
 	size := resource.MustParse(defaultSize)
-	if ephemeralLimit.Cmp(size) > 0 {
-		size = ephemeralLimit.DeepCopy()
+	if excess := ephemeralLimit.DeepCopy(); excess.Cmp(resource.MustParse(defaultLimit)) > 0 {
+		excess.Sub(resource.MustParse(defaultLimit))
+		size.Add(excess)
 	}
 	return &size
 }
@@ -813,7 +846,7 @@ func credentialProxyEmptyDirSizeLimit(defaultSize string, ephemeralLimit resourc
 // the watcher reads is not here: the gateway pod already declares it.
 //
 // The /tmp emptyDir is widened to the sidecar's own merged ephemeral-storage
-// limit, as buildCredentialProxyRuntimeVolumes widens the broker's: the sidecar
+// limit, as buildCredentialProxyRuntimeVolumes widens the broker's state: the sidecar
 // is the gateway pod's container and the kubelet evicts the pod when the volume
 // passes its sizeLimit, whatever the container's ephemeral-storage limit. The
 // override read here is agentAPIAuth's, not the broker's, so the gateway pod
@@ -825,7 +858,7 @@ func buildAgentAPIAuthVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Volum
 	ephemeralLimit := resolveAgentAPIAuthResources(agent.Spec.Deployment).Limits[corev1.ResourceEphemeralStorage]
 	for i := range volumes {
 		if volumes[i].Name == credentialProxyTmpVolumeName {
-			volumes[i].EmptyDir.SizeLimit = credentialProxyEmptyDirSizeLimit(credentialProxyTmpSizeLimit, ephemeralLimit)
+			volumes[i].EmptyDir.SizeLimit = credentialProxyEmptyDirSizeLimit(credentialProxyTmpSizeLimit, agentAPIAuthEphemeralStorageLimit, ephemeralLimit)
 		}
 	}
 	return volumes

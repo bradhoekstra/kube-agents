@@ -1121,7 +1121,7 @@ platformAgent:
     # The credential-proxy container's requests and limits, forwarded to the CR as
     # spec.deployment.credentialProxy.resources when any key is set. Each key
     # merges over the operator's defaults (500m CPU and 1Gi requests; 1 CPU,
-    # 2Gi memory and 2Gi ephemeral-storage limits), so
+    # 2Gi memory and 8Gi ephemeral-storage limits), so
     #
     #   credentialProxy:
     #     resources:
