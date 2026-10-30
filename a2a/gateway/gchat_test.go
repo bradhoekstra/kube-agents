@@ -558,11 +558,46 @@ func TestToGchatText(t *testing.T) {
 		// the rows stay lined up.
 		"| PR | State |\n|---|---|\n| <https://github.com/x/y/pull/1|#1> | open |": "```\nPR                                 | State\n-----------------------------------+------\n#1 (https://github.com/x/y/pull/1) | open\n```",
 		"| who | n |\n|---|---|\n| <users/all> | 1 |\n| me | 2 |":                  "```\nwho          | n\n-------------+--\n< users/all> | 1\nme           | 2\n```",
+		// A `.#` inside a kept link's label is not a glued heading: the
+		// link stays whole and kept.
+		"see <https://x.example|v1.# Notes> now":    "see <https://x.example|v1.# Notes> now",
+		"see [v1.# Notes](https://x.example/p) now": "see <https://x.example/p|v1.# Notes> now",
 	}
 	for in, want := range cases {
 		if got := toGchatText(in); got != want {
 			t.Errorf("toGchatText(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// A chunk whose padded table would run past Chat's message cap posts its
+// table as written: one 700-character cell over a hundred short rows is
+// under the relay's chunk size raw and tens of thousands of bytes padded,
+// which Chat would refuse along with the rest of the answer.
+func TestToGchatTextLeavesATableThatWouldOverflowChat(t *testing.T) {
+	wide := strings.Repeat("x", 700)
+	rows := []string{"| Pod | Ready |", "|---|---|", "| " + wide + " | 1/1 |"}
+	for i := 0; i < 110; i++ {
+		rows = append(rows, "| p | - |")
+	}
+	in := "Pods:\n\n" + strings.Join(rows, "\n")
+	if len(in) > discordChunk {
+		t.Fatalf("the probe must fit one chunk: %d bytes", len(in))
+	}
+	if rendered := rewriteLineForms(in, gchatBullet, true); len(rendered) <= gchatTextMax {
+		t.Fatalf("the probe must overflow when rendered: %d bytes", len(rendered))
+	}
+	got := toGchatText(in)
+	if len(got) > gchatTextMax {
+		t.Errorf("toGchatText posted %d bytes, past gchatTextMax", len(got))
+	}
+	if strings.Contains(got, "```") || !strings.Contains(got, "|---|---|") {
+		t.Errorf("the table should be left as written:\n%s", got[:200])
+	}
+	// A table that fits still renders.
+	small := "| a | b |\n|---|---|\n| 1 | 2 |"
+	if got := toGchatText(small); !strings.Contains(got, "```") {
+		t.Errorf("a small table should render: %q", got)
 	}
 }
 

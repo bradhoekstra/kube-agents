@@ -51,6 +51,10 @@ var (
 	// The row must also carry a pipe (slackTablePipe), as GFM requires, so a
 	// bare "---" under a line that happens to hold a pipe stays a rule.
 	slackTableSepRE = regexp.MustCompile(`^[ \t]*\|?[ \t]*:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)*\|?[ \t]*$`)
+	// mdLinkSpanRE is the span of a markdown link, label and destination,
+	// as either surface's link rule reads one: masked while glued headings
+	// are sought (splitGluedHeadings), so a `.#` in a label is not a split.
+	mdLinkSpanRE = regexp.MustCompile(`\[[^\]\n]+\]\([^\s)]+\)`)
 	// slackGluedHeadingRE is a heading run onto the end of a sentence with
 	// no line break ("…its health status.# Cluster Report"), as a model's
 	// answer can arrive: a sentence's closing . or !, one to six #, a space,
@@ -108,19 +112,19 @@ const (
 // rewriteSlackBlocks applies the line-level rewrites above to text, leaving
 // fenced code blocks as written.
 func rewriteSlackBlocks(text string) string {
-	return rewriteLineForms(text, slackBullet)
+	return rewriteLineForms(text, slackBullet, true)
 }
 
 // rewriteLineForms is the pass itself, for either chat surface: bullet is
-// what a list item's marker becomes.
-func rewriteLineForms(text, bullet string) string {
+// what a list item's marker becomes, and tables is whether a pipe table
+// becomes a fenced block (the Google Chat adapter turns it off for a chunk
+// whose padded table would run past Chat's message cap, toGchatText).
+func rewriteLineForms(text, bullet string, tables bool) string {
 	lines := strings.Split(text, "\n")
 	for i, line := range lines {
 		lines[i] = strings.TrimSuffix(line, slackLineCR)
 	}
-	lines = strings.Split(rewriteOutsideCode(strings.Join(lines, "\n"), func(s string) string {
-		return slackGluedHeadingRE.ReplaceAllString(s, slackGluedHeadingSplit)
-	}), "\n")
+	lines = strings.Split(rewriteOutsideCode(strings.Join(lines, "\n"), splitGluedHeadings), "\n")
 	code := fencedLines(lines)
 	out := make([]string, 0, len(lines))
 	// paragraph is whether the last line out is a prose line as written,
@@ -138,7 +142,7 @@ func rewriteLineForms(text, bullet string) string {
 			out[len(out)-1] = slackBoldLine(out[len(out)-1])
 			continue
 		}
-		if end := tableEnd(lines, code, i); end > i {
+		if end := tableEnd(lines, code, i); tables && end > i {
 			out = append(out, renderSlackTable(lines[i], lines[i+2:end])...)
 			i = end - 1
 			continue
@@ -160,6 +164,30 @@ func rewriteLineForms(text, bullet string) string {
 		paragraph = strings.TrimSpace(line) != "" && !slackNotParagraphRE.MatchString(line)
 	}
 	return strings.Join(out, "\n")
+}
+
+// splitGluedHeadings puts a heading run onto the end of a sentence
+// (slackGluedHeadingRE) on a paragraph of its own, in prose: a `.#` inside a
+// link's label, markdown or <url|text>, is the label's, so the links are
+// masked (maskRanges) while the glued headings are sought and the split is
+// applied to the text as written.
+func splitGluedHeadings(s string) string {
+	var protected [][]int
+	for _, m := range chatNativeLinkRE.FindAllStringIndex(s, -1) {
+		protected = append(protected, m)
+	}
+	for _, m := range mdLinkSpanRE.FindAllStringIndex(s, -1) {
+		protected = append(protected, m)
+	}
+	var b strings.Builder
+	end := 0
+	for _, m := range slackGluedHeadingRE.FindAllStringSubmatchIndex(maskRanges(s, protected), -1) {
+		b.WriteString(s[end:m[0]])
+		b.WriteString(slackGluedHeadingRE.ReplaceAllString(s[m[0]:m[1]], slackGluedHeadingSplit))
+		end = m[1]
+	}
+	b.WriteString(s[end:])
+	return b.String()
 }
 
 // slackBoldLine renders a heading's text as one bold line: the bold pairs

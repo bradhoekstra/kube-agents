@@ -2020,7 +2020,7 @@ keeps a code span's content without its backticks, sheds the marks of closed bol
 markdown or `<url|text>`, as its label and URL, since a code block renders no link; only an
 escaped `\|` and the pipe of a `<url|text>` link stay inside a cell). A table the chunker cuts gets its header and delimiter rows again at the head of the next chunk, so each part renders as a table. A
 heading run onto the end of a sentence with no line break is moved to its own line
-first. Bold and links are translated after it. The translation leaves
+first, in prose: a `.#` inside a link's label, markdown or `<url|text>`, is the label's. Bold and links are translated after it. The translation leaves
 code spans as written, converts bold only on a closed `**` pair, never alters a
 link's destination, and refuses a link whose label carries a URL naming a host other
 than the one it opens. A link the agent already wrote in the surfaces' own `<url|text>`
@@ -2035,7 +2035,10 @@ unfurled into a preview card under it. Everything else posted is escaped first (
 model output, and an unescaped `<!channel>` in a result would ping the room. The Google
 Chat adapter runs the same line pass first, with `- ` for a list marker, since Chat draws
 a bulleted list from that marker itself; its mention defang runs before the pass, so a
-table's cells are measured as they post. It then applies the same markdown rules, and
+table's cells are measured as they post. The pass is measured after it runs: a padded table
+can take a chunk the relay cut under 1,900 bytes past Chat's 32,000-byte message cap, which
+Chat would refuse along with the rest of the answer, so a chunk whose rendering runs past
+30,000 bytes is rendered again with its tables left as written. It then applies the same markdown rules, and
 keeps the same links, behind its own defang, in two halves: the link defang reads prose, link text and an unclosed fence but
 not a closed code span, a fenced block or a kept link; the mention defang reads
 everything, code included, but a kept link, whose URL and text hold no `<`. The adapters translate each chunk of a result alone, so the chunker closes a

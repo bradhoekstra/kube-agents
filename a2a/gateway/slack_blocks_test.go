@@ -56,6 +56,7 @@ func TestRewriteSlackBlocks(t *testing.T) {
 		{"a heading holding dunder names keeps them", "## __init__ vs __main__", "**__init__ vs __main__**"},
 		{"a heading with a pipe above a delimiter row is not a table header", "## Pods | Nodes\n|---|---|\n| a | b |", "**Pods | Nodes**\n|---|---|\n| a | b |"},
 		{"a glued heading is repaired beside an inline code span", "Ran `ls`.# Report", "Ran `ls`.\n\n**Report**"},
+		{"a dot-hash inside a link's label is the label's", "see <https://x.example|v1.# Notes> and [v2.# Notes](https://y.example/p) now.# Report", "see <https://x.example|v1.# Notes> and [v2.# Notes](https://y.example/p) now.\n\n**Report**"},
 		{"two marks are not a rule", "sig\n\n--\n**\n__", "sig\n\n--\n**\n__"},
 		{"a spaced pair of dashes is a bullet, not a rule", "- -", "• -"},
 		{"a heading sheds inline bold before it is bolded whole", "## Status: **Critical**", "**Status: Critical**"},

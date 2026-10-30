@@ -124,6 +124,10 @@ const (
 	// message text; gchatMentionDefused is what it posts as instead.
 	gchatMentionOpen    = "<" + gchatUsersToken
 	gchatMentionDefused = "< " + gchatUsersToken
+	// gchatTextMax bounds one posted text, in bytes, under Chat's 32,000-byte
+	// message cap with room for the markdown rules' few added bytes: a
+	// rendered chunk past it posts its tables as written (toGchatText).
+	gchatTextMax = 30000
 )
 
 // Google Chat's own vocabulary, as it appears in event payloads and API
@@ -934,9 +938,20 @@ func decodeGchatEvent(data string) (*gchatEvent, error) {
 // Chat draws a bullet from. The mention defang runs before it, so a table's
 // cells are measured as they will post; the link defang runs after it, and
 // reads the fenced table as the code it is.
+//
+// The pass is measured after it runs: a pipe table's cells are padded to
+// their column's widest, so a chunk the relay cut under its raw size can
+// render past Chat's message cap, and Chat would refuse the post and the
+// rest of the answer with it. A chunk whose rendering runs past
+// gchatTextMax is rendered again with its tables left as written, which is
+// what posted before tables were rendered at all.
 func toGchatText(s string) string {
-	s = rewriteLineForms(defangGchatMentions(s), gchatBullet)
-	return rewriteMarkdown(keepChatLinks(s, defangGchatControls, func(dest, label string) string {
+	s = defangGchatMentions(s)
+	out := rewriteLineForms(s, gchatBullet, true)
+	if len(out) > gchatTextMax {
+		out = rewriteLineForms(s, gchatBullet, false)
+	}
+	return rewriteMarkdown(keepChatLinks(out, defangGchatControls, func(dest, label string) string {
 		return chatLinkOpen + dest + chatLinkSep + label + chatLinkClose
 	}), gchatLinkRe)
 }
