@@ -85,7 +85,7 @@ Anti-goals, what would make this a failure even if it works:
    fold, as `clustersRegistered` and `clustersMonitored` do, and are projected as the latest poll's
    reading.
 3. **Forge cost.** GitHub's search index answers a count in one call per state; GitLab and Gitea
-   answer with a total header on a one-item page. Per-proposal detail costs four or five calls per
+   answer with a total header on a one-item page. Per-proposal detail costs about seven calls per
    proposal and must not be paid for every proposal on every sweep.
 4. **Identity.** The install's login is the credential's `whoami`, cached per repository for the
    life of the process as the removed `_merged_viewer_for` did, but the sweep does not ask through
@@ -266,13 +266,13 @@ so a merge reaches `status.usage` within two poll intervals end to end.
 `updated` and the record. It is written per proposal as each is read, whatever the sweep's
 outcome, so an attempt cut short by a rate limit keeps what it read and the next one continues
 rather than starting over. It is derived data: a restart empties it and the sweeps after refill
-it at the cost of step 2 for every proposal once, four or five core-API calls for an ordinary
+it at the cost of step 2 for every proposal once, about seven core-API calls for an ordinary
 proposal and more for one whose conversation runs past a page, against the installation token's
 hourly quota, which the agent's own verbs share. So step 2 is budgeted by the hour and in calls,
 not in proposals: `VCS_READINGS_DETAIL_CALLS_PER_HOUR` (1000, a fifth of GitHub's five-thousand-call
 installation quota) spread evenly over the sweeps in an hour, about sixty calls a sweep at the
 default TTL, twelve ordinary proposals or fewer long ones, so a refill of a thousand proposals
-takes about five hours and never starves the agent's own verbs. The details reading is taken only
+takes about seven hours and never starves the agent's own verbs. The details reading is taken only
 once every listed proposal is current in the cache; until then its series keep their previous
 values, or stay absent after a restart, with `reason="warming"` on the failure counter, while
 the outcomes reading is taken from the first complete listing. The cache's eviction rule is one
@@ -306,7 +306,7 @@ accepted, and the operator's two-miss clear bounds it.
 **Cost.** Steady state per managed repository per sweep: one author-filtered page per hundred of
 the install's own proposals, and step 2 only for proposals that changed since the last sweep. A
 repository where the install has opened 300 proposals and people add two reviews an hour costs
-three listing calls a sweep and, on the sweeps where a proposal changed, four or five more.
+three listing calls a sweep and, on the sweeps where a proposal changed, about seven more.
 GitHub's search quota is thirty calls a minute per token, so the sweep paces its search calls at
 `VCS_READINGS_SEARCH_CALLS_PER_MINUTE` (25): an install with many managed repositories gets a
 sweep longer than the TTL and older readings, not a rate-limited tail that never completes.
@@ -345,7 +345,7 @@ transient child memory the same way.
 ## 6. What the operator does
 
 A new reading slot beside the cluster gauges, generic rather than a third special case: a declared
-list of reading series (`usageReadingSeries`) with, for each, the status field it lands in, its
+list of reading series (`usageReadingSpecs`) with, for each, the status field it lands in, its
 label filter, the reading it belongs to (`outcomes` or `details`) and the aggregation across pods
 (`max`, the cluster gauges' rule; the broker is one pod by design, with a `Recreate` strategy, so
 the rule is for form). The scrape parses them from the broker body into `usageReading.Readings`;
@@ -390,9 +390,9 @@ Field names are this document's call: the two kept names carry `Total` for a rea
 renaming them breaks the chart's health rules and the feedback summary for nothing a reader
 gains; the four new ones do not say `Total`, because they are not.
 
-**Health rules.** `charts/kube-agents/templates/platform-agent-health-rules.yaml` computes
+**Health rules.** Before this design `charts/kube-agents/templates/platform-agent-health-rules.yaml` computed
 `proposals_rejected_ratio_14d` and `proposals_merge_rate_14d` with `increase()` over the operator's
-usage gauges, and the merge rate divides by `remediationsProposedTotal`, the event counter.
+usage gauges, and the merge rate divided by `remediationsProposedTotal`, the event counter.
 `increase()` reads a fall in a reading as a counter reset and inflates the result, and a reading
 over a counter is the mixed-source ratio section 4 rules out. Both recording rules and the
 alerts' minimum-count guards are rewritten over readings alone, keeping their fourteen-day
@@ -401,9 +401,9 @@ fields, and the `KubeAgentsProposalsUnmerged` guard, which applies it to
 `remediationsProposedTotal` and moves to `proposalsAuthored`, keeping the threshold's name and
 its meaning of proposals opened in the window. An operator roll-over splits a window across two
 series of the usage gauge, which is why the template sums `increase()` and maxes instants; a
-`delta()` has neither aggregation right, so each reading field first gets a recording rule that
-takes `max by (agent_namespace, agent)` of the gauge, and the window deltas are taken over those
-recorded series. With `merged_14d = clamp_min(delta(<recorded merged>[14d]), 0)`, `closed_14d`
+`delta()` has neither aggregation right, so one recording rule (`usage_reading:max`, keyed by
+`field`) first takes `max by (agent_namespace, agent, field)` of the gauge over the reading fields,
+and the window deltas are taken over that recorded series. With `merged_14d = clamp_min(delta(<recorded merged>[14d]), 0)`, `closed_14d`
 and `authored_14d` likewise: `proposals_rejected_ratio_14d = closed_14d / (closed_14d + merged_14d)`,
 the share of decided proposals a person rejected, as today; and
 `proposals_merge_rate_14d = merged_14d / authored_14d`, the share of proposals opened that merged,

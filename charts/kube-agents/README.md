@@ -455,6 +455,8 @@ The operator now exports the proposal fields of `kubeagents_platformagent_usage`
 
 A reading can also fall: a repository leaves the managed list, or a proposal is deleted. When `proposalsAuthored` falls inside the window, the rules drop both proposal ratios, and `KubeAgentsProposalsRejected` and `KubeAgentsProposalsUnmerged` cannot fire for the fourteen days the fall stays in the window. A proposal that a person closes and reopens does not cause this. The thresholds keep their names and values; `proposalsProposedMin14d` now counts proposals authored in the window.
 
+`status.usage.remediationsAppliedTotal`, which nothing ever wrote, leaves the CRD schema and the operator's export in this release. `remediationsMergedTotal` and `remediationsClosedUnmergedTotal` keep their names but are absent, not 0, until the first reading lands and whenever two polls in a row read none, so a dashboard that read them as counters sees a gap rather than a zero.
+
 #### Upgrade notes: inference-gateway Service rename
 
 The agent-facing K8s Service was renamed from `litellm` to `inference-gateway` (and `litellm-gateway` to `inference-gateway-upstream` for the upstream gateway). The operator now renders `base_url: http://inference-gateway.<namespace>.svc.cluster.local/v1` into the managed agent config on every reconcile; the managed scope is overlaid on load, so agents cannot retain the old name via a local override.
@@ -655,7 +657,7 @@ defaults and keeps the release's values, or every threshold set; the schema requ
 block and the template says so when it is missing. The rules read the operator's scrape, so
 enabling them with `operator.metrics` off, or where the `PodMonitoring` CRD is absent, fails at
 render with a message. The two proposal alerts read the forge's proposal readings, and a fall in
-one silences them for two weeks; see
+`proposalsAuthored` (a repository leaving the managed list, or a deleted proposal) silences them for two weeks; see
 [Upgrade notes: proposal counters become readings](#upgrade-notes-proposal-counters-become-readings).
 
 ### Turning telemetry off

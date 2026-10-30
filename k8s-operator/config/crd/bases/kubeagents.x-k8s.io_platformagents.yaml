@@ -11910,8 +11910,9 @@ spec:
                         ProposalHumanTouches and ProposalsMergedUntouched: one poll that cannot
                         read the broker, or reads it without that reading, leaves the three
                         where they were, and a second in a row clears them to absent; a broker
-                        still warming, or one whose last sweep could not read the details,
-                        serves the outcomes reading without this one. A 0 is a reading. Does not
+                        still warming serves the outcomes reading without this one, and one
+                        whose last sweep could not read the details keeps serving the details
+                        it last read, for an hour. A 0 is a reading. Does not
                         move LastActiveTime: a close is not the agent at work.
                       format: int64
                       type: integer
