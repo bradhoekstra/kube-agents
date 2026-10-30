@@ -1677,7 +1677,8 @@ def explained_by_wake(
 ) -> bool:
     """Whether the creator's wake will narrate this failure, so the ping can go.
 
-    True only on Slack with the flag on, for a failure kind, on a subscription
+    True only on a card platform (Slack, or Google Chat where the gateway serves
+    it under ``spec.mode: next``) with the flag on, for a failure kind, on a subscription
     that asked to be woken, when ``kanban.wake_on_events`` wakes for the kind.
     Those are the conditions under which ``wake_kinds_for`` on a push adapter
     puts the kind in the wake set, so the one message the thread gets is the

@@ -1401,10 +1401,11 @@ def _first_report_card(
 
 
 def _posted_as_blocks(data_dir: Path, card: inventory_card.Card | None) -> bool:
-    """Whether the report was posted to Slack as the card; False posts nothing.
+    """Whether the report was posted as the card, to Slack or to Google Chat through
+    the gateway under ``spec.mode: next``; False posts nothing.
 
     False, and the caller prints the text, with no card (``_first_report_card``
-    said why), an origin that is not Slack with a chat id, or no relay. Any
+    said why), an origin that is not a card platform with a chat id, or no relay. Any
     failure is False too, including one that may have posted (a timeout once
     the request was sent): this report is sent once per install, and a second
     copy of it is a smaller loss than none. Each goes to the stage log.
