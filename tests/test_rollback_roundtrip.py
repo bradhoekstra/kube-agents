@@ -1351,8 +1351,13 @@ class FailureTest(RoundTripTest):
         if proc.poll() is not None:
             out, err = proc.communicate(timeout=_SIGNAL_WAIT_SECONDS)
             self.fail(f"the script exited with status {proc.returncode} before the signal:\n{out}{err}")
-        self.assertTrue(flipped, "the script did not flip to today within the wait")
-        self.assertTrue(sleeping, "the script did not reach a poll sleep after the flip")
+        if not sleeping:
+            # The script is still running somewhere this test did not expect:
+            # reap it and carry its transcript, so the failure says what it was doing.
+            proc.kill()
+            out, err = proc.communicate(timeout=_SIGNAL_WAIT_SECONDS)
+            what = "reach a poll sleep after the flip" if flipped else "flip to today"
+            self.fail(f"the script did not {what} within {_SIGNAL_WAIT_SECONDS}s:\n{out}{err}")
         proc.send_signal(signal.SIGTERM)
         out, err = proc.communicate(timeout=_SIGNAL_WAIT_SECONDS)
         self.assertEqual(proc.returncode, 1, out + err)
