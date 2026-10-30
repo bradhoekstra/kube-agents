@@ -1531,8 +1531,10 @@ def store_incident_report(
 # does not. And a failure is told twice: the notifier posts ``✖ … gave up``,
 # then the wake has the creator explain the same failure in its own words.
 #
-# Both are presentation and both are gated on the flag *and* on the Slack
-# platform, so Google Chat and a flag-off Slack get exactly upstream's text.
+# Both are presentation and both are gated on the flag *and* on a platform
+# the cards are drawn for (Slack, and Google Chat where the gateway serves it
+# under ``spec.mode: next``), so every other platform, and a flag-off one, gets
+# exactly upstream's text.
 #
 # The failure line is held, not dropped. The ping is sent before the wake is
 # attempted, so skipping it outright would leave the thread silent whenever the

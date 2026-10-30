@@ -4650,11 +4650,12 @@ def _card_platform(platform: str, chat_id: str) -> bool:
 def _slack_audit_headline(
     platform: str, message: str, chat_id: str, profile: str, job_id: str, deadline: float
 ) -> AuditHeadline | None:
-    """With ``KAGE_SLACK_UX`` on, the headline a fleet-audit report leads with in Slack.
+    """With ``KAGE_SLACK_UX`` on, the headline a fleet-audit report leads with on a
+    card platform: Slack, or Google Chat under ``spec.mode: next``.
 
     None, and the leg posts `message` as it always has, unless every condition
-    holds: the flag is on, the leg is Slack, a channel is known
-    (the leg's chat id or the Slack home channel), the job runs the fleet-audit
+    holds: the flag is on, the leg is a card platform with a channel known
+    (the leg's chat id or the gateway's home channel), the job runs the fleet-audit
     skill, and the message
     ends with an issue URL in a managed repository, which is where fleet-audit
     keeps its ledger, and at least `AUDIT_HEADLINE_MIN_LEFT_S` is left before

@@ -146,10 +146,10 @@ LOWERABLE = re.compile(r"^(?!I(?:'|$))[A-Z](?:[a-z]|$)")
 #: Slack's cap on a message's blocks; a reply already at it keeps its question as text.
 MESSAGE_BLOCKS_MAX = 50
 
-#: Marked threads, ``(chat_id, thread_id) -> (monotonic time, wall time, card id)``.
+#: Marked threads, ``(platform, chat_id, thread_id) -> (monotonic time, wall time, card id)``.
 _marks: "OrderedDict[tuple[str, str, str], tuple[float, datetime, str]]" = OrderedDict()
-#: Marks a queued wake carried to its follow-up's reply, ``(chat_id, thread_id) ->
-#: (mark time, when carried)``: taken under any event that arrived before the carry.
+#: Marks a queued wake carried to its follow-up's reply, ``(platform, chat_id, thread_id)
+#: -> (mark time, when carried)``: taken under any event that arrived before the carry.
 _carried: "OrderedDict[tuple[str, str, str], tuple[float, datetime]]" = OrderedDict()
 
 #: The step the final being sent declared, held while its line is kept off the posted text.
