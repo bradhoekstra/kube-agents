@@ -314,7 +314,7 @@ const (
 	// token-accounting writer to drain, and on a sandboxed install (the chart
 	// default) the operator pins SQLite to the DELETE journal mode, where the
 	// read that follows takes the writer's lock (hermes_state.py _read_ctx)
-	// behind any turn persisting its transcript. 5s is therefore spent before a
+	// behind any turn persisting its transcript. Up to 5s can therefore pass before a
 	// byte is read; 10s under the 15s period covers the flush with as much
 	// again for the locked read and the exec spawn. The startup probe keeps 5s
 	// under its 10s period: at boot the answer is absent rather than slow, and

@@ -58,7 +58,7 @@ const (
 	// the heap approaches it; it does not cap live heap.
 	memoryLimitFraction = 0.5
 	// defaultGatewayWait outlasts two of the agent container's startup probe
-	// budgets (agentAPIProbe(10, 90) in platformagent_manifests.go, 905s)
+	// budgets (905s: agentAPIProbeInitialDelaySeconds plus the agentAPIStartupProbe* constants in platformagent_manifests.go)
 	// plus the kill grace period and restart backoff between them. A boot
 	// that overruns one budget is restarted, and the restarted entrypoint
 	// redoes its profile steps before the gateway binds, so a single budget
