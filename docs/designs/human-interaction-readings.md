@@ -60,14 +60,14 @@ is outside the count until it moves to the door. The docs say both.
 without a TTL, `feedback` with a 720-hour one). It gets one more bucket, `people`, history 1, a
 720-hour TTL, a small size cap, and the same grants as `feedback`:
 
-| Key            | Value                               | Written                                                                                             |
-| -------------- | ----------------------------------- | --------------------------------------------------------------------------------------------------- |
-| `people.<hex>` | the time of the last turn, RFC 3339 | on each verified turn from a chat platform, for that turn's principal, at most once an hour per key |
+| Key            | Value                              | Written                                                                                                                                             |
+| -------------- | ---------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `people.<hex>` | the time of the last put, RFC 3339 | on each verified turn from a chat platform, for that turn's principal, at most once an hour per key, so the time is within an hour of the last turn |
 
 `<hex>` is the 32 hex characters of `Requester.Principal` without its `hmac:` prefix, since a
 key-value key admits no colon. A person is that principal: the principal map folds a platform's
 member id into one identity where an entry exists, and no backend is part of the key. A put
-refreshes the entry, so the bucket's TTL deletes a person's key 30 days after their last turn; the
+refreshes the entry, so the bucket's TTL deletes a person's key 30 days after their last put, within an hour of their last turn; the
 hourly bound keeps a busy conversation from writing the bucket on every message. The hash is the
 one the gateway already computes for every turn's authority block; nothing new about a person is
 written anywhere. A put that fails (the bucket full, the bus away) is logged and never ends the
@@ -75,7 +75,7 @@ turn; the count under-counts until the next put succeeds. The bucket's size cap 
 hundred thousand people, far past any install.
 
 A turn counts when the gateway has verified its sender and its backend is a chat platform a
-person writes on (Google Chat and Slack, the platforms the gateway serves): the program doors (`inject`, `a2a`, and the Google
+person writes on, the set the gateway's own inbound counter labels as platforms (Google Chat, Slack and Discord): the program doors (`inject`, `a2a`, and the Google
 door) are not people, and an eval or CI install must not read its inject principals as such; the
 console is not counted either, since every console user resolves to the one principal
 `nats:console`. The inbound counter counts before the sender is verified and counts the console,
