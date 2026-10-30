@@ -11,7 +11,7 @@ import unittest
 from unittest import mock
 
 import providers
-from providers import IdentityUnknown, WorkspaceError
+from providers import ForgeUnsupported, IdentityUnknown, WorkspaceError
 
 import vcs_readings
 from vcs_readings import (
@@ -26,9 +26,10 @@ from vcs_readings import (
 INSTALL = "kube-agents[bot]"
 INSTALL_BARE = "kube-agents"
 INSTALL_EMAIL = "platform-agent@kube-agents.invalid"
-REPO = "github.com/acme/infra"
-OTHER_REPO = "github.com/acme/apps"
-GITEA_REPO = "gitea.example.com/acme/infra"
+REPO = "fake:github.com/acme/infra"
+OTHER_REPO = "fake:github.com/acme/apps"
+GITEA_REPO = "gitea:gitea.example.com/acme/infra"
+GITHUB_REPO = "github:github.com/acme/infra"
 LOGGER_NAME = "credential-proxy.vcs-readings"
 
 
@@ -171,12 +172,24 @@ class FakeForge:
 
 
 class FakeRegistry:
+    """`providers.Registry.resolve` over `host/path`, keyed by managed key.
+
+    A managed key handed whole, `provider:` and all, is refused the way the
+    real registry refuses it: the text before the first `/` reads as a host no
+    forge serves.
+    """
+
     def __init__(self, forges: dict[str, FakeForge]):
         self.forges = forges
 
-    def resolve(self, key):
-        host, _, path = key.partition("/")
-        return self.forges[key], path
+    def resolve(self, locator):
+        host, _, path = locator.partition("/")
+        if ":" in host:
+            raise ForgeUnsupported(f"{host} is not a forge this install serves")
+        for key, forge in self.forges.items():
+            if key.partition(":")[2] == locator:
+                return forge, path
+        raise ForgeUnsupported(f"{host} is not a forge this install serves")
 
 
 class FakeMetrics:
@@ -420,7 +433,7 @@ class ReadingsSweepTest(unittest.TestCase):
         forge = FakeForge(host="gitea.example.com", login="kube-agents", clamp=50, splits=False, http_user=True)
         for number in range(1, 1102):
             forge.add(number, "merged", updated=f"2026-01-01T00:00:00Z{number:05d}")
-        harness = Harness({GITEA_REPO: forge}, interval=WIDE)
+        harness = Harness({"fake:gitea.example.com/acme/infra": forge}, interval=WIDE)
 
         harness.sweep.run_once()
 
@@ -566,7 +579,7 @@ class ReadingsSweepTest(unittest.TestCase):
         named.add(1, "merged")
         named.add(2, "open")
         harness = Harness(
-            {REPO: nameless, OTHER_REPO: named, "github.com/acme/third": refusing}
+            {REPO: nameless, OTHER_REPO: named, "fake:github.com/acme/third": refusing}
         )
 
         with self.assertLogs(LOGGER_NAME, level="INFO") as logs:
@@ -865,7 +878,7 @@ class ListingCompletenessTest(unittest.TestCase):
 
         search.api = paged
         forge = GitHubForge(refresh=mock.Mock())
-        sweep, metrics = real_forge_sweep(forge, search, REPO)
+        sweep, metrics = real_forge_sweep(forge, search, GITHUB_REPO)
 
         with self.assertLogs(LOGGER_NAME, level="WARNING"):
             sweep.run_once()
@@ -923,7 +936,7 @@ class ListingCompletenessTest(unittest.TestCase):
     def test_an_incomplete_github_search_publishes_no_outcomes_reading(self):
         search = GitHubSearch(incomplete=True)
         forge = GitHubForge(refresh=mock.Mock())
-        sweep, metrics = real_forge_sweep(forge, search, REPO)
+        sweep, metrics = real_forge_sweep(forge, search, GITHUB_REPO)
 
         with self.assertLogs(LOGGER_NAME, level="WARNING"):
             sweep.run_once()
@@ -959,8 +972,8 @@ class SearchPacingTest(unittest.TestCase):
 
         search.api = api
         forge = GitHubForge(refresh=mock.Mock())
-        sweep, _ = real_forge_sweep(forge, search, REPO, clock=clock, sleep=sleep)
-        bound = sweep._bind(REPO)
+        sweep, _ = real_forge_sweep(forge, search, GITHUB_REPO, clock=clock, sleep=sleep)
+        bound = sweep._bind(GITHUB_REPO)
 
         for _ in range(60):
             bound.api("GET", "search/issues", params={})
@@ -1044,21 +1057,21 @@ class SweepIdentityTest(unittest.TestCase):
         executor = _SweepExecutor()
         opener = Opener({"data": {"viewer": {"login": INSTALL}}})
         sweep = ReadingsSweep(
-            registry=FakeRegistry({REPO: forge}),
+            registry=FakeRegistry({GITHUB_REPO: forge}),
             transport_for=lambda f, r: credential_proxy.sweep_transport_for(executor, f, r, opener=opener),
             metrics=FakeMetrics(),
-            managed_repositories=lambda: frozenset({REPO}),
+            managed_repositories=lambda: frozenset({GITHUB_REPO}),
             app_credential=credential_proxy.sweep_app_credential,
         )
 
         with mock.patch.object(vcs_broker.Binding, "whoami", side_effect=AssertionError("Binding.whoami")):
-            sweep._bind(REPO)
-            self.assertEqual(INSTALL, sweep._login(REPO))
+            sweep._bind(GITHUB_REPO)
+            self.assertEqual(INSTALL, sweep._login(GITHUB_REPO))
 
         (request,) = opener.requests
         self.assertEqual("https://api.github.com/graphql", request.full_url)
         self.assertEqual("Bearer ghs_sweep_1", request.get_header("Authorization"))
-        self.assertEqual({"author": "app/kube-agents"}, sweep._author_payload(REPO))
+        self.assertEqual({"author": "app/kube-agents"}, sweep._author_payload(GITHUB_REPO))
         refresh.assert_not_called()
 
     def test_an_app_credential_is_searched_as_app_slug_with_or_without_the_marking(self):
@@ -1095,3 +1108,28 @@ class PureFunctionTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ManagedKeyTest(unittest.TestCase):
+    """The managed list keys repositories as `provider:host/path`; the registry
+    takes `host/path`. The sweep's first live run on a GitHub install failed
+    every attempt with `ForgeUnsupported` because the key went to the registry
+    whole, and the provider read as a host no forge serves."""
+
+    def test_a_managed_key_is_resolved_by_its_host_and_path(self):
+        harness = Harness({REPO: FakeForge()}, interval=WIDE)
+        harness.sweep.run_once()
+        outcomes, _ = harness.last()
+        self.assertIsNotNone(outcomes)
+        self.assertEqual([], harness.metrics.failures)
+
+    def test_a_key_registered_as_another_provider_admits_nothing(self):
+        # The host resolves to the fake forge, whose provider is `fake`, and
+        # the entry says `github`: refused with the failure counted, no reading.
+        forge = FakeForge()
+        forge.add(1, "merged")
+        harness = Harness({"github:github.com/acme/infra": forge}, interval=WIDE)
+        harness.sweep.run_once()
+        self.assertEqual(["forge"], harness.metrics.failures)
+        self.assertEqual([], harness.metrics.readings)
+        self.assertEqual([], forge.calls)

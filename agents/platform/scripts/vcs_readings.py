@@ -34,6 +34,11 @@ from vcs_broker import _login_key
 
 LOGGER = logging.getLogger("credential-proxy.vcs-readings")
 
+# A managed key is `provider:host/path` (`credential_proxy._repository_key`).
+# The registry resolves the `host/path` part; the provider names the forge
+# the entry was registered as, and no other forge serves it.
+MANAGED_KEY_SEPARATOR = ":"
+
 # The sweep's timing and bounds (design section 5).
 VCS_READINGS_TTL_SECONDS = 240
 # Read by the metrics object: past this age a reading's series are omitted.
@@ -461,8 +466,26 @@ class ReadingsSweep:
             key,
         )
 
+    def _resolve(self, key: str) -> tuple[Any, str]:
+        """The forge and path a managed key names.
+
+        The registry takes `host/path`, so the key's `provider:` prefix comes off
+        first; handed whole, the registry would read the provider as a host and
+        refuse it. A key whose provider is not the forge serving its host admits
+        nothing, as every other gate on the managed list holds.
+        """
+        provider, separator, locator = key.partition(MANAGED_KEY_SEPARATOR)
+        if not separator:
+            provider, locator = "", key
+        forge, path = self._registry.resolve(locator)
+        if provider and forge.name != provider:
+            raise ForgeUnsupported(
+                f"{key} is registered as {provider!r}, and {_host(forge)} is served by {forge.name!r}"
+            )
+        return forge, path
+
     def _bind(self, key: str) -> _Repository:
-        forge, path = self._registry.resolve(key)
+        forge, path = self._resolve(key)
         transport = self._transport_for(forge, path)
         host = _host(forge)
         paced = getattr(forge, "search_routes", frozenset())
@@ -744,7 +767,7 @@ class ReadingsSweep:
         live: set[tuple[str, str]] = set()
         for key in managed:
             try:
-                forge, path = self._registry.resolve(key)
+                forge, path = self._resolve(key)
             except Exception:  # noqa: BLE001 -- a host no forge serves holds no records
                 continue
             live.add((_host(forge), path.casefold()))
