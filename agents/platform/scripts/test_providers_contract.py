@@ -690,10 +690,10 @@ class ContractTest(unittest.TestCase):
                     self.assertEqual(
                         {"open": RECORDED_TALLY["open"], "merged": None, "closed": None}, answer
                     )
-                elif name == "github":
-                    # The states are separate searches; GitHub's tally also
-                    # carries the unqualified query's count, the one snapshot
-                    # the sweep sums the states to.
+                elif name in ("github", "gitlab"):
+                    # The states are separate requests; these two also answer
+                    # the one count of every state, which the sweep sums the
+                    # states to, and derive `open` from it.
                     self.assertEqual({**RECORDED_TALLY, "total": RECORDED_TOTAL}, answer)
                 else:
                     self.assertEqual(RECORDED_TALLY, answer)

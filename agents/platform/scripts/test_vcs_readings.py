@@ -1155,13 +1155,13 @@ class TallyAndUnsupportedTest(unittest.TestCase):
         outcomes, details = harness.last()
         self.assertIsNone(outcomes)
         self.assertIsNotNone(details, "the details reading is published from the listing the tally did not touch")
-        self.assertEqual(["forge"], harness.metrics.failures)
+        self.assertEqual(["truncated", "forge"], harness.metrics.failures)
 
     def test_the_tally_takes_the_sum_from_the_forges_one_count(self):
-        # Separate per-state searches straddle a merge: 1 open + 1 merged + 1 closed
-        # would sum to 3 while the forge counts 2 proposals; open takes the difference.
+        # Separate per-state requests straddle a merge: the forge counts 2
+        # proposals, merged 1 and closed 1, and open takes the difference.
         def tally(api, repo, payload):
-            return {"open": 1, "merged": 1, "closed": 1, "total": 2}
+            return {"merged": 1, "closed": 1, "total": 2}
 
         forge = self._truncated_forge(tally)
         harness = Harness({GITEA_REPO.replace("gitea:", "fake:"): forge}, interval=WIDE)
@@ -1169,7 +1169,22 @@ class TallyAndUnsupportedTest(unittest.TestCase):
         outcomes, _ = harness.last()
         self.assertEqual((0, 1, 1), (outcomes.open, outcomes.merged, outcomes.closed))
 
-    def test_a_forge_that_does_not_serve_the_sweep_leaves_the_required_set(self):
+    def test_a_failed_tally_keeps_its_reason_beside_warming(self):
+        # Under the default interval the budget warms a few dozen proposals a
+        # sweep, so a repository past the bound warms for many sweeps; the
+        # tally's failure stays the reason the outcomes reading is withheld.
+        def tally(api, repo, payload):
+            raise WorkspaceError("search down", status=502, code="FORGE_CALL_FAILED")
+
+        forge = self._truncated_forge(tally)
+        harness = Harness({GITEA_REPO.replace("gitea:", "fake:"): forge})
+        harness.sweep.run_once()
+        self.assertEqual(["truncated", "forge", "warming"], harness.metrics.failures)
+        self.assertEqual([], harness.metrics.readings)
+
+    def test_a_forge_that_does_not_serve_the_sweep_withholds_the_readings_each_sweep(self):
+        # The design's rule: a repository the forge cannot serve is a failed
+        # required repository, so no sum is published without it, every sweep.
         served = FakeForge()
         served.add(1, "merged")
         refusing = FakeForge()
@@ -1179,16 +1194,12 @@ class TallyAndUnsupportedTest(unittest.TestCase):
 
         refusing.proposal_list_by_author = refuse
         harness = Harness({REPO: served, OTHER_REPO: refusing}, interval=WIDE)
-        with self.assertLogs("credential-proxy.vcs-readings", level="INFO") as logs:
-            harness.sweep.run_once()
-        outcomes, _ = harness.last()
-        self.assertEqual(1, outcomes.merged, "the served repository's reading is published")
-        self.assertEqual(["forge"], harness.metrics.failures)
-        self.assertEqual(1, sum("does not serve the sweep" in line for line in logs.output))
-        calls = len(served.calls)
         harness.sweep.run_once()
-        self.assertEqual(["forge"], harness.metrics.failures, "an unsupported repository is not attempted again")
-        self.assertGreater(len(served.calls), calls)
+        self.assertEqual([], harness.metrics.readings)
+        self.assertEqual(["forge"], harness.metrics.failures)
+        harness.sweep.run_once()
+        self.assertEqual(["forge", "forge"], harness.metrics.failures, "attempted again every sweep")
+        self.assertEqual([], harness.metrics.readings)
 
 
 class GitHubTallyTest(unittest.TestCase):
@@ -1204,5 +1215,5 @@ class GitHubTallyTest(unittest.TestCase):
 
         answer = forge.proposal_tally(api, "acme/infra", {"author": "app/kube-agents"})
         self.assertEqual({"open": 2, "merged": 5, "closed": 1, "total": 8}, answer)
-        self.assertEqual(4, len(queries))
+        self.assertEqual(3, len(queries), "merged, closed and the one count; open is derived, not searched")
         self.assertFalse(queries[-1].endswith(" "), "the unqualified query carries no trailing space")

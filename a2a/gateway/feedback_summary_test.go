@@ -157,7 +157,7 @@ func TestRenderUsageSummaryPrintsNoReadingForAnAbsentReading(t *testing.T) {
 	cr := summaryCR()
 	cr["status"].(map[string]any)["usage"] = map[string]any{"remediationsOpen": int64(0)}
 	text := renderUsageSummary(summaryNow, cr, "", usageSummaryWindow, taskRollup{}, false)
-	for _, reading := range []string{"remediationsMergedTotal", "proposalsAuthored", "remediationsClosedUnmergedTotal", "proposalHumanTouches"} {
+	for _, reading := range []string{"remediationsMergedTotal", "proposalsAuthored", "remediationsClosedUnmergedTotal", "proposalHumanTouches", "proposalsMergedUntouched"} {
 		if want := "  " + reading + ": no reading (as the forge reports)\n"; !strings.Contains(text, want) {
 			t.Errorf("block lacks %q:\n%s", want, text)
 		}

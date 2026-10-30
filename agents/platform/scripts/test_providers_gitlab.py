@@ -585,10 +585,12 @@ class ProposalTest(unittest.TestCase):
         self.assertIsNone(missing["total"])
 
     def test_tally_reads_one_total_per_state_and_refuses_a_missing_one(self):
-        api = Api(([], {"x-total": "2"}), ([], {"x-total": "5"}), ([], {"x-total": "1"}))
+        # Merged, closed and every state together; open is the difference,
+        # since the three counts are separate requests, not one snapshot.
+        api = Api(([], {"x-total": "5"}), ([], {"x-total": "1"}), ([], {"x-total": "8"}))
         answer = forge().proposal_tally(api, "acme/infra", {"author": "u", "authorId": 7})
-        self.assertEqual({"open": 2, "merged": 5, "closed": 1}, answer)
-        self.assertEqual(["opened", "merged", "closed"], [call[2]["state"] for call in api.calls])
+        self.assertEqual({"open": 2, "merged": 5, "closed": 1, "total": 8}, answer)
+        self.assertEqual(["merged", "closed", "all"], [call[2]["state"] for call in api.calls])
         self.assertEqual({1}, {call[2]["per_page"] for call in api.calls})
         with self.assertRaises(WorkspaceError):
             forge().proposal_tally(Api(([], {})), "acme/infra", {"author": "u", "authorId": 7})

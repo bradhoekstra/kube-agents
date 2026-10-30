@@ -28,7 +28,7 @@ from collections import Counter, deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
 
-from providers import ForgeUnsupported, IdentityUnknown, MAX_PAGE_SIZE, WorkspaceError
+from providers import ForgeUnsupported, IdentityUnknown, MAX_PAGE_SIZE, TALLY_TOTAL, WorkspaceError
 from providers.validate import MAX_CONVERSATION_SIZE
 from vcs_broker import _login_key
 
@@ -86,8 +86,6 @@ VCS_READINGS_FAILURES_METRIC = "kubeagents_vcs_readings_failures_total"
 STATE_OPEN = "open"
 STATE_MERGED = "merged"
 STATE_CLOSED = "closed"
-# A tally may carry the forge's one count of every proposal beside the states.
-TALLY_TOTAL = "total"
 STATES = (STATE_OPEN, STATE_MERGED, STATE_CLOSED)
 OUTCOMES = (STATE_MERGED, STATE_CLOSED)
 ACTOR_INSTALL = "install"
@@ -291,11 +289,10 @@ class _Attempt:
 
     counts: Counter | None = None  # None withholds the outcomes reading
     details: bool = False  # False withholds the details reading
-    reason: str | None = None
+    # Every failure the attempt produced, in order: a repository past the walk
+    # bound that is still warming records both `truncated` and `warming`.
+    reasons: list[str] = field(default_factory=list)
     nameless: bool = False
-    # The forge does not serve the sweep's reads (`ForgeUnsupported` from the
-    # bind or the listing): the repository is left out of the required set.
-    unsupported: bool = False
 
 
 class ReadingsSweep:
@@ -333,8 +330,6 @@ class ReadingsSweep:
         self._emails: dict[str, frozenset[str]] = {}
         self._nameless: set[str] = set()
         self._nameless_logged = False
-        self._unsupported: set[str] = set()
-        self._unsupported_logged = False
         # Step 2's token bucket, in forge calls: refilled at the hourly rate,
         # holding at most one sweep's share so the hour's calls spread evenly.
         self._capacity = VCS_READINGS_DETAIL_CALLS_PER_HOUR * interval / SECONDS_PER_HOUR
@@ -394,7 +389,7 @@ class ReadingsSweep:
         scopes: set[tuple[str, str]] = set()
         required = 0
         for key in managed:
-            if key in self._nameless or key in self._unsupported:
+            if key in self._nameless:
                 continue
             attempt = self._attempt(key)
             if attempt.nameless:
@@ -402,14 +397,9 @@ class ReadingsSweep:
                 self._metrics.record_reading_failure(REASON_IDENTITY)
                 self._log_nameless(key)
                 continue
-            if attempt.unsupported:
-                self._unsupported.add(key)
-                self._metrics.record_reading_failure(REASON_FORGE)
-                self._log_unsupported(key)
-                continue
             required += 1
-            if attempt.reason:
-                self._metrics.record_reading_failure(attempt.reason)
+            for reason in attempt.reasons:
+                self._metrics.record_reading_failure(reason)
             if attempt.counts is None:
                 outcomes_whole = False
             else:
@@ -435,18 +425,15 @@ class ReadingsSweep:
             if not self._login(key):
                 return _Attempt(nameless=True)
             proposals, truncated, _ = self._list(key)
-        except ForgeUnsupported as exc:
-            LOGGER.warning("proposal readings: %s is not served by its forge: %s", key, exc)
-            return _Attempt(unsupported=True)
         except _ForeignAuthor:
             LOGGER.warning("proposal readings: %s listed a proposal another account authored", key)
-            return _Attempt(reason=REASON_FORGE)
+            return _Attempt(reasons=[REASON_FORGE])
         except _ShortListing:
             LOGGER.warning("proposal readings: %s listed fewer proposals than the forge counted", key)
-            return _Attempt(reason=REASON_FORGE)
+            return _Attempt(reasons=[REASON_FORGE])
         except Exception as exc:  # noqa: BLE001 -- one repository never ends the sweep
             return self._failed(key, exc, _Attempt())
-        attempt = _Attempt(reason=REASON_TRUNCATED if truncated else None)
+        attempt = _Attempt(reasons=[REASON_TRUNCATED] if truncated else [])
         if truncated:
             # A tally that fails withholds the outcomes reading alone: the
             # listing is whole enough for the details, which go on below.
@@ -459,7 +446,7 @@ class ReadingsSweep:
             self._evict_missing(key, proposals)
         try:
             if not self._warm(key, proposals):
-                attempt.reason = REASON_WARMING
+                attempt.reasons.append(REASON_WARMING)
                 return attempt
         except Exception as exc:  # noqa: BLE001
             return self._failed(key, exc, attempt)
@@ -468,25 +455,16 @@ class ReadingsSweep:
 
     @staticmethod
     def _failed(key: str, exc: Exception, attempt: _Attempt) -> _Attempt:
-        attempt.reason = _reason(exc)
+        reason = _reason(exc)
+        attempt.reasons.append(reason)
         LOGGER.warning(
             "proposal readings: %s failed reason=%s type=%s code=%s",
             key,
-            attempt.reason,
+            reason,
             type(exc).__name__,
             exc.fields.get("code") if isinstance(exc, WorkspaceError) else "",
         )
         return attempt
-
-    def _log_unsupported(self, key: str) -> None:
-        if self._unsupported_logged:
-            return
-        self._unsupported_logged = True
-        LOGGER.info(
-            "proposal readings are off for %s: its forge does not serve the sweep's reads, "
-            "so the repository is left out of the readings",
-            key,
-        )
 
     def _log_nameless(self, key: str) -> None:
         if self._nameless_logged:
@@ -665,13 +643,17 @@ class ReadingsSweep:
         bound = self._bound[repo]
         answer = bound.forge.proposal_tally(bound.api, bound.path, self._author_payload(repo))
         counts = Counter()
+        total = answer.get(TALLY_TOTAL)
+        if not isinstance(total, int) or isinstance(total, bool):
+            total = None
         for state in STATES:
             value = answer.get(state)
+            if state == STATE_OPEN and total is not None:
+                continue
             if not isinstance(value, int) or isinstance(value, bool):
                 return None
             counts[state] = value
-        total = answer.get(TALLY_TOTAL)
-        if isinstance(total, int) and not isinstance(total, bool):
+        if total is not None:
             # The per-state counts are separate queries, not one snapshot: a
             # proposal that changes state between two of them is counted twice
             # or not at all, and the sum would dip or double for a sweep, which

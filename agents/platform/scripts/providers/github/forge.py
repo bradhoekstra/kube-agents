@@ -27,7 +27,7 @@ from urllib.parse import quote
 
 import repo_ref
 
-from ..base import COLLABORATION_VERBS, Forge, WorkspaceError, listing
+from ..base import COLLABORATION_VERBS, Forge, WorkspaceError, listing, TALLY_TOTAL
 from ..credentials import (
     BrokeredCredential,
     Credential,
@@ -82,9 +82,8 @@ INCOMPLETE_RESULTS = "incomplete_results"
 
 # The qualifiers that count an author's proposals by outcome. `is:closed`
 # alone would count merged ones twice.
-TALLY_TOTAL_KEY = "total"
+# The states the tally searches; `open` is the one count less these two.
 TALLY_QUALIFIERS = {
-    "open": "is:open",
     "merged": "is:merged",
     "closed": "is:unmerged is:closed",
 }
@@ -726,8 +725,9 @@ class GitHubForge(Forge):
         query = self._author_query(repo, payload)
         tally: dict[str, Any] = {}
         # The states are separate searches, not one snapshot; the unqualified
-        # query's count is the one number the sweep sums the states to.
-        for state, qualifier in {**TALLY_QUALIFIERS, TALLY_TOTAL_KEY: ""}.items():
+        # query's count is the one number the sweep sums the states to, and
+        # `open` is derived from it rather than searched.
+        for state, qualifier in {**TALLY_QUALIFIERS, TALLY_TOTAL: ""}.items():
             found = api("GET", SEARCH_PATH, params={"q": f"{query} {qualifier}".strip(), "per_page": 1}) or {}
             total = found.get("total_count")
             if not isinstance(total, int) or isinstance(total, bool):
@@ -741,6 +741,7 @@ class GitHubForge(Forge):
                     code="FORGE_CALL_FAILED",
                 )
             tally[state] = total
+        tally["open"] = max(tally[TALLY_TOTAL] - tally["merged"] - tally["closed"], 0)
         return tally
 
     def proposal_reviews(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:

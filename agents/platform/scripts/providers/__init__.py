@@ -14,6 +14,7 @@ forge and names no forge at all.
 """
 
 from .base import (
+    TALLY_TOTAL,
     BROKER_VERBS,
     COLLABORATION_VERBS,
     ISSUE_VERBS,
@@ -82,6 +83,7 @@ __all__ = [
     "LabelsUnsupported",
     "Guidance",
     "MAX_PAGE_SIZE",
+    "TALLY_TOTAL",
     "MintedReadCredential",
     "MintedWriteCredential",
     "NoCredential",

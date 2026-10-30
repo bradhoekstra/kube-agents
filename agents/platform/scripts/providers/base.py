@@ -52,8 +52,13 @@ from .validate import repo_segments
 # the shared contract. `WorkspaceError` is the broker's "the caller sent
 # something wrong" with an HTTP status attached; a forge raises it for anything
 # specific to its own request shapes that the shared validators cannot know.
+# The key a `proposal_tally` answer carries the forge's one count of every state
+# under, where the forge counts the states in separate queries.
+TALLY_TOTAL = "total"
+
 __all__ = [
     "BROKER_VERBS",
+    "TALLY_TOTAL",
     "COLLABORATION_VERBS",
     "ISSUE_VERBS",
     "LABEL_FIELDS",
@@ -497,7 +502,10 @@ class Forge:
     def proposal_tally(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
         """How many proposals `payload["author"]` has open, merged and closed.
 
-        None for a count the forge cannot split out.
+        None for a count the forge cannot split out. A forge whose counts are
+        separate queries also answers `TALLY_TOTAL`, its one count of every
+        state together, and derives `open` from it: the states are not one
+        snapshot, and the sum is what the sweep publishes.
         """
         return self._unsupported("proposal-tally")
 

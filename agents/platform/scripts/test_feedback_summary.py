@@ -9,7 +9,9 @@ import datetime as dt
 import io
 import json
 import subprocess
+import re
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import feedback_summary as fs
@@ -239,7 +241,7 @@ class RenderTest(unittest.TestCase):
         cr = json.loads(json.dumps(CR))
         cr["status"]["usage"] = {"remediationsOpen": 0}
         text = fs.render(full_snapshot(cr=cr))
-        for reading in ("remediationsMergedTotal", "proposalsAuthored", "remediationsClosedUnmergedTotal", "proposalHumanTouches"):
+        for reading in ("remediationsMergedTotal", "proposalsAuthored", "remediationsClosedUnmergedTotal", "proposalHumanTouches", "proposalsMergedUntouched"):
             self.assertIn(f"  {reading}: no reading (as the forge reports)\n", text)
         self.assertIn("  remediationsOpen: 0 (as the forge reports)\n", text)
         for counter in ("clustersRegistered", "toolExecutionsTotal", "remediationsProposedTotal"):
@@ -479,3 +481,19 @@ class MainTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GatewayCopyTest(unittest.TestCase):
+    """The gateway's Go copy of the field lists is this script's, verbatim."""
+
+    GO_FILE = Path(__file__).resolve().parents[3] / "a2a" / "gateway" / "feedback_summary.go"
+
+    def _go_strings(self, var: str) -> list[str]:
+        source = self.GO_FILE.read_text()
+        start = source.index(f"var {var} = ")
+        body = source[start : source.index("}", start)]
+        return re.findall(r'"([A-Za-z]+)"', body)
+
+    def test_the_gateway_prints_the_same_counters_and_readings(self):
+        self.assertEqual(list(fs.USAGE_COUNTERS), self._go_strings("usageSummaryCounters"))
+        self.assertEqual(sorted(fs.USAGE_READINGS), sorted(self._go_strings("usageSummaryReadings")))
