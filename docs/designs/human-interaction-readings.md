@@ -100,7 +100,8 @@ name (the gateway's restricted permissions refuse the stream purge that would cl
 ChatOps gateway design records): a pseudonym under the bucket's own key, with no time, listable
 by the provision and seed identities until the bucket's max age expires it, within 30 days. So a
 removed person is gone from the count at once and from the bucket's subjects within 30 days,
-which is the bound the anti-goal below sets. The ChatOps page's privacy section gets a paragraph that says all of this.
+which is the bound the anti-goal below sets. The ChatOps page gets a paragraph that says all of this, beside its "Answer feedback" section,
+which is where the page already says what a kept record holds and who can read it.
 
 A turn counts when the gateway has verified its sender and its backend is a chat platform a
 person writes on: one of the gateway's three chat backends, Google Chat, Slack or Discord, named
@@ -199,8 +200,8 @@ The breakdown of proposals by what started them (Workstream 3) is not part of th
   and the `a2aProvisionedStreams` seed list in `platformagent_a2a_manifests.go`, the gateway
   user's `$KV.people.>` publish and subscribe grants and the provision identity's stream grants
   in `platformagent_a2a_identities.go`, the bucket's name in `a2aGatewayJetStreamGrants`
-  (stream info, consumer create and consumer delete, which the bind, the watch and its stop
-  need) with `TestGatewayGrantNamesTheBucketItsDataPlaneWritesTo` extended to it, and every
+  (stream info, direct get, consumer create and consumer delete, the four `feedback` carries,
+  which the bind, a read, the watch and its stop need) with `TestGatewayGrantNamesTheBucketItsDataPlaneWritesTo` extended to it, and every
   other place that spells a bucket's name (the operator's bucket constant, the hard-coded stream
   lists and the authorization test, the auth-callout goldens); the hourly-bounded put on each
   verified chat turn after the principal and backend checks; the key derivation (HKDF of the
@@ -238,8 +239,7 @@ The breakdown of proposals by what started them (Workstream 3) is not part of th
   pinned between the gateway and the operator.
 - **Docs**: the observability page (the series, the fields, the five answers, the three fields
   absent on an older served CRD beside the existing skew note), the CRD page (the same, and the
-  switch), the fields page (generated), the ChatOps page's privacy section (the per-person record,
-  who can read it, the switch, the deletion), `usage-counters-producer.md` (the cross-install
+  switch), the fields page (generated), the ChatOps page, beside its "Answer feedback" section (the per-person record, who can read it, the switch, the deletion), `usage-counters-producer.md` (the cross-install
   section), and a pointer in `proposal-outcome-readings.md` where it defines the slot this design
   generalises.
 
