@@ -638,8 +638,10 @@ class ReadingsSweep:
             page += 1
 
     def _tally(self, repo: str) -> Counter | None:
-        """Exact state counts for a repository past the walk bound, or None
-        when the forge cannot split them, which withholds the outcomes reading."""
+        """State counts for a repository past the walk bound, from the tally:
+        merged and closed as counted, open the remainder of the forge's one count
+        where it gives one. None when the forge cannot split them, which
+        withholds the outcomes reading."""
         bound = self._bound[repo]
         answer = bound.forge.proposal_tally(bound.api, bound.path, self._author_payload(repo))
         counts = Counter()
