@@ -3,17 +3,27 @@ package gateway
 import (
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
 )
 
+// gchatClickEvent is the add-on click fixture as a distinct click each time:
+// Pub/Sub redelivers an event with its time unchanged, so a test that means
+// a redelivery classifies one event twice, and one that means another click
+// calls this again.
 func gchatClickEvent(t *testing.T) *gchatEvent {
 	t.Helper()
-	return gchatFixtureEvent(t, "addon-dm-button-click.json", nil)
+	ev := gchatFixtureEvent(t, "addon-dm-button-click.json", nil)
+	ev.click.EventTime = fmt.Sprintf("2026-10-29T20:01:%02d.000000Z", clickEvents.Add(1))
+	return ev
 }
+
+var clickEvents atomic.Int32
 
 // A button click in the add-on shape decodes to a click event: the clicked
 // message and space from the payload, the clicker from chat.user, the
@@ -104,7 +114,7 @@ func TestGchatClickIsATurnOnce(t *testing.T) {
 	// The click's id is the message and the event time, so two clicks on
 	// one message are two ids in the ingress log.
 	if msg.Conversation != "gchat:dm/spaces/_c2fixtureAA" || msg.Kind != "dm" || msg.AuthorID != "sender@example.com" ||
-		msg.MessageID != "spaces/_c2fixtureAA/messages/BOT1.BOT1#2026-10-29T20:01:02.000000Z" || msg.Text != "Look at the first one: prod-eu" || !msg.Click {
+		!strings.HasPrefix(msg.MessageID, "spaces/_c2fixtureAA/messages/BOT1.BOT1#2026-10-29T20:01:") || msg.Text != "Look at the first one: prod-eu" || !msg.Click {
 		t.Errorf("click turn = %+v", msg)
 	}
 	if _, reason := a.classify(gchatClickEvent(t)); !strings.Contains(reason, "already waiting") {
@@ -414,6 +424,69 @@ func TestGchatTypedReplyAnswersAndEditsClose(t *testing.T) {
 	a.InboundVerified(msg.Conversation, msg.MessageID, true)
 	if body := f.call(calls).arguments["body"].(map[string]any); !strings.HasPrefix(body["text"].(string), "*Which cluster?*\n\nTwo clusters run one.") {
 		t.Errorf("late click rewrote from the old layout: %q", body["text"])
+	}
+}
+
+// Pub/Sub is at-least-once: a redelivered click is a duplicate whatever the
+// question's state since, even after the question was asked again on the
+// same message, where the answered and waiting marks were cleared.
+func TestGchatRedeliveredClickIsADuplicate(t *testing.T) {
+	f := newFakeChatRelay(t)
+	f.responses["spaces.messages/create"] = map[string]any{"name": "spaces/_c2fixtureAA/messages/BOT1.BOT1"}
+	f.responses["spaces.messages/patch"] = map[string]any{"name": "spaces/_c2fixtureAA/messages/BOT1.BOT1"}
+	a := newTestGchatAdapterWithRelay(t, f)
+	a.syncRewrites = true
+	question := &chatmsg.Message{Schema: chatmsg.Schema, Headline: "Which?", Choices: []chatmsg.Choice{{Text: "Look at the first one"}, {Text: "Skip"}}}
+	if _, err := a.PostMessage("gchat:dm/spaces/_c2fixtureAA", OutMessage{Text: "fallback", Chat: question}); err != nil {
+		t.Fatal(err)
+	}
+	ev := gchatClickEvent(t)
+	msg, reason := a.classify(ev)
+	if reason != "" {
+		t.Fatal(reason)
+	}
+	a.InboundVerified(msg.Conversation, msg.MessageID, true)
+	if err := a.EditMessage("gchat:dm/spaces/_c2fixtureAA", "spaces/_c2fixtureAA/messages/BOT1.BOT1", OutMessage{Text: "fallback", Chat: question}); err != nil {
+		t.Fatal(err)
+	}
+	if _, reason := a.classify(ev); !strings.Contains(reason, "duplicate delivery") {
+		t.Errorf("a redelivered click after a re-ask: %q", reason)
+	}
+	// A new click (another event time) on the re-asked question is a turn.
+	if _, reason := a.classify(gchatClickEvent(t)); reason != "" {
+		t.Errorf("a fresh click on the re-asked question: %q", reason)
+	}
+}
+
+// A typed reply awaiting verification does not block a click on the same
+// question: both are turns, and whichever the gateway verifies first
+// answers; the other changes nothing.
+func TestGchatTypedReplyDoesNotBlockAClick(t *testing.T) {
+	f := newFakeChatRelay(t)
+	f.responses["spaces.messages/create"] = map[string]any{"name": "spaces/_c2fixtureAA/messages/BOT1.BOT1"}
+	f.responses["spaces.messages/patch"] = map[string]any{"name": "spaces/_c2fixtureAA/messages/BOT1.BOT1"}
+	a := newTestGchatAdapterWithRelay(t, f)
+	a.syncRewrites = true
+	conv := "gchat:dm/spaces/_c2fixtureAA"
+	question := &chatmsg.Message{Schema: chatmsg.Schema, Headline: "Which?", Choices: []chatmsg.Choice{{Text: "Look at the first one"}, {Text: "Skip"}}}
+	if _, err := a.PostMessage(conv, OutMessage{Text: "fallback", Chat: question}); err != nil {
+		t.Fatal(err)
+	}
+	typed := InboundMessage{Conversation: conv, Kind: sessionKindDM, AuthorID: "other@example.com", MessageID: "spaces/_c2fixtureAA/messages/U9", Text: "one sec"}
+	a.noteTypedAnswer(typed, gchatSender{DisplayName: "Other", Email: "other@example.com"})
+	click, reason := a.classify(gchatClickEvent(t))
+	if reason != "" {
+		t.Fatalf("a click while a typed reply waits: %s", reason)
+	}
+	// The click is verified first: it answers. The typer, verified later,
+	// changes nothing.
+	a.InboundVerified(click.Conversation, click.MessageID, true)
+	a.InboundVerified(typed.Conversation, typed.MessageID, true)
+	if len(f.calls) != 2 {
+		t.Fatalf("calls = %d, want the post and one rewrite", len(f.calls))
+	}
+	if body := f.call(1).arguments["body"].(map[string]any); !strings.HasSuffix(body["text"].(string), "✓ Test Sender: Look at the first one") {
+		t.Errorf("rewrite = %q", body["text"])
 	}
 }
 

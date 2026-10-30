@@ -143,11 +143,16 @@ func gchatChatRows(rows []chatmsg.Row) string {
 		if r.Severity != "" {
 			line += gchatChatCode + r.Severity + gchatChatCode + " "
 		}
-		line += toGchatText(r.Text)
+		// A row the model wrote as a list item keeps its marker through
+		// the line pass (Chat's bullet is the renderer's), so the marker is
+		// shed before the renderer's goes on; a row that was a rule is
+		// nothing after the pass, and draws no empty bullet.
+		text := strings.TrimPrefix(strings.TrimSpace(toGchatText(r.Text)), gchatChatRowBullet)
+		line += text
 		if strings.TrimSpace(r.Detail) != "" {
 			line += gchatChatRowDetailSep + toGchatText(r.Detail)
 		}
-		if strings.TrimSpace(r.Text) != "" || r.Severity != "" {
+		if text != "" || r.Severity != "" {
 			lines = append(lines, line)
 		}
 	}
@@ -177,7 +182,7 @@ func gchatChatFold(f *chatmsg.Fold) string {
 	if title == "" {
 		title = chatmsg.DefaultFoldTitle
 	}
-	parts := []string{gchatChatBold + defangGchatControls(title) + gchatChatBold}
+	parts := []string{gchatChatBold + defangGchatControls(gchatOneLine(title)) + gchatChatBold}
 	if strings.TrimSpace(f.Text) != "" {
 		parts = append(parts, toGchatText(f.Text))
 	}
@@ -193,12 +198,12 @@ func gchatChatFold(f *chatmsg.Fold) string {
 
 // gchatChatTableLine writes one table row in the pipe form the table pass
 // reads, a pipe inside a cell escaped (slackEscapedPipe, which tableCells
-// reads back) so it stays in its cell. Cells are plain by the spec; the
-// defang keeps a mention in one inert.
+// reads back) so it stays in its cell, and a cell flattened to one line.
+// Cells are plain by the spec; the defang keeps a mention in one inert.
 func gchatChatTableLine(cells []string) string {
 	escaped := make([]string, len(cells))
 	for i, c := range cells {
-		escaped[i] = strings.ReplaceAll(defangGchatControls(c), slackTablePipe, slackEscapedPipe)
+		escaped[i] = strings.ReplaceAll(defangGchatControls(gchatOneLine(c)), slackTablePipe, slackEscapedPipe)
 	}
 	return slackTablePipe + " " + strings.Join(escaped, " "+slackTablePipe+" ") + " " + slackTablePipe
 }
@@ -211,7 +216,7 @@ func gchatChatPlan(p *chatmsg.Plan) string {
 	var lines []string
 	for _, item := range p.Items {
 		glyph := gchatChatStatusGlyph[item.Status]
-		title := defangGchatControls(item.Title)
+		title := defangGchatControls(gchatOneLine(item.Title))
 		if glyph != "" {
 			title = glyph + " " + title
 		}
@@ -258,6 +263,14 @@ func gchatChatWidgets(choices []chatmsg.Choice, links []chatmsg.Link) []map[stri
 		return nil
 	}
 	return []map[string]any{{"buttonList": map[string]any{"buttons": buttons}}}
+}
+
+// gchatOneLine flattens a plain field the schema caps but does not hold to
+// one line (a table cell, a column name, a plan item's title, a fold's
+// title) onto the one line the layout draws it on: a line break inside a
+// cell would break the row, and inside a title the bold marks.
+func gchatOneLine(s string) string {
+	return strings.Join(strings.Fields(s), " ")
 }
 
 func gchatChatButton(label string, primary bool) map[string]any {

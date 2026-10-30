@@ -106,6 +106,23 @@ func TestRenderGchatChatPlanAndEdges(t *testing.T) {
 		t.Errorf("defanged head =\n%s\nwant\n%s", layout.Text, want)
 	}
 
+	// A row written as a list item or a rule, and plain fields the schema
+	// caps but does not hold to one line.
+	rows := &chatmsg.Message{Schema: chatmsg.Schema, Rows: []chatmsg.Row{{Text: "- restart the deployment"}, {Text: "---"}, {Text: "* also this", Severity: "minor"}},
+		Fold: &chatmsg.Fold{Title: "why\nnot", Table: &chatmsg.Table{Columns: []string{"state\nnow"}, Rows: [][]string{{"OOMKilled\nexit 137"}}}},
+		Plan: nil}
+	layout, err = renderGchatChat(rows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "- restart the deployment\n- `minor` also this\n\n*why not*\n```\nstate now\n------------------\nOOMKilled exit 137\n```"; layout.Text != want {
+		t.Errorf("rows =\n%s\nwant\n%s", layout.Text, want)
+	}
+	planTitle := &chatmsg.Message{Schema: chatmsg.Schema, Plan: &chatmsg.Plan{Items: []chatmsg.PlanItem{{ID: "a", Title: "two\nlines", Status: chatmsg.StatusComplete}}}}
+	if layout, _ := renderGchatChat(planTitle); layout.Text != "✅ two lines" {
+		t.Errorf("plan title = %q", layout.Text)
+	}
+
 	// Buttons alone are a layout; nothing at all is not.
 	only := &chatmsg.Message{Schema: chatmsg.Schema, Links: []chatmsg.Link{{Text: "PR", URL: "https://github.com/o/r/pull/1"}}}
 	if layout, err := renderGchatChat(only); err != nil || layout.Text != "" || len(layout.Widgets) != 1 {

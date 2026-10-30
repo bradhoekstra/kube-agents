@@ -1169,18 +1169,7 @@ func (a *GoogleChatAdapter) classify(ev *gchatEvent) (InboundMessage, string) {
 		a.userIDs[sender.Name] = sender.Email
 		a.userEmails[strings.ToLower(sender.Email)] = sender.Name
 	}
-	dup := a.seen[ev.Message.Name]
-	if !dup {
-		a.seen[ev.Message.Name] = true
-		a.seenOrder = append(a.seenOrder, ev.Message.Name)
-		// Pub/Sub's redelivery window is bounded, so the dedupe memory is
-		// too: evict oldest-first at the cap rather than leaking one entry
-		// per message for the pod's lifetime.
-		if len(a.seenOrder) > gchatSeenCap {
-			delete(a.seen, a.seenOrder[0])
-			a.seenOrder = a.seenOrder[1:]
-		}
-	}
+	dup := a.seenLocked(ev.Message.Name)
 	a.mu.Unlock()
 	if dup {
 		return InboundMessage{}, "duplicate delivery of " + ev.Message.Name
@@ -1195,6 +1184,24 @@ func (a *GoogleChatAdapter) classify(ev *gchatEvent) (InboundMessage, string) {
 	}
 	a.noteTypedAnswer(msg, sender)
 	return msg, ""
+}
+
+// seenLocked reports whether name was delivered before, and records it:
+// Pub/Sub is at-least-once, and a redelivered event, a message or a click,
+// must not become a second turn. Pub/Sub's redelivery window is bounded, so
+// the dedupe memory is too: evict oldest-first at the cap rather than
+// leaking one entry per event for the pod's lifetime. Called under a.mu.
+func (a *GoogleChatAdapter) seenLocked(name string) bool {
+	if a.seen[name] {
+		return true
+	}
+	a.seen[name] = true
+	a.seenOrder = append(a.seenOrder, name)
+	if len(a.seenOrder) > gchatSeenCap {
+		delete(a.seen, a.seenOrder[0])
+		a.seenOrder = a.seenOrder[1:]
+	}
+	return false
 }
 
 // resolvePrincipal establishes the requester's principal from the backend's

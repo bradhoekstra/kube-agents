@@ -1695,9 +1695,12 @@ become turns" below and #3246.)
 **Chat messages on Google Chat (added 10/29).** The adapter renders a `kube-agents.chat/v1`
 message (spec-a2a-payloads.md, "Chat messages") as a Chat text message with accessory
 buttons, in the spec's fixed order: the headline in bold with the note after it, the detail,
-the rows as a bulleted list (the severity as inline code, the detail after the text on its line),
+the rows as a bulleted list (the severity as inline code, the detail after the text on its line, a
+row's own list marker shed),
 the after lines, the fold open under its title in bold with its table as a monospace block,
-and the buttons as one accessory button list, choices before links, the primary one filled.
+and the buttons as one accessory button list, choices before links, the primary one filled. A
+plain field the schema caps but does not hold to one line (a table cell, a column name, a plan
+item's title, a fold's title) is flattened onto the line it is drawn on.
 In a progress message the plan takes the rows' place, one line per item led by a status
 glyph with its steps under it. It is text and not a card because Chat's card text has no
 monospace and no code, which a table or a command in an answer needs, while a text message
@@ -1729,7 +1732,9 @@ line, and one that lays choices out opens the question anew, the earlier answer 
 while one that lays none out closes it. A typed message in the conversation of an open
 question that asks (not a next step), other than a command, answers it the same way once its
 sender is verified, with the reply's first words as the label. A question is answered once,
-whichever way comes first, and a click or reply from a sender the gateway drops changes
+whichever way comes first (a typed reply awaiting verification does not block a click), a
+redelivered click is a duplicate like a redelivered message, and a click or reply from a
+sender the gateway drops changes
 nothing. A remembered question binds its click to the conversation it was posted in; the
 event's surface binds only a click on one the adapter does not remember. A question posted
 to the home channel (chat.notify) has no conversation at post time, so its click is bound by

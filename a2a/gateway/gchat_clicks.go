@@ -142,9 +142,10 @@ type gchatUX struct {
 	// open is the conversation's newest question that takes a typed
 	// answer, by conversation key.
 	open map[string]string
-	// pending is by click id (gchatClickID), and waiting by the message a
-	// pending click is on; every click the gateway is handed is verified or
-	// dropped (InboundVerified), so neither needs a ring.
+	// pending is by click id (gchatClickID) or typed message name, and
+	// waiting by the message a pending click is on (a typed reply claims
+	// nothing); every one the gateway is handed is verified or dropped
+	// (InboundVerified), so neither needs a ring.
 	pending map[string]gchatPendingClick
 	waiting map[string]bool
 	// answered marks a question whose answer has been taken, and lines
@@ -239,15 +240,17 @@ func (a *GoogleChatAdapter) noteTypedAnswer(msg InboundMessage, sender gchatSend
 	ux := a.uxLocked()
 	name := ux.open[msg.Conversation]
 	q, ok := ux.questions[name]
-	if name == "" || !ok || ux.waiting[name] {
+	if name == "" || !ok {
 		return
 	}
 	clicker := sender.DisplayName
 	if clicker == "" {
 		clicker = namelessClicker
 	}
+	// A typed reply claims nothing: a click on the question while the
+	// typer awaits verification is still a turn, and whichever the gateway
+	// verifies first answers (InboundVerified).
 	ux.pending[msg.MessageID] = gchatPendingClick{message: name, clicker: clicker, label: slackTypedWords(msg.Text), text: q.layout.Text, links: q.links}
-	ux.waiting[name] = true
 }
 
 // classifyClick normalizes one button click to an InboundMessage, or names
@@ -276,8 +279,13 @@ func (a *GoogleChatAdapter) classifyClick(ev *gchatEvent) (InboundMessage, strin
 	if err != nil {
 		index = gchatChoiceUnknown
 	}
+	id := gchatClickID(ev.Message.Name, click.EventTime)
 	a.mu.Lock()
 	ux := a.uxLocked()
+	if a.seenLocked(id) {
+		a.mu.Unlock()
+		return InboundMessage{}, "duplicate delivery of click " + id
+	}
 	if ux.answered[ev.Message.Name] {
 		a.mu.Unlock()
 		return InboundMessage{}, "the question is already answered (" + ev.Message.Name + ")"
@@ -306,7 +314,6 @@ func (a *GoogleChatAdapter) classifyClick(ev *gchatEvent) (InboundMessage, strin
 		p.text = ev.Message.Text
 		p.links, p.label = gchatMessageButtons(ev.Message, index, p.label)
 	}
-	id := gchatClickID(ev.Message.Name, click.EventTime)
 	ux.pending[id] = p
 	ux.waiting[ev.Message.Name] = true
 	a.mu.Unlock()
@@ -374,7 +381,9 @@ func (a *GoogleChatAdapter) InboundVerified(conversation, messageID string, veri
 		return
 	}
 	delete(ux.waiting, p.message)
-	if !verified {
+	if !verified || ux.answered[p.message] {
+		// Dropped, or answered since by the other way (a typed reply and
+		// a click both pending): the first verified answer stands.
 		a.mu.Unlock()
 		return
 	}
