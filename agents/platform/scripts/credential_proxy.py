@@ -19,6 +19,7 @@ import os
 import posixpath
 import queue
 import re
+import resource
 import select
 import selectors
 import shlex
@@ -311,6 +312,47 @@ CHILD_MEMORY_BUDGET_FLOOR_BYTES_AT_DEFAULT_CAP = 704643072
 ENV_MEMORY_LIMIT_BYTES = "CREDENTIAL_PROXY_MEMORY_LIMIT_BYTES"
 CGROUP_MEMORY_MAX_PATH = "/sys/fs/cgroup/memory.max"
 CGROUP_NO_LIMIT = "max"
+# What the container holds, as the kernel accounts it, beside the limit above
+# (#4315): the memory series and the high-water log read these. Each is a
+# high-water mark the kernel keeps itself (the cgroup's memory.peak, a
+# process's VmHWM, the children's ru_maxrss), so a sampler that reads them
+# every MEMORY_SAMPLE_INTERVAL_S misses nothing a burst between two reads did.
+# An unreadable file leaves its series absent rather than at zero.
+CGROUP_MEMORY_CURRENT_PATH = "/sys/fs/cgroup/memory.current"
+CGROUP_MEMORY_PEAK_PATH = "/sys/fs/cgroup/memory.peak"
+CGROUP_MEMORY_STAT_PATH = "/sys/fs/cgroup/memory.stat"
+CGROUP_MEMORY_EVENTS_PATH = "/sys/fs/cgroup/memory.events"
+CGROUP_DIR = "/sys/fs/cgroup"
+# The memory.stat keys read: anonymous memory is what the processes hold and
+# what an OOM kill is about; file memory is page cache the kernel can drop
+# first, which is why memory.current alone overstates the pressure.
+CGROUP_MEMORY_STAT_KEYS = ("anon", "file")
+# The memory.events counters read. `max` counts the times usage reached the
+# limit and the kernel reclaimed to stay under it, which is the pressure
+# before a kill; `oom_kill` the kills. With memory.oom.group set, as the
+# kubelet sets it on cgroup v2, one kill takes every process in the container,
+# so a kill is a container restart and this counter is read from the next
+# container's cgroup, where it starts again at zero; the kubelet's lastState
+# is where a kill is recorded.
+CGROUP_MEMORY_EVENT_KEYS = ("high", "max", "oom", "oom_kill")
+PROC_ROOT = "/proc"
+PROC_SELF = "self"
+PROC_STATUS_FILE = "status"
+PROC_COMM_FILE = "comm"
+# The process beside the broker in its container, found by its comm name; the
+# api-proxy role has none and its series is absent there.
+ENVOY_PROCESS_NAME = "envoy"
+PROCESS_LABEL_BROKER = "broker"
+PROCESS_LABEL_ENVOY = "envoy"
+# /proc/<pid>/status fields, in kB: the resident set now and its high-water.
+PROC_STATUS_RSS_KEY = "VmRSS"
+PROC_STATUS_PEAK_KEY = "VmHWM"
+KIBIBYTE = 1024
+MEMORY_SAMPLE_INTERVAL_S = 30
+# A new container high-water is logged with the breakdown once it has risen by
+# this much since the last line, so a climb writes a line per step and a
+# steady broker writes none after its first.
+MEMORY_HIGH_WATER_LOG_STEP_BYTES = 64 * MEBIBYTE
 # The session role's own share of that pool. Session pods are opened by chat
 # conversations, and under the cluster-view flag all of them draw on the one
 # pool the platform agent's shell uses, so without a bound of their own a
@@ -579,6 +621,28 @@ SLOTS_IN_USE_METRIC = "kubeagents_credential_proxy_slots_in_use"
 CHILD_MEMORY_RESERVED_METRIC = "kubeagents_credential_proxy_child_memory_reserved_bytes"
 SLOT_CAP_METRIC = "kubeagents_credential_proxy_slot_cap"
 CHILD_MEMORY_BUDGET_METRIC = "kubeagents_credential_proxy_child_memory_budget_bytes"
+# The container's memory as the kernel accounts it (#4315), read at scrape
+# time: the cgroup's usage, high-water and limit with the anonymous and file
+# parts of the usage; its event counters; the broker's and Envoy's resident
+# set and high-water; and the largest child reaped so far, by tool. Together
+# they are the breakdown a restart on a large fleet needs and the budget's
+# constants cannot give: the budget charges what it expects a child to cost,
+# these read what one did cost.
+CGROUP_MEMORY_METRIC = "kubeagents_credential_proxy_cgroup_memory_bytes"
+CGROUP_MEMORY_EVENTS_METRIC = "kubeagents_credential_proxy_cgroup_memory_events_total"
+PROCESS_MEMORY_METRIC = "kubeagents_credential_proxy_process_memory_bytes"
+CHILD_PEAK_RSS_METRIC = "kubeagents_credential_proxy_child_peak_rss_bytes"
+MEMORY_KIND_LABEL = "kind"
+MEMORY_KIND_CURRENT = "current"
+MEMORY_KIND_PEAK = "peak"
+MEMORY_KIND_LIMIT = "limit"
+MEMORY_KIND_RSS = "rss"
+MEMORY_EVENT_LABEL = "event"
+MEMORY_PROCESS_LABEL = "process"
+MEMORY_TOOL_LABEL = "tool"
+# The child peak's label for the bootstrap command's tree, reaped before the
+# broker serves and so outside every tool's count.
+CHILD_PEAK_TOOL_BOOTSTRAP = "bootstrap"
 ADMISSION_BOUND_LABEL = "bound"
 ADMISSION_BOUND_SLOT = "slot"
 ADMISSION_BOUND_BUDGET = "budget"
@@ -2046,6 +2110,276 @@ class AdmissionSnapshot(NamedTuple):
     slot_cap: int
     reserved_bytes: int
     budget_bytes: int | None
+
+
+class MemorySnapshot(NamedTuple):
+    """What the container holds, read from the kernel at one moment: the
+    cgroup's figures by kind (current, peak, limit, anon, file; a kind whose
+    file was unreadable is absent), its event counters, each process's resident
+    set and high-water by label, the largest child reaped per tool, and the
+    largest of all with its tool. Rendered by `ProxyMetrics`, logged by
+    `MemorySampler`."""
+
+    cgroup: dict[str, int]
+    events: dict[str, int]
+    processes: dict[str, dict[str, int]]
+    children: dict[str, int]
+    largest_child: tuple[str, int] | None
+
+
+def _read_int_file(path: Path) -> int | None:
+    """The one integer a cgroup file holds, or None when it is unreadable or
+    says something else (`max`)."""
+    try:
+        return int(path.read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _read_keyed_file(path: Path, keys: tuple[str, ...]) -> dict[str, int]:
+    """The `key value` lines of a cgroup file, for the keys asked for; an
+    unreadable file reads as none of them."""
+    try:
+        text = path.read_text()
+    except OSError:
+        return {}
+    found: dict[str, int] = {}
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0] in keys:
+            try:
+                found[parts[0]] = int(parts[1])
+            except ValueError:
+                continue
+    return found
+
+
+def _proc_status_memory(path: Path) -> dict[str, int]:
+    """A process's resident set and high-water in bytes from its
+    /proc/<pid>/status, under the metric's kind labels; empty when the file
+    cannot be read, which is a process that has gone."""
+    try:
+        text = path.read_text()
+    except OSError:
+        return {}
+    wanted = {PROC_STATUS_RSS_KEY: MEMORY_KIND_RSS, PROC_STATUS_PEAK_KEY: MEMORY_KIND_PEAK}
+    found: dict[str, int] = {}
+    for line in text.splitlines():
+        # `VmRSS:\t  108748 kB`: the key before the colon, the figure after it.
+        key, _, rest = line.partition(":")
+        if key in wanted and rest.split():
+            try:
+                found[wanted[key]] = int(rest.split()[0]) * KIBIBYTE
+            except ValueError:
+                continue
+    return found
+
+
+class ChildPeakTracker:
+    """The largest child process the broker has reaped, from the kernel's
+    ru_maxrss for its children, attributed to the tool that was just reaped.
+
+    RUSAGE_CHILDREN's ru_maxrss is the largest resident set of every
+    descendant reaped so far, one number for the process. It is read right
+    after a command is reaped, on the thread that reaped it, so a rise is that
+    command's (its tree's: the auth helper under a kubectl counts) unless
+    another thread reaped between the wait and the read. A child smaller than
+    an earlier one does not move it, which is the point: the question this
+    answers is what the biggest child was, which is what the budget's flat
+    per-request reserve has to hold and what the comment above it only
+    estimates.
+    """
+
+    def __init__(self, rusage: Callable[[int], Any] = resource.getrusage) -> None:
+        self._lock = threading.Lock()
+        self._rusage = rusage
+        self._largest_bytes = 0
+        self._largest_tool: str | None = None
+        self._by_tool: dict[str, int] = {}
+
+    def record_after_reap(self, tool: str) -> int | None:
+        """Read the children's high-water after reaping a `tool` child; when
+        it rose, the rise is this child's. Returns the new high-water, or None
+        when nothing moved."""
+        with self._lock:
+            peak = int(self._rusage(resource.RUSAGE_CHILDREN).ru_maxrss) * KIBIBYTE
+            if peak <= self._largest_bytes:
+                return None
+            self._largest_bytes = peak
+            self._largest_tool = tool
+            self._by_tool[tool] = max(self._by_tool.get(tool, 0), peak)
+        LOGGER.info("largest child so far tool=%s peak_rss=%dMiB", tool, peak // MEBIBYTE)
+        return peak
+
+    def snapshot(self) -> tuple[dict[str, int], tuple[str, int] | None]:
+        with self._lock:
+            largest = (self._largest_tool, self._largest_bytes) if self._largest_tool is not None else None
+            return dict(self._by_tool), largest
+
+
+class MemoryReader:
+    """Reads a `MemorySnapshot` from the cgroup v2 files, /proc and the child
+    tracker. Envoy is found once by comm name and the pid kept until its
+    status file is gone or names another process."""
+
+    def __init__(
+        self,
+        children: ChildPeakTracker,
+        *,
+        cgroup_dir: Path = Path(CGROUP_DIR),
+        proc_root: Path = Path(PROC_ROOT),
+    ) -> None:
+        self._children = children
+        self._cgroup_dir = cgroup_dir
+        self._proc_root = proc_root
+        self._envoy_pid: str | None = None
+
+    def _cgroup(self) -> dict[str, int]:
+        figures: dict[str, int] = {}
+        for kind, name in (
+            (MEMORY_KIND_CURRENT, Path(CGROUP_MEMORY_CURRENT_PATH).name),
+            (MEMORY_KIND_PEAK, Path(CGROUP_MEMORY_PEAK_PATH).name),
+            (MEMORY_KIND_LIMIT, Path(CGROUP_MEMORY_MAX_PATH).name),
+        ):
+            value = _read_int_file(self._cgroup_dir / name)
+            if value is not None:
+                figures[kind] = value
+        figures.update(_read_keyed_file(self._cgroup_dir / Path(CGROUP_MEMORY_STAT_PATH).name, CGROUP_MEMORY_STAT_KEYS))
+        return figures
+
+    def _envoy_status(self) -> Path | None:
+        if self._envoy_pid is not None:
+            candidate = self._proc_root / self._envoy_pid
+            if self._comm(candidate) == ENVOY_PROCESS_NAME:
+                return candidate / PROC_STATUS_FILE
+            self._envoy_pid = None
+        try:
+            entries = sorted(entry for entry in self._proc_root.iterdir() if entry.name.isdigit())
+        except OSError:
+            return None
+        for entry in entries:
+            if self._comm(entry) == ENVOY_PROCESS_NAME:
+                self._envoy_pid = entry.name
+                return entry / PROC_STATUS_FILE
+        return None
+
+    @staticmethod
+    def _comm(entry: Path) -> str | None:
+        try:
+            return (entry / PROC_COMM_FILE).read_text().strip()
+        except OSError:
+            return None
+
+    def read(self) -> MemorySnapshot:
+        processes: dict[str, dict[str, int]] = {}
+        broker = _proc_status_memory(self._proc_root / PROC_SELF / PROC_STATUS_FILE)
+        if broker:
+            processes[PROCESS_LABEL_BROKER] = broker
+        envoy_status = self._envoy_status()
+        if envoy_status is not None:
+            envoy = _proc_status_memory(envoy_status)
+            if envoy:
+                processes[PROCESS_LABEL_ENVOY] = envoy
+        children, largest = self._children.snapshot()
+        return MemorySnapshot(
+            cgroup=self._cgroup(),
+            events=_read_keyed_file(self._cgroup_dir / Path(CGROUP_MEMORY_EVENTS_PATH).name, CGROUP_MEMORY_EVENT_KEYS),
+            processes=processes,
+            children=children,
+            largest_child=largest,
+        )
+
+
+def _mib(value: int | None) -> str:
+    return "?" if value is None else f"{value // MEBIBYTE}MiB"
+
+
+class MemorySampler:
+    """A thread that reads the snapshot every `interval_s` and writes one log
+    line when there is news: at the first read, when the container's
+    high-water has risen by `step_bytes` since the last line, and, as a
+    warning, when an event counter moved, which is the limit being reached.
+
+    The line carries the whole breakdown each time, so the one line before a
+    restart says what the container held and which process held it; that is
+    the record the budget's constants were calibrated without (#4315).
+    """
+
+    def __init__(
+        self,
+        reader: MemoryReader,
+        *,
+        interval_s: float = MEMORY_SAMPLE_INTERVAL_S,
+        step_bytes: int = MEMORY_HIGH_WATER_LOG_STEP_BYTES,
+        stop: threading.Event | None = None,
+    ) -> None:
+        self._reader = reader
+        self._interval_s = interval_s
+        self._step_bytes = step_bytes
+        self._stop = stop if stop is not None else threading.Event()
+        self._logged_peak: int | None = None
+        self._logged_events: dict[str, int] = {}
+        # The sampler's own high-water of `current`, for a kernel without
+        # memory.peak (before 5.19): coarser, sampled rather than kept by the
+        # kernel, but the high-water line is still written as it climbs.
+        self._sampled_peak = 0
+
+    @staticmethod
+    def describe(snapshot: MemorySnapshot) -> str:
+        cgroup = snapshot.cgroup
+        parts = [
+            f"cgroup_peak={_mib(cgroup.get(MEMORY_KIND_PEAK))}",
+            f"current={_mib(cgroup.get(MEMORY_KIND_CURRENT))}",
+            f"limit={_mib(cgroup.get(MEMORY_KIND_LIMIT))}",
+        ]
+        parts += [f"{key}={_mib(cgroup[key])}" for key in CGROUP_MEMORY_STAT_KEYS if key in cgroup]
+        for process, fields in sorted(snapshot.processes.items()):
+            parts.append(f"{process}_rss={_mib(fields.get(MEMORY_KIND_RSS))}")
+            parts.append(f"{process}_peak={_mib(fields.get(MEMORY_KIND_PEAK))}")
+        if snapshot.largest_child is not None:
+            tool, size = snapshot.largest_child
+            parts.append(f"largest_child={tool}:{_mib(size)}")
+        if snapshot.events:
+            parts.append("events " + " ".join(f"{key}={snapshot.events[key]}" for key in CGROUP_MEMORY_EVENT_KEYS if key in snapshot.events))
+        return " ".join(parts)
+
+    def tick(self) -> str | None:
+        """One read; the line written, or None when there was no news."""
+        snapshot = self._reader.read()
+        peak = snapshot.cgroup.get(MEMORY_KIND_PEAK)
+        if peak is None and MEMORY_KIND_CURRENT in snapshot.cgroup:
+            self._sampled_peak = max(self._sampled_peak, snapshot.cgroup[MEMORY_KIND_CURRENT])
+            peak = self._sampled_peak
+        moved = {
+            key: count for key, count in snapshot.events.items() if count > self._logged_events.get(key, 0)
+        }
+        first = self._logged_peak is None
+        risen = peak is not None and self._logged_peak is not None and peak - self._logged_peak >= self._step_bytes
+        if not (first or risen or moved):
+            return None
+        description = self.describe(snapshot)
+        if moved:
+            line = f"memory limit reached: {description}"
+            LOGGER.warning("%s", line)
+        else:
+            line = f"memory {'at start' if first else 'high-water'}: {description}"
+            LOGGER.info("%s", line)
+        self._logged_peak = peak if peak is not None else self._logged_peak or 0
+        self._logged_events.update(snapshot.events)
+        return line
+
+    def run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self.tick()
+            except Exception as exc:  # noqa: BLE001 - the sampler never takes the broker down
+                LOGGER.warning("memory sample failed type=%s", type(exc).__name__)
+            self._stop.wait(self._interval_s)
+
+    def start(self) -> threading.Thread:
+        thread = threading.Thread(target=self.run, daemon=True)
+        thread.start()
+        return thread
 
 
 def session_slot_limit_from_env() -> int:
@@ -5892,6 +6226,7 @@ class CommandExecutor:
         # Bytes reserved by admitted requests right now; guarded by
         # `_slot_condition` like the slot count, because admission reads both.
         self._reserved_bytes = 0
+        self.child_peaks = ChildPeakTracker()
         # The degenerate case (§2.3) warns once per process, not once per request.
         self._budget_warned = False
         floor = child_memory_budget_floor_bytes(max_output_bytes)
@@ -6584,6 +6919,10 @@ class CommandExecutor:
             stderr=subprocess.PIPE,
             timeout=max(self.timeout_seconds, 120),
         )
+        # The one child reaped outside `execute`, and the first: its tree (a
+        # gcloud, around 100 MiB) would otherwise be credited to the first
+        # brokered command the tracker sees.
+        self.child_peaks.record_after_reap(CHILD_PEAK_TOOL_BOOTSTRAP)
         if result.returncode != 0:
             # The command's output is the only useful diagnostic when the
             # bootstrap fails, but it must not travel with the exception, which
@@ -8273,6 +8612,14 @@ class CommandExecutor:
                 timeout=effective_timeout,
                 caller=caller,
             )
+            # The child is reaped; what its tree peaked at is the kernel's to
+            # tell, and the one measurement the flat reserve above cannot make.
+            # argv[0] is the resolved path by now; the label is its name when
+            # the broker serves it, else LABEL_OTHER, as the counters do it.
+            executable = Path(argv[0]).name
+            self.child_peaks.record_after_reap(
+                executable if executable in self.ALLOWED_EXECUTABLES else LABEL_OTHER
+            )
         stdout_text, stdout_cut = _bounded_text(captured.stdout, self.max_output_bytes)
         stderr_text, stderr_cut = _bounded_text(captured.stderr, self.max_output_bytes)
         if captured.timed_out and argv and Path(argv[0]).name == "kubectl":
@@ -8885,6 +9232,9 @@ class ProxyMetrics:
         # The executor's `admission_snapshot`, read at render time; None until
         # serve() wires one, and the gauges are absent until then.
         self._admission_gauges: Callable[[], AdmissionSnapshot] | None = None
+        # The memory reader, read at render time like the gauges; None until
+        # serve() wires one, and the memory series are absent until then.
+        self._memory_reader: Callable[[], MemorySnapshot] | None = None
 
     @staticmethod
     def _observe(
@@ -8938,6 +9288,10 @@ class ProxyMetrics:
     def set_admission_gauges(self, snapshot: Callable[[], AdmissionSnapshot] | None) -> None:
         with self._lock:
             self._admission_gauges = snapshot
+
+    def set_memory_reader(self, reader: Callable[[], MemorySnapshot] | None) -> None:
+        with self._lock:
+            self._memory_reader = reader
 
     def record_tool(self, tool: str, subcommand: str, status: str) -> None:
         key = (tool, subcommand, status)
@@ -9001,8 +9355,10 @@ class ProxyMetrics:
             }
             refusals = sorted(self._refusals.items())
             gauges = self._admission_gauges
+            memory_reader = self._memory_reader
         # The snapshot takes the executor's lock, so it is read outside this one.
         snapshot = gauges() if gauges is not None else None
+        memory = memory_reader() if memory_reader is not None else None
         lines = [
             f"# HELP {TOOL_INVOCATIONS_METRIC} CLI tool executions brokered, by tool, subcommand and outcome.",
             f"# TYPE {TOOL_INVOCATIONS_METRIC} counter",
@@ -9055,6 +9411,35 @@ class ProxyMetrics:
                     f"# TYPE {CHILD_MEMORY_BUDGET_METRIC} gauge",
                     f"{CHILD_MEMORY_BUDGET_METRIC} {snapshot.budget_bytes}",
                 ]
+        if memory is not None:
+            lines += [
+                f"# HELP {CGROUP_MEMORY_METRIC} The proxy container's memory as its cgroup accounts it, in bytes: current usage, its high-water (peak), the limit, and the anonymous (anon) and page-cache (file) parts of the usage.",
+                f"# TYPE {CGROUP_MEMORY_METRIC} gauge",
+            ]
+            for kind, value in sorted(memory.cgroup.items()):
+                lines.append(f'{CGROUP_MEMORY_METRIC}{{{MEMORY_KIND_LABEL}="{_escape_label_value(kind)}"}} {value}')
+            lines += [
+                f"# HELP {CGROUP_MEMORY_EVENTS_METRIC} The container cgroup's memory.events counters: max is the times usage reached the limit, oom_kill the kills.",
+                f"# TYPE {CGROUP_MEMORY_EVENTS_METRIC} counter",
+            ]
+            for event, value in sorted(memory.events.items()):
+                lines.append(f'{CGROUP_MEMORY_EVENTS_METRIC}{{{MEMORY_EVENT_LABEL}="{_escape_label_value(event)}"}} {value}')
+            lines += [
+                f"# HELP {PROCESS_MEMORY_METRIC} The broker's and Envoy's resident set (rss) and its high-water (peak), in bytes.",
+                f"# TYPE {PROCESS_MEMORY_METRIC} gauge",
+            ]
+            for process, fields in sorted(memory.processes.items()):
+                for kind, value in sorted(fields.items()):
+                    lines.append(
+                        f'{PROCESS_MEMORY_METRIC}{{{MEMORY_PROCESS_LABEL}="{_escape_label_value(process)}",'
+                        f'{MEMORY_KIND_LABEL}="{_escape_label_value(kind)}"}} {value}'
+                    )
+            lines += [
+                f"# HELP {CHILD_PEAK_RSS_METRIC} The largest resident set a child process of the broker reached since it started, in bytes, by the tool that set it (bootstrap for the startup command).",
+                f"# TYPE {CHILD_PEAK_RSS_METRIC} gauge",
+            ]
+            for tool, value in sorted(memory.children.items()):
+                lines.append(f'{CHILD_PEAK_RSS_METRIC}{{{MEMORY_TOOL_LABEL}="{_escape_label_value(tool)}"}} {value}')
         lines += [
             f"# HELP {VCS_REQUESTS_METRIC} Version-control requests brokered, by verb, outcome and provider (the forge the request resolved to; {VCS_PROVIDER_NONE} when the route resolved no built forge: every capabilities request, a host this install serves no forge for, and any exit before the resolve).",
             f"# TYPE {VCS_REQUESTS_METRIC} counter",
@@ -11837,6 +12222,9 @@ def serve(args: argparse.Namespace) -> None:
         metrics=CredentialProxyHandler.metrics,
     )
     CredentialProxyHandler.metrics.set_admission_gauges(executor.admission_snapshot)
+    memory_reader = MemoryReader(executor.child_peaks)
+    CredentialProxyHandler.metrics.set_memory_reader(memory_reader.read)
+    MemorySampler(memory_reader).start()
     executor.bootstrap(os.getenv("CREDENTIAL_PROXY_BOOTSTRAP_COMMAND", ""))
     CredentialProxyHandler.executor = executor
     CredentialProxyHandler.session_slots = SessionSlots(session_slot_limit_from_env())
