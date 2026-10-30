@@ -195,7 +195,7 @@ On Google Chat, the agent's answer posts as one formatted text message. Its firs
 
 A link button opens its link. A choice button is your reply: clicking it sends the button's answer as your message in the conversation, checked against the allowed-users list like a typed one. A click from someone the gateway would not answer changes nothing. The question then loses its choice buttons and shows `✓ <your name>: <the button>`, by your Chat display name (or "Someone" when Chat gives none), never an @-mention.
 
-A reply you type in the conversation answers the question the same way, with your reply's first words, unless it is `stop`, a status question or `/session`. A next step an answer offers takes no typed reply, and a question posted to the home channel answers only by its buttons. A question is answered once, by the first click or reply, until the agent asks again on the same message. A button on a message posted before a gateway restart answers the same way.
+A reply you type in the conversation answers the question the same way, with your reply's first words, unless it is a command the gateway reads itself: `stop`, a status question, `/session`, `/feedback` or a `delegate …` request. A next step an answer offers takes no typed reply, and a question posted to the home channel answers only by its buttons. A question is answered once, by the first click or reply, until the agent asks again on the same message. A button on a message posted before a gateway restart answers the same way.
 
 ### Follow-ups while a task runs
 

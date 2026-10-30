@@ -12,15 +12,7 @@ import (
 
 func gchatClickEvent(t *testing.T) *gchatEvent {
 	t.Helper()
-	raw, err := os.ReadFile("testdata/gchat/addon-dm-button-click.json")
-	if err != nil {
-		t.Fatal(err)
-	}
-	ev, err := decodeGchatEvent(base64.StdEncoding.EncodeToString(raw))
-	if err != nil {
-		t.Fatal(err)
-	}
-	return ev
+	return gchatFixtureEvent(t, "addon-dm-button-click.json", nil)
 }
 
 // A button click in the add-on shape decodes to a click event: the clicked
@@ -235,6 +227,15 @@ func TestGchatClickLineIsDefangedAndFallsBack(t *testing.T) {
 	body := post.arguments["body"].(map[string]any)
 	if post.method != "create" || post.arguments["parent"] != "spaces/_c2fixtureAA" || body["thread"] != nil || body["text"] != "✓ Someone: < users/all> now" {
 		t.Errorf("fallback post = %+v", post)
+	}
+	// The line is on record in the conversation, not on the message, so a
+	// later edit of the message without choices does not show it again.
+	f.responses["spaces.messages/patch"] = map[string]any{"name": "spaces/_c2fixtureAA/messages/BOT1.BOT1"}
+	if err := a.EditMessage(msg.Conversation, "spaces/_c2fixtureAA/messages/BOT1.BOT1", OutMessage{Text: "settled"}); err != nil {
+		t.Fatal(err)
+	}
+	if body := f.call(3).arguments["body"].(map[string]any); strings.Contains(body["text"].(string), "✓") {
+		t.Errorf("the answered line shows twice: %q", body["text"])
 	}
 }
 

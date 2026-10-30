@@ -1381,7 +1381,9 @@ keeps the destructive-method denylist and the error-scrubbing in force for the n
 path without new code.
 
 **Two wire shapes, one decoder.** A Chat app publishes one of two event layouts to its
-topic, and which one is a property of how the app was registered, not of the message.
+topic, and which one is a property of how the app was registered, not of the message (with
+one exception measured live: an app that sends messages in the add-on layout sent a button
+click in the legacy one, so the click decoder reads both).
 The Chat-API registration sends `{"type":"MESSAGE","space":…,"message":…}` — the layout
 `tests/e2e/gchat_agent_test.py` forges. An app configured through the Google Workspace
 add-on surface sends the add-on event object: `{"commonEventObject":…,"chat":{"user":…,
@@ -1711,9 +1713,12 @@ without a chat message replaces the layout, the widgets patched empty. A `mark` 
 nothing: Chat's reaction API takes user credentials, and the relay holds the app's.
 
 A click on a choice button arrives on the same subscription as a message, as a
-`CARD_CLICKED` interaction in the add-on shape (`chat.buttonClickedPayload` with the clicked
-message and its space, `chat.user` the clicker, `commonEventObject` the button's function
-and parameters). The adapter turns it into a text turn from the clicker whose text is the
+`CARD_CLICKED` interaction, in either wire layout: the add-on one (`chat.buttonClickedPayload`
+with the clicked message and its space, `chat.user` the clicker, `commonEventObject` the
+button's function and parameters) or the legacy one (`message`, `user`, `space`, `action` and
+`common` at the top level), which is the layout the one install measured so far delivers
+clicks in while its messages arrive in the add-on layout; both are read the same.
+The adapter turns it into a text turn from the clicker whose text is the
 choice's reply, bound to the conversation the clicked message sits in by the rule a message
 takes, marked as a click, and handed over like a typed message, so the allowlist decides.
 Once the gateway says the clicker is verified it rewrites the clicked message, off the inbox

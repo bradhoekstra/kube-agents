@@ -1198,10 +1198,14 @@ func TestGchatOpenDirectUsesTheLearnedIDForAKnownEmail(t *testing.T) {
 }
 
 // realGchatFixture loads one captured payload from testdata/gchat and
-// base64-encodes it the way the relay hands events over. Every file there
-// is real traffic from the Chat app in bnaylor-kagents-dev (2026-09-09),
-// scrubbed only of identity fields and the one-time redirect token; field
-// set, key order and every other byte are as Chat published them.
+// base64-encodes it the way the relay hands events over. The addon-dm-*.json
+// files are real traffic from the Chat app in bnaylor-kagents-dev
+// (2026-09-09), and legacy-dm-button-click.json from the one in
+// bhoekstra-gkedemos (2026-10-30), scrubbed only of identity fields and the
+// one-time redirect token; field set, key order and every other byte are as
+// Chat published them. addon-dm-button-click.json is the exception: a click
+// composed in the add-on layout from Google's documented shape, since the
+// measured app delivers clicks in the legacy layout.
 func realGchatFixture(t *testing.T, name string) (raw []byte, b64 string) {
 	t.Helper()
 	raw, err := os.ReadFile(filepath.Join("testdata", "gchat", name))

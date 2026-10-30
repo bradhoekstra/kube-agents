@@ -12,10 +12,14 @@ import (
 
 // Clicks on Google Chat. A click on a choice button the renderer drew
 // (gchat_chat.go) arrives as a CARD_CLICKED interaction on the same Pub/Sub
-// subscription as a message, in the add-on event shape:
+// subscription as a message, in either wire layout: the add-on one, where
 // chat.buttonClickedPayload names the message the button is on and its
 // space, chat.user the clicker, and commonEventObject the function and
-// parameters the button carried. The adapter turns it into a text turn from
+// parameters the button carried; or the legacy one, with message, user,
+// space, action and common at the top level, which is how the one install
+// measured so far delivers clicks while its messages arrive in the add-on
+// layout (decodeGchatLegacyClick). Both are read the same. The adapter turns
+// the click into a text turn from
 // the clicker, as the Slack adapter does (slack_interactive.go): its text is
 // the choice's reply, handed to the gateway like a typed message, so it
 // passes the allowlist like one and carries no intent of its own. Once the
@@ -376,7 +380,6 @@ func (a *GoogleChatAdapter) InboundVerified(conversation, messageID string, veri
 	}
 	ux.answered[p.message] = true
 	line := defangGchatControls(fmt.Sprintf(answeredLine, p.clicker, p.label))
-	ux.lines[p.message] = line
 	remember(&ux.answeredRing, p.message, func(k string) { delete(ux.answered, k); delete(ux.lines, k) })
 	ux.dropQuestionLocked(p.message)
 	forget(&ux.questionsOrder, p.message)
@@ -396,6 +399,14 @@ func (a *GoogleChatAdapter) rewriteAnswered(conversation, messageID string, layo
 	}
 	err := a.apiCall([]string{"spaces", "messages"}, "patch", arguments, nil)
 	if err == nil {
+		// Only once it is on the message: a later edit keeps the line it
+		// shows (answeredLayout), and one posted in the conversation
+		// instead, below, must not show twice.
+		a.mu.Lock()
+		if ux := a.uxLocked(); ux.answered[messageID] {
+			ux.lines[messageID] = line
+		}
+		a.mu.Unlock()
 		return
 	}
 	a.log.Warn("gchat: rewriting an answered question failed; posting the answer in its conversation", "message", messageID, "err", err)
