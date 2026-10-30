@@ -88,6 +88,17 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.serviceAccountName
+            # This container's memory limit in bytes, which the manager turns
+            # into the Go runtime's soft memory limit (nine tenths of it; a
+            # GOMEMLIMIT set through operator.extraEnv wins). Read from the
+            # container itself so it follows operator.resources.limits.memory,
+            # and on Autopilot the limit the cluster admitted rather than the
+            # one written here. With no limit set the Downward API reports the
+            # node's allocatable memory, and the soft limit is a share of that.
+            - name: OPERATOR_MEMORY_LIMIT_BYTES
+              valueFrom:
+                resourceFieldRef:
+                  resource: limits.memory
             {{- if include "kube-agents.a2aGatewayPodPolicyEnabled" . }}
             # The chart rendered the A2A gateway's pod admission policy
             # (templates/a2a-gateway-pod-admission-policy.yaml), from the same helper:

@@ -75,6 +75,15 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.serviceAccountName
+            # This container's memory limit in bytes, which the manager turns
+            # into the Go runtime's soft memory limit (nine tenths of it; an
+            # explicit GOMEMLIMIT wins). Read from the container itself so it
+            # follows the limit below, and on Autopilot the limit the cluster
+            # admitted rather than the one written here.
+            - name: OPERATOR_MEMORY_LIMIT_BYTES
+              valueFrom:
+                resourceFieldRef:
+                  resource: limits.memory
             # Private-registry installs: uncomment (or patch via kustomize) to
             # point the images the operator deploys at your own registry.
             # OPERATOR_IMAGE is this container's own image; the A2A next-stack
