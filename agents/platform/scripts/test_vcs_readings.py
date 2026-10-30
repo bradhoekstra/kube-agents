@@ -1188,6 +1188,31 @@ class TallyAndUnsupportedTest(unittest.TestCase):
         self.assertEqual([], harness.metrics.readings)
 
 
+class MalformedListingTest(unittest.TestCase):
+    def test_a_listed_proposal_with_no_number_fails_that_repository_and_not_the_sweep(self):
+        # One such item used to raise out of `run_once` before any failure was
+        # counted; it is a forge failure of that repository, and the other
+        # repositories are still attempted.
+        broken = FakeForge()
+        broken.add(1, "merged")
+        listed = broken.proposal_list_by_author
+
+        def nulled(api, repo, payload):
+            answer = listed(api, repo, payload)
+            for item in answer["proposals"]:
+                item["number"] = None
+            return answer
+
+        broken.proposal_list_by_author = nulled
+        other = FakeForge()
+        other.add(2, "merged")
+        harness = Harness({REPO: broken, OTHER_REPO: other}, interval=WIDE)
+        harness.sweep.run_once()
+        self.assertEqual(["forge"], harness.metrics.failures)
+        self.assertEqual([], harness.metrics.readings, "all or nothing: the sum is withheld")
+        self.assertIn("list", other.calls, "the other repository was still attempted")
+
+
 class TallyWithOpenTest(unittest.TestCase):
     def test_open_is_the_remainder_of_the_one_count(self):
         self.assertEqual({"merged": 5, "closed": 1, "total": 8, "open": 2}, providers.tally_with_open({"merged": 5, "closed": 1, "total": 8}))

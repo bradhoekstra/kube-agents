@@ -263,6 +263,10 @@ class _ShortListing(Exception):
     """A complete-looking listing held fewer proposals than the forge counted."""
 
 
+class _MalformedListing(Exception):
+    """A listed proposal carried no usable number, so the listing cannot be read whole."""
+
+
 @dataclass
 class _Repository:
     """One managed repository bound for one sweep."""
@@ -431,6 +435,9 @@ class ReadingsSweep:
         except _ShortListing:
             LOGGER.warning("proposal readings: %s listed fewer proposals than the forge counted", key)
             return _Attempt(reasons=[REASON_FORGE])
+        except _MalformedListing:
+            LOGGER.warning("proposal readings: %s listed a proposal with no usable number", key)
+            return _Attempt(reasons=[REASON_FORGE])
         except Exception as exc:  # noqa: BLE001 -- one repository never ends the sweep
             return self._failed(key, exc, _Attempt())
         attempt = _Attempt(reasons=[REASON_TRUNCATED] if truncated else [])
@@ -443,8 +450,9 @@ class ReadingsSweep:
                 self._failed(key, exc, attempt)
         else:
             attempt.counts = Counter(p.get("state") for p in proposals if p.get("state") in STATES)
-            self._evict_missing(key, proposals)
         try:
+            if not truncated:
+                self._evict_missing(key, proposals)
             if not self._warm(key, proposals):
                 attempt.reasons.append(REASON_WARMING)
                 return attempt
@@ -610,6 +618,8 @@ class ReadingsSweep:
             for item in batch:
                 if _login_key(str(item.get("author") or "")) != install:
                     raise _ForeignAuthor()
+                if not isinstance(item.get("number"), int) or isinstance(item.get("number"), bool):
+                    raise _MalformedListing()
                 if item.get("number") not in seen:
                     seen.add(item.get("number"))
                     read.append(item)

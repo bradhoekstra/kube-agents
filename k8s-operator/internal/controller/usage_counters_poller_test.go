@@ -1722,6 +1722,29 @@ func TestUsagePoller_ReadingsClearPerReading(t *testing.T) {
 	}
 }
 
+// A read in between resets a reading's miss streak: miss, read, miss keeps
+// the fields, where two misses in a row would clear them.
+func TestUsagePoller_AReadInBetweenResetsTheMissStreak(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	h := newUsageHarness(t, usageTestAgent(created), usageDefaultObjects(created)...)
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.stub.set(brokerAddr(), 0, ptr.To(200.0))
+	h.stub.setReadings(brokerAddr(), usageTestReadings(1), usageReadingOutcomes, usageReadingDetails)
+	h.poll(5)
+	h.stub.setReadings(brokerAddr(), usageTestReadings(2), usageReadingOutcomes)
+	h.poll(10)
+	h.stub.setReadings(brokerAddr(), usageTestReadings(3), usageReadingOutcomes, usageReadingDetails)
+	h.poll(15)
+	h.stub.setReadings(brokerAddr(), usageTestReadings(4), usageReadingOutcomes)
+	h.poll(20)
+	status := h.status()
+	for _, field := range []string{usageExportRemediationsClosedUnmerged, usageExportProposalHumanTouches, usageExportProposalsMergedUntouched} {
+		if got := usageReadingValue(status, field); got != usageTestReadings(3)[field] {
+			t.Errorf("miss, read, miss: %s = %d, want it kept at the read's %d", field, got, usageTestReadings(3)[field])
+		}
+	}
+}
+
 // A reading is the forge's count as it stands, not an accumulation: a fall,
 // a repository leaving the managed list, is projected as the fall.
 func TestUsagePoller_AReadingThatFallsIsProjectedAsItStands(t *testing.T) {

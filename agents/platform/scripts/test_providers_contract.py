@@ -769,15 +769,17 @@ class ContractTest(unittest.TestCase):
                     size, number = params["per_page"], int(params.get("page", 1))
                     return rows[(number - 1) * size : number * size]
 
-            for limit, page in ((MAX_PAGE_SIZE, 1), (MAX_PAGE_SIZE, 3), (30, 1), (30, 4), (60, 4)):
+            for limit, page in ((MAX_PAGE_SIZE, 1), (MAX_PAGE_SIZE, 3), (30, 1), (30, 4), (30, 9), (60, 4)):
                 with self.subTest(limit=limit, page=page):
                     api = Pager()
                     answer = forge.proposal_commits(api, "acme/infra", {"number": 4321, "limit": limit, "page": page})
                     expected = {"per_page": limit} if page == 1 else {"per_page": limit, "page": page}
                     self.assertEqual([expected], api.calls)
                     self.assertEqual(rows[(page - 1) * limit]["sha"], answer["commits"][0]["sha"])
-                    # The page that straddles the cap holds what GitHub serves up to it.
+                    # The page that straddles the cap holds what GitHub serves up to it,
+                    # and says `truncated` though it is short: (100, 3) and (30, 9).
                     self.assertEqual(min(limit, cap - (page - 1) * limit), answer["count"])
+                    self.assertTrue(answer["truncated"], "a full page, or the page that reaches the cap")
 
     def test_github_proposal_commits_pages_to_the_cap_and_reports_truncated(self):
         for name, forge, directory in self.instances():

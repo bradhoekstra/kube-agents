@@ -2938,16 +2938,16 @@ class CollaborationTest(unittest.TestCase):
     def test_a_listing_asks_for_the_page_it_was_given(self):
         """The two listings a caller reads to the end take a page; the first is implicit.
 
-        A proposal's commits are read in full pages from the first, up to the
-        250 GitHub serves, and the caller's page is cut from them: a caller's
-        third page of thirty is inside GitHub's first page of a hundred.
+        A proposal's commits are one call at the caller's own page size, up to
+        the 250 GitHub serves: a caller's third page of thirty is GitHub's
+        third page of thirty.
         """
         broker, recorder = self.broker([])
         broker.proposal_commits({"repository": "acme/infra", "number": 9})
         self.assertNotIn("&page=", recorder.path)
         broker, recorder = self.broker([])
         broker.proposal_commits({"repository": "acme/infra", "number": 9, "page": 3})
-        self.assertEqual(["repos/acme/infra/pulls/9/commits?per_page=100"], [c[4] for c in recorder.calls])
+        self.assertEqual(["repos/acme/infra/pulls/9/commits?per_page=30&page=3"], [c[4] for c in recorder.calls])
         broker, recorder = self.broker([])
         broker.proposal_list({"repository": "acme/infra", "page": 2})
         self.assertIn("&page=2", recorder.path)

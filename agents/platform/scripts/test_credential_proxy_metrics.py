@@ -1268,6 +1268,26 @@ class ReadingsMetricTest(_BrokerFixture):
         self.assertEqual(6, _series(families, "kubeagents_vcs_proposals", state="merged"))
         self.assertEqual(1, _series(families, "kubeagents_vcs_proposals_ignored"), "a withheld details reading was dropped")
 
+    def test_a_withheld_outcomes_reading_keeps_the_previous_one(self):
+        # The other half of the rule: a sweep whose tally failed publishes the
+        # details alone, and the last outcomes reading stays served until it
+        # is an hour old, not blanked at once.
+        metrics = CredentialProxyHandler.metrics
+        metrics.set_readings(self.outcomes(), self.details())
+        metrics.set_readings(None, self.details())
+        families = self.families()
+        self.assertEqual(5, _series(families, "kubeagents_vcs_proposals", state="merged"))
+        self.assertIsNotNone(_series(families, "kubeagents_vcs_readings_age_seconds", reading="outcomes"))
+
+    def test_an_unknown_failure_reason_is_counted_as_other(self):
+        metrics = CredentialProxyHandler.metrics
+        metrics.record_reading_failure("a-reason-nobody-declared")
+        families = self.families()
+        self.assertEqual(1, _series(families, "kubeagents_vcs_readings_failures_total", reason="other"))
+        labels = {dict(key).get("reason") for key in families["kubeagents_vcs_readings_failures_total"]}
+        self.assertIn("other", labels)
+        self.assertNotIn("a-reason-nobody-declared", labels, "an undeclared reason must never become a label")
+
     def test_only_the_reading_taken_is_rendered(self):
         CredentialProxyHandler.metrics.set_readings(self.outcomes(), None)
         families = self.families()
