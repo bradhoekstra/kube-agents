@@ -176,14 +176,19 @@ exit {later_exit}
         self.assertIn("Nothing to tear down", proc.stdout)
 
     def test_a_failure_that_persists_is_fatal_after_the_last_attempt(self):
-        proc, calls, summary = self._run(uninstall_exit=1)
+        proc, calls, summary = self._run(uninstall_exit=1, uninstall_stdout="destroy blew up here")
         self.assertEqual(proc.returncode, 1, proc.stdout)
         self.assertEqual(len(calls), 2, calls)
         self.assertIn("still running (exit 1)", summary)
         # The summary is rendered from the teed log, which holds both runs: the
         # second appended behind a marker line, the first not overwritten.
-        self.assertIn("--- uninstall.sh run 2 of 2 ---", summary)
-        self.assertLess(summary.index("exit 1"), summary.index("--- uninstall.sh run 2 of 2 ---"), summary)
+        marker = "--- uninstall.sh run 2 of 2 ---"
+        self.assertIn(marker, summary)
+        # Both runs' own output is in the summary, the first before the marker
+        # and the second after it; an overwrite would leave one copy, after it.
+        self.assertEqual(2, summary.count("destroy blew up here"), summary)
+        self.assertLess(summary.index("destroy blew up here"), summary.index(marker), summary)
+        self.assertGreater(summary.rindex("destroy blew up here"), summary.index(marker), summary)
 
     def test_the_attempt_count_is_an_override(self):
         proc, calls, _ = self._run(
@@ -200,9 +205,9 @@ exit {later_exit}
                 self.assertEqual(len(calls), 1, calls)
 
     def test_a_retry_knob_that_is_not_a_plain_decimal_is_refused(self):
-        """Refused before uninstall.sh runs, as provision_environment.sh does
-        for its stockout knobs: a word or a leading zero breaks the loop's
-        arithmetic."""
+        """Refused before uninstall.sh runs, by the check provision_environment.sh
+        shares: a word breaks the attempt comparison, and a leading zero is
+        refused so every knob of the pipeline reads one way."""
         for name, value in (
             ("TEARDOWN_ATTEMPTS", "two"),
             ("TEARDOWN_ATTEMPTS", "0"),

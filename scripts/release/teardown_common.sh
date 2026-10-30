@@ -112,7 +112,6 @@ teardown_require_plain_decimal() {
 # Assigns to a global rather than echoing, because a caller would have to write
 # `x="$(...)"` to read an echo and command substitution is a subshell: the
 # abort would kill the subshell, `x` would be empty, and the script would carry
-
 # on to tear down a target it could not name.
 teardown_require_inputs() {
   # shellcheck disable=SC2034  # read by the sourcing script, not by this file
