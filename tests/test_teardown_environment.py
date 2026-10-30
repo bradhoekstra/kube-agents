@@ -180,6 +180,10 @@ exit {later_exit}
         self.assertEqual(proc.returncode, 1, proc.stdout)
         self.assertEqual(len(calls), 2, calls)
         self.assertIn("still running (exit 1)", summary)
+        # The summary is rendered from the teed log, which holds both runs: the
+        # second appended behind a marker line, the first not overwritten.
+        self.assertIn("--- uninstall.sh run 2 of 2 ---", summary)
+        self.assertLess(summary.index("exit 1"), summary.index("--- uninstall.sh run 2 of 2 ---"), summary)
 
     def test_the_attempt_count_is_an_override(self):
         proc, calls, _ = self._run(

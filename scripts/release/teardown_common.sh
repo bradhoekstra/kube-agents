@@ -23,10 +23,10 @@
 # Both knobs are environment overrides so a test runs with no wait; the job
 # timeouts in deploy-environment.yml and teardown-environment.yml hold the
 # extra attempt.
-TEARDOWN_DEFAULT_ATTEMPTS=2
-TEARDOWN_DEFAULT_RETRY_WAIT_SECONDS=60
+readonly TEARDOWN_DEFAULT_ATTEMPTS=2
+readonly TEARDOWN_DEFAULT_RETRY_WAIT_SECONDS=60
 # uninstall.sh's EXIT_NOTHING_TO_TEAR_DOWN: no state, so nothing to retry.
-TEARDOWN_EXIT_NOTHING_TO_TEAR_DOWN=3
+readonly TEARDOWN_EXIT_NOTHING_TO_TEAR_DOWN=3
 
 # TEARDOWN_STRICT is the name, and both `rc` and `nightly` define it, so that is
 # what deploy-environment.yml forwards and what CI reads. RC_TEARDOWN_STRICT is
@@ -86,13 +86,6 @@ canonical_bool() {
 }
 
 
-# Expands the three coordinates into TEARDOWN_TARGET so that a `set -u`
-# abort on a missing one happens at the top of a script, before it has created
-# a temp file or reached GCP.
-#
-# Assigns to a global rather than echoing, because a caller would have to write
-# `x="$(...)"` to read an echo and command substitution is a subshell: the
-# abort would kill the subshell, `x` would be empty, and the script would carry
 # Refuses, with a GitHub Actions error, any named variable that is not a plain
 # decimal: a word makes a `[ -ge ]` comparison exit 2, which an if reads as
 # false; a value past six digits is "not an integer" to `[`; and a leading
@@ -111,6 +104,14 @@ teardown_require_plain_decimal() {
     esac
   done
 }
+
+# Expands the three coordinates into TEARDOWN_TARGET so that a `set -u`
+# abort on a missing one happens at the top of a script, before it has created
+# a temp file or reached GCP.
+#
+# Assigns to a global rather than echoing, because a caller would have to write
+# `x="$(...)"` to read an echo and command substitution is a subshell: the
+# abort would kill the subshell, `x` would be empty, and the script would carry
 
 # on to tear down a target it could not name.
 teardown_require_inputs() {
@@ -133,7 +134,8 @@ teardown_require_inputs() {
 # Runs uninstall.sh against the resolved coordinates, teeing its output to $1, and
 # returns uninstall.sh's own status. A failure is run again, up to
 # TEARDOWN_ATTEMPTS runs in all with TEARDOWN_RETRY_WAIT_SECONDS between them
-# (see the top of this file); $1 then holds the last run's output.
+# (see the top of this file); $1 then holds every run's output, each after the
+# first behind a marker line.
 #
 # Call it as `teardown_run "$log" || status=$?`. The arguments are expanded
 # in this function body rather than inside the pipeline because a function runs
@@ -160,8 +162,11 @@ teardown_run() {
     # of uninstall.sh. tee always succeeds, so a bare `$?` would report every
     # teardown as clean.
     # The first run truncates the log and a later one appends behind a
-    # marker line, so the job summary shows every run, not only the last,
-    # and a first run that ended without a newline does not join the second.
+    # marker line, so the log holds every run and a first run that ended
+    # without a newline does not join the second. The job summary renders
+    # the log's last 40 lines, so after two long failures it shows the
+    # second run's tail; the first run's exit status is in the warning
+    # annotation below, and its output in the job log.
     set +e
     if [ "$attempt" -eq 1 ]; then
       ./uninstall.sh "${args[@]}" 2>&1 | tee "${log_file}"
