@@ -239,12 +239,23 @@ operator:
   # (OPERATOR_MEMORY_LIMIT_BYTES) and sets its Go soft memory limit to nine
   # tenths of it, so raising this is the one change. A GOMEMLIMIT set through
   # operator.extraEnv takes precedence.
+  #
+  # requests.cpu is 50m rather than the 10m the manager needs because GKE
+  # Autopilot admits a pod unchanged only at 50m or more per pod and between
+  # 1 and 6.5 GiB of memory per vCPU on the requests pair, and raises the
+  # smaller request into that band: 10m beside 128Mi is 12.8 GiB per vCPU,
+  # so Autopilot wrote 50m onto the pod and the quota preflight, which sums
+  # this line, had counted 10m. Declared on the floor, the manifest is the
+  # pod the cluster admits on both Standard and Autopilot. Autopilot without
+  # bursting also sets the limits equal to the requests, so there the
+  # manager runs under a 128Mi limit, the soft limit follows it, and a
+  # larger cluster raises requests.memory with limits.memory.
   resources:
     limits:
       cpu: 500m
       memory: 512Mi
     requests:
-      cpu: 10m
+      cpu: 50m
       memory: 128Mi
 
 telemetry:

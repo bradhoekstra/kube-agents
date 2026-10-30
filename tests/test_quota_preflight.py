@@ -66,7 +66,7 @@ data:
 # are the same numbers the install prerequisites table quotes, so a change that moves one
 # without updating the other fails here.
 _DEFAULT_PODS = 7
-_DEFAULT_REQUESTS_CPU_MILLIS = 2466
+_DEFAULT_REQUESTS_CPU_MILLIS = 2506
 _DEFAULT_LIMITS_CPU_MILLIS = 10200
 # Memory and ephemeral storage are summed by the same helper as CPU but were asserted
 # nowhere, so a generator that stopped parsing them could be regenerated and committed
@@ -100,8 +100,8 @@ _HA_REPLICAS = 2
 # The largest pod that rolls with a surge Pod at defaults: LiteLLM, at a 100m CPU request.
 # The agent pod is larger but rolls with Recreate at the default single replica.
 _LARGEST_SURGING_REQUEST_MILLIS = 100
-# The operator's own request.
-_OPERATOR_REQUEST_MILLIS = 10
+# The operator's own request: the smallest GKE Autopilot admits unchanged beside 128Mi.
+_OPERATOR_REQUEST_MILLIS = 50
 # Two operator-rendered claims plus two from the shell StatefulSet's volumeClaimTemplates.
 _OPERATOR_PVC_COUNT = 4
 _OPERATOR_STORAGE_BYTES = 102 * 1024**3
@@ -1196,7 +1196,8 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small cpu shorthand quota must fail")
         self.assertIn("  - cpu:", res.stderr)
-        self.assertIn('"cpu":"2566m"', res.stderr)
+        # The release's 2506m plus one LiteLLM surge Pod's 100m.
+        self.assertIn('"cpu":"2606m"', res.stderr)
 
     def test_shorthand_memory_spelling_is_enforced(self) -> None:
         """`memory` is the shorthand spelling for `requests.memory` and must be checked."""
