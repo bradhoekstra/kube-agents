@@ -227,6 +227,14 @@ operator:
   # Sized from a measurement rather than the Kubebuilder scaffold it replaces:
   # on a 3-node install the store holds 675 objects in 3.7 MiB of live heap,
   # in a process of 22 MiB RSS. Kept in step with k8s-operator/config/manager.
+  #
+  # limits.memory has a floor at this default (kube-agents.operatorMemoryFloorBytes
+  # in templates/_helpers.tpl): the chart fails the render on a smaller limit,
+  # naming the key. Releases up to 0.16.0 shipped the scaffold's 128Mi, and
+  # `helm upgrade --reuse-values` renders a new chart against the old release's
+  # values, defaults included, so an install upgraded that way kept 128Mi and
+  # the manager was OOM-killed as the cache filled. upgrade.sh resets the values
+  # first and never meets the floor. Raise the limit for a larger cluster.
   resources:
     limits:
       cpu: 500m

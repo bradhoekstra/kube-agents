@@ -185,6 +185,12 @@ spec:
               port: 8081
             initialDelaySeconds: 5
             periodSeconds: 10
+          {{- /* Fails the render on a memory limit under
+                 kube-agents.operatorMemoryFloorBytes: a `helm upgrade
+                 --reuse-values` from a release up to 0.16.0 otherwise keeps
+                 that release's 128Mi, and the manager is OOM-killed as its
+                 cache fills. */}}
+          {{- include "kube-agents.operatorResourcesCheck" . }}
           resources:
             {{- toYaml .Values.operator.resources | nindent 12 }}
           volumeMounts:

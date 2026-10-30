@@ -1013,6 +1013,54 @@ tests/test_chart_operator_monitoring.py holds them together.
 {{- end }}
 
 {{/*
+The smallest memory limit the chart renders for the manager, and the check that
+holds operator.resources.limits.memory to it. The floor is the default, 512Mi,
+which values.yaml sizes from a measurement of the manager's cache; the value
+exists to be raised for a larger cluster, never lowered. Releases up to 0.16.0
+shipped the Kubebuilder scaffold's 128Mi limit and 64Mi request, and
+`helm upgrade --reuse-values` renders this chart against that release's values
+rather than this chart's defaults, so an install upgraded that way kept the
+128Mi the sizing replaced and nothing said so. The check fails the render
+instead, naming the key and the way out. A missing limits.memory is left alone:
+it is no limit at all, not a small one. tests/test_chart_operator_resources.py
+holds the floor to the default and pins the message.
+*/}}
+{{- define "kube-agents.operatorMemoryFloorBytes" -}}
+536870912
+{{- end }}
+
+{{- define "kube-agents.operatorResourcesCheck" -}}
+{{- $prefix := "operator.resources" -}}
+{{- $floor := include "kube-agents.operatorMemoryFloorBytes" . | int64 -}}
+{{- $floorMi := div $floor 1048576 -}}
+{{- $resources := .Values.operator.resources | default dict -}}
+{{- if not (kindIs "map" $resources) -}}
+{{- fail (printf "%s is %v, which is not a map of requests and limits, for example `limits: {memory: %dMi}`" $prefix $resources $floorMi) -}}
+{{- end -}}
+{{- $limits := (index $resources "limits") | default dict -}}
+{{- if not (kindIs "map" $limits) -}}
+{{- fail (printf "%s.limits is %v, which is not a map of resource name to quantity, for example `limits: {memory: %dMi}`" $prefix $limits $floorMi) -}}
+{{- end -}}
+{{- $quantity := index $limits "memory" -}}
+{{- if not (or (kindIs "invalid" $quantity) (and (kindIs "string" $quantity) (eq $quantity ""))) -}}
+{{- $raw := toString $quantity | trim -}}
+{{- $key := printf "%s.limits.memory" $prefix -}}
+{{- /* The grammar kube-agents.containerResourcesCheck admits, so quantityExact
+       scales a value it can read rather than answering zero for one it cannot. */ -}}
+{{- $quantityPattern := "^(([0-9]+(\\.[0-9]*)?)|(\\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE][-+]?[0-9]+))?$" -}}
+{{- if hasPrefix "-" $raw -}}
+{{- fail (printf "%s is %s; a quantity must not be negative" $key $raw) -}}
+{{- end -}}
+{{- if not (regexMatch $quantityPattern (trimPrefix "+" $raw)) -}}
+{{- fail (printf "%s is %q, which is not a Kubernetes quantity (a number with an optional suffix: Ki, Mi, Gi, Ti, Pi, Ei, n, u, m, k, M, G, T, P, E, or an integer exponent such as e3)" $key $raw) -}}
+{{- end -}}
+{{- if lt (include "kube-agents.quantityExact" (dict "raw" $raw "cpu" false "key" $key) | float64) (float64 $floor) -}}
+{{- fail (printf "%s is %s, under the %dMi floor the manager's cache is sized for; below it the manager is OOM-killed as the cache fills. Releases up to 0.16.0 shipped 128Mi, and `helm upgrade --reuse-values` keeps that release's defaults: upgrade with upgrade.sh or `--reset-then-reuse-values`, set at least %dMi, or omit the key for the default" $key $raw $floorMi $floorMi) -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 topologySpreadConstraints for a multi-replica workload this chart owns.
 
 Renders nothing below two replicas, so the operator gets the field only if
