@@ -1709,7 +1709,10 @@ class CompletionTextTest(unittest.TestCase):
             self.assertFalse(chat_ux_on("google_chat"), "the flag governs Google Chat as it governs Slack")
 
     def test_a_platform_no_presenter_reads_gets_no_step_line(self):
-        # The [next: ...] line is plumbing: Google Chat, and Slack with the flag off, show the report alone.
+        # The [next: ...] line is plumbing: Google Chat under today, and Slack with the flag off, show the report alone.
+        unserved = mock.patch.dict(os.environ, {"A2A_NOTIFY_PLATFORM": "", "A2A_NOTIFY_CONVERSATIONS": ""})
+        unserved.start()
+        self.addCleanup(unserved.stop)
         stepped = HANDOFF + "\n\n[next: check seeded-a]"
         # In the image slack_moments sits beside the gateway; here the scripts directory stands in.
         scripts = mock.patch.object(sys, "path", [str(Path(__file__).resolve().parents[3] / "agents" / "platform" / "scripts"), *sys.path])

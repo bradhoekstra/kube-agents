@@ -1639,8 +1639,8 @@ card filed under `today` in a DM or another channel and delivered after the swit
 refused rather than reported into home; a Slack subscription with no channel is not sent. Slack
 lays out a home-channel request's `chat` message as it lays out a conversation's (the fleet
 audit's report card, `a2a notify --chat-file`): one that breaks a rule, or that Slack refuses,
-is dropped and its `text` posted, and the request's `update` and `mark` are not read. Chat posts
-the `text`. Slack also takes Block Kit: a request may carry `blocks`, a JSON array posted as one message with
+is dropped and its `text` posted, and the request's `update` and `mark` are not read. Google Chat
+under `next` lays a home-channel `chat` message out the same way ("Chat messages on Google Chat"). Slack also takes Block Kit: a request may carry `blocks`, a JSON array posted as one message with
 `text` as its notification and fallback (`a2a notify --blocks-file`). A backend without blocks, Chat today, refuses such a request
 rather than dropping them, and Slack's own refusal (`invalid_blocks`) comes back as the
 `error`, so the caller falls back to text. Blocks cannot be escaped the way text is, so the
