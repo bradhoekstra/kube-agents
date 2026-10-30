@@ -1256,3 +1256,42 @@ func TestFoldUsage_ThreeReplicasResetAgainstTheLatestMarker(t *testing.T) {
 		})
 	}
 }
+
+func TestMigrateUsageDocument_FlagsNameTheMigrationApplied(t *testing.T) {
+	floors := map[string]int64{}
+	for _, counter := range usageCounters {
+		floors[counter] = 0
+	}
+	complete := func() *usageDocument {
+		doc := &usageDocument{Version: usageDocumentVersion, Pods: map[string]*usagePodEntry{}, Totals: map[string]int64{}}
+		for _, counter := range usageCounters {
+			doc.Totals[counter] = 1
+		}
+		return doc
+	}
+	t.Run("a document that only carries the retired counters is retired and nothing is added", func(t *testing.T) {
+		doc := complete()
+		for _, counter := range usageRetiredCounters {
+			doc.Totals[counter] = 3
+		}
+		migrateUsageDocument(doc, floors)
+		if !doc.retired || doc.added || doc.rekeyed || !doc.migrated {
+			t.Errorf("retired=%v added=%v rekeyed=%v migrated=%v, want retired only", doc.retired, doc.added, doc.rekeyed, doc.migrated)
+		}
+	})
+	t.Run("a document missing a counter has it added", func(t *testing.T) {
+		doc := complete()
+		delete(doc.Totals, usageCounters[0])
+		migrateUsageDocument(doc, floors)
+		if !doc.added || doc.retired || !doc.migrated {
+			t.Errorf("added=%v retired=%v migrated=%v, want added only", doc.added, doc.retired, doc.migrated)
+		}
+	})
+	t.Run("a complete current document is none of them", func(t *testing.T) {
+		doc := complete()
+		migrateUsageDocument(doc, floors)
+		if doc.added || doc.retired || doc.rekeyed || doc.migrated {
+			t.Errorf("added=%v retired=%v rekeyed=%v migrated=%v, want none", doc.added, doc.retired, doc.rekeyed, doc.migrated)
+		}
+	})
+}

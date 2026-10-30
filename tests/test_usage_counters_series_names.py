@@ -86,6 +86,27 @@ class UsageCountersSeriesNamesTest(unittest.TestCase):
             with self.subTest(series=python):
                 self.assertEqual(_py_const(python, _READINGS_PY), _go_const(_SCRAPE_GO, go))
 
+    def test_the_reading_labels_the_poller_filters_on_are_the_brokers(self):
+        """The fold selects samples by label key and value; a rename on either
+        side would drop a field from the readings with every suite green."""
+        for python, path, go in (
+            ("VCS_READINGS_STATE_LABEL", _BROKER_PY, "vcsReadingsStateLabel"),
+            ("VCS_READINGS_ACTOR_LABEL", _BROKER_PY, "vcsReadingsActorLabel"),
+            ("VCS_READINGS_OUTCOME_LABEL", _BROKER_PY, "vcsReadingsOutcomeLabel"),
+            ("VCS_READINGS_LE_LABEL", _BROKER_PY, "vcsReadingsLeLabel"),
+            ("VCS_READINGS_READING_LABEL", _BROKER_PY, "vcsReadingsReadingLabel"),
+            ("STATE_OPEN", _READINGS_PY, "vcsStateOpen"),
+            ("STATE_MERGED", _READINGS_PY, "vcsStateMerged"),
+            ("STATE_CLOSED", _READINGS_PY, "vcsStateClosed"),
+            ("ACTOR_HUMAN", _READINGS_PY, "vcsActorHuman"),
+            ("ACTOR_BOT", _READINGS_PY, "vcsActorBot"),
+            ("STATE_MERGED", _READINGS_PY, "vcsOutcomeMerged"),
+            ("READING_OUTCOMES", _READINGS_PY, "usageReadingOutcomes"),
+            ("READING_DETAILS", _READINGS_PY, "usageReadingDetails"),
+        ):
+            with self.subTest(label=go):
+                self.assertEqual(_py_const(python, path), _go_const(_SCRAPE_GO, go))
+
     def test_the_a2a_gateways_inbound_counter_is_the_chat_counters_other_family(self):
         """On a next-mode install the A2A gateway counts the chat messages it accepts;
         the poller folds that family into chatMessagesInboundTotal beside the plugin's,

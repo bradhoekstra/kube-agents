@@ -235,6 +235,9 @@ type usageDocument struct {
 	// retired says migrateUsageDocument dropped a retired counter's total or
 	// pod entries. Not serialised.
 	retired bool
+	// added is whether a counter this operator keeps was missing from the
+	// document and was added at its status floor.
+	added bool
 	// Unfolded names the counters migrateUsageDocument added to Totals at
 	// zero and no pod has been recorded for since: the status carried nothing
 	// for them and no pod's sample has been folded into them through this
@@ -330,6 +333,7 @@ func migrateUsageDocument(doc *usageDocument, floors map[string]int64) {
 		}
 		doc.Totals[counter] = floors[counter]
 		doc.migrated = true
+		doc.added = true
 		if usageFieldFloor(floors, counter) == 0 && !usageUnfolded(doc, counter) {
 			doc.Unfolded = append(doc.Unfolded, counter)
 		}

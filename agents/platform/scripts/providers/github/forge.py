@@ -658,33 +658,24 @@ class GitHubForge(Forge):
         # proposal instead; `submit_suggestion.stale_tip` says why, and is the
         # one that was bitten.
         #
-        # Read in full pages up to the cap and paged here, as GitLab and Gitea
-        # read theirs, so the page that reaches the cap says `truncated`: a
-        # caller's own page there is short, and judged alone it would read as
-        # the end of a branch GitHub has stopped serving. A page past the cap
-        # is empty and says nothing more, so a caller walking pages stops
-        # there. Read only the full pages the caller's page needs, from the
-        # first that holds its start, so a caller walking pages reads each
-        # full page once; the first page is asked without `page`, as GitHub's
+        # One call at the caller's own page size, as every other listing
+        # verb makes. The page that reaches the cap says `truncated` from
+        # arithmetic alone: its window straddles COMMIT_CAP and GitHub served
+        # exactly up to it, where judged by its length alone a short page would
+        # read as the end of a branch GitHub has stopped serving. A page past
+        # the cap is empty without a call, so a caller walking pages stops
+        # there. The first page is asked without `page`, as GitHub's
         # unqualified route answers it.
         start = (page - 1) * limit
-        wanted = min(page * limit, self.COMMIT_CAP)
-        first = start // MAX_PAGE_SIZE + 1
-        offset = (first - 1) * MAX_PAGE_SIZE
-        path = f"repos/{repo}/pulls/{number}/commits"
-        nodes: list[dict] = []
-        for fetch in range(first, -(-self.COMMIT_CAP // MAX_PAGE_SIZE) + 1):
-            params: dict[str, Any] = {"per_page": MAX_PAGE_SIZE}
-            if fetch > 1:
-                params["page"] = fetch
-            batch = api("GET", path, params=params) or []
-            nodes.extend(batch)
-            if len(batch) < MAX_PAGE_SIZE or offset + len(nodes) >= wanted:
-                break
-        nodes = nodes[: self.COMMIT_CAP - offset]
-        commits = [translate.commit(node) for node in nodes[start - offset : wanted - offset]]
-        answer = listing(commits, limit, "commits")
-        reaches_cap = offset + len(nodes) >= self.COMMIT_CAP and start < self.COMMIT_CAP
+        if start >= self.COMMIT_CAP:
+            return listing([], limit, "commits")
+        params: dict[str, Any] = {"per_page": limit}
+        if page > 1:
+            params["page"] = page
+        nodes = api("GET", f"repos/{repo}/pulls/{number}/commits", params=params) or []
+        nodes = nodes[: self.COMMIT_CAP - start]
+        answer = listing([translate.commit(node) for node in nodes], limit, "commits")
+        reaches_cap = page * limit >= self.COMMIT_CAP and len(nodes) == self.COMMIT_CAP - start
         answer["truncated"] = answer["truncated"] or reaches_cap
         return answer
 

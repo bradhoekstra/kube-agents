@@ -750,47 +750,34 @@ class ContractTest(unittest.TestCase):
                     linked = [c for c in answer["commits"] if c["email"] != INSTALL_COMMIT_EMAIL]
                     self.assertTrue(linked and all(c["bot"] for c in linked))
 
-    def test_github_proposal_commits_reads_each_full_page_once_across_a_walk(self):
-        # A caller walking pages at the sweep's page size reads GitHub's page
-        # 1, then page 2, then page 3: never the pages before its own again.
+    def test_github_proposal_commits_makes_one_call_at_the_callers_page_size(self):
+        # Every caller page is one call at the caller's own size, the default
+        # size included: no full-page read behind it, no re-read of page 1.
         for name, forge, directory in self.instances():
             if name != "github":
                 continue
             row = self.load(directory, "proposal-commits")["responses"][0][0]
             cap = forge.COMMIT_CAP
             rows = [dict(row, sha=f"{index:040x}") for index in range(cap)]
-            pages = {
-                start // MAX_PAGE_SIZE + 1: rows[start : start + MAX_PAGE_SIZE]
-                for start in range(0, cap, MAX_PAGE_SIZE)
-            }
 
-            class Walker:
+            class Pager:
                 def __init__(self):
-                    self.fetched = []
+                    self.calls = []
 
                 def __call__(self, method, path, params=None, **kwargs):
-                    number = int((params or {}).get("page", 1))
-                    self.fetched.append(number)
-                    return pages.get(number, [])
+                    self.calls.append(dict(params or {}))
+                    size, number = params["per_page"], int(params.get("page", 1))
+                    return rows[(number - 1) * size : number * size]
 
-            for page in (1, 2, 3):
-                with self.subTest(page=page):
-                    api = Walker()
-                    answer = forge.proposal_commits(api, "acme/infra", {"number": 4321, "limit": MAX_PAGE_SIZE, "page": page})
-                    self.assertEqual([page], api.fetched)
-                    self.assertEqual(rows[(page - 1) * MAX_PAGE_SIZE]["sha"], answer["commits"][0]["sha"])
-            with self.subTest(page="a window inside one full page"):
-                api = Walker()
-                answer = forge.proposal_commits(api, "acme/infra", {"number": 4321, "limit": 60, "page": 3})
-                self.assertEqual([2], api.fetched)
-                self.assertEqual(rows[120]["sha"], answer["commits"][0]["sha"])
-                self.assertEqual(60, answer["count"])
-            with self.subTest(page="a window straddling two full pages"):
-                api = Walker()
-                answer = forge.proposal_commits(api, "acme/infra", {"number": 4321, "limit": 60, "page": 4})
-                self.assertEqual([2, 3], api.fetched)
-                self.assertEqual(rows[180]["sha"], answer["commits"][0]["sha"])
-                self.assertEqual(60, answer["count"])
+            for limit, page in ((MAX_PAGE_SIZE, 1), (MAX_PAGE_SIZE, 3), (30, 1), (30, 4), (60, 4)):
+                with self.subTest(limit=limit, page=page):
+                    api = Pager()
+                    answer = forge.proposal_commits(api, "acme/infra", {"number": 4321, "limit": limit, "page": page})
+                    expected = {"per_page": limit} if page == 1 else {"per_page": limit, "page": page}
+                    self.assertEqual([expected], api.calls)
+                    self.assertEqual(rows[(page - 1) * limit]["sha"], answer["commits"][0]["sha"])
+                    # The page that straddles the cap holds what GitHub serves up to it.
+                    self.assertEqual(min(limit, cap - (page - 1) * limit), answer["count"])
 
     def test_github_proposal_commits_pages_to_the_cap_and_reports_truncated(self):
         for name, forge, directory in self.instances():
@@ -802,19 +789,26 @@ class ContractTest(unittest.TestCase):
             pages = [rows[start : start + MAX_PAGE_SIZE] for start in range(0, cap, MAX_PAGE_SIZE)]
             limit = 50
             with self.subTest(case="the page that reaches the cap"):
-                # The caller's page starts inside GitHub's last full page
-                # under the cap, which is the one page the forge reads.
+                # GitHub serves exactly up to the cap: a page whose window
+                # straddles it comes back that long and says `truncated`.
                 answer, api = self.invoke(
                     forge,
                     "proposal-commits",
-                    {"payload": {"number": 4321, "limit": limit, "page": cap // limit}, "responses": pages[-1:]},
+                    {"payload": {"number": 4321, "limit": limit, "page": cap // limit}, "responses": [rows[cap - limit :]]},
                 )
                 self.assertEqual(limit, answer["count"])
                 self.assertEqual(rows[-1]["sha"], answer["commits"][-1]["sha"])
                 self.assertTrue(answer["truncated"])
                 self.assertEqual(1, len(api.calls))
-                self.assertEqual([MAX_PAGE_SIZE], [params["per_page"] for _, _, params, _, _ in api.calls])
-                self.assertEqual([len(pages)], [params["page"] for _, _, params, _, _ in api.calls])
+                self.assertEqual([(limit, cap // limit)], [(params["per_page"], params["page"]) for _, _, params, _, _ in api.calls])
+            with self.subTest(case="a short page under the cap is the end of the branch"):
+                answer, _ = self.invoke(
+                    forge,
+                    "proposal-commits",
+                    {"payload": {"number": 4321, "limit": limit, "page": 2}, "responses": [rows[limit : limit + 7]]},
+                )
+                self.assertEqual(7, answer["count"])
+                self.assertFalse(answer["truncated"])
             with self.subTest(case="a page past the cap ends a walk"):
                 answer, _ = self.invoke(
                     forge,
@@ -827,7 +821,7 @@ class ContractTest(unittest.TestCase):
                 answer, _ = self.invoke(
                     forge,
                     "proposal-commits",
-                    {"payload": {"number": 4321, "limit": limit, "page": 2}, "responses": [rows[:70]]},
+                    {"payload": {"number": 4321, "limit": limit, "page": 2}, "responses": [rows[limit:70]]},
                 )
                 self.assertEqual(
                     [r["sha"] for r in rows[limit:70]], [c["sha"] for c in answer["commits"]]
@@ -837,7 +831,7 @@ class ContractTest(unittest.TestCase):
                 answer, _ = self.invoke(
                     forge,
                     "proposal-commits",
-                    {"payload": {"number": 4321, "limit": limit}, "responses": [rows[:MAX_PAGE_SIZE]]},
+                    {"payload": {"number": 4321, "limit": limit}, "responses": [rows[:limit]]},
                 )
                 self.assertEqual(limit, answer["count"])
                 self.assertTrue(answer["truncated"])

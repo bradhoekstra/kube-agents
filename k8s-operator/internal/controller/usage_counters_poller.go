@@ -907,7 +907,7 @@ func (p *UsageCounterPoller) readDocument(ctx context.Context, log logr.Logger, 
 	if doc.retired {
 		log.Info("the usage counters document carries counters this operator reads as proposal readings now; their totals and pod entries were dropped, the other totals kept", "configmap", cm.Name)
 	}
-	if doc.migrated {
+	if doc.added {
 		log.Info("the usage counters document predates a counter this operator keeps; the counter's total was added at its status floor, nothing lost", "configmap", cm.Name)
 	}
 	return cm, &doc, nil
