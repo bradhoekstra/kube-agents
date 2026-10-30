@@ -118,6 +118,16 @@ func TestRenderGchatChatPlanAndEdges(t *testing.T) {
 	if want := "- restart the deployment\n- `minor` also this\n\n*why not*\n```\nstate now\n------------------\nOOMKilled exit 137\n```"; layout.Text != want {
 		t.Errorf("rows =\n%s\nwant\n%s", layout.Text, want)
 	}
+	// A cell is plain: markup in one is shown as written, not read.
+	plainCells := &chatmsg.Message{Schema: chatmsg.Schema, Fold: &chatmsg.Fold{Table: &chatmsg.Table{Columns: []string{"sev", "cmd", "where"},
+		Rows: [][]string{{"**critical**", "`kubectl get pods`", "[ledger](https://x.example/l)"}, {"a|b", "<users/all>", "x"}}}}}
+	layout, err = renderGchatChat(plainCells)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "*why*\n```\nsev          | cmd                | where\n-------------+--------------------+------------------------------\n**critical** | `kubectl get pods` | [ledger](https://x.example/l)\na|b          | < users/all>       | x\n```"; layout.Text != want {
+		t.Errorf("plain cells =\n%s\nwant\n%s", layout.Text, want)
+	}
 	planTitle := &chatmsg.Message{Schema: chatmsg.Schema, Plan: &chatmsg.Plan{Items: []chatmsg.PlanItem{{ID: "a", Title: "two\nlines", Status: chatmsg.StatusComplete}}}}
 	if layout, _ := renderGchatChat(planTitle); layout.Text != "✅ two lines" {
 		t.Errorf("plan title = %q", layout.Text)

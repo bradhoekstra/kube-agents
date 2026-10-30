@@ -266,6 +266,15 @@ func renderSlackTable(header string, body []string) []string {
 	for _, line := range body {
 		rows = append(rows, cellTexts(line))
 	}
+	return renderTableCells(rows)
+}
+
+// renderTableCells renders rows of cells, the first row the header, as a
+// fenced monospace block with its columns padded to line up: the padder
+// renderSlackTable runs after it has read a markdown table's cells, and the
+// Google Chat renderer runs on a chat message's table as it is, whose cells
+// are plain and read by nothing.
+func renderTableCells(rows [][]string) []string {
 	cols := 0
 	for _, r := range rows {
 		cols = max(cols, len(r))

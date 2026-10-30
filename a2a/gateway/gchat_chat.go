@@ -172,8 +172,8 @@ func gchatChatAfter(after []string) string {
 
 // gchatChatFold is the fold, open: Chat has no collapsible section in a text
 // message, so its title leads in bold, then its text, then its table as a
-// monospace block with its columns lined up (renderSlackTable, the pass a
-// pipe table in prose takes), the column names as its first row.
+// monospace block with its columns lined up (renderTableCells, the padder a
+// pipe table in prose ends in), the column names as its first row.
 func gchatChatFold(f *chatmsg.Fold) string {
 	if strings.TrimSpace(f.Text) == "" && (f.Table == nil || len(f.Table.Columns) == 0) {
 		return ""
@@ -187,25 +187,24 @@ func gchatChatFold(f *chatmsg.Fold) string {
 		parts = append(parts, toGchatText(f.Text))
 	}
 	if f.Table != nil && len(f.Table.Columns) > 0 {
-		body := make([]string, 0, len(f.Table.Rows))
+		rows := [][]string{gchatChatTableCells(f.Table.Columns)}
 		for _, r := range f.Table.Rows {
-			body = append(body, gchatChatTableLine(r))
+			rows = append(rows, gchatChatTableCells(r))
 		}
-		parts = append(parts, strings.Join(renderSlackTable(gchatChatTableLine(f.Table.Columns), body), "\n"))
+		parts = append(parts, strings.Join(renderTableCells(rows), "\n"))
 	}
 	return strings.Join(parts, "\n")
 }
 
-// gchatChatTableLine writes one table row in the pipe form the table pass
-// reads, a pipe inside a cell escaped (slackEscapedPipe, which tableCells
-// reads back) so it stays in its cell, and a cell flattened to one line.
-// Cells are plain by the spec; the defang keeps a mention in one inert.
-func gchatChatTableLine(cells []string) string {
-	escaped := make([]string, len(cells))
+// gchatChatTableCells is one table row as the block draws it: each cell as
+// written, flattened to one line, the defang keeping a mention in one inert.
+// Cells are plain by the spec, so no markdown reader touches them.
+func gchatChatTableCells(cells []string) []string {
+	out := make([]string, len(cells))
 	for i, c := range cells {
-		escaped[i] = strings.ReplaceAll(defangGchatControls(gchatOneLine(c)), slackTablePipe, slackEscapedPipe)
+		out[i] = defangGchatControls(gchatOneLine(c))
 	}
-	return slackTablePipe + " " + strings.Join(escaped, " "+slackTablePipe+" ") + " " + slackTablePipe
+	return out
 }
 
 // gchatChatPlan is the plan, one line per item led by its status glyph, its

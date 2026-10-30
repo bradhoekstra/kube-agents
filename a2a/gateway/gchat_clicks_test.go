@@ -490,6 +490,46 @@ func TestGchatTypedReplyDoesNotBlockAClick(t *testing.T) {
 	}
 }
 
+// A click whose event carries no time has no id of its own: it is still a
+// turn, and a later click on the same message is not a duplicate of it.
+func TestGchatClickWithoutEventTimeIsNotDeduplicated(t *testing.T) {
+	a := newTestGchatAdapterWithRelay(t, newFakeChatRelay(t))
+	first := gchatClickEvent(t)
+	first.click.EventTime = ""
+	msg, reason := a.classify(first)
+	if reason != "" || msg.MessageID != "spaces/_c2fixtureAA/messages/BOT1.BOT1" {
+		t.Fatalf("click without a time: %+v (%s)", msg, reason)
+	}
+	a.InboundVerified(msg.Conversation, msg.MessageID, false)
+	second := gchatClickEvent(t)
+	second.click.EventTime = ""
+	if _, reason := a.classify(second); reason != "" {
+		t.Errorf("a later click on the message was refused: %q", reason)
+	}
+}
+
+// A typed reply the gateway drops releases nothing: a click still waiting
+// on verification keeps its claim, so a second click is still refused.
+func TestGchatDroppedTypedReplyKeepsAClicksClaim(t *testing.T) {
+	f := newFakeChatRelay(t)
+	f.responses["spaces.messages/create"] = map[string]any{"name": "spaces/_c2fixtureAA/messages/BOT1.BOT1"}
+	a := newTestGchatAdapterWithRelay(t, f)
+	conv := "gchat:dm/spaces/_c2fixtureAA"
+	question := &chatmsg.Message{Schema: chatmsg.Schema, Headline: "Which?", Choices: []chatmsg.Choice{{Text: "Look at the first one"}, {Text: "Skip"}}}
+	if _, err := a.PostMessage(conv, OutMessage{Text: "fallback", Chat: question}); err != nil {
+		t.Fatal(err)
+	}
+	typed := InboundMessage{Conversation: conv, Kind: sessionKindDM, AuthorID: "other@example.com", MessageID: "spaces/_c2fixtureAA/messages/U9", Text: "one sec"}
+	a.noteTypedAnswer(typed, gchatSender{DisplayName: "Other", Email: "other@example.com"})
+	if _, reason := a.classify(gchatClickEvent(t)); reason != "" {
+		t.Fatal(reason)
+	}
+	a.InboundVerified(typed.Conversation, typed.MessageID, false)
+	if _, reason := a.classify(gchatClickEvent(t)); !strings.Contains(reason, "already waiting") {
+		t.Errorf("a second click after a dropped typed reply: %q", reason)
+	}
+}
+
 // The buttons the renderer writes are the buttons a click event reads back:
 // one round trip keeps the two shapes in step.
 func TestGchatWidgetsRoundTrip(t *testing.T) {

@@ -131,6 +131,9 @@ type gchatPendingClick struct {
 	label   string
 	text    string
 	links   []chatmsg.Link
+	// click is set for a click, which claims the question while it waits
+	// (waiting); a typed reply claims nothing and releases nothing.
+	click bool
 }
 
 // gchatUX is the click state, held under the adapter's lock. Each ring holds
@@ -282,7 +285,10 @@ func (a *GoogleChatAdapter) classifyClick(ev *gchatEvent) (InboundMessage, strin
 	id := gchatClickID(ev.Message.Name, click.EventTime)
 	a.mu.Lock()
 	ux := a.uxLocked()
-	if a.seenLocked(id) {
+	// A click with no event time has no id of its own, so it is not run
+	// through the dedupe ring: the message name alone would make every
+	// later click on the message a duplicate.
+	if click.EventTime != "" && a.seenLocked(id) {
 		a.mu.Unlock()
 		return InboundMessage{}, "duplicate delivery of click " + id
 	}
@@ -294,7 +300,7 @@ func (a *GoogleChatAdapter) classifyClick(ev *gchatEvent) (InboundMessage, strin
 		a.mu.Unlock()
 		return InboundMessage{}, "a click on the question is already waiting (" + ev.Message.Name + ")"
 	}
-	p := gchatPendingClick{message: ev.Message.Name, clicker: click.User.DisplayName, label: reply}
+	p := gchatPendingClick{message: ev.Message.Name, clicker: click.User.DisplayName, label: reply, click: true}
 	if p.clicker == "" {
 		p.clicker = namelessClicker
 	}
@@ -333,7 +339,8 @@ func (a *GoogleChatAdapter) classifyClick(ev *gchatEvent) (InboundMessage, strin
 // gchatClickID names one click for the audit chain and the pending map: the
 // clicked message and the event's time, so two clicks on one message (a
 // question asked again on its update key) are two ids, as Slack's clicks
-// are by their own ts. An event with no time names the message alone.
+// are by their own ts. An event with no time names the message alone, and
+// is not deduplicated by it (classifyClick).
 func gchatClickID(message, eventTime string) string {
 	if eventTime == "" {
 		return message
@@ -380,7 +387,9 @@ func (a *GoogleChatAdapter) InboundVerified(conversation, messageID string, veri
 		a.mu.Unlock()
 		return
 	}
-	delete(ux.waiting, p.message)
+	if p.click {
+		delete(ux.waiting, p.message)
+	}
 	if !verified || ux.answered[p.message] {
 		// Dropped, or answered since by the other way (a typed reply and
 		// a click both pending): the first verified answer stands.
