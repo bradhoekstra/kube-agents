@@ -93,9 +93,14 @@ absent. A new spec field has the chart's standing guard: `platform-agent-cr.yaml
 render `peopleSeen: false` against a served CRD that lacks the field, with the `lookup`-gated
 `fail` every other new spec field there carries, because `helm upgrade` never applies `crds/` and
 an API server serving the older schema would prune the value silently while the record is
-written; `upgrade.sh --upgrade-mode=harness` and a hand `lifecycle.sh apply` take that route. A single person is removed with a key-value delete of their key by whoever holds
-the gateway's credentials; the gateway's watch honours deletes, so the count drops at once rather
-than at the TTL. The ChatOps page's privacy section gets a paragraph that says all of this.
+written; `upgrade.sh --upgrade-mode=harness` and a hand `lifecycle.sh apply` take that route. A single person is removed with a key-value delete of their key by whoever holds the gateway's
+credentials; the gateway's watch honours deletes, so the count drops at once rather than at the
+TTL. A delete, the purge included, removes the value and leaves a tombstone that carries the key
+name (the gateway's restricted permissions refuse the stream purge that would clear it, as the
+ChatOps gateway design records): a pseudonym under the bucket's own key, with no time, listable
+by the provision and seed identities until the bucket's max age expires it, within 30 days. So a
+removed person is gone from the count at once and from the bucket's subjects within 30 days,
+which is the bound the anti-goal below sets. The ChatOps page's privacy section gets a paragraph that says all of this.
 
 A turn counts when the gateway has verified its sender and its backend is a chat platform a
 person writes on: one of the gateway's three chat backends, Google Chat, Slack or Discord, named
@@ -108,9 +113,9 @@ the console, so the two populations differ by the unverified share and the conso
 **Series.** The gateway's metrics listener, the one the usage poller already scrapes on a next
 install, serves the count as a gauge computed at scrape time from the bucket's keys and values:
 
-| Series                                       | Type  | Labels                   | Meaning                                                                                                                                                                                                          |
-| -------------------------------------------- | ----- | ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `kubeagents_a2a_gateway_people_seen{window}` | gauge | `window` = `7d` \| `30d` | Distinct principals whose last verified chat turn is inside the window, both counts taken from the recorded times (a watch does not see a key age out, so the bucket's TTL is storage pruning, never the count). |
+| Series                                       | Type  | Labels                   | Meaning                                                                                                                                                                                                                                                                          |
+| -------------------------------------------- | ----- | ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `kubeagents_a2a_gateway_people_seen{window}` | gauge | `window` = `7d` \| `30d` | Distinct principals whose recorded time, the last put and so within an hour of their last verified chat turn, is inside the window; both counts are taken from the recorded times (a watch does not see a key age out, so the bucket's TTL is storage pruning, never the count). |
 
 The windows are fixed: 30 days is the window the stalled-onboarding alert already reads
 `lastHumanActiveTime` against and the bucket's lifetime; 7 days is a week. The listener serves
