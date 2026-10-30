@@ -985,7 +985,7 @@ memory, and after a restart it reads every proposal again within an hourly budge
 The details fields return when that is done, which takes some hours on an install with a thousand
 proposals. The outcomes fields return on the first sweep.
 
-The operator also serves every counter, cluster gauge, proposal reading and time of this block, and `status.phase`, as Prometheus gauges on its own metrics port, so a collector reads them without a query against the status; the series are on [Observability](/kube-agents/concepts/observability/#prometheus-metrics).
+The operator also serves every counter, cluster gauge, proposal reading and time of this block, and `status.phase`, as Prometheus gauges on its own metrics port. A collector reads them without a query against the status; the series are on [Observability](/kube-agents/concepts/observability/#prometheus-metrics).
 
 `usage.activeInterfaces` is `dashboard` unless `harness.hermes.dashboardEnabled` is `false`, plus
 `googlechat`, `slack` and `teams` for each `integration` entry with `enabled: true`. It is resolved
