@@ -237,13 +237,13 @@ operator:
   # requests.cpu is 50m rather than the 10m the manager needs because GKE
   # Autopilot admits a pod unchanged only at 50m or more per pod and between
   # 1 and 6.5 GiB of memory per vCPU on the requests pair, and raises the
-  # smaller request into that band: 10m beside 128Mi is 12.8 GiB per vCPU,
+  # smaller request into that band: 10m beside 128Mi is 12.5 GiB per vCPU,
   # so Autopilot wrote 50m onto the pod and the quota preflight, which sums
   # this line, had counted 10m. Declared on the floor, the manifest is the
-  # pod the cluster admits on both Standard and Autopilot. Autopilot without
-  # bursting also sets the limits equal to the requests, so there the
-  # manager runs under a 128Mi limit, the soft limit follows it, and a
-  # larger cluster raises requests.memory with limits.memory.
+  # pod the cluster admits on Standard and on Autopilot with bursting.
+  # Autopilot without bursting raises the pod to its per-pod minimums
+  # (250m CPU, 512 MiB) and sets the limits equal to the requests, so the
+  # manager runs under at least 512Mi there and reads that limit.
   resources:
     limits:
       cpu: 500m

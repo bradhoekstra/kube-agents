@@ -159,6 +159,12 @@ class OperatorMemoryLimitRenderTest(unittest.TestCase):
         self.assertIn(f"{_VALUE_PATH}.limits.memory is 1e400, which is not a representable byte count", err)
         self.assertNotIn("under the", err)
 
+    def test_a_quantity_past_int64_fails_naming_the_downward_api_bound(self):
+        # 9Ei is a float64 but not an int64; the Downward API cannot hand it to the manager.
+        err = self._render([f"{_VALUE_PATH}.limits.memory=9Ei"], expect_failure=True)
+        self.assertIn(f"{_VALUE_PATH}.limits.memory is 9Ei, which exceeds the 9223372036854775807 bytes an int64 holds", err)
+        self.assertNotIn("under the", err)
+
     def test_a_negative_quantity_fails_naming_the_key(self):
         err = self._render([f"{_VALUE_PATH}.limits.memory=-1Gi"], expect_failure=True)
         self.assertIn(f"{_VALUE_PATH}.limits.memory is -1Gi; a quantity must not be negative", err)

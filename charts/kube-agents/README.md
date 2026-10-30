@@ -1183,10 +1183,10 @@ own overrides; `upgrade.sh` resets the values the same way, so it never meets th
 old defaults. An explicit limit under 512Mi, in a values file or `extra_helm_values`, fails on
 every path: raise it to 512Mi or more, or drop the key. The operator reads whatever limit is
 rendered through the Downward API and sets its Go soft memory limit to nine tenths of it, so a
-larger cluster raises this one value. On GKE Autopilot without bursting the cluster sets the
-container's limit equal to its request, so there the effective limit is
-`operator.resources.requests.memory` (128Mi by default), which the floor does not read; that is
-the value to raise on such a cluster.
+larger cluster raises this one value. On GKE Autopilot the floor still applies. A cluster without
+bursting raises the Pod to its per-Pod minimums, 250m CPU and 512 MiB, and sets the limits equal to
+the requests, so the manager runs under at least 512Mi there and the admitted pod differs from the
+rendered manifest. A cluster with bursting admits the manifest as rendered.
 
 ### Optional AgentProfiles (`profiles.tse`)
 

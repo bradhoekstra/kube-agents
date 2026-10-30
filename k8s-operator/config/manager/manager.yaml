@@ -174,8 +174,9 @@ spec:
           # 1 and 6.5 GiB of memory per vCPU on the requests pair, and raises
           # the smaller request into that band, so 10m beside 128Mi was
           # admitted at 50m whatever this line said. Autopilot without
-          # bursting also sets the limits equal to the requests; the manager
-          # reads the admitted limit through OPERATOR_MEMORY_LIMIT_BYTES.
+          # bursting also raises the pod to 250m CPU and 512 MiB and sets the
+          # limits equal to the requests; the manager reads the admitted
+          # limit through OPERATOR_MEMORY_LIMIT_BYTES.
           resources:
             limits:
               cpu: 500m

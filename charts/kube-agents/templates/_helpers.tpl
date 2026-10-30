@@ -1058,6 +1058,10 @@ holds the floor to the default and pins the message.
 {{- if include "kube-agents.quantityOverflowsFloat64" $raw -}}
 {{- fail (printf "%s is %s, which is not a representable byte count: it is past the range of a float64, which the chart would read as zero, and it exceeds the 9223372036854775807 bytes an int64 holds, which is what the Downward API hands the manager" $key $raw) -}}
 {{- end -}}
+{{- /* Between float64's range and int64's: a float64 holds it, the Downward API does not. */ -}}
+{{- if include "kube-agents.bytesExceedInt64" $raw -}}
+{{- fail (printf "%s is %s, which exceeds the 9223372036854775807 bytes an int64 holds, the most the Downward API hands the manager" $key $raw) -}}
+{{- end -}}
 {{- if lt (include "kube-agents.quantityExact" (dict "raw" $raw "cpu" false "key" $key) | float64) (float64 $floor) -}}
 {{- fail (printf "%s is %s, under the %dMi floor the manager's cache is sized for; below it the manager is OOM-killed as the cache fills. Releases up to 0.16.0 shipped 128Mi, and `helm upgrade --reuse-values` keeps that release's defaults: upgrade with upgrade.sh or `--reset-then-reuse-values`, set at least %dMi, or omit the key for the default" $key $raw $floorMi $floorMi) -}}
 {{- end -}}
