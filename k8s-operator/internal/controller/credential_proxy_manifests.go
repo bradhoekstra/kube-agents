@@ -806,10 +806,11 @@ var (
 // readable because that pod sets an fsGroup, which is what makes kubelet apply
 // group ownership to a projected file.
 //
-// The /tmp and state emptyDirs are widened here, not in
-// buildCredentialProxyVolumes, because the gateway pod shares the /tmp volume's
-// definition and sizes it from its own agentAPIAuth override, not the broker's.
-// buildAgentAPIAuthVolumes applies that override to the gateway pod's copy.
+// The state emptyDir is widened here, not in buildCredentialProxyVolumes,
+// because the gateway pod shares the /tmp volume's definition and sizes it from
+// its own agentAPIAuth override, not the broker's; the broker's /tmp keeps its
+// cap at any override. buildAgentAPIAuthVolumes applies the sidecar's override
+// to the gateway pod's copy.
 func buildCredentialProxyRuntimeVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Volume {
 	volumes := filterVolumes(buildCredentialProxyVolumes(agent), credentialProxyRuntimeVolumeNames)
 	ephemeralLimit := resolveCredentialProxyResources(agent.Spec.Deployment).Limits[corev1.ResourceEphemeralStorage]

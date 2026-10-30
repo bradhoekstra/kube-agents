@@ -357,7 +357,7 @@ class PreflightDecisionTest(unittest.TestCase):
         """An override of limits.ephemeral-storage alone is counted as a request of the same size.
 
         The operator renders no ephemeral-storage request, so the API server defaults it to
-        the limit; counting the footprint's 2Gi against a 10Gi limit passes a quota with 2
+        the limit; counting the footprint's 8Gi against a 10Gi limit passes a quota with 8
         to 10Gi of request headroom that then refuses the pod.
         """
         base = self._requirements()
