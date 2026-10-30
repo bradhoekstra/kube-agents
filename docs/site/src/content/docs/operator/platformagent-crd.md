@@ -979,11 +979,13 @@ broker, or reads it without a reading, leaves that reading's fields as they were
 row clears them to absent. The broker stops serving a reading more than an hour old. A 0 is a
 reading.
 
-A broker restart clears the details fields (`remediationsClosedUnmergedTotal`,
-`proposalHumanTouches`, `proposalsMergedUntouched`). The broker keeps what it read of each proposal in
-memory, and after a restart it reads every proposal again within an hourly budget of forge calls.
-The details fields return when that is done, which takes some hours on an install with a thousand
-proposals. The outcomes fields return on the first sweep.
+A broker restart leaves the details fields (`remediationsClosedUnmergedTotal`,
+`proposalHumanTouches`, `proposalsMergedUntouched`) as they were for one operator poll, and clears
+them when a second poll in a row finds no details reading. The broker keeps what it read of each
+proposal in memory, and after a restart it reads every proposal again within an hourly budget of
+forge calls. A small install is done within the first sweep. An install with a thousand proposals
+takes some hours, and the fields are absent in between. The outcomes fields return on the first
+sweep.
 
 The operator also serves every counter, cluster gauge, proposal reading and time of this block, and `status.phase`, as Prometheus gauges on its own metrics port. A collector reads them without a query against the status; the series are on [Observability](/kube-agents/concepts/observability/#prometheus-metrics).
 

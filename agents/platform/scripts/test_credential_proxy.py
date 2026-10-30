@@ -14869,6 +14869,9 @@ class SweepCredentialMintTest(unittest.TestCase):
         executor = credential_proxy.CommandExecutor.__new__(credential_proxy.CommandExecutor)
         executor.calls = []
         executor._request_budget = threading.local()
+        # The budget off: the sweep mint's reservation then marks the thread
+        # covered and takes no queue.
+        executor.children_budget_bytes = None
 
         def run(argv):
             executor.calls.append(list(argv))
@@ -14934,6 +14937,25 @@ class SweepCredentialMintTest(unittest.TestCase):
         self.assertEqual(["--sweep", "acme/gitops"], argv[1:])
         # Two copies of one string, kept in step here for FORGE_READ_ONLY_FLAG's reason.
         self.assertEqual(github_token_refresh.SWEEP_FLAG, credential_proxy.FORGE_SWEEP_FLAG)
+
+    def test_mint_sweep_credential_reserves_child_memory_and_never_takes_the_exemption(self):
+        # The sweep thread holds no store lock, so its spawn is not under the
+        # content workspace's reserve: it reserves like any route that spawns,
+        # never under the exemption the read and write mints run in.
+        executor = self._executor()
+        entered = []
+
+        @contextlib.contextmanager
+        def reserving(*args, **kwargs):
+            entered.append("reserved")
+            yield
+
+        with mock.patch.object(credential_proxy, "repository_role", return_value="managed"), \
+                mock.patch.object(executor, "reserve_child_memory", side_effect=reserving), \
+                mock.patch.object(executor, "_outside_budget") as exempt:
+            executor.mint_sweep_credential("github", "acme/gitops")
+        self.assertEqual(["reserved"], entered)
+        exempt.assert_not_called()
 
     def test_drop_sweep_credential_forgets_one_repositorys_token(self):
         executor = self._executor()

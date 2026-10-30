@@ -898,12 +898,16 @@ func (p *UsageCounterPoller) readDocument(ctx context.Context, log logr.Logger, 
 	}
 	// After the bounds, so that a migrated document the bounds refuse logs
 	// the re-seed alone: "nothing lost" is only true of one that passed.
-	switch {
-	case doc.rekeyed:
+	// One line per migration the document went through: a document can be
+	// at the previous layout, carry retired counters and lack a newer one at
+	// once, and each is said.
+	if doc.rekeyed {
 		log.Info("the usage counters document was at the previous layout; migrated in place, nothing lost", "configmap", cm.Name)
-	case doc.retired:
+	}
+	if doc.retired {
 		log.Info("the usage counters document carries counters this operator reads as proposal readings now; their totals and pod entries were dropped, the other totals kept", "configmap", cm.Name)
-	case doc.migrated:
+	}
+	if doc.migrated {
 		log.Info("the usage counters document predates a counter this operator keeps; the counter's total was added at its status floor, nothing lost", "configmap", cm.Name)
 	}
 	return cm, &doc, nil

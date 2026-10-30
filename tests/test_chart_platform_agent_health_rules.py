@@ -268,6 +268,7 @@ class HealthRulesRenderTest(unittest.TestCase):
         readings = _reading_fields()
         self.assertEqual(6, len(readings), readings)
         for expr in exprs:
+            self.assertNotRegex(expr, r"increase\(kubeagents:platformagent:usage_reading:max", "increase() over the recorded reading series")
             for field in readings:
                 self.assertNotRegex(expr, rf'increase\({_GAUGE_PREFIX}usage\{{field="{field}"\}}', f"increase() over the reading {field}")
 

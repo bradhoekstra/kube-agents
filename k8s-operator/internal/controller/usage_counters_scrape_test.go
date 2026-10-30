@@ -813,3 +813,41 @@ func TestPodUsageSource_TransportUsesNoProxyAndBoundsHeaders(t *testing.T) {
 		t.Errorf("client timeout = %v, want %v", source.client.Timeout, usageScrapeTimeout)
 	}
 }
+
+func TestPodUsageSource_ASingleSampleReadingTakesTheLargestOfARepeatedLabelSet(t *testing.T) {
+	// A body that repeats a label set is not one the broker renders; a summed
+	// field adds every sample, a single-sample field must not double.
+	body := strings.Join([]string{
+		"# TYPE kubeagents_vcs_proposals gauge",
+		`kubeagents_vcs_proposals{state="open"} 2`,
+		`kubeagents_vcs_proposals{state="merged"} 5`,
+		`kubeagents_vcs_proposals{state="merged"} 5`,
+		`kubeagents_vcs_proposals{state="closed"} 7`,
+		"# TYPE kubeagents_vcs_proposals_closed_by gauge",
+		`kubeagents_vcs_proposals_closed_by{actor="human"} 1`,
+		`kubeagents_vcs_proposals_closed_by{actor="bot"} 2`,
+		"# TYPE kubeagents_vcs_proposal_touches gauge",
+		`kubeagents_vcs_proposal_touches{kind="comment",actor="human"} 4`,
+		"# TYPE kubeagents_vcs_proposal_touches_per_proposal gauge",
+		`kubeagents_vcs_proposal_touches_per_proposal{outcome="merged",le="0"} 2`,
+		`kubeagents_vcs_proposal_touches_per_proposal{outcome="merged",le="0"} 2`,
+		"# TYPE kubeagents_vcs_proposals_ignored gauge",
+		"kubeagents_vcs_proposals_ignored 0",
+		"# TYPE kubeagents_vcs_readings_age_seconds gauge",
+		`kubeagents_vcs_readings_age_seconds{reading="outcomes"} 1`,
+		`kubeagents_vcs_readings_age_seconds{reading="details"} 1`,
+		"# TYPE process_start_time_seconds gauge",
+		"process_start_time_seconds 1759400000.25",
+		"",
+	}, "\n")
+	addr := serveBody(t, http.StatusOK, body)
+	reading, err := newPodUsageSource().Scrape(context.Background(), addr, usageBrokerCounters)
+	if err != nil {
+		t.Fatalf("Scrape: %v", err)
+	}
+	for field, want := range map[string]int64{"remediationsMergedTotal": 5, "proposalsMergedUntouched": 2, "proposalsAuthored": 19} {
+		if got := reading.Readings[field]; got != want {
+			t.Errorf("%s = %d, want %d", field, got, want)
+		}
+	}
+}

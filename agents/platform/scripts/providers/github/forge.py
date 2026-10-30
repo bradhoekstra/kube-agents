@@ -82,6 +82,10 @@ INCOMPLETE_RESULTS = "incomplete_results"
 
 # The qualifiers that count an author's proposals by outcome. `is:closed`
 # alone would count merged ones twice.
+# What a tally raises when GitHub's search answers no count or an incomplete
+# one: the forge call failed, as a gateway failure.
+TALLY_FAILED_STATUS = 502
+TALLY_FAILED_CODE = "FORGE_CALL_FAILED"
 # The states the tally searches; `open` is the one count less these two.
 TALLY_QUALIFIERS = {
     "merged": "is:merged",
@@ -659,23 +663,28 @@ class GitHubForge(Forge):
         # caller's own page there is short, and judged alone it would read as
         # the end of a branch GitHub has stopped serving. A page past the cap
         # is empty and says nothing more, so a caller walking pages stops
-        # there. Read only as far as the caller's page needs; the first page
-        # is asked without `page`, as GitHub's unqualified route answers it.
+        # there. Read only the full pages the caller's page needs, from the
+        # first that holds its start, so a caller walking pages reads each
+        # full page once; the first page is asked without `page`, as GitHub's
+        # unqualified route answers it.
+        start = (page - 1) * limit
         wanted = min(page * limit, self.COMMIT_CAP)
+        first = start // MAX_PAGE_SIZE + 1
+        offset = (first - 1) * MAX_PAGE_SIZE
         path = f"repos/{repo}/pulls/{number}/commits"
         nodes: list[dict] = []
-        for fetch in range(1, -(-self.COMMIT_CAP // MAX_PAGE_SIZE) + 1):
+        for fetch in range(first, -(-self.COMMIT_CAP // MAX_PAGE_SIZE) + 1):
             params: dict[str, Any] = {"per_page": MAX_PAGE_SIZE}
             if fetch > 1:
                 params["page"] = fetch
             batch = api("GET", path, params=params) or []
             nodes.extend(batch)
-            if len(batch) < MAX_PAGE_SIZE or len(nodes) >= wanted:
+            if len(batch) < MAX_PAGE_SIZE or offset + len(nodes) >= wanted:
                 break
-        nodes = nodes[: self.COMMIT_CAP]
-        commits = [translate.commit(node) for node in nodes[(page - 1) * limit : page * limit]]
+        nodes = nodes[: self.COMMIT_CAP - offset]
+        commits = [translate.commit(node) for node in nodes[start - offset : wanted - offset]]
         answer = listing(commits, limit, "commits")
-        reaches_cap = len(nodes) >= self.COMMIT_CAP and (page - 1) * limit < self.COMMIT_CAP
+        reaches_cap = offset + len(nodes) >= self.COMMIT_CAP and start < self.COMMIT_CAP
         answer["truncated"] = answer["truncated"] or reaches_cap
         return answer
 
@@ -732,13 +741,13 @@ class GitHubForge(Forge):
             total = found.get("total_count")
             if not isinstance(total, int) or isinstance(total, bool):
                 raise WorkspaceError(
-                    "GitHub's search answered with no count", status=502, code="FORGE_CALL_FAILED"
+                    "GitHub's search answered with no count", status=TALLY_FAILED_STATUS, code=TALLY_FAILED_CODE
                 )
             if found.get(INCOMPLETE_RESULTS) is True:
                 raise WorkspaceError(
                     "GitHub's search timed out and its count is incomplete",
-                    status=502,
-                    code="FORGE_CALL_FAILED",
+                    status=TALLY_FAILED_STATUS,
+                    code=TALLY_FAILED_CODE,
                 )
             tally[state] = total
         return tally_with_open(tally)

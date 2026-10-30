@@ -8670,7 +8670,12 @@ class CommandExecutor:
             token = cached()
             if token:
                 return token
-            with self._outside_budget():
+            # The sweep runs on its own thread with no store lock, so its spawn
+            # is not covered by the content workspace's reserve the way the
+            # read and write mints are: it takes a reservation of its own and
+            # waits for admission like any route that spawns, which a
+            # background thread can afford.
+            with self.reserve_child_memory():
                 result = self._run_forge_helper(
                     provider, helper, [FORGE_SWEEP_FLAG, repository], "sweep credential mint"
                 )

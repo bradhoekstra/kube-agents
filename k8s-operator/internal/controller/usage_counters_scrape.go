@@ -641,7 +641,16 @@ func (f *usageReadingFold) fold(name string, metric *dto.Metric, value float64) 
 		}
 		matched = true
 		if usageLabelsMatch(metric, spec.filter) {
-			f.sums[i] += value
+			// A summed field adds every matching sample; a single-sample
+			// field takes the largest, so a body that repeats a label set
+			// (which no broker renders) cannot double it.
+			if spec.sum || !f.resolved[i] || value > f.sums[i] {
+				if spec.sum {
+					f.sums[i] += value
+				} else {
+					f.sums[i] = value
+				}
+			}
 			f.resolved[i] = true
 		}
 	}

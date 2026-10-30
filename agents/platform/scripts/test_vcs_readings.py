@@ -1108,8 +1108,6 @@ class PureFunctionTest(unittest.TestCase):
         self.assertEqual(counts[math.inf], 5)
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class ManagedKeyTest(unittest.TestCase):
@@ -1215,3 +1213,7 @@ class GitHubTallyTest(unittest.TestCase):
         self.assertEqual({"open": 2, "merged": 5, "closed": 1, "total": 8}, answer)
         self.assertEqual(3, len(queries), "merged, closed and the one count; open is derived, not searched")
         self.assertFalse(queries[-1].endswith(" "), "the unqualified query carries no trailing space")
+
+
+if __name__ == "__main__":
+    unittest.main()
