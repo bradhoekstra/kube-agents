@@ -1361,7 +1361,8 @@ def _first_report_card(
     """The first report as the card ``inventory_card`` builds from the stage's files, or None and
     why the text goes instead.
 
-    The card needs all of: ``KAGE_SLACK_UX`` on; a Slack destination (``platform``); a hand-off
+    The card needs all of: ``KAGE_SLACK_UX`` on; a card platform as the destination (``platform``:
+    Slack, or Google Chat through the gateway under ``spec.mode: next``); a hand-off
     that filed a prioritization card (``no_ranking`` False: otherwise the files beside the report
     are an earlier sweep's, or that cannot be told); the items and shown files there and readable,
     and the scores file readable when an item is listed; and a card the builder accepts, which recomputes

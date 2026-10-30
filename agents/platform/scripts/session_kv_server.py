@@ -4115,7 +4115,8 @@ def trigger_agent_troubleshooter(
     """Post warning alert to Chat, configure thread mapping, and trigger the agent loop in background.
 
     ``slack_alert_msg`` replaces ``alert_msg`` when the alert goes to Slack, and
-    ``alert_title`` is recorded only for a Slack thread.
+    ``alert_title`` is recorded for a thread on a card platform: Slack, or Google
+    Chat under ``spec.mode: next``.
 
     An exception releases the row's fold anchor before it propagates: the
     ledger row was written as admitted before this task was queued, and a task

@@ -1647,17 +1647,19 @@ def _ux_flag_on() -> bool:
 
 
 def completion_text(head: str, title: str, handoff: str, platform: object = None) -> str:
-    """Return the completion message: upstream's, or on Slack the handoff alone.
+    """Return the completion message: upstream's, or on a card platform the handoff alone.
 
-    Flag off, or any platform but Slack, this is upstream's f-string exactly.
-    On Slack it drops the head line and leads with the worker's report, or
+    Flag off, or a platform the cards are not drawn for (:func:`chat_ux_on`), this
+    is upstream's f-string exactly. On a card platform (Slack, or Google Chat where
+    the gateway serves it under ``spec.mode: next``) it drops the head line and
+    leads with the worker's report, or
     its summary when there is no report (:func:`handoff_with_result`); a card
     that completed with neither keeps the head line, since an empty message
     is worse than a terse one.
     """
     upstream = COMPLETION_HEAD.format(head=head, title=title) + (handoff or "")
     if not chat_ux_on(platform):
-        # No Slack presenter reads this one, so the declared step's line, plumbing, comes off here.
+        # No card presenter reads this one, so the declared step's line, plumbing, comes off here.
         return _visible(upstream)
     return str(handoff or "").strip() or upstream
 
