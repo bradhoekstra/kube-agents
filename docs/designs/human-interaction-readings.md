@@ -31,16 +31,18 @@ the summary and existing dashboards read it, and a split that renames it buys no
 clamped to `[0, 1<<53]`): the same document counter, one more projection. On a next install the
 chat half sums the Hermes plugin's sessions series and the A2A gateway's, as `sessionsTotal` does
 today. Its first value is the document's chat half as it stands. An upgrade keeps the usage
-document, and the poller's re-seed (`usageStatusSeed`) has until now put the whole of
-`sessionsTotal` into that half, triage included, because the status could not tell the halves
-apart: an install whose document was ever re-seeded while `sessionsTotal` was above zero starts
-`chatSessionsTotal` with those triage sessions in it, once, and the docs say so. From this release
-the re-seed splits by the new field: the chat half from `chatSessionsTotal`, the triage half from
-the difference, and a status that lacks the field (a served CRD that holds it back) seeds the chat
-half at 0 and gives the whole to triage; a status whose `chatSessionsTotal` is above its
-`sessionsTotal` seeds the chat half clamped to the sum, so the seed never writes a value the
-read-back refuses. `sessionsTotal` stays whole, and the read-back floor on the halves gains
-`chatSessionsTotal <= sessionsTotal`. It does not move
+document, and the poller's re-seed (`usageStatusSeed`) puts the whole of `sessionsTotal` into that
+half, triage included, because a status without the new field cannot tell the halves apart: an
+install whose document was ever re-seeded while `sessionsTotal` was above zero starts
+`chatSessionsTotal` with those triage sessions in it, once, and the docs say so. The seed changes
+in one case only: a status that carries `chatSessionsTotal` seeds the chat half from it, clamped
+to `sessionsTotal`, and the triage half from the difference. A status without the field, whatever
+the reason (the first poll after the upgrade, a served CRD that holds the field back, a return
+from a rollback whose write dropped it), seeds as today, the whole into the chat half, so a re-seed
+never hides past chat sessions in the triage half. The floor rule stays what it is: the pair's
+floors are summed, and a half is unfolded only when the status carries no sessions at all, so a
+document that predates the halves migrates under a split seed as it does under today's. The
+read-back floor on the halves gains `chatSessionsTotal <= sessionsTotal`. It does not move
 `lastHumanActiveTime`: a chat session begins with a message `chatMessagesInboundTotal` already
 counted, which is the rule `usageHumanCounters` states. The export gauge
 (`kubeagents_platformagent_usage{field="chatSessionsTotal"}`) and the feedback summary follow the
@@ -75,11 +77,12 @@ turn; the count under-counts until the next put succeeds. The bucket's size cap 
 hundred thousand people, far past any install.
 
 A turn counts when the gateway has verified its sender and its backend is a chat platform a
-person writes on, the set the gateway's own inbound counter labels as platforms (Google Chat, Slack and Discord): the program doors (`inject`, `a2a`, and the Google
-door) are not people, and an eval or CI install must not read its inject principals as such; the
-console is not counted either, since every console user resolves to the one principal
-`nats:console`. The inbound counter counts before the sender is verified and counts the console,
-so the two populations differ by the unverified share and the console's turns.
+person writes on: one of the gateway's three chat backends, Google Chat, Slack or Discord, named
+as such in the code and not by reference to any counter's label set. The program doors (`inject`,
+`a2a`, and the Google door) are not people, and an eval or CI install must not read its inject
+principals as such; the console is not counted either, since every console user resolves to the
+one principal `nats:console`. The inbound counter counts before the sender is verified and counts
+the console, so the two populations differ by the unverified share and the console's turns.
 
 **Series.** The gateway's metrics listener, the one the usage poller already scrapes on a next
 install, serves the count as a gauge computed at scrape time from the bucket's keys and values:
@@ -178,13 +181,15 @@ The breakdown of proposals by what started them (Workstream 3) is not part of th
   (`TestSeedGrantsAndProvisionScriptNameTheSameStreams` extended to the identities file).
 - **Operator** (`usage_counters_scrape.go`, `usage_counters_fold.go`, `usage_counters_poller.go`,
   `usage_gauges.go`, `common_types.go`, the CRD copies): `chatSessionsTotal` projected from
-  `sessionsChat`; the seed split in `usageStatusSeed`, its floor in `usageFieldFloor`, the
-  migration's handling of a document that predates the field, and the read-back floor; a target
-  per reading in the slot; the `people` reading kind, read from the A2A gateway's listener, with
-  its two specs and miss streak; the pruning record for the three newer fields; the export rows.
-  Tests beside the existing `usage_counters_*_test.go`: the projection, a re-seed that splits by
-  the field and one from a status without it, a status with the chat half above the sum re-seeding
-  once, the reading's presence and clearing, the fall projected as it stands.
+  `sessionsChat`; the one new seed case in `usageStatusSeed` (a status that carries the field),
+  `usageFieldFloor` unchanged in rule and extended to read the split, and the read-back floor; a
+  target per reading in the slot; the `people` reading kind, read from the A2A gateway's listener,
+  with its two specs and miss streak; the pruning record for the three newer fields; the export
+  rows. Tests beside the existing `usage_counters_*_test.go`: the projection, a re-seed from a
+  status with the field (split, and clamped when the chat half is above the sum) and one from a
+  status without it (the whole into the chat half, as today),
+  `TestMigrateUsageDocument_TheSessionsHalvesAreUnfoldedOnlyWithoutASessionsStatus` extended to the
+  split seed shape, the reading's presence and clearing, the fall projected as it stands.
 - **Feedback summary** (`feedback_summary.py` and `a2a/gateway/feedback_summary.go`): the three
   fields, the two readings with their source suffix, the two copies held in step by
   `GatewayCopyTest` in `test_feedback_summary.py`, which reads the Go copy (added with the proposal
