@@ -65,7 +65,8 @@ kanban notifier's chat.notify stand-in (``kanban_chat_notify``), and the edit
 is a ``kube-agents.chat/v1`` message (:func:`chat_triage`) sent with the
 ``update`` key the event watcher's alert post carries, one per alert
 (``chat_notify.alert_update_key`` of the alert's event session, found by its
-thread as :func:`alert_title` finds it), so the gateway edits the alert in place. The
+thread as :func:`alert_title` finds it); the gateway posts it laid out under the
+alert, since it does not edit a home-channel post by its key. The
 fold is the report's markdown up to the same divider, laid out by the
 renderer. Each button is the option's title, the recommended one primary, and
 its reply starts with that title: "<title> — apply Option B" (or "<title> —
@@ -601,7 +602,8 @@ class _ChatAlertEditor:
 
 
 def adapter_for(adapter: Any, platform: str, event: Any, task: Any, sub: Any) -> Any:
-    """``adapter``, or one whose ``send`` edits the alert this report answers.
+    """``adapter``, or one whose ``send`` answers the alert with the triage: Slack
+    edits the alert itself, the gateway posts the triage laid out under it.
 
     The editor is returned only with the flag on, on Slack or on Google Chat through
     the chat.notify stand-in (``spec.mode: next``), for a ``completed``
@@ -614,8 +616,8 @@ def adapter_for(adapter: Any, platform: str, event: Any, task: Any, sub: Any) ->
         if not enabled() or name not in _chat_ux_platforms():
             return adapter
         if name != SLACK and not callable(getattr(adapter, "send_chat", None)):
-            # Google Chat edits the alert only through the chat.notify stand-in
-            # (spec.mode: next), where the gateway lays the triage out; under
+            # Google Chat gets the triage only through the chat.notify stand-in
+            # (spec.mode: next), where the gateway lays it out; under
             # today Hermes's own adapter takes text and has no Slack client.
             return adapter
         if getattr(event, "kind", None) != COMPLETED or not isinstance(sub, dict):
