@@ -66,15 +66,32 @@ without a TTL, `feedback` with a 720-hour one). It gets one more bucket, `people
 | -------------- | ---------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `people.<hex>` | the time of the last put, RFC 3339 | on each verified turn from a chat platform, for that turn's principal, at most once an hour per key, so the time is within an hour of the last turn |
 
-`<hex>` is the 32 hex characters of `Requester.Principal` without its `hmac:` prefix, since a
-key-value key admits no colon. A person is that principal: the principal map folds a platform's
-member id into one identity where an entry exists, and no backend is part of the key. A put
-refreshes the entry, so the bucket's TTL deletes a person's key 30 days after their last put, within an hour of their last turn; the
-hourly bound keeps a busy conversation from writing the bucket on every message. The hash is the
-one the gateway already computes for every turn's authority block; nothing new about a person is
-written anywhere. A put that fails (the bucket full, the bus away) is logged and never ends the
-turn; the count under-counts until the next put succeeds. The bucket's size cap is sized for a
-hundred thousand people, far past any install.
+`<hex>` is 32 hex characters of an HMAC-SHA-256 of the resolved principal under a key derived for
+this bucket alone (HKDF of the attribution salt with the info string `people`), so a key joins
+neither the authority block's `Requester.Principal` nor the session store's pseudonyms, and a
+key-value key admits no colon anyway. A person is that principal: the principal map folds a
+platform's member id into one identity where an entry exists, and no backend is part of the key.
+A put refreshes the entry, so the bucket's TTL deletes a person's key 30 days after their last
+put, within an hour of their last turn; the hourly bound keeps a busy conversation from writing
+the bucket on every message. A put that fails (the bucket full, the bus away) is logged and never
+ends the turn; the count under-counts until the next put succeeds. The bucket's size cap is sized
+for a hundred thousand people, far past any install, and the gateway checks at start that the
+bucket has a max age, as it does for `feedback`, and writes nothing to one without.
+
+This is a new durable per-person record, and the design says so rather than calling it nothing:
+one pseudonym and one last-active time per person, for 30 days after their last turn. Who can
+read it: the gateway's NATS user reads and writes the bucket; the provision and seed users hold
+stream create and info on it, as on `feedback`, and stream info lists a bucket's keys (the ChatOps
+page says the same of `feedback`), so they can list the pseudonyms, never the people. Anyone who
+holds the attribution salt and a directory of addresses can re-identify a key of a Google Chat
+sender by hashing the directory, as they can the authority block's pseudonyms today; the salt sits
+in the credentials Secret, which the inference gateway also mounts, and narrowing that mount is a
+follow-up outside this design. The record has an off switch, `spec.telemetry.peopleSeen` (the
+chart's `platformAgent.telemetry.peopleSeen`), on by default: off, the gateway writes no key,
+deletes every key the bucket holds at its next start, and serves no sample, and the two fields
+stay absent. A single person is removed with a key-value delete of their key by whoever holds
+the gateway's credentials; the gateway's watch honours deletes, so the count drops at once rather
+than at the TTL. The ChatOps page's privacy section gets a paragraph that says all of this.
 
 A turn counts when the gateway has verified its sender and its backend is a chat platform a
 person writes on: one of the gateway's three chat backends, Google Chat, Slack or Discord, named
@@ -108,7 +125,11 @@ the salt gives everyone a new key and reads as more people for one window; the d
 added: a third reading kind, `people`, with two fields, `peopleSeen7d` and `peopleSeen30d`
 (`*int64`, a 0 is a reading, absent until the first reading and after two polls in a row without
 one, `max` across pods, never moving `lastActiveTime`). They are readings and not counters because
-a window count falls when people stop writing, which a monotonic counter cannot say. The slot as
+a window count falls when people stop writing, which a monotonic counter cannot say. The operator
+reads the `people` reading only while every chat platform the install enables is on the A2A door
+(the same facts that choose the Slack consumer); while a platform is served through Hermes the
+fields stay absent, since a real 0 would say nobody wrote while Slack users were writing, and the
+summary prints "no reading". The slot as
 that design specifies it reads the broker's body alone; this design generalises it to a target per
 reading, the
 `people` reading coming from the A2A gateway's listener. Its miss rule follows the target: a poll
@@ -152,13 +173,13 @@ the field. Four of the five are answered by `proposal-outcome-readings.md` and t
 design; the page gets a short list in the second implementation pull request, once every field it
 names exists on `main`:
 
-| Question                             | Field                                                                                                                                                   |
-| ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| How many PRs does kube-agents create | `remediationsProposedTotal` (every `proposal-create` that succeeded); `proposalsAuthored` (the forge's count now)                                       |
-| How many merge                       | `remediationsMergedTotal`, a reading of the forge                                                                                                       |
-| How many close without a merge       | `remediationsClosedUnmergedTotal`, a reading of the forge                                                                                               |
-| How many human touches per PR        | `proposalHumanTouches` over `proposalsAuthored`; the per-proposal distribution is `kubeagents_vcs_proposal_touches_per_proposal` in Prometheus          |
-| How often do customers interact      | `chatSessionsTotal` and `chatMessagesInboundTotal` for how much, `peopleSeen7d` and `peopleSeen30d` for how many people, `lastHumanActiveTime` for when |
+| Question                             | Field                                                                                                                                                                                                                                  |
+| ------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| How many PRs does kube-agents create | `remediationsProposedTotal` (every `proposal-create` that succeeded); `proposalsAuthored` (the forge's count now)                                                                                                                      |
+| How many merge                       | `remediationsMergedTotal`, a reading of the forge                                                                                                                                                                                      |
+| How many close without a merge       | `remediationsClosedUnmergedTotal`, a reading of the forge                                                                                                                                                                              |
+| How many human touches per PR        | `proposalHumanTouches` over `proposalsAuthored`; the per-proposal distribution is `kubeagents_vcs_proposal_touches_per_proposal` in Prometheus                                                                                         |
+| How often do customers interact      | `chatSessionsTotal` and `chatMessagesInboundTotal` for how much (console conversations included), `peopleSeen7d` and `peopleSeen30d` for how many people (the console's one shared principal excluded), `lastHumanActiveTime` for when |
 
 The breakdown of proposals by what started them (Workstream 3) is not part of this design.
 
@@ -172,20 +193,26 @@ The breakdown of proposals by what started them (Workstream 3) is not part of th
   (stream info, consumer create and consumer delete, which the bind, the watch and its stop
   need) with `TestGatewayGrantNamesTheBucketItsDataPlaneWritesTo` extended to it, and every
   other place that spells a bucket's name (the operator's bucket constant, the hard-coded stream
-  lists and the authorization test, the auth-callout goldens); the hourly-bounded put on
-  each verified chat turn after the principal and backend checks; the watch-fed map and the gauge
-  on the metrics listener. Tests beside the gateway's: a turn writes the key once an hour and a
-  door or console turn never, a failed put leaves the turn alone, the two windows count the right
-  keys from their times, an entry past 30 days leaves the count without a restart, an unloaded map
-  serves no sample, and the bucket's TTL and grants are rendered and named in step
+  lists and the authorization test, the auth-callout goldens); the hourly-bounded put on each
+  verified chat turn after the principal and backend checks; the key derivation (HKDF of the
+  attribution salt, info `people`); the start-time check that the bucket has a max age, as
+  `feedback`'s; the `spec.telemetry.peopleSeen` switch, read from the CR by the operator into the
+  gateway's environment, with the purge at start when it is off; the watch-fed map, which does not
+  ignore deletes, and the gauge on the metrics listener. Tests beside the gateway's: a turn
+  writes the key once an hour and a door or console turn never, a failed put leaves the turn
+  alone, the two windows count the right keys from their times, an entry past 30 days leaves the
+  count without a restart, a deleted key leaves it at once, an unloaded map serves no sample, the
+  key of a principal differs from its authority hash, the switch off writes nothing and purges,
+  and the bucket's TTL and grants are rendered and named in step
   (`TestSeedGrantsAndProvisionScriptNameTheSameStreams` extended to the identities file).
 - **Operator** (`usage_counters_scrape.go`, `usage_counters_fold.go`, `usage_counters_poller.go`,
   `usage_gauges.go`, `common_types.go`, the CRD copies): `chatSessionsTotal` projected from
   `sessionsChat`; the one new seed case in `usageStatusSeed` (a status that carries the field),
   `usageFieldFloor` unchanged in rule and extended to read the split, and the read-back floor; a
-  target per reading in the slot; the `people` reading kind, read from the A2A gateway's listener,
-  with its two specs and miss streak; the pruning record for the three newer fields; the export
-  rows. Tests beside the existing `usage_counters_*_test.go`: the projection, a re-seed from a
+  target per reading in the slot; the `people` reading kind, read from the A2A gateway's listener
+  only while every enabled chat platform is on the door, with its two specs and miss streak; the
+  `spec.telemetry.peopleSeen` field and its render into the gateway; the pruning record for the
+  three newer fields; the export rows. Tests beside the existing `usage_counters_*_test.go`: the projection, a re-seed from a
   status with the field (split, and clamped when the chat half is above the sum) and one from a
   status without it (the whole into the chat half, as today),
   `TestMigrateUsageDocument_TheSessionsHalvesAreUnfoldedOnlyWithoutASessionsStatus` extended to the
@@ -197,9 +224,11 @@ The breakdown of proposals by what started them (Workstream 3) is not part of th
 - **Series names** (`tests/test_usage_counters_series_names.py`): the new family and its label
   pinned between the gateway and the operator.
 - **Docs**: the observability page (the series, the fields, the five answers, the three fields
-  absent on an older served CRD beside the existing skew note), the CRD page (the same), the fields
-  page (generated), `usage-counters-producer.md` (the cross-install section), and a pointer in
-  `proposal-outcome-readings.md` where it defines the slot this design generalises.
+  absent on an older served CRD beside the existing skew note), the CRD page (the same, and the
+  switch), the fields page (generated), the ChatOps page's privacy section (the per-person record,
+  who can read it, the switch, the deletion), `usage-counters-producer.md` (the cross-install
+  section), and a pointer in `proposal-outcome-readings.md` where it defines the slot this design
+  generalises.
 
 ## 4. Goals, non-goals, what stays out
 
@@ -215,8 +244,9 @@ Non-goals: per-person anything (no field, label or log carries a pseudonym); a s
 serves through Hermes; a count of people who only read (reactions and views are not interactions
 here).
 
-Anti-goals: a window long enough that the table becomes a roster of who uses the install; a
-count that a maintainer can reach without the customer handing it over.
+Anti-goals: a record of more than a pseudonym and a last-active time, or kept longer than 30
+days, which would make the bucket a roster of who uses the install; a count that a maintainer can
+reach without the customer handing it over.
 
 ## 5. Eval exemption
 
@@ -228,5 +258,5 @@ reaches the model.
 ## 6. Left to the builder
 
 Where in the turn path the put sits (after the principal resolves and the backend check, before
-or after the session mint); how the watch rebuilds its map after a gap; the bucket's size cap; the
-exact pruning record name; the order of the new rows in the summary block; test fixture shapes.
+or after the session mint); how the watch rebuilds its map after a gap; the exact pruning record
+name; the order of the new rows in the summary block; test fixture shapes.
