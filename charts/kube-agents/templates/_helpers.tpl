@@ -2141,8 +2141,12 @@ The defaults carry no ephemeral-storage request because the operator renders non
        operator.resources.limits.memory first and parseBytes would refuse it with
        "please report it" before the operator template could name the key. Both
        readers call the check, as both readers of the credential-proxy override
-       call kube-agents.containerResourcesCheck. */ -}}
+       call kube-agents.containerResourcesCheck. Gated as the operator template
+       and the workload loop below are: a chart that renders no manager has no
+       limit to hold to the floor. */ -}}
+{{- if .Values.operator.enabled -}}
 {{- include "kube-agents.operatorResourcesCheck" . -}}
+{{- end -}}
 {{- $footprint := .Files.Get "files/footprint.yaml" | fromYaml -}}
 {{- /* The footprint is the only source for the operator-rendered pods, which are most of
        the release. If it is missing or unparseable every one of them silently counts as

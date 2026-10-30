@@ -228,18 +228,11 @@ operator:
   # on a 3-node install the store holds 675 objects in 3.7 MiB of live heap,
   # in a process of 22 MiB RSS. Kept in step with k8s-operator/config/manager.
   #
-  # limits.memory has a floor at this default (kube-agents.operatorMemoryFloorBytes
-  # in templates/_helpers.tpl): the chart fails the render on a smaller limit,
-  # naming the key. Releases up to 0.16.0 shipped the scaffold's 128Mi, and
-  # `helm upgrade --reuse-values` renders a new chart against the old release's
-  # values, defaults included, so an install upgraded that way kept 128Mi and
-  # the manager was OOM-killed as the cache filled. upgrade.sh resets the values
-  # first, so it never meets the floor on the old defaults; an explicit limit
-  # under 512Mi in a values file still fails there. Raise the limit for a larger cluster: the
-  # manager reads whatever limit is rendered through the Downward API
-  # (OPERATOR_MEMORY_LIMIT_BYTES) and sets its Go soft memory limit to nine
-  # tenths of it, so raising this is the one change. A GOMEMLIMIT set through
-  # operator.extraEnv takes precedence.
+  # limits.memory has a floor at this default: the chart fails the render on a
+  # smaller limit, naming the key (README, "Upgrade notes: operator memory
+  # floor", for the --reuse-values upgrade that meets it and the way out). The
+  # manager sets its Go soft memory limit to nine tenths of whatever limit is
+  # rendered, so raising this is the one change for a larger cluster.
   #
   # requests.cpu is 50m rather than the 10m the manager needs because GKE
   # Autopilot admits a pod unchanged only at 50m or more per pod and between
