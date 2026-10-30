@@ -242,6 +242,15 @@ KILLED_COMMAND_DRAIN_SECONDS = 5
 # looked at: nothing can wake that wait, so the deadline and the caller's
 # hang-up are checked in steps this long.
 PIPES_CLOSED_POLL_SECONDS = 0.5
+# `_reap`'s poll for a child that has not exited yet, the cadence Popen.wait
+# uses: short at first, doubling to the ceiling, so a quick exit is seen at
+# once and a slow one costs no busy loop.
+REAP_POLL_MIN_SECONDS = 0.0005
+REAP_POLL_MAX_SECONDS = 0.05
+# Where `_reap` leaves the reaped child's peak resident set on its Popen, so
+# whichever path reaped it (the capture, or the kill helper's zombie check)
+# the capture reads one place.
+REAPED_PEAK_RSS_ATTRIBUTE = "credential_proxy_peak_rss_bytes"
 # How many requests that run commands may be in flight at once. A slot is held
 # from the moment a request is admitted until its response is on the wire,
 # because everything the request costs lives that long: one child process -- a
@@ -2176,40 +2185,37 @@ def _proc_status_memory(path: Path) -> dict[str, int]:
 
 
 class ChildPeakTracker:
-    """The largest child process the broker has reaped, from the kernel's
-    ru_maxrss for its children, attributed to the tool that was just reaped.
+    """The largest child process the broker has reaped, per tool and overall,
+    from each child's own rusage.
 
-    RUSAGE_CHILDREN's ru_maxrss is the largest resident set of every
-    descendant reaped so far, one number for the process. It is read right
-    after a command is reaped, on the thread that reaped it, so a rise is that
-    command's (its tree's: the auth helper under a kubectl counts) unless
-    another thread reaped between the wait and the read. A child smaller than
-    an earlier one does not move it, which is the point: the question this
-    answers is what the biggest child was, which is what the budget's flat
-    per-request reserve has to hold and what the comment above it only
-    estimates.
+    Every brokered command is reaped by `_reap`, whose `wait4` returns the
+    peak resident set of exactly that child's tree (the auth helper under a
+    kubectl counts), so the figure recorded under a tool is that tool's and
+    no other thread's reap can move it. The question this answers is what the
+    biggest child was, which is what the budget's flat per-request reserve
+    has to hold and what the comment above it only estimates.
     """
 
-    def __init__(self, rusage: Callable[[int], Any] = resource.getrusage) -> None:
+    def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._rusage = rusage
         self._largest_bytes = 0
         self._largest_tool: str | None = None
         self._by_tool: dict[str, int] = {}
 
-    def record_after_reap(self, tool: str) -> int | None:
-        """Read the children's high-water after reaping a `tool` child; when
-        it rose, the rise is this child's. Returns the new high-water, or None
-        when nothing moved."""
+    def record(self, tool: str, peak_rss_bytes: int | None) -> bool:
+        """A `tool` child reaped at `peak_rss_bytes`. Its tool's figure rises
+        to it when larger; the overall high-water, and a log line, when it is
+        the largest of all so far. Returns whether the overall moved."""
+        if not peak_rss_bytes:
+            return False
         with self._lock:
-            peak = int(self._rusage(resource.RUSAGE_CHILDREN).ru_maxrss) * KIBIBYTE
-            if peak <= self._largest_bytes:
-                return None
-            self._largest_bytes = peak
+            self._by_tool[tool] = max(self._by_tool.get(tool, 0), peak_rss_bytes)
+            if peak_rss_bytes <= self._largest_bytes:
+                return False
+            self._largest_bytes = peak_rss_bytes
             self._largest_tool = tool
-            self._by_tool[tool] = max(self._by_tool.get(tool, 0), peak)
-        LOGGER.info("largest child so far tool=%s peak_rss=%dMiB", tool, peak // MEBIBYTE)
-        return peak
+        LOGGER.info("largest child so far tool=%s peak_rss=%dMiB", tool, peak_rss_bytes // MEBIBYTE)
+        return True
 
     def snapshot(self) -> tuple[dict[str, int], tuple[str, int] | None]:
         with self._lock:
@@ -5890,6 +5896,9 @@ class _CapturedOutput:
     truncated: bool
     timed_out: bool
     abandoned: bool
+    # The child's own peak resident set from the rusage its reap returned, in
+    # bytes; None when the reap did not go through `_reap` (already reaped).
+    peak_rss_bytes: int | None = None
 
 
 def _caller_has_gone(caller: Any) -> bool:
@@ -5961,8 +5970,9 @@ def _kill_process_group(process: subprocess.Popen) -> None:
         deadline = time.monotonic() + bound_seconds
         while True:
             # Reap the child if it has exited; a zombie would otherwise keep
-            # the group looking occupied for the whole wait.
-            process.poll()
+            # the group looking occupied for the whole wait. Through `_reap`,
+            # so the child's peak is kept for the capture.
+            _reap(process, 0)
             if group_is_empty():
                 return True
             if time.monotonic() >= deadline:
@@ -6018,6 +6028,41 @@ def _bounded_text(raw: bytes, limit: int) -> tuple[str, bool]:
         pieces.append(piece)
         budget -= len(encoded)
     return "".join(pieces), False
+
+
+def _reap(process: subprocess.Popen, timeout: float | None) -> tuple[bool, int | None]:
+    """Reap `process` with `wait4`, so the child's own rusage comes back with
+    its status: its peak resident set is then exactly this child's tree, not a
+    process-wide high-water another thread's reap may have moved (#4315).
+
+    `timeout` None blocks until the exit; 0 is one non-blocking look; any
+    other value polls until then. Returns (reaped, peak_rss_bytes), and leaves
+    the peak on the Popen under REAPED_PEAK_RSS_ATTRIBUTE. When reaped,
+    `process.returncode` is set the way Popen sets it (a signal as its
+    negative number), so Popen's own `wait` and `poll` return at once after.
+    A child something else already reaped (there is nothing else here that
+    does) is taken from Popen's view with no peak.
+    """
+    if process.returncode is not None:
+        return True, None
+    deadline = None if timeout is None else time.monotonic() + timeout
+    delay = REAP_POLL_MIN_SECONDS
+    while True:
+        try:
+            pid, status, usage = os.wait4(process.pid, 0 if deadline is None else os.WNOHANG)
+        except ChildProcessError:
+            process.poll()
+            return process.returncode is not None, None
+        if pid == process.pid:
+            process.returncode = os.waitstatus_to_exitcode(status)
+            peak_rss_bytes = int(usage.ru_maxrss) * KIBIBYTE
+            setattr(process, REAPED_PEAK_RSS_ATTRIBUTE, peak_rss_bytes)
+            return True, peak_rss_bytes
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False, None
+        time.sleep(min(delay, remaining))
+        delay = min(delay * 2, REAP_POLL_MAX_SECONDS)
 
 
 def _capture_output(
@@ -6124,18 +6169,16 @@ def _capture_output(
             # What the command wrote before it died is still in the pipes, and
             # what is left to wait for after that is the reaping.
             pump(time.monotonic() + KILLED_COMMAND_DRAIN_SECONDS, watch_caller=False)
-            try:
-                process.wait(timeout=KILLED_COMMAND_DRAIN_SECONDS)
-            except subprocess.TimeoutExpired:
+            if not _reap(process, KILLED_COMMAND_DRAIN_SECONDS)[0]:
                 _kill_process_group(process)
-                process.wait()
+                _reap(process, None)
         else:
             # Every pipe closed but the command is still running -- it handed
             # them to a child, or closed them itself. Nothing can wake a wait
             # now, so it is taken in steps: the deadline still applies, and so
             # does the caller's hang-up, and either gets the command the same
             # end a command that kept writing gets.
-            while process.poll() is None:
+            while not _reap(process, 0)[0]:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     timed_out = True
@@ -6145,13 +6188,13 @@ def _capture_output(
                     time.sleep(min(PIPES_CLOSED_POLL_SECONDS, remaining))
                     continue
                 _kill_process_group(process)
-                process.wait()
+                _reap(process, None)
     except BaseException:
         # Whatever went wrong in here -- a read or write that raised, the
         # thread being torn down -- the child does not get to outlive the
         # capture: it would run on outside the cap, unwatched and unreaped.
         _kill_process_group(process)
-        process.wait()
+        _reap(process, None)
         raise
     finally:
         selector.close()
@@ -6164,6 +6207,7 @@ def _capture_output(
         truncated=truncated,
         timed_out=timed_out,
         abandoned=abandoned,
+        peak_rss_bytes=getattr(process, REAPED_PEAK_RSS_ATTRIBUTE, None),
     )
 
 
@@ -6919,10 +6963,12 @@ class CommandExecutor:
             stderr=subprocess.PIPE,
             timeout=max(self.timeout_seconds, 120),
         )
-        # The one child reaped outside `execute`, and the first: its tree (a
-        # gcloud, around 100 MiB) would otherwise be credited to the first
-        # brokered command the tracker sees.
-        self.child_peaks.record_after_reap(CHILD_PEAK_TOOL_BOOTSTRAP)
+        # The one child reaped outside `_reap`, and the first child of the
+        # process, so the children's high-water is its tree's (a gcloud,
+        # around 100 MiB) and nobody else's.
+        self.child_peaks.record(
+            CHILD_PEAK_TOOL_BOOTSTRAP, int(resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss) * KIBIBYTE
+        )
         if result.returncode != 0:
             # The command's output is the only useful diagnostic when the
             # bootstrap fails, but it must not travel with the exception, which
@@ -8612,13 +8658,14 @@ class CommandExecutor:
                 timeout=effective_timeout,
                 caller=caller,
             )
-            # The child is reaped; what its tree peaked at is the kernel's to
-            # tell, and the one measurement the flat reserve above cannot make.
-            # argv[0] is the resolved path by now; the label is its name when
-            # the broker serves it, else LABEL_OTHER, as the counters do it.
+            # What the child's tree peaked at came back with its reap, the one
+            # measurement the flat reserve above cannot make. argv[0] is the
+            # resolved path by now; the label is its name when the broker
+            # serves it, else LABEL_OTHER, as the counters do it.
             executable = Path(argv[0]).name
-            self.child_peaks.record_after_reap(
-                executable if executable in self.ALLOWED_EXECUTABLES else LABEL_OTHER
+            self.child_peaks.record(
+                executable if executable in self.ALLOWED_EXECUTABLES else LABEL_OTHER,
+                captured.peak_rss_bytes,
             )
         stdout_text, stdout_cut = _bounded_text(captured.stdout, self.max_output_bytes)
         stderr_text, stderr_cut = _bounded_text(captured.stderr, self.max_output_bytes)

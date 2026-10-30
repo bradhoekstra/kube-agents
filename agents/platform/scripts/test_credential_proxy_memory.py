@@ -14,8 +14,9 @@ from __future__ import annotations
 
 import logging
 import re
+import subprocess
 import tempfile
-import types
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -28,6 +29,8 @@ from credential_proxy import (
     MemorySampler,
     MemorySnapshot,
     ProxyMetrics,
+    _capture_output,
+    _reap,
 )
 
 _MIB = 1024 * 1024
@@ -89,16 +92,12 @@ def _fake_proc(root: Path) -> Path:
     return proc
 
 
-def _rusage(kib: int):
-    return types.SimpleNamespace(ru_maxrss=kib)
-
-
 class MemoryReaderTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        self.tracker = ChildPeakTracker(rusage=lambda who: _rusage(0))
+        self.tracker = ChildPeakTracker()
 
     def reader(self, *, cgroup_dir: Path | None = None, proc_root: Path | None = None) -> MemoryReader:
         return MemoryReader(
@@ -153,10 +152,9 @@ class MemoryReaderTest(unittest.TestCase):
         self.assertEqual(["broker"], sorted(self.reader(proc_root=proc).read().processes))
 
     def test_the_children_come_from_the_tracker(self):
-        readings = iter([_rusage(120 * _KIB), _rusage(600 * _KIB)])
-        tracker = ChildPeakTracker(rusage=lambda who: next(readings))
-        tracker.record_after_reap("gcloud")
-        tracker.record_after_reap("kubectl")
+        tracker = ChildPeakTracker()
+        tracker.record("gcloud", 120 * _MIB)
+        tracker.record("kubectl", 600 * _MIB)
         reader = MemoryReader(tracker, cgroup_dir=_fake_cgroup(self.root), proc_root=_fake_proc(self.root))
         snapshot = reader.read()
         self.assertEqual({"gcloud": 120 * _MIB, "kubectl": 600 * _MIB}, snapshot.children)
@@ -164,15 +162,15 @@ class MemoryReaderTest(unittest.TestCase):
 
 
 class ChildPeakTrackerTest(unittest.TestCase):
-    def test_a_rise_after_a_reap_is_that_tools_and_a_smaller_child_moves_nothing(self):
-        readings = iter([_rusage(100 * _KIB), _rusage(100 * _KIB), _rusage(432 * _KIB)])
-        tracker = ChildPeakTracker(rusage=lambda who: next(readings))
+    def test_each_tools_figure_is_its_own_and_the_largest_is_logged(self):
+        tracker = ChildPeakTracker()
         with self.assertLogs(credential_proxy.LOGGER, level=logging.INFO) as logs:
-            self.assertEqual(100 * _MIB, tracker.record_after_reap("gcloud"))
-            # A child under the high-water does not show in ru_maxrss at all,
-            # which is what makes the figure the largest child, not the last.
-            self.assertIsNone(tracker.record_after_reap("kubectl"))
-            self.assertEqual(432 * _MIB, tracker.record_after_reap("kubectl"))
+            self.assertTrue(tracker.record("gcloud", 100 * _MIB))
+            # A smaller child moves its own tool's figure only when larger
+            # than that tool's, and never the overall; no line for it.
+            self.assertFalse(tracker.record("kubectl", 60 * _MIB))
+            self.assertTrue(tracker.record("kubectl", 432 * _MIB))
+            self.assertFalse(tracker.record("gcloud", 90 * _MIB))
         self.assertEqual({"gcloud": 100 * _MIB, "kubectl": 432 * _MIB}, tracker.snapshot()[0])
         self.assertEqual(("kubectl", 432 * _MIB), tracker.snapshot()[1])
         self.assertEqual(
@@ -180,31 +178,35 @@ class ChildPeakTrackerTest(unittest.TestCase):
             [record.getMessage() for record in logs.records],
         )
 
+    def test_a_reap_without_a_peak_records_nothing(self):
+        tracker = ChildPeakTracker()
+        self.assertFalse(tracker.record("kubectl", None))
+        self.assertFalse(tracker.record("kubectl", 0))
+        self.assertEqual(({}, None), tracker.snapshot())
+
     def test_the_bootstrap_command_is_recorded_under_its_own_label(self):
-        # The bootstrap's gcloud is the first child reaped and sets ru_maxrss
-        # on its own; recorded as `bootstrap` right after its run, the first
-        # brokered command does not inherit it, and only a larger child moves
-        # the figure.
-        readings = iter([_rusage(140 * _KIB), _rusage(140 * _KIB), _rusage(432 * _KIB)])
+        # The bootstrap is the process's first child, so the children's
+        # high-water after it is its tree's; it is recorded as `bootstrap`
+        # and the first brokered command does not inherit it.
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         executor = CommandExecutor(timeout_seconds=5, max_output_bytes=1024, state_dir=temp.name, scoped_pool=None)
-        executor.child_peaks = ChildPeakTracker(rusage=lambda who: next(readings))
+        executor.child_peaks = ChildPeakTracker()
         executor.bootstrap("true")
-        self.assertEqual(({"bootstrap": 140 * _MIB}, ("bootstrap", 140 * _MIB)), executor.child_peaks.snapshot())
-        self.assertIsNone(executor.child_peaks.record_after_reap("kubectl"))
-        self.assertEqual(432 * _MIB, executor.child_peaks.record_after_reap("kubectl"))
-        self.assertEqual(("kubectl", 432 * _MIB), executor.child_peaks.snapshot()[1])
+        by_tool, largest = executor.child_peaks.snapshot()
+        self.assertEqual(["bootstrap"], sorted(by_tool))
+        self.assertGreater(by_tool["bootstrap"], 0)
+        self.assertEqual("bootstrap", largest[0])
 
     def test_an_empty_bootstrap_records_nothing(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         executor = CommandExecutor(timeout_seconds=5, max_output_bytes=1024, state_dir=temp.name, scoped_pool=None)
-        executor.child_peaks = ChildPeakTracker(rusage=lambda who: _rusage(0))
+        executor.child_peaks = ChildPeakTracker()
         executor.bootstrap("")
         self.assertEqual(({}, None), executor.child_peaks.snapshot())
 
-    def test_the_executor_records_after_every_reap_under_the_tools_label(self):
+    def test_the_executor_records_each_reaped_child_under_the_tools_label(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         stub_dir = Path(temp.name) / "bin"
@@ -217,7 +219,73 @@ class ChildPeakTrackerTest(unittest.TestCase):
         with mock.patch.object(executor, "child_peaks") as peaks:
             result = executor.execute(["kubectl", "get", "pods"])
         self.assertEqual(0, result.exit_code, result.stderr)
-        peaks.record_after_reap.assert_called_once_with("kubectl")
+        peaks.record.assert_called_once()
+        tool, peak = peaks.record.call_args.args
+        self.assertEqual("kubectl", tool)
+        self.assertGreater(peak, 0)
+
+
+class ReapTest(unittest.TestCase):
+    """`_reap` is the one place a brokered child is waited for: wait4, so the
+    child's own rusage comes back, and Popen's view set from it."""
+
+    def test_a_blocking_reap_returns_the_childs_own_peak_and_sets_the_returncode(self):
+        process = subprocess.Popen(["sh", "-c", "exit 3"])
+        reaped, peak = _reap(process, None)
+        self.assertTrue(reaped)
+        self.assertGreater(peak, 0)
+        self.assertEqual(3, process.returncode)
+        # Popen agrees and does not wait again.
+        self.assertEqual(3, process.wait())
+        self.assertEqual(3, process.poll())
+
+    def test_a_signal_is_the_negative_number_as_popen_reports_it(self):
+        process = subprocess.Popen(["sleep", "30"])
+        process.kill()
+        reaped, peak = _reap(process, None)
+        self.assertTrue(reaped)
+        self.assertEqual(-9, process.returncode)
+        self.assertIsNotNone(peak)
+
+    def test_a_timed_reap_gives_up_on_a_running_child_and_takes_it_once_it_exits(self):
+        process = subprocess.Popen(["sleep", "30"])
+        try:
+            started = time.monotonic()
+            self.assertEqual((False, None), _reap(process, 0))
+            self.assertEqual((False, None), _reap(process, 0.05))
+            self.assertLess(time.monotonic() - started, 1)
+            self.assertIsNone(process.returncode)
+        finally:
+            process.kill()
+        reaped, peak = _reap(process, 1)
+        self.assertTrue(reaped)
+        self.assertEqual(-9, process.returncode)
+
+    def test_a_child_already_reaped_is_taken_from_popens_view_with_no_peak(self):
+        process = subprocess.Popen(["sh", "-c", "exit 2"])
+        self.assertEqual(2, process.wait())
+        self.assertEqual((True, None), _reap(process, None))
+
+    def test_capture_output_carries_the_peak_on_the_ordinary_path(self):
+        process = subprocess.Popen(["sh", "-c", "echo out; echo err >&2"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        captured = _capture_output(process, stdin=None, limit=4096, timeout=5)
+        self.assertEqual((b"out\n", b"err\n", 0), (captured.stdout, captured.stderr, process.returncode))
+        self.assertGreater(captured.peak_rss_bytes, 0)
+
+    def test_capture_output_carries_the_peak_when_the_child_closed_its_pipes_early(self):
+        # The pipes close but the command runs on: the stepped poll path.
+        process = subprocess.Popen(["sh", "-c", "exec >/dev/null 2>&1; sleep 0.3; exit 0"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        captured = _capture_output(process, stdin=None, limit=4096, timeout=5)
+        self.assertEqual(0, process.returncode)
+        self.assertFalse(captured.timed_out)
+        self.assertGreater(captured.peak_rss_bytes, 0)
+
+    def test_capture_output_carries_the_peak_of_a_timed_out_child(self):
+        process = subprocess.Popen(["sh", "-c", "sleep 30"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+        captured = _capture_output(process, stdin=None, limit=4096, timeout=0.2)
+        self.assertTrue(captured.timed_out)
+        self.assertIsNotNone(process.returncode)
+        self.assertGreater(captured.peak_rss_bytes, 0)
 
 
 class _Readings:

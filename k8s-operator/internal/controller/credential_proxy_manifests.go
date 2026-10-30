@@ -123,7 +123,7 @@ const (
 	// fleet with thousands of objects per cluster the limit has to hold the
 	// largest listing the fleet produces for every command that may run at
 	// once, plus the two fixed reserves (320Mi): eight 500Mi listings need
-	// about 4.3Gi, not the 2Gi below. The broker measures this itself
+	// about 4.2Gi, not the 2Gi below. The broker measures this itself
 	// (kubeagents_credential_proxy_child_peak_rss_bytes and its memory
 	// high-water log lines), and that is what a large fleet's override is
 	// sized from (#4315).
