@@ -86,10 +86,14 @@ page says the same of `feedback`), so they can list the pseudonyms, never the pe
 holds the attribution salt and a directory of addresses can re-identify a key of a Google Chat
 sender by hashing the directory, as they can the authority block's pseudonyms today; the salt sits
 in the credentials Secret, which the inference gateway also mounts, and narrowing that mount is a
-follow-up outside this design. The record has an off switch, `spec.telemetry.peopleSeen` (the
-chart's `platformAgent.telemetry.peopleSeen`), on by default: off, the gateway writes no key,
-deletes every key the bucket holds at its next start, and serves no sample, and the two fields
-stay absent. A single person is removed with a key-value delete of their key by whoever holds
+follow-up outside this design. The record has an off switch, `spec.telemetry.peopleSeen` (the chart's
+`platformAgent.telemetry.peopleSeen`), on by default: off, the gateway writes no key, deletes
+every key the bucket holds at its next start, and serves no sample, and the two fields stay
+absent. A new spec field has the chart's standing guard: `platform-agent-cr.yaml` refuses to
+render `peopleSeen: false` against a served CRD that lacks the field, with the `lookup`-gated
+`fail` every other new spec field there carries, because `helm upgrade` never applies `crds/` and
+an API server serving the older schema would prune the value silently while the record is
+written; `upgrade.sh --upgrade-mode=harness` and a hand `lifecycle.sh apply` take that route. A single person is removed with a key-value delete of their key by whoever holds
 the gateway's credentials; the gateway's watch honours deletes, so the count drops at once rather
 than at the TTL. The ChatOps page's privacy section gets a paragraph that says all of this.
 
@@ -125,11 +129,11 @@ the salt gives everyone a new key and reads as more people for one window; the d
 added: a third reading kind, `people`, with two fields, `peopleSeen7d` and `peopleSeen30d`
 (`*int64`, a 0 is a reading, absent until the first reading and after two polls in a row without
 one, `max` across pods, never moving `lastActiveTime`). They are readings and not counters because
-a window count falls when people stop writing, which a monotonic counter cannot say. The operator
-reads the `people` reading only while every chat platform the install enables is on the A2A door
-(the same facts that choose the Slack consumer); while a platform is served through Hermes the
-fields stay absent, since a real 0 would say nobody wrote while Slack users were writing, and the
-summary prints "no reading". The slot as
+a window count falls when people stop writing, which a monotonic counter cannot say. The operator reads the `people` reading only while no chat platform the install enables is
+served through Hermes: not Chat on its legacy consumer, not Slack on its legacy consumer (the
+facts that choose the Slack consumer), and not Teams, which Hermes alone serves and the gateway
+has no backend for; while any of them is, the fields stay absent, since a real 0 would say nobody
+wrote while those platforms' users were writing, and the summary prints "no reading". The slot as
 that design specifies it reads the broker's body alone; this design generalises it to a target per
 reading, the
 `people` reading coming from the A2A gateway's listener. Its miss rule follows the target: a poll
@@ -210,13 +214,17 @@ The breakdown of proposals by what started them (Workstream 3) is not part of th
   `sessionsChat`; the one new seed case in `usageStatusSeed` (a status that carries the field),
   `usageFieldFloor` unchanged in rule and extended to read the split, and the read-back floor; a
   target per reading in the slot; the `people` reading kind, read from the A2A gateway's listener
-  only while every enabled chat platform is on the door, with its two specs and miss streak; the
-  `spec.telemetry.peopleSeen` field and its render into the gateway; the pruning record for the
-  three newer fields; the export rows. Tests beside the existing `usage_counters_*_test.go`: the projection, a re-seed from a
+  only while every enabled chat platform is on the door, with its two specs and miss streak; the `spec.telemetry.peopleSeen` field and its render into the gateway; the rule that reads the
+  reading only while no chat platform is served through Hermes (Chat, Slack, Teams); the pruning
+  record for the three newer fields; the export rows. Tests beside the existing `usage_counters_*_test.go`: the projection, a re-seed from a
   status with the field (split, and clamped when the chat half is above the sum) and one from a
   status without it (the whole into the chat half, as today),
   `TestMigrateUsageDocument_TheSessionsHalvesAreUnfoldedOnlyWithoutASessionsStatus` extended to the
   split seed shape, the reading's presence and clearing, the fall projected as it stands.
+- **Chart** (`charts/kube-agents/templates/platform-agent-cr.yaml`, `values.yaml`, the schema):
+  `platformAgent.telemetry.peopleSeen` rendered into `spec.telemetry`, with the `lookup`-gated
+  `fail` against a served CRD that lacks the field, beside the guards the other new spec fields
+  carry, and a test beside theirs in `tests/`.
 - **Feedback summary** (`feedback_summary.py` and `a2a/gateway/feedback_summary.go`): the three
   fields, the two readings with their source suffix, the two copies held in step by
   `GatewayCopyTest` in `test_feedback_summary.py`, which reads the Go copy (added with the proposal
