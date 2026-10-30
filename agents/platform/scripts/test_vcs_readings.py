@@ -66,6 +66,8 @@ class FakeTransport:
 class FakeForge:
     """Answers the sweep's six reads from in-memory proposals and events."""
 
+    COMMIT_CAP = 250
+
     def __init__(self, host="github.com", login=INSTALL, clamp=None, splits=True, http_user=False):
         self.name = "fake"
         self.hosts = (host,)
@@ -158,7 +160,7 @@ class FakeForge:
 
     def proposal_commits(self, api, repo, payload):
         self._call(api, "commits", payload["number"])
-        rows = self.commits.get(payload["number"], [])[: vcs_readings.COMMIT_CAP]
+        rows = self.commits.get(payload["number"], [])[: self.COMMIT_CAP]
         start = (payload["page"] - 1) * payload["limit"]
         batch = rows[start : start + payload["limit"]]
         return {"commits": batch, "count": len(batch), "truncated": len(batch) >= payload["limit"]}
@@ -651,7 +653,7 @@ class ReadingsSweepTest(unittest.TestCase):
         harness.sweep.run_once()
 
         _, details = harness.last()
-        self.assertEqual(details.touches, {Touch("commit", "human"): vcs_readings.COMMIT_CAP})
+        self.assertEqual(details.touches, {Touch("commit", "human"): FakeForge.COMMIT_CAP})
         self.assertEqual(harness.metrics.failures, ["detail_truncated"])
         self.assertEqual(forge.calls.count("commits"), 3)
 
@@ -1133,3 +1135,74 @@ class ManagedKeyTest(unittest.TestCase):
         self.assertEqual(["forge"], harness.metrics.failures)
         self.assertEqual([], harness.metrics.readings)
         self.assertEqual([], forge.calls)
+
+
+class TallyAndUnsupportedTest(unittest.TestCase):
+    def _truncated_forge(self, tally):
+        forge = FakeForge(host="gitea.example.com", login="kube-agents", clamp=50, splits=True, http_user=True)
+        for number in range(1, 1102):
+            forge.add(number, "merged", updated=f"2026-01-01T00:00:00Z{number:05d}")
+        forge.proposal_tally = tally
+        return forge
+
+    def test_a_failed_tally_withholds_the_outcomes_reading_only(self):
+        def tally(api, repo, payload):
+            raise WorkspaceError("search down", status=502, code="FORGE_CALL_FAILED")
+
+        forge = self._truncated_forge(tally)
+        harness = Harness({GITEA_REPO.replace("gitea:", "fake:"): forge}, interval=WIDE)
+        harness.sweep.run_once()
+        outcomes, details = harness.last()
+        self.assertIsNone(outcomes)
+        self.assertIsNotNone(details, "the details reading is published from the listing the tally did not touch")
+        self.assertEqual(["forge"], harness.metrics.failures)
+
+    def test_the_tally_takes_the_sum_from_the_forges_one_count(self):
+        # Separate per-state searches straddle a merge: 1 open + 1 merged + 1 closed
+        # would sum to 3 while the forge counts 2 proposals; open takes the difference.
+        def tally(api, repo, payload):
+            return {"open": 1, "merged": 1, "closed": 1, "total": 2}
+
+        forge = self._truncated_forge(tally)
+        harness = Harness({GITEA_REPO.replace("gitea:", "fake:"): forge}, interval=WIDE)
+        harness.sweep.run_once()
+        outcomes, _ = harness.last()
+        self.assertEqual((0, 1, 1), (outcomes.open, outcomes.merged, outcomes.closed))
+
+    def test_a_forge_that_does_not_serve_the_sweep_leaves_the_required_set(self):
+        served = FakeForge()
+        served.add(1, "merged")
+        refusing = FakeForge()
+
+        def refuse(api, repo, payload):
+            raise vcs_readings.ForgeUnsupported("fake does not serve `proposal-list-by-author`")
+
+        refusing.proposal_list_by_author = refuse
+        harness = Harness({REPO: served, OTHER_REPO: refusing}, interval=WIDE)
+        with self.assertLogs("credential-proxy.vcs-readings", level="INFO") as logs:
+            harness.sweep.run_once()
+        outcomes, _ = harness.last()
+        self.assertEqual(1, outcomes.merged, "the served repository's reading is published")
+        self.assertEqual(["forge"], harness.metrics.failures)
+        self.assertEqual(1, sum("does not serve the sweep" in line for line in logs.output))
+        calls = len(served.calls)
+        harness.sweep.run_once()
+        self.assertEqual(["forge"], harness.metrics.failures, "an unsupported repository is not attempted again")
+        self.assertGreater(len(served.calls), calls)
+
+
+class GitHubTallyTest(unittest.TestCase):
+    def test_the_tally_adds_the_unqualified_count_as_total(self):
+        forge = GitHubForge(refresh=mock.Mock())
+        queries = []
+
+        def api(method, path, params=None, **kwargs):
+            queries.append(params["q"])
+            counts = {"is:open": 2, "is:merged": 5, "is:unmerged is:closed": 1}
+            total = next((v for k, v in counts.items() if params["q"].endswith(" " + k)), 8)
+            return {"total_count": total, "incomplete_results": False, "items": []}
+
+        answer = forge.proposal_tally(api, "acme/infra", {"author": "app/kube-agents"})
+        self.assertEqual({"open": 2, "merged": 5, "closed": 1, "total": 8}, answer)
+        self.assertEqual(4, len(queries))
+        self.assertFalse(queries[-1].endswith(" "), "the unqualified query carries no trailing space")

@@ -116,6 +116,7 @@ USAGE_COUNTERS: Tuple[str, ...] = (
     "remediationsOpen",
     "remediationsClosedUnmergedTotal",
     "proposalHumanTouches",
+    "proposalsMergedUntouched",
 )
 #: The fields the broker reads off the forge rather than counts: absent means it
 #: has no reading yet, which is not 0.
@@ -125,6 +126,7 @@ USAGE_READINGS = frozenset({
     "remediationsOpen",
     "remediationsClosedUnmergedTotal",
     "proposalHumanTouches",
+    "proposalsMergedUntouched",
 })
 USAGE_NO_READING = "no reading"
 USAGE_READING_SUFFIX = " (as the forge reports)"

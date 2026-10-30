@@ -95,13 +95,14 @@ var usageSummaryCounters = []string{
 	"clustersRegistered", "clustersMonitored", "chatMessagesInboundTotal", "sessionsTotal",
 	"toolExecutionsTotal", "eventsIngestedTotal", "remediationsProposedTotal", "remediationsMergedTotal",
 	"proposalsAuthored", "remediationsOpen", "remediationsClosedUnmergedTotal", "proposalHumanTouches",
+	"proposalsMergedUntouched",
 }
 
 // : The fields the broker reads off the forge rather than counts: absent means
 // : it has no reading yet, which is not 0. The script's USAGE_READINGS.
 var usageSummaryReadings = map[string]bool{
 	"remediationsMergedTotal": true, "proposalsAuthored": true, "remediationsOpen": true,
-	"remediationsClosedUnmergedTotal": true, "proposalHumanTouches": true,
+	"remediationsClosedUnmergedTotal": true, "proposalHumanTouches": true, "proposalsMergedUntouched": true,
 }
 
 // : Spec subtrees whose string leaves name the install and must not reach the

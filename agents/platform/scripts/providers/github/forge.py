@@ -82,6 +82,7 @@ INCOMPLETE_RESULTS = "incomplete_results"
 
 # The qualifiers that count an author's proposals by outcome. `is:closed`
 # alone would count merged ones twice.
+TALLY_TOTAL_KEY = "total"
 TALLY_QUALIFIERS = {
     "open": "is:open",
     "merged": "is:merged",
@@ -724,8 +725,10 @@ class GitHubForge(Forge):
     def proposal_tally(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
         query = self._author_query(repo, payload)
         tally: dict[str, Any] = {}
-        for state, qualifier in TALLY_QUALIFIERS.items():
-            found = api("GET", SEARCH_PATH, params={"q": f"{query} {qualifier}", "per_page": 1}) or {}
+        # The states are separate searches, not one snapshot; the unqualified
+        # query's count is the one number the sweep sums the states to.
+        for state, qualifier in {**TALLY_QUALIFIERS, TALLY_TOTAL_KEY: ""}.items():
+            found = api("GET", SEARCH_PATH, params={"q": f"{query} {qualifier}".strip(), "per_page": 1}) or {}
             total = found.get("total_count")
             if not isinstance(total, int) or isinstance(total, bool):
                 raise WorkspaceError(

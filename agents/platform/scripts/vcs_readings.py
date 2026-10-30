@@ -60,7 +60,9 @@ VCS_READINGS_IGNORED_AFTER_SECONDS = 14 * 24 * 3600
 # The per-proposal gauge's cumulative `le` edges.
 VCS_READINGS_BUCKETS = (0.0, 1.0, 2.0, 3.0, 5.0, 8.0, 13.0, 21.0, math.inf)
 # The most commits any forge serves for one proposal; the forges cap there too.
-COMMIT_CAP = 250
+# For a forge class that declares no `COMMIT_CAP` of its own; GitHub, GitLab
+# and Gitea each declare theirs, and the sweep reads the bound forge's.
+COMMIT_CAP_FALLBACK = 250
 SECONDS_PER_HOUR = 3600
 SECONDS_PER_MINUTE = 60
 # GitHub serves thirty searches a minute; the sweep keeps under that, so a
@@ -84,6 +86,8 @@ VCS_READINGS_FAILURES_METRIC = "kubeagents_vcs_readings_failures_total"
 STATE_OPEN = "open"
 STATE_MERGED = "merged"
 STATE_CLOSED = "closed"
+# A tally may carry the forge's one count of every proposal beside the states.
+TALLY_TOTAL = "total"
 STATES = (STATE_OPEN, STATE_MERGED, STATE_CLOSED)
 OUTCOMES = (STATE_MERGED, STATE_CLOSED)
 ACTOR_INSTALL = "install"
@@ -289,6 +293,9 @@ class _Attempt:
     details: bool = False  # False withholds the details reading
     reason: str | None = None
     nameless: bool = False
+    # The forge does not serve the sweep's reads (`ForgeUnsupported` from the
+    # bind or the listing): the repository is left out of the required set.
+    unsupported: bool = False
 
 
 class ReadingsSweep:
@@ -326,6 +333,8 @@ class ReadingsSweep:
         self._emails: dict[str, frozenset[str]] = {}
         self._nameless: set[str] = set()
         self._nameless_logged = False
+        self._unsupported: set[str] = set()
+        self._unsupported_logged = False
         # Step 2's token bucket, in forge calls: refilled at the hourly rate,
         # holding at most one sweep's share so the hour's calls spread evenly.
         self._capacity = VCS_READINGS_DETAIL_CALLS_PER_HOUR * interval / SECONDS_PER_HOUR
@@ -385,13 +394,18 @@ class ReadingsSweep:
         scopes: set[tuple[str, str]] = set()
         required = 0
         for key in managed:
-            if key in self._nameless:
+            if key in self._nameless or key in self._unsupported:
                 continue
             attempt = self._attempt(key)
             if attempt.nameless:
                 self._nameless.add(key)
                 self._metrics.record_reading_failure(REASON_IDENTITY)
                 self._log_nameless(key)
+                continue
+            if attempt.unsupported:
+                self._unsupported.add(key)
+                self._metrics.record_reading_failure(REASON_FORGE)
+                self._log_unsupported(key)
                 continue
             required += 1
             if attempt.reason:
@@ -421,9 +435,9 @@ class ReadingsSweep:
             if not self._login(key):
                 return _Attempt(nameless=True)
             proposals, truncated, _ = self._list(key)
-            counts = self._tally(key) if truncated else Counter(
-                p.get("state") for p in proposals if p.get("state") in STATES
-            )
+        except ForgeUnsupported as exc:
+            LOGGER.warning("proposal readings: %s is not served by its forge: %s", key, exc)
+            return _Attempt(unsupported=True)
         except _ForeignAuthor:
             LOGGER.warning("proposal readings: %s listed a proposal another account authored", key)
             return _Attempt(reason=REASON_FORGE)
@@ -432,8 +446,16 @@ class ReadingsSweep:
             return _Attempt(reason=REASON_FORGE)
         except Exception as exc:  # noqa: BLE001 -- one repository never ends the sweep
             return self._failed(key, exc, _Attempt())
-        attempt = _Attempt(counts=counts, reason=REASON_TRUNCATED if truncated else None)
-        if not truncated:
+        attempt = _Attempt(reason=REASON_TRUNCATED if truncated else None)
+        if truncated:
+            # A tally that fails withholds the outcomes reading alone: the
+            # listing is whole enough for the details, which go on below.
+            try:
+                attempt.counts = self._tally(key)
+            except Exception as exc:  # noqa: BLE001
+                self._failed(key, exc, attempt)
+        else:
+            attempt.counts = Counter(p.get("state") for p in proposals if p.get("state") in STATES)
             self._evict_missing(key, proposals)
         try:
             if not self._warm(key, proposals):
@@ -455,6 +477,16 @@ class ReadingsSweep:
             exc.fields.get("code") if isinstance(exc, WorkspaceError) else "",
         )
         return attempt
+
+    def _log_unsupported(self, key: str) -> None:
+        if self._unsupported_logged:
+            return
+        self._unsupported_logged = True
+        LOGGER.info(
+            "proposal readings are off for %s: its forge does not serve the sweep's reads, "
+            "so the repository is left out of the readings",
+            key,
+        )
 
     def _log_nameless(self, key: str) -> None:
         if self._nameless_logged:
@@ -638,6 +670,14 @@ class ReadingsSweep:
             if not isinstance(value, int) or isinstance(value, bool):
                 return None
             counts[state] = value
+        total = answer.get(TALLY_TOTAL)
+        if isinstance(total, int) and not isinstance(total, bool):
+            # The per-state counts are separate queries, not one snapshot: a
+            # proposal that changes state between two of them is counted twice
+            # or not at all, and the sum would dip or double for a sweep, which
+            # the fall guard reads as a removal. The forge's one count of every
+            # proposal is the sum; `open` takes up the difference.
+            counts[STATE_OPEN] = max(total - counts[STATE_MERGED] - counts[STATE_CLOSED], 0)
         return counts
 
     def _warm(self, repo: str, proposals: list[dict]) -> bool:
@@ -714,7 +754,8 @@ class ReadingsSweep:
         """A proposal's commits up to the cap, and whether the cap was reached."""
         rows: list[dict] = []
         page = 1
-        while len(rows) < COMMIT_CAP:
+        cap = getattr(bound.forge, "COMMIT_CAP", COMMIT_CAP_FALLBACK)
+        while len(rows) < cap:
             answer = bound.forge.proposal_commits(
                 bound.api, bound.path, {"number": number, "limit": MAX_PAGE_SIZE, "page": page}
             )
@@ -723,8 +764,8 @@ class ReadingsSweep:
             if len(batch) < MAX_PAGE_SIZE:
                 break
             page += 1
-        rows = rows[:COMMIT_CAP]
-        return rows, len(rows) >= COMMIT_CAP
+        rows = rows[:cap]
+        return rows, len(rows) >= cap
 
     @staticmethod
     def _closer(bound: _Repository, number: int, login: str) -> str:
