@@ -234,7 +234,8 @@ operator:
   # `helm upgrade --reuse-values` renders a new chart against the old release's
   # values, defaults included, so an install upgraded that way kept 128Mi and
   # the manager was OOM-killed as the cache filled. upgrade.sh resets the values
-  # first and never meets the floor. Raise the limit for a larger cluster: the
+  # first, so it never meets the floor on the old defaults; an explicit limit
+  # under 512Mi in a values file still fails there. Raise the limit for a larger cluster: the
   # manager reads whatever limit is rendered through the Downward API
   # (OPERATOR_MEMORY_LIMIT_BYTES) and sets its Go soft memory limit to nine
   # tenths of it, so raising this is the one change. A GOMEMLIMIT set through

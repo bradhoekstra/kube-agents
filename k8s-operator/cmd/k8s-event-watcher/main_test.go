@@ -709,12 +709,11 @@ func clusterNames(clusters []targetCluster) []string {
 	return out
 }
 
-// The soft memory limit is half of what the operator reports as the container's
-// limit, and only when nothing else has already set one. The derivation's input
-// classes are internal/memlimit's tests; what is pinned here is that the watcher
-// hands it its own variable and its own share.
-// applyMemoryLimit turns the derived value into the runtime's soft limit —
-// the same setting GOMEMLIMIT controls — and leaves it alone otherwise.
+// applyMemoryLimit sets the runtime's soft limit, the same setting GOMEMLIMIT
+// controls, to half of what the operator reports as the container's limit, and
+// leaves it alone when something else has already set one. The derivation's
+// input classes are internal/memlimit's tests; what is pinned here is that the
+// watcher hands it its own variable and its own share.
 func TestApplyMemoryLimit_SetsTheRuntimeSoftLimit(t *testing.T) {
 	// SetMemoryLimit(-1) reads the current limit without changing it.
 	prev := debug.SetMemoryLimit(-1)

@@ -907,7 +907,7 @@ Or on an existing one:
 
 ```bash
 helm upgrade kube-agents ./charts/kube-agents \
-  --namespace kubeagents-system --reuse-values \
+  --namespace kubeagents-system --reset-then-reuse-values \
   --set platformAgent.harness.experimental.shellSandbox.runtimeClassName=gvisor \
   --wait --timeout 10m
 ```

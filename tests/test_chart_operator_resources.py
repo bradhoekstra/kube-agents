@@ -152,6 +152,13 @@ class OperatorMemoryLimitRenderTest(unittest.TestCase):
         err = self._render([f"{_VALUE_PATH}.limits.memory=lots"], expect_failure=True)
         self.assertIn(f'{_VALUE_PATH}.limits.memory is "lots", which is not a Kubernetes quantity', err)
 
+    def test_a_quantity_past_float64_fails_as_unrepresentable_not_as_under_the_floor(self):
+        # Sprig's float64 answers 0 on a range error, which the floor compare would
+        # otherwise report as "under the 512Mi floor".
+        err = self._render([f"{_VALUE_PATH}.limits.memory=1e400"], expect_failure=True)
+        self.assertIn(f"{_VALUE_PATH}.limits.memory is 1e400, which is not a representable byte count", err)
+        self.assertNotIn("under the", err)
+
     def test_a_negative_quantity_fails_naming_the_key(self):
         err = self._render([f"{_VALUE_PATH}.limits.memory=-1Gi"], expect_failure=True)
         self.assertIn(f"{_VALUE_PATH}.limits.memory is -1Gi; a quantity must not be negative", err)
