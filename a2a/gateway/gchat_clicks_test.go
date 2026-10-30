@@ -598,3 +598,28 @@ func TestGchatWidgetsRoundTrip(t *testing.T) {
 		t.Errorf("an unknown index names no button: %q", label)
 	}
 }
+
+// A click waiting on a message the adapter does not remember (posted before
+// a restart) is forgotten when the message is laid out again without
+// choices, so its verification does not patch the old question back over
+// the settled text.
+func TestGchatSettlingAnUnrememberedQuestionForgetsItsPendingClick(t *testing.T) {
+	a := newTestGchatAdapter(t)
+	ev := gchatClickEvent(t)
+	if _, reason := a.classifyClick(ev); reason != "" {
+		t.Fatalf("click refused: %s", reason)
+	}
+	a.mu.Lock()
+	pending, waiting := len(a.uxLocked().pending), a.uxLocked().waiting[ev.Message.Name]
+	a.mu.Unlock()
+	if pending != 1 || !waiting {
+		t.Fatalf("pending = %d, waiting = %v; want the click held", pending, waiting)
+	}
+	a.trackQuestion(ev.Message.Name, "", &chatmsg.Message{Schema: chatmsg.Schema, Headline: "Settled"}, gchatChatLayout{Text: "*Settled*"})
+	a.mu.Lock()
+	pending, waiting = len(a.uxLocked().pending), a.uxLocked().waiting[ev.Message.Name]
+	a.mu.Unlock()
+	if pending != 0 || waiting {
+		t.Errorf("pending = %d, waiting = %v after the settle; want the click forgotten", pending, waiting)
+	}
+}

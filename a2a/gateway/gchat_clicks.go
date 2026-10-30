@@ -181,10 +181,13 @@ func (a *GoogleChatAdapter) trackQuestion(name, conversation string, m *chatmsg.
 	defer a.mu.Unlock()
 	ux := a.uxLocked()
 	if m == nil || len(m.Choices) == 0 {
+		// A click waiting on the message, remembered or not (one from
+		// before a restart is not), would patch its stale snapshot of the
+		// text over this layout once verified.
+		ux.forgetClicksLocked(name)
 		if _, ok := ux.questions[name]; ok {
 			ux.dropQuestionLocked(name)
 			forget(&ux.questionsOrder, name)
-			ux.forgetClicksLocked(name)
 		}
 		return
 	}

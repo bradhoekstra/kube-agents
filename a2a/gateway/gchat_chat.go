@@ -126,12 +126,24 @@ func renderGchatChat(m *chatmsg.Message) (gchatChatLayout, error) {
 func gchatChatHead(m *chatmsg.Message) string {
 	var head []string
 	if m.Headline != "" {
-		head = append(head, gchatChatBold+defangGchatControls(m.Headline)+gchatChatBold)
+		head = append(head, gchatBoldLine(defangGchatControls(m.Headline)))
 	}
 	if m.Note != "" {
 		head = append(head, defangGchatControls(m.Note))
 	}
 	return strings.Join(head, " ")
+}
+
+// gchatBoldLine wraps a plain line (a headline, a fold's title) in Chat's
+// bold mark. A line that holds a star of its own (`kube-*`, `2**20`,
+// `*.yaml`) is left as written, since the added marks would pair with it and
+// Chat would show a plain text as part bold with a stray star, as
+// slackBoldLine leaves such a heading plain in the markdown pass.
+func gchatBoldLine(text string) string {
+	if strings.Contains(text, gchatChatBold) {
+		return text
+	}
+	return gchatChatBold + text + gchatChatBold
 }
 
 // gchatChatRows is the rows as a bulleted list: the severity as inline code
@@ -184,7 +196,7 @@ func gchatChatFold(f *chatmsg.Fold) string {
 	if title == "" {
 		title = chatmsg.DefaultFoldTitle
 	}
-	parts := []string{gchatChatBold + defangGchatControls(gchatOneLine(title)) + gchatChatBold}
+	parts := []string{gchatBoldLine(defangGchatControls(gchatOneLine(title)))}
 	if strings.TrimSpace(f.Text) != "" {
 		parts = append(parts, toGchatText(f.Text))
 	}

@@ -227,3 +227,23 @@ func TestGchatEditMessageLaysOutOrClears(t *testing.T) {
 		t.Errorf("a 404 is a gone message: %v", err)
 	}
 }
+
+// A plain headline or fold title that holds a star of its own is left as
+// written: wrapping it in Chat's bold mark would pair the added marks with
+// its star and show it part bold.
+func TestRenderGchatChatLeavesAStarredHeadlinePlain(t *testing.T) {
+	for _, headline := range []string{"Memory is 2**20 bytes.", "kube-* clusters are behind", "*.yaml manifests missing"} {
+		m := &chatmsg.Message{Schema: chatmsg.Schema, Headline: headline, Fold: &chatmsg.Fold{Title: headline, Text: "x"}}
+		layout, err := renderGchatChat(m)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Count(layout.Text, headline) != 2 || strings.Contains(layout.Text, gchatChatBold+headline) {
+			t.Errorf("headline %q renders as %q; want it twice, unwrapped", headline, layout.Text)
+		}
+	}
+	plain, err := renderGchatChat(&chatmsg.Message{Schema: chatmsg.Schema, Headline: "Plain"})
+	if err != nil || plain.Text != "*Plain*" {
+		t.Errorf("a plain headline = %q, %v; want it bold", plain.Text, err)
+	}
+}
