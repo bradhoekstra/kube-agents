@@ -348,8 +348,9 @@ PROC_ROOT = "/proc"
 PROC_SELF = "self"
 PROC_STATUS_FILE = "status"
 PROC_COMM_FILE = "comm"
-# The process beside the broker in its container, found by its comm name; the
-# api-proxy role has none and its series is absent there.
+# The process beside the broker in its container, found by its comm name.
+# (The api-proxy role runs no Envoy, and serve() returns in that role before
+# the reader exists, so no series is read there at all.)
 ENVOY_PROCESS_NAME = "envoy"
 PROCESS_LABEL_BROKER = "broker"
 PROCESS_LABEL_ENVOY = "envoy"
