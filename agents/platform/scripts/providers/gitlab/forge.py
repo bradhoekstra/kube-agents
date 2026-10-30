@@ -35,7 +35,7 @@ from urllib.parse import quote
 
 import repo_ref
 
-from ..base import COLLABORATION_VERBS, TALLY_TOTAL, Forge, WorkspaceError, listing
+from ..base import COLLABORATION_VERBS, TALLY_TOTAL, Forge, WorkspaceError, listing, tally_with_open
 from ..credentials import Credential, NoCredential, StaticFileCredential
 from ..validate import (
     MAX_CONVERSATION_SIZE,
@@ -94,9 +94,9 @@ AUTHORED_STATE = "all"
 AUTHORED_ORDER_BY = "updated_at"
 AUTHORED_SORT = "desc"
 
-#: GitLab's state filter for each neutral outcome a tally counts.
-# The states the tally counts; `open` is the `all` count less these two, since
-# the three counts are separate requests, not one snapshot.
+#: GitLab's state filter for each count a tally makes: the two terminal
+#: outcomes and `all`, every state together, from which `open` is the remainder
+#: (the three counts are separate requests, not one snapshot).
 TALLY_STATES = {"merged": "merged", "closed": "closed", TALLY_TOTAL: "all"}
 
 
@@ -778,8 +778,7 @@ class GitLabForge(Forge):
                     code="FORGE_CALL_FAILED",
                 )
             tally[neutral] = total
-        tally["open"] = max(tally[TALLY_TOTAL] - tally["merged"] - tally["closed"], 0)
-        return tally
+        return tally_with_open(tally)
 
     def proposal_reviews(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
         # GitLab has approvals, not reviews: one unpaged answer naming every

@@ -48,17 +48,19 @@ from .credentials import Credential, NoCredential
 from .errors import Override
 from .validate import repo_segments
 
-# Re-exported so a forge package can refuse a request without importing outside
-# the shared contract. `WorkspaceError` is the broker's "the caller sent
-# something wrong" with an HTTP status attached; a forge raises it for anything
-# specific to its own request shapes that the shared validators cannot know.
 # The key a `proposal_tally` answer carries the forge's one count of every state
 # under, where the forge counts the states in separate queries.
 TALLY_TOTAL = "total"
 
+# Re-exported so a forge package can refuse a request without importing outside
+# the shared contract. `WorkspaceError` is the broker's "the caller sent
+# something wrong" with an HTTP status attached; a forge raises it for anything
+# specific to its own request shapes that the shared validators cannot know.
+
 __all__ = [
     "BROKER_VERBS",
     "TALLY_TOTAL",
+    "tally_with_open",
     "COLLABORATION_VERBS",
     "ISSUE_VERBS",
     "LABEL_FIELDS",
@@ -122,6 +124,18 @@ BROKER_VERBS: tuple[str, ...] = (
 # the agent to a command that does not exist.
 LIBRARY_VERBS: frozenset[str] = frozenset({"snapshot"})
 
+
+
+def tally_with_open(tally: dict[str, Any]) -> dict[str, Any]:
+    """`tally` with `open` as the remainder of its one count less merged and closed.
+
+    The three counts are separate requests, not one snapshot, so a proposal
+    that changes state between two of them is counted twice or not at all;
+    the remainder keeps the sum at the forge's one count. Clamped at zero, so
+    a count that straddled a merge never publishes a negative gauge.
+    """
+    tally["open"] = max(tally[TALLY_TOTAL] - tally["merged"] - tally["closed"], 0)
+    return tally
 
 class ForgeUnsupported(WorkspaceError):
     """This host is not one this install has a credential and a client for."""

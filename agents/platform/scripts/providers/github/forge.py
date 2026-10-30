@@ -27,7 +27,7 @@ from urllib.parse import quote
 
 import repo_ref
 
-from ..base import COLLABORATION_VERBS, Forge, WorkspaceError, listing, TALLY_TOTAL
+from ..base import COLLABORATION_VERBS, Forge, WorkspaceError, listing, TALLY_TOTAL, tally_with_open
 from ..credentials import (
     BrokeredCredential,
     Credential,
@@ -741,8 +741,7 @@ class GitHubForge(Forge):
                     code="FORGE_CALL_FAILED",
                 )
             tally[state] = total
-        tally["open"] = max(tally[TALLY_TOTAL] - tally["merged"] - tally["closed"], 0)
-        return tally
+        return tally_with_open(tally)
 
     def proposal_reviews(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
         # The reviews `proposal-view` reads, without its bodiless-review drop:

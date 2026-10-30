@@ -479,9 +479,6 @@ class MainTest(unittest.TestCase):
         self.assertIn("refused", err.getvalue())
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class GatewayCopyTest(unittest.TestCase):
     """The gateway's Go copy of the field lists is this script's, verbatim."""
@@ -497,3 +494,7 @@ class GatewayCopyTest(unittest.TestCase):
     def test_the_gateway_prints_the_same_counters_and_readings(self):
         self.assertEqual(list(fs.USAGE_COUNTERS), self._go_strings("usageSummaryCounters"))
         self.assertEqual(sorted(fs.USAGE_READINGS), sorted(self._go_strings("usageSummaryReadings")))
+
+
+if __name__ == "__main__":
+    unittest.main()

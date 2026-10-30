@@ -28,7 +28,7 @@ from collections import Counter, deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
 
-from providers import ForgeUnsupported, IdentityUnknown, MAX_PAGE_SIZE, TALLY_TOTAL, WorkspaceError
+from providers import ForgeUnsupported, IdentityUnknown, MAX_PAGE_SIZE, WorkspaceError
 from providers.validate import MAX_CONVERSATION_SIZE
 from vcs_broker import _login_key
 
@@ -638,30 +638,18 @@ class ReadingsSweep:
             page += 1
 
     def _tally(self, repo: str) -> Counter | None:
-        """State counts for a repository past the walk bound, from the tally:
-        merged and closed as counted, open the remainder of the forge's one count
-        where it gives one. None when the forge cannot split them, which
-        withholds the outcomes reading."""
+        """State counts for a repository past the walk bound, as the forge's
+        tally gives them (`tally_with_open` derives open from the one count on a
+        forge that counts the states separately). None when the forge cannot
+        split them, which withholds the outcomes reading."""
         bound = self._bound[repo]
         answer = bound.forge.proposal_tally(bound.api, bound.path, self._author_payload(repo))
         counts = Counter()
-        total = answer.get(TALLY_TOTAL)
-        if not isinstance(total, int) or isinstance(total, bool):
-            total = None
         for state in STATES:
             value = answer.get(state)
-            if state == STATE_OPEN and total is not None:
-                continue
             if not isinstance(value, int) or isinstance(value, bool):
                 return None
             counts[state] = value
-        if total is not None:
-            # The per-state counts are separate queries, not one snapshot: a
-            # proposal that changes state between two of them is counted twice
-            # or not at all, and the sum would dip or double for a sweep, which
-            # the fall guard reads as a removal. The forge's one count of every
-            # proposal is the sum; `open` takes up the difference.
-            counts[STATE_OPEN] = max(total - counts[STATE_MERGED] - counts[STATE_CLOSED], 0)
         return counts
 
     def _warm(self, repo: str, proposals: list[dict]) -> bool:

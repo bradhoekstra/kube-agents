@@ -1157,20 +1157,8 @@ class TallyAndUnsupportedTest(unittest.TestCase):
         self.assertIsNotNone(details, "the details reading is published from the listing the tally did not touch")
         self.assertEqual(["truncated", "forge"], harness.metrics.failures)
 
-    def test_the_tally_takes_the_sum_from_the_forges_one_count(self):
-        # Separate per-state requests straddle a merge: the forge counts 2
-        # proposals, merged 1 and closed 1, and open takes the difference.
-        def tally(api, repo, payload):
-            return {"merged": 1, "closed": 1, "total": 2}
-
-        forge = self._truncated_forge(tally)
-        harness = Harness({GITEA_REPO.replace("gitea:", "fake:"): forge}, interval=WIDE)
-        harness.sweep.run_once()
-        outcomes, _ = harness.last()
-        self.assertEqual((0, 1, 1), (outcomes.open, outcomes.merged, outcomes.closed))
-
     def test_a_failed_tally_keeps_its_reason_beside_warming(self):
-        # Under the default interval the budget warms a few dozen proposals a
+        # Under the default interval the budget warms about nine proposals a
         # sweep, so a repository past the bound warms for many sweeps; the
         # tally's failure stays the reason the outcomes reading is withheld.
         def tally(api, repo, payload):
@@ -1200,6 +1188,16 @@ class TallyAndUnsupportedTest(unittest.TestCase):
         harness.sweep.run_once()
         self.assertEqual(["forge", "forge"], harness.metrics.failures, "attempted again every sweep")
         self.assertEqual([], harness.metrics.readings)
+
+
+class TallyWithOpenTest(unittest.TestCase):
+    def test_open_is_the_remainder_of_the_one_count(self):
+        self.assertEqual({"merged": 5, "closed": 1, "total": 8, "open": 2}, providers.tally_with_open({"merged": 5, "closed": 1, "total": 8}))
+
+    def test_a_count_that_straddled_a_merge_is_clamped_at_zero(self):
+        # merged and closed each counted a proposal that merged between the
+        # requests; the remainder would be -1 and a gauge never goes negative.
+        self.assertEqual(0, providers.tally_with_open({"merged": 2, "closed": 1, "total": 2})["open"])
 
 
 class GitHubTallyTest(unittest.TestCase):
