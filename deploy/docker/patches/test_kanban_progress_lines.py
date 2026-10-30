@@ -835,6 +835,13 @@ SLACK_SUB = {
     "thread_id": "1790717879.123899",
     "delivery_mode": "notify+wake",
 }
+GCHAT_SUB = {
+    "task_id": "t_e0c1",
+    "platform": "google_chat",
+    "chat_id": "spaces/H",
+    "thread_id": "spaces/H/threads/T",
+    "delivery_mode": "notify+wake",
+}
 
 
 class SlackQuietTerminalTest(unittest.IsolatedAsyncioTestCase):
@@ -1032,6 +1039,19 @@ class ChatNotifyAnswerTest(SlackQuietTerminalTest):
         self.assertEqual(adapter.sent[-1][1], "Both pods are up. Seeded-a runs two.")
         self.assertEqual(adapter.metadata[-1]["kage_chat"],
                          {"schema": "kube-agents.chat/v1", "headline": "Both pods are up.", "detail": "Seeded-a runs two."})
+
+    async def test_a_google_chat_card_under_next_carries_its_answer_too(self):
+        # The gateway lays the answer out on Google Chat under next; under today
+        # (nothing served) the report goes as text, as before.
+        served = {"A2A_NOTIFY_PLATFORM": "google_chat", "A2A_NOTIFY_CONVERSATIONS": "google_chat"}
+        with mock.patch.dict(os.environ, served):
+            adapter = _ChatNotifyStandIn()
+            await self._run(adapter, GCHAT_SUB, "completed", "Both pods are up. Seeded-a runs two.")
+        self.assertEqual(adapter.metadata[-1]["kage_chat"]["headline"], "Both pods are up.")
+        with mock.patch.dict(os.environ, {"A2A_NOTIFY_PLATFORM": "", "A2A_NOTIFY_CONVERSATIONS": ""}):
+            adapter = _ChatNotifyStandIn()
+            await self._run(adapter, GCHAT_SUB, "completed", "Both pods are up. Seeded-a runs two.")
+        self.assertNotIn("kage_chat", adapter.metadata[-1] or {})
 
     def _plan(self, settled):
         async def settle_row(adapter, sub, kind, result="", title=""):

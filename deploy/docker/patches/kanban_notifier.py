@@ -219,6 +219,20 @@ CLIPPED_TAIL = (
 )
 
 
+# The platform names as a subscription and the gateway's env carry them. The platforms whose cards get laid-out chat
+# messages (chat_ux_on) are Slack under either mode and Google Chat under
+# ``spec.mode: next``, where the A2A gateway lays a ``kube-agents.chat/v1``
+# message out as text with buttons; the other patch modules read this tuple
+# rather than keep their own. The gateway's served platform is read from the
+# operator's env (kanban_chat_notify.NOTIFY_PLATFORM_ENV and
+# NOTIFY_CONVERSATIONS_ENV name the same two variables), by name here so the
+# read needs no import of that module, which the unit tests load flat.
+SLACK_PLATFORM = "slack"
+GOOGLE_CHAT_PLATFORM = "google_chat"
+CHAT_UX_PLATFORMS = (SLACK_PLATFORM, GOOGLE_CHAT_PLATFORM)
+GATEWAY_PLATFORM_ENVS = ("A2A_NOTIFY_PLATFORM", "A2A_NOTIFY_CONVERSATIONS")
+
+
 def _normalise(text: str) -> str:
     """Collapse whitespace and case, so two renderings of one report compare equal."""
     return " ".join(text.split()).casefold()
@@ -1557,8 +1571,6 @@ def store_incident_report(
 # when a delivery runs: that module is copied into the image after this one,
 # and an image without it reads as flag off.
 
-SLACK_PLATFORM = "slack"
-
 #: Upstream's completion head line, byte for byte. Kept whole when there is no
 #: handoff at all, since then it is the only thing the message would say.
 COMPLETION_HEAD = "✔ {head} done — {title}"
@@ -1587,6 +1599,40 @@ def slack_ux_on(platform: object) -> bool:
     """Whether ``KAGE_SLACK_UX`` is on and ``platform`` is Slack."""
     if str(platform or "").strip().lower() != SLACK_PLATFORM:
         return False
+    return _ux_flag_on()
+
+
+def chat_ux_on(platform: object) -> bool:
+    """Whether ``platform``'s cards get laid-out chat messages: :func:`slack_ux_on`, or
+    Google Chat with the flag on when the gateway serves it (``spec.mode: next``).
+
+    Under ``next`` the A2A gateway lays a ``kube-agents.chat/v1`` message out on
+    Google Chat as text with buttons, so the plan, the moments, the answer and
+    the failure reply go to it as they go to Slack. Under ``today`` Google
+    Chat is Hermes's own adapter, which takes text, and nothing is served, so
+    this reads False there as before. The Slack-API paths (reactions, Agent
+    Sessions, ``chat.update``) keep their own Slack gates; a Google Chat card
+    under ``next`` is delivered by the chat.notify stand-in, which has none.
+    """
+    name = str(platform or "").strip().lower()
+    if name == SLACK_PLATFORM:
+        return slack_ux_on(platform)
+    if name != GOOGLE_CHAT_PLATFORM or not gateway_serves(name):
+        return False
+    return _ux_flag_on()
+
+
+def gateway_serves(platform: object) -> bool:
+    """Whether the A2A gateway serves ``platform``'s posts (``spec.mode: next``): the
+    platform the operator names in ``A2A_NOTIFY_PLATFORM`` (home posts) or
+    ``A2A_NOTIFY_CONVERSATIONS`` (conversations), as kanban_chat_notify reads them."""
+    name = str(platform or "").strip().lower()
+    served = {os.environ.get(key, "").strip().lower() for key in GATEWAY_PLATFORM_ENVS}
+    return bool(name) and name in served
+
+
+def _ux_flag_on() -> bool:
+    """Whether ``KAGE_SLACK_UX`` is on, read through ``gateway.slack_ux_reactions``."""
     try:
         from gateway import slack_ux_reactions
     except ImportError:
@@ -1608,7 +1654,7 @@ def completion_text(head: str, title: str, handoff: str, platform: object = None
     is worse than a terse one.
     """
     upstream = COMPLETION_HEAD.format(head=head, title=title) + (handoff or "")
-    if not slack_ux_on(platform):
+    if not chat_ux_on(platform):
         # No Slack presenter reads this one, so the declared step's line, plumbing, comes off here.
         return _visible(upstream)
     return str(handoff or "").strip() or upstream
@@ -1635,7 +1681,7 @@ def explained_by_wake(
     puts the kind in the wake set, so the one message the thread gets is the
     creator's explanation. Anything short of all four keeps upstream's line.
     """
-    if kind not in EXPLAINED_KINDS or not slack_ux_on(sub.get("platform")):
+    if kind not in EXPLAINED_KINDS or not chat_ux_on(sub.get("platform")):
         return False
     if (sub.get("delivery_mode") or DEFAULT_DELIVERY_MODE) not in WAKING_MODES:
         return False

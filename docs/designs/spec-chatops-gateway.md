@@ -1547,7 +1547,8 @@ works and until the parent's own answer has been delivered on that thread, then 
 cursor moved past it, and posted after all if the parent ends blocked, its subscription is gone,
 or the hold passes two hours (then led "Interim result from <card title> …"). One that arrives after
 the parent's answer has posted opens with "Late result from <card title>:". On Slack with
-`KAGE_SLACK_UX` on, a child whose parent still works is not held: its `completed` delivers, and
+`KAGE_SLACK_UX` on, and on Google Chat under `next`, where the gateway lays the plan out, a
+child whose parent still works is not held: its `completed` delivers, and
 `kanban_progress_lines` settles its plan row and posts nothing, as under `today`. Its other events (blocked, gave up, progress) post as before. A route probe (an empty notify, which an armed gateway refuses at once) tells the
 notifier when the route is unavailable (the gateway restarting), and it holds deliveries
 unclaimed then; only a send that meets the outage before the next probe spends one unit of

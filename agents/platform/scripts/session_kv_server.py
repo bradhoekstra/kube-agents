@@ -1079,6 +1079,9 @@ DRIFT_UNKNOWN_FIELD = "unknown"
 # misstate it. The title is stored on the session's routing row, where
 # gateway/slack_ux_incident.py reads it; Slack's rename refuses `·`, so " in ".
 SLACK_PLATFORM = "slack"
+# The platforms a cron report's card goes to: Slack, and Google Chat where the gateway
+# routes it (spec.mode: next) and lays the card out (kanban_notifier.CHAT_UX_PLATFORMS).
+CARD_PLATFORMS = (SLACK_PLATFORM, chat_notify.GCHAT_PLATFORM)
 CRASHLOOP_REASON = "CrashLoopBackOff"
 BACKOFF_REASON = "BackOff"
 IMAGE_PULL_MARKER = "pulling image"
@@ -4197,7 +4200,9 @@ def _trigger_agent_troubleshooter(
         if thread_id:
             _register_session_routing(session_id, active_platform, thread_id)
             notice = _TriageNotice(active_platform, thread_id, "")
-            if alert_title and active_platform == SLACK_PLATFORM:
+            if alert_title and active_platform in CARD_PLATFORMS and (active_platform == SLACK_PLATFORM or chat_notify.routes(active_platform)):
+                # The title heads the plan the cards draw: on Slack, and on the
+                # platform the gateway lays the plan out for under spec.mode: next.
                 _record_alert_title(session_id, alert_title)
             # Armed here, before the gateway is contacted: an alert whose turn
             # never starts (session creation refused, the turn's POST failing)
@@ -4630,6 +4635,18 @@ class AuditHeadline(NamedTuple):
     ref: slack_audit_report.LedgerRef
 
 
+def _card_platform(platform: str, chat_id: str) -> bool:
+    """Whether a cron report's card goes to ``platform``: with ``KAGE_SLACK_UX`` on, Slack
+    (Block Kit through the relay, or a chat message through the gateway under
+    ``spec.mode: next``), or Google Chat when the gateway routes it, where the gateway
+    lays the chat message out; and a destination, the thread's chat or the home
+    channel, which the gateway holds itself for the platform it routes."""
+    routed = chat_notify.routes(platform)
+    if not slack_presenter.enabled() or platform not in CARD_PLATFORMS or not (platform == SLACK_PLATFORM or routed):
+        return False
+    return bool(routed or chat_id or _slack_home_channel())
+
+
 def _slack_audit_headline(
     platform: str, message: str, chat_id: str, profile: str, job_id: str, deadline: float
 ) -> AuditHeadline | None:
@@ -4647,9 +4664,7 @@ def _slack_audit_headline(
     link. The issue rides along
     for :func:`_post_audit_blocks`.
     """
-    if platform != "slack" or not slack_presenter.enabled():
-        return None
-    if not (chat_id or _slack_home_channel()):
+    if not _card_platform(platform, chat_id):
         return None
     if not _is_fleet_audit_job(profile, job_id):
         return None
@@ -4785,6 +4800,7 @@ def _fetch_ledger_issue(ref: slack_audit_report.LedgerRef) -> dict | None:
 
 
 def _post_audit_blocks(
+    platform: str,
     profile: str,
     job_id: str,
     headline: AuditHeadline,
@@ -4812,18 +4828,18 @@ def _post_audit_blocks(
     missing report. An ok answer with no ts posted:
     ``thread_id`` is then empty and the caller counts the leg as delivered.
     """
-    routed = chat_notify.routes(SLACK_PLATFORM)
+    routed = chat_notify.routes(platform)
     if headline.issue is None or not (routed or slack_blocks_post.configured()):
         return None
     if routed:
         built = slack_audit_report.chat_from_issue(headline.issue, headline.ref, message)
     else:
         built = slack_audit_report.blocks_from_issue(headline.issue, headline.ref, message)
-    return _post_audit_card(profile, job_id, built, routed, chat_id, thread_id, deadline)
+    return _post_audit_card(platform, profile, job_id, built, routed, chat_id, thread_id, deadline)
 
 
 def _post_summary_card(
-    profile: str, job_id: str, report: str, chat_id: str, thread_id: str, deadline: float
+    platform: str, profile: str, job_id: str, report: str, chat_id: str, thread_id: str, deadline: float
 ) -> AuditPost | None:
     """Post the card of a fleet-audit report with no ledger issue (:func:`slack_audit_report.summary_card`).
 
@@ -4832,17 +4848,18 @@ def _post_summary_card(
     through the gateway; None, and the caller posts text, when neither is
     there, the card cannot be built, or the post did not land.
     """
-    routed = chat_notify.routes(SLACK_PLATFORM)
+    routed = chat_notify.routes(platform)
     if not (routed or slack_blocks_post.configured()):
         return None
     if routed:
         built = slack_audit_report.chat_from_summary(report)
     else:
         built = slack_audit_report.blocks_from_summary(report)
-    return _post_audit_card(profile, job_id, built, routed, chat_id, thread_id, deadline)
+    return _post_audit_card(platform, profile, job_id, built, routed, chat_id, thread_id, deadline)
 
 
 def _post_audit_card(
+    platform: str,
     profile: str,
     job_id: str,
     built: tuple[Any, str] | None,
@@ -4866,7 +4883,7 @@ def _post_audit_card(
         return None
     if routed:
         return _post_audit_chat_via_gateway(
-            profile, job_id, blocks, text, thread_id if threaded else "", min(AUDIT_BLOCKS_POST_TIMEOUT_S, left)
+            platform, profile, job_id, blocks, text, thread_id if threaded else "", min(AUDIT_BLOCKS_POST_TIMEOUT_S, left)
         )
     try:
         ts = slack_blocks_post.post(
@@ -4894,15 +4911,15 @@ GATEWAY_POST_TIMEOUT_MARGIN_S = 3
 
 
 def _post_audit_chat_via_gateway(
-    profile: str, job_id: str, chat: dict, text: str, thread_id: str, timeout: float
+    platform: str, profile: str, job_id: str, chat: dict, text: str, thread_id: str, timeout: float
 ) -> AuditPost | None:
-    """Post the audit report's card through the gateway's Slack chat.notify route.
+    """Post the audit report's card through the gateway's chat.notify route for ``platform``.
 
     The next-stack half of :func:`_post_audit_blocks`: under ``spec.mode: next``
-    the broker's Slack relay is gone and the gateway holds Slack, so the card
-    goes as a ``kube-agents.chat/v1`` message (``a2a notify --chat-file``,
-    chat_notify.py) into the home channel, and the gateway lays it out, its
-    buttons included. ``text`` is the message's fallback, which the gateway
+    the broker's Slack relay is gone and the gateway holds the chat platform,
+    Slack or Google Chat, so the card goes as a ``kube-agents.chat/v1`` message
+    (``a2a notify --chat-file``, chat_notify.py) into the home channel, and the
+    gateway lays it out, its buttons included. ``text`` is the message's fallback, which the gateway
     posts itself when it does not lay the message out. Same outcomes as the
     relay path: None, to post text instead, after a refusal, a failure to
     send, or a post that may have landed.
@@ -4914,7 +4931,7 @@ def _post_audit_chat_via_gateway(
             path = handle.name
         res = subprocess.run(
             chat_notify.chat_command(
-                SLACK_PLATFORM, thread_id, text, path, max(timeout - GATEWAY_POST_TIMEOUT_MARGIN_S, 1)
+                platform, thread_id, text, path, max(timeout - GATEWAY_POST_TIMEOUT_MARGIN_S, 1)
             ),
             capture_output=True,
             text=True,
@@ -4943,11 +4960,11 @@ def _post_audit_chat_via_gateway(
         resp = {}
     if thread_id:
         return AuditPost(thread_id)
-    return AuditPost(chat_notify.thread_from_response(SLACK_PLATFORM, resp if isinstance(resp, dict) else {}))
+    return AuditPost(chat_notify.thread_from_response(platform, resp if isinstance(resp, dict) else {}))
 
 
 def _post_failed_audit_via_gateway(
-    profile: str, job_id: str, report: str, chat_id: str, thread_id: str, deadline: float
+    platform: str, profile: str, job_id: str, report: str, chat_id: str, thread_id: str, deadline: float
 ) -> AuditPost | None:
     """Under ``spec.mode: next``, post a failed fleet-audit report as its one line with the report folded under it.
 
@@ -4963,7 +4980,7 @@ def _post_failed_audit_via_gateway(
         return None
     chat, text = built
     thread = thread_id if chat_id and thread_id else ""
-    return _post_audit_chat_via_gateway(profile, job_id, chat, text, thread, min(AUDIT_BLOCKS_POST_TIMEOUT_S, left))
+    return _post_audit_chat_via_gateway(platform, profile, job_id, chat, text, thread, min(AUDIT_BLOCKS_POST_TIMEOUT_S, left))
 
 
 def _slack_summary_text(platform: str, report: str, chat_id: str, profile: str, job_id: str) -> str | None:
@@ -4976,9 +4993,7 @@ def _slack_summary_text(platform: str, report: str, chat_id: str, profile: str, 
     skill. The card itself is :func:`_post_summary_card`'s; this text is what
     posts when the card does not.
     """
-    if platform != SLACK_PLATFORM or not slack_presenter.enabled():
-        return None
-    if not (chat_id or _slack_home_channel()):
+    if not _card_platform(platform, chat_id):
         return None
     text = slack_audit_report.headline_from_summary(report)
     if text is None or not _is_fleet_audit_job(profile, job_id):
@@ -4995,9 +5010,7 @@ def _board_health_card(platform: str, report: str, chat_id: str, job_id: str) ->
     for this very report. Never raises: a card that cannot be read posts as
     text.
     """
-    if platform != SLACK_PLATFORM or job_id != kanban_board_health.JOB_ID or not slack_presenter.enabled():
-        return None
-    if not (chat_id or _slack_home_channel()):
+    if job_id != kanban_board_health.JOB_ID or not _card_platform(platform, chat_id):
         return None
     try:
         return board_health_card.load(kanban_board_health.agent_home(), report)
@@ -5007,18 +5020,18 @@ def _board_health_card(platform: str, report: str, chat_id: str, job_id: str) ->
 
 
 def _post_board_health_card(
-    profile: str, job_id: str, card: dict, chat_id: str, thread_id: str, deadline: float
+    platform: str, profile: str, job_id: str, card: dict, chat_id: str, thread_id: str, deadline: float
 ) -> AuditPost | None:
     """Post the board-health card; where it landed, or None to post the report as text.
 
     Block Kit through the Slack relay, or under ``spec.mode: next`` a chat
     message through the gateway, with the outcomes of :func:`_post_audit_card`.
     """
-    routed = chat_notify.routes(SLACK_PLATFORM)
+    routed = chat_notify.routes(platform)
     if not (routed or slack_blocks_post.configured()):
         return None
     built = board_health_card.chat_from_card(card) if routed else board_health_card.blocks_from_card(card)
-    return _post_audit_card(profile, job_id, built, routed, chat_id, thread_id, deadline)
+    return _post_audit_card(platform, profile, job_id, built, routed, chat_id, thread_id, deadline)
 
 
 def _failed_audit_line(platform: str, report: str, chat_id: str, profile: str, job_id: str) -> str | None:
@@ -5033,9 +5046,7 @@ def _failed_audit_line(platform: str, report: str, chat_id: str, profile: str, j
     whole report for a reply in the thread, and under ``spec.mode: next`` the
     report folds under the line instead (:func:`_post_failed_audit_via_gateway`).
     """
-    if platform != SLACK_PLATFORM or not slack_presenter.enabled():
-        return None
-    if not (chat_id or _slack_home_channel()):
+    if not _card_platform(platform, chat_id):
         return None
     line = slack_audit_report.failed_line(report)
     if line is None or not _is_fleet_audit_job(profile, job_id):
@@ -5527,11 +5538,11 @@ def relay_cron_report(
             # The stuck tasks alone, as a card with Retry and Drop on each row;
             # where it does not post, the report goes out as written.
             posted = _post_board_health_card(
-                profile, job_id, board, leg_chat_id, leg_thread_id, blocks_deadline
+                platform, profile, job_id, board, leg_chat_id, leg_thread_id, blocks_deadline
             )
         elif headline and not truncation_notice:
             posted = _post_audit_blocks(
-                profile, job_id, headline, message, leg_chat_id, leg_thread_id, blocks_deadline
+                platform, profile, job_id, headline, message, leg_chat_id, leg_thread_id, blocks_deadline
             )
         elif not truncation_notice:
             try:
@@ -5540,7 +5551,7 @@ def relay_cron_report(
                 logger.warning(f"Relay for {profile}/{job_id}: audit summary card skipped: {exc!r}")
             if summary:
                 posted = _post_summary_card(
-                    profile, job_id, report, leg_chat_id, leg_thread_id, blocks_deadline
+                    platform, profile, job_id, report, leg_chat_id, leg_thread_id, blocks_deadline
                 )
             else:
                 try:
@@ -5549,7 +5560,7 @@ def relay_cron_report(
                     logger.warning(f"Relay for {profile}/{job_id}: failed-audit line skipped: {exc!r}")
                 if failed and chat_notify.routes(platform):
                     posted = _post_failed_audit_via_gateway(
-                        profile, job_id, report, leg_chat_id, leg_thread_id, blocks_deadline
+                        platform, profile, job_id, report, leg_chat_id, leg_thread_id, blocks_deadline
                     )
         if posted is not None:
             new_thread_id = posted.thread_id or None
