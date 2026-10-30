@@ -108,7 +108,7 @@ func TestRenderGchatChatPlanAndEdges(t *testing.T) {
 
 	// A row written as a list item or a rule, and plain fields the schema
 	// caps but does not hold to one line.
-	rows := &chatmsg.Message{Schema: chatmsg.Schema, Rows: []chatmsg.Row{{Text: "- restart the deployment"}, {Text: "---"}, {Text: "* also this", Severity: "minor"}},
+	rows := &chatmsg.Message{Schema: chatmsg.Schema, Rows: []chatmsg.Row{{Text: "- restart the deployment", Detail: "---"}, {Text: "---"}, {Text: "* also this", Severity: "minor"}},
 		Fold: &chatmsg.Fold{Title: "why\nnot", Table: &chatmsg.Table{Columns: []string{"state\nnow"}, Rows: [][]string{{"OOMKilled\nexit 137"}}}},
 		Plan: nil}
 	layout, err = renderGchatChat(rows)

@@ -595,6 +595,12 @@ func (a *GoogleChatAdapter) EditMessage(conversation, messageID string, m OutMes
 	}
 	layout := gchatChatLayout{Text: toGchatText(m.Text)}
 	if m.Chat != nil {
+		if len(m.Chat.Choices) > 0 {
+			// An edit that asks again opens the question anew whether or
+			// not its layout lands: the text the gateway falls back to must
+			// not carry the earlier answer's line.
+			a.forgetAnswer(messageID)
+		}
 		var err error
 		if layout, err = renderGchatChat(m.Chat); err != nil {
 			return fmt.Errorf("%w: %w", ErrLayoutRefused, err)
@@ -1159,16 +1165,7 @@ func (a *GoogleChatAdapter) classify(ev *gchatEvent) (InboundMessage, string) {
 	kind, thread := gchatSurface(ev)
 
 	a.mu.Lock()
-	if strings.HasPrefix(sender.Name, gchatUsersToken) {
-		// Bounded by the same cap as the dedupe memory: one entry per
-		// human who has spoken, evicted wholesale rather than leaked.
-		if len(a.userIDs) >= gchatSeenCap {
-			a.userIDs = map[string]string{}
-			a.userEmails = map[string]string{}
-		}
-		a.userIDs[sender.Name] = sender.Email
-		a.userEmails[strings.ToLower(sender.Email)] = sender.Name
-	}
+	a.rememberUserLocked(sender)
 	dup := a.seenLocked(ev.Message.Name)
 	a.mu.Unlock()
 	if dup {
@@ -1184,6 +1181,25 @@ func (a *GoogleChatAdapter) classify(ev *gchatEvent) (InboundMessage, string) {
 	}
 	a.noteTypedAnswer(msg, sender)
 	return msg, ""
+}
+
+// rememberUserLocked records a human's users/{id} resource name against the
+// email Chat asserted for them, from a message or a click, so Roster can map
+// a member's id back to the email they were verified as and OpenDirect can
+// open their DM by id (Chat withholds emails from spaces.members.list under
+// app credentials). Bounded by the same cap as the dedupe memory: one entry
+// per human who has spoken, evicted wholesale rather than leaked. Called
+// under a.mu.
+func (a *GoogleChatAdapter) rememberUserLocked(sender gchatSender) {
+	if !strings.HasPrefix(sender.Name, gchatUsersToken) || sender.Email == "" {
+		return
+	}
+	if len(a.userIDs) >= gchatSeenCap {
+		a.userIDs = map[string]string{}
+		a.userEmails = map[string]string{}
+	}
+	a.userIDs[sender.Name] = sender.Email
+	a.userEmails[strings.ToLower(sender.Email)] = sender.Name
 }
 
 // seenLocked reports whether name was delivered before, and records it:

@@ -149,8 +149,10 @@ func gchatChatRows(rows []chatmsg.Row) string {
 		// nothing after the pass, and draws no empty bullet.
 		text := strings.TrimPrefix(strings.TrimSpace(toGchatText(r.Text)), gchatChatRowBullet)
 		line += text
-		if strings.TrimSpace(r.Detail) != "" {
-			line += gchatChatRowDetailSep + toGchatText(r.Detail)
+		// Measured after the pass, as the text is: a detail that was a rule
+		// is nothing, and draws no separator.
+		if detail := strings.TrimSpace(toGchatText(r.Detail)); detail != "" {
+			line += gchatChatRowDetailSep + detail
 		}
 		if text != "" || r.Severity != "" {
 			lines = append(lines, line)

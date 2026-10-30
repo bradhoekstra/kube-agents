@@ -3,6 +3,7 @@ package gateway
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -527,6 +528,53 @@ func TestGchatDroppedTypedReplyKeepsAClicksClaim(t *testing.T) {
 	a.InboundVerified(typed.Conversation, typed.MessageID, false)
 	if _, reason := a.classify(gchatClickEvent(t)); !strings.Contains(reason, "already waiting") {
 		t.Errorf("a second click after a dropped typed reply: %q", reason)
+	}
+}
+
+// A click records the clicker's id against their email as a typed message
+// does, so the roster maps them and a DM can be opened for them before they
+// ever type.
+func TestGchatClickRemembersTheClicker(t *testing.T) {
+	a := newTestGchatAdapterWithRelay(t, newFakeChatRelay(t))
+	if _, reason := a.classify(gchatClickEvent(t)); reason != "" {
+		t.Fatal(reason)
+	}
+	a.mu.Lock()
+	id, email := a.userIDs["users/100000000000000000042"], a.userEmails["sender@example.com"]
+	a.mu.Unlock()
+	if id != "sender@example.com" || email != "users/100000000000000000042" {
+		t.Errorf("clicker not remembered: %q %q", id, email)
+	}
+}
+
+// A question asked again on a message is open anew even when the re-ask's
+// layout is refused and the gateway edits the text instead: the text carries
+// no earlier answer line.
+func TestGchatRefusedReAskCarriesNoStaleAnswer(t *testing.T) {
+	f := newFakeChatRelay(t)
+	f.responses["spaces.messages/create"] = map[string]any{"name": "spaces/_c2fixtureAA/messages/BOT1.BOT1"}
+	f.responses["spaces.messages/patch"] = map[string]any{"name": "spaces/_c2fixtureAA/messages/BOT1.BOT1"}
+	a := newTestGchatAdapterWithRelay(t, f)
+	a.syncRewrites = true
+	conv := "gchat:dm/spaces/_c2fixtureAA"
+	question := &chatmsg.Message{Schema: chatmsg.Schema, Headline: "Which?", Choices: []chatmsg.Choice{{Text: "Look at the first one"}, {Text: "Skip"}}}
+	if _, err := a.PostMessage(conv, OutMessage{Text: "fallback", Chat: question}); err != nil {
+		t.Fatal(err)
+	}
+	msg, reason := a.classify(gchatClickEvent(t))
+	if reason != "" {
+		t.Fatal(reason)
+	}
+	a.InboundVerified(msg.Conversation, msg.MessageID, true)
+	huge := &chatmsg.Message{Schema: chatmsg.Schema, Headline: "Again?", Choices: question.Choices, Fold: &chatmsg.Fold{Text: strings.Repeat("x", gchatChatTextMax+1)}}
+	if err := a.EditMessage(conv, "spaces/_c2fixtureAA/messages/BOT1.BOT1", OutMessage{Text: "Again? fallback", Chat: huge}); !errors.Is(err, ErrLayoutRefused) {
+		t.Fatalf("a layout past the cap must be refused: %v", err)
+	}
+	if err := a.EditMessage(conv, "spaces/_c2fixtureAA/messages/BOT1.BOT1", OutMessage{Text: "Again? fallback"}); err != nil {
+		t.Fatal(err)
+	}
+	if body := f.call(len(f.calls) - 1).arguments["body"].(map[string]any); strings.Contains(body["text"].(string), "✓") {
+		t.Errorf("the text fallback of a re-ask carries the old answer: %q", body["text"])
 	}
 }
 

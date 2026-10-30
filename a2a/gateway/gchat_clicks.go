@@ -203,6 +203,18 @@ func (a *GoogleChatAdapter) trackQuestion(name, conversation string, m *chatmsg.
 		delete(ux.open, conversation)
 	}
 	ux.forgetClicksLocked(name)
+	ux.forgetAnswerLocked(name)
+}
+
+// forgetAnswer forgets a message's answer and its line: it asks anew.
+func (a *GoogleChatAdapter) forgetAnswer(name string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.uxLocked().forgetAnswerLocked(name)
+}
+
+// forgetAnswerLocked is forgetAnswer under the adapter's lock.
+func (ux *gchatUX) forgetAnswerLocked(name string) {
 	delete(ux.answered, name)
 	delete(ux.lines, name)
 	forget(&ux.answeredRing, name)
@@ -322,6 +334,9 @@ func (a *GoogleChatAdapter) classifyClick(ev *gchatEvent) (InboundMessage, strin
 	}
 	ux.pending[id] = p
 	ux.waiting[ev.Message.Name] = true
+	// The clicker spoke, in the roster's sense: their id maps to their
+	// email from here, as after a typed message.
+	a.rememberUserLocked(click.User)
 	a.mu.Unlock()
 	if bound == "" {
 		bound = gchatConversationID(ev.Space.Name, thread, kind)
