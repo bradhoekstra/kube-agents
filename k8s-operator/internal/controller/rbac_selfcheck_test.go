@@ -17,8 +17,11 @@ limitations under the License.
 package controller
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"sort"
 	"strings"
@@ -34,13 +37,13 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
 	authorizationv1client "k8s.io/client-go/kubernetes/typed/authorization/v1"
 	k8stesting "k8s.io/client-go/testing"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
-	"sigs.k8s.io/yaml"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -92,10 +95,21 @@ type generatedRoles struct {
 	roles       []rbacv1.Role
 }
 
+// strictJSON decodes one document into v and refuses unknown fields, the
+// json counterpart of yaml.UnmarshalStrict for a document the YAML decoder has
+// already turned into JSON.
+func strictJSON(doc json.RawMessage, v any) error {
+	dec := json.NewDecoder(bytes.NewReader(doc))
+	dec.DisallowUnknownFields()
+	return dec.Decode(v)
+}
+
 // loadGeneratedRoles reads role.yaml document by document. controller-gen
 // writes the namespaced Role into the same file after the ClusterRole, and a
 // single-object parse would read the first document and silently drop the
-// rest -- the Secret grant among them.
+// rest -- the Secret grant among them. The apimachinery decoder splits the
+// stream, so a separator written with trailing whitespace or CRLF line ends
+// still parses as two documents rather than one.
 func loadGeneratedRoles(t *testing.T) generatedRoles {
 	t.Helper()
 	raw, err := os.ReadFile(generatedRolePath)
@@ -104,23 +118,31 @@ func loadGeneratedRoles(t *testing.T) generatedRoles {
 	}
 	var out generatedRoles
 	var clusterRoles int
-	for _, doc := range strings.Split(string(raw), "\n---\n") {
-		if strings.TrimSpace(strings.TrimPrefix(doc, "---")) == "" {
+	decoder := utilyaml.NewYAMLOrJSONDecoder(bytes.NewReader(raw), len(raw))
+	for {
+		var doc json.RawMessage
+		if err := decoder.Decode(&doc); err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			t.Fatalf("parse %s: %v", generatedRolePath, err)
+		}
+		if len(bytes.TrimSpace(doc)) == 0 || string(bytes.TrimSpace(doc)) == "null" {
 			continue
 		}
 		var kind metav1.TypeMeta
-		if err := yaml.Unmarshal([]byte(doc), &kind); err != nil {
+		if err := json.Unmarshal(doc, &kind); err != nil {
 			t.Fatalf("parse %s: %v", generatedRolePath, err)
 		}
 		switch kind.Kind {
 		case "ClusterRole":
 			clusterRoles++
-			if err := yaml.UnmarshalStrict([]byte(doc), &out.clusterRole); err != nil {
+			if err := strictJSON(doc, &out.clusterRole); err != nil {
 				t.Fatalf("parse %s ClusterRole: %v", generatedRolePath, err)
 			}
 		case "Role":
 			var role rbacv1.Role
-			if err := yaml.UnmarshalStrict([]byte(doc), &role); err != nil {
+			if err := strictJSON(doc, &role); err != nil {
 				t.Fatalf("parse %s Role: %v", generatedRolePath, err)
 			}
 			out.roles = append(out.roles, role)
