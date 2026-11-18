@@ -455,6 +455,22 @@ class PrintCommitTest(FetchTest):
                 self.assertEqual((status, out), (1, ""))
                 self.assertIn('"refused"', err)
 
+    def test_the_retired_eval_mode_next_flag_is_accepted_and_ignored(self):
+        # The Prow replay lane still passes --eval-mode-next "${EVAL_MODE_NEXT:-}"; every record
+        # is keyed next, so the value changes nothing: the same commit, with it, without it, empty.
+        self.record("200", 1, {VERSION: [f"answers/{fp(1)}.json"]}, created=NOW - 3 * HOUR, job=self.job(COMMIT_B))
+        self.record("301", 1, {VERSION: [f"answers/{fp(4)}.json"]}, created=NOW, job=self.job(COMMIT_A, mode="today"))
+        without = self.main()
+        self.assertEqual(without[:2], (0, COMMIT_B + "\n"))
+        for value in ("1", ""):
+            with self.subTest(value=repr(value)):
+                self.assertEqual(self.main("--eval-mode-next", value), without)
+        self.assertEqual(self.main("--eval-mode-next", "1", "--forge", ""), without)
+        import contextlib
+        import io
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            FC.main(["--bucket", BUCKET, "--print-commit", "--eval-mode-next"])
+
     def test_print_commit_needs_no_dest_and_fetch_still_does(self):
         import contextlib
         import io

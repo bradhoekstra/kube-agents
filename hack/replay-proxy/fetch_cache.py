@@ -560,6 +560,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         help="the normalizer version to fetch (default: this checkout's)")
     parser.add_argument("--max-age-hours", type=float, default=DEFAULT_MAX_AGE_HOURS)
     parser.add_argument("--max-bytes", type=int, default=DEFAULT_MAX_BYTES)
+    # `--eval-mode-next` chose the lane's mode while `spec.mode: today` existed; every
+    # record is keyed `next` now and the value is not read. Accepted and ignored while
+    # the Prow replay lane (oss-test-infra, ci-kube-agents-eval-replay-lane) still passes
+    # it; remove this argument and its test once that job's fetch_cache.py call no longer
+    # names the flag.
+    parser.add_argument("--eval-mode-next", default="",
+                        help="retired and ignored: every record is keyed next")
     parser.add_argument("--forge", default="", help="the lane's EVAL_FORGE (empty is github)")
     args = parser.parse_args(argv)
     if not args.print_commit and not args.dest:

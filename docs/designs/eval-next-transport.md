@@ -721,7 +721,7 @@ the door can carry off the lanes that graded over the agent API. A second lane,
 Secret keeping their UIDs) and graded the rolled-back install over the agent API, gating nothing;
 a report-only round trip after the verdict ran the same script on `main`. The mode, the flag,
 the lane, the round trip and the api-lane list retired together; a Prow job that still exports
-`EVAL_MODE_NEXT=1` is ignored.
+`EVAL_MODE_NEXT=1` is ignored. For the same reason `fetch_cache.py` accepts the replay lane's retired `--eval-mode-next` and ignores it.
 
 ## Open questions
 
