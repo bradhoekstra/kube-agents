@@ -697,7 +697,14 @@ class TestMaskPrivateKeys(unittest.TestCase):
                 self.assertEqual(AuditRedactor.mask_private_keys(text), want)
 
     def test_each_entry_point_masks_a_key_block(self):
-        block = "-----BEGIN RSA PRIVATE KEY-----\nMIIEow\n-----END RSA PRIVATE KEY-----"
+        # One literal per line, as the fixture at the top of this file is:
+        # GitHub secret scanning reported this block, written as one string, as
+        # a leaked RSA key (alert 24). The body is a six-character stub.
+        block = (
+            "-----BEGIN RSA PRIVATE KEY-----\n"
+            "MIIEow\n"
+            "-----END RSA PRIVATE KEY-----"
+        )
         open_header = "-----BEGIN RSA PRIVATE KEY-----\nMIIEow"
         self.assertEqual(AuditRedactor.redact_text("key: " + block + " then " + open_header), "key: " + self.MARKER + " then " + open_header)
         self.assertEqual(AuditRedactor.redact_text_counted("a " + block + " b " + block), ("a " + self.MARKER + " b " + self.MARKER, {"credential": 2}))
