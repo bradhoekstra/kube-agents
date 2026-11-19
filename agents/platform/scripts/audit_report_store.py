@@ -151,6 +151,14 @@ JWKS_ACCEPT = "application/jwk-set+json, application/json"
 DEFAULT_SA_DIR = "/var/run/secrets/kubernetes.io/serviceaccount"
 # The port. start-services.sh runs this module as a script, which binds it.
 LISTEN_PORT = 8700
+# Every IPv4 address of the pod, not loopback: the broker runs in another pod
+# and reaches this port through the Service <agent>-report-store, on the pod
+# IP. A pod's network namespace holds loopback and the pod interface, so the
+# wildcard adds only loopback, which the containers of this pod reach the pod
+# IP from anyway. What bounds the callers is the token check on every request
+# and, where the gateway NetworkPolicy is on and enforced, its rule; not the
+# address.
+LISTEN_ADDRESS = "0.0.0.0"
 DISCOVERY_PATH = "/.well-known/openid-configuration"
 JWKS_PATH = "/openid/v1/jwks"
 JWKS_TTL_SECONDS = 300.0
@@ -986,7 +994,7 @@ def create_app(verifier: TokenVerifier | None = None, root: str = DEFAULT_REPORT
 app = create_app()
 
 
-def bind_listener(port: int = LISTEN_PORT) -> socket.socket:
+def bind_listener(port: int = LISTEN_PORT, address: str = LISTEN_ADDRESS) -> socket.socket:
     """The listening socket, or a loud ERROR and SystemExit when the port is taken.
 
     The platform-agent container shares this pod's network namespace, so a
@@ -997,7 +1005,7 @@ def bind_listener(port: int = LISTEN_PORT) -> socket.socket:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
-        sock.bind(("0.0.0.0", port))
+        sock.bind((address, port))
     except OSError as exc:
         sock.close()
         if exc.errno == errno.EADDRINUSE:

@@ -724,15 +724,32 @@ class HardeningTests(StoreTestCase):
     def test_a_taken_port_is_a_loud_error(self) -> None:
         import socket
 
+        # Loopback on both sides: the test needs one port held twice, not a
+        # socket open to the network. The same address, because a wildcard
+        # bind over a loopback holder is refused on Linux but not on every
+        # platform that sets SO_REUSEADDR.
         holder = socket.socket()
-        holder.bind(("0.0.0.0", 0))
+        holder.bind(("127.0.0.1", 0))
         holder.listen(1)
         self.addCleanup(holder.close)
         port = holder.getsockname()[1]
         with self.assertLogs("audit_report_store", level="ERROR") as logs, self.assertRaises(SystemExit):
-            store.bind_listener(port)
+            store.bind_listener(port, "127.0.0.1")
         self.assertIn(f"port {port}", "\n".join(logs.output))
         self.assertIn("another process", "\n".join(logs.output))
+
+    def test_the_listener_binds_the_address_it_is_given(self) -> None:
+        sock = store.bind_listener(0, "127.0.0.1")
+        self.addCleanup(sock.close)
+        self.assertEqual("127.0.0.1", sock.getsockname()[0])
+
+    def test_the_default_address_is_one_the_broker_can_reach(self) -> None:
+        # The broker is in another pod and comes in through the Service, so a
+        # loopback default would refuse every profile worker's report.
+        import inspect
+
+        self.assertEqual("0.0.0.0", store.LISTEN_ADDRESS)
+        self.assertEqual(store.LISTEN_ADDRESS, inspect.signature(store.bind_listener).parameters["address"].default)
 
 
 class JWKSFailureHoldTests(unittest.TestCase):
